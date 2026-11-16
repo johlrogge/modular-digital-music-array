@@ -63,7 +63,7 @@ pub struct IndexedTrackInfo {
     pub styles: Vec<String>,
     pub duration_seconds: Option<u32>,
     pub bpm: Option<f32>,
-    pub key: Option<String>,
+    pub key: Option<music_facts::Key>,
     pub year: Option<u32>,
     pub source: Option<String>,
     pub blob_path: PathBuf,
@@ -415,7 +415,7 @@ fn apply_assert_scalar(
         MusicValue::StyleDescriptor(v) => push_unique(&mut entry.styles, v.clone()),
         MusicValue::DurationSeconds(v) => entry.duration_seconds = Some(v.value()),
         MusicValue::Bpm(v) => entry.bpm = Some(v.as_f32()),
-        MusicValue::Key(v) => entry.key = Some(v.to_string()),
+        MusicValue::Key(v) => entry.key = Some(*v),
         MusicValue::Year(v) => entry.year = Some(v.value()),
         MusicValue::TrackNumber(v) => entry.track_number = Some(v.value()),
         MusicValue::DiscNumber(v) => entry.disc_number = Some(v.value()),
@@ -609,7 +609,7 @@ fn apply_retract_scalar(entry: &mut IndexedTrackInfo, retracted: &MusicValue) {
             entry.key = last_surviving(&entry.provenance, &|v| matches!(v, MusicValue::Key(_)))
                 .and_then(|v| {
                     if let MusicValue::Key(k) = v {
-                        Some(k.to_string())
+                        Some(k)
                     } else {
                         None
                     }

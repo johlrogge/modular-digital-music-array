@@ -17,7 +17,7 @@ Example facts for a single track:
 sha256:abc…  Title         "Vacker"
 sha256:abc…  Artist        "Rymden"
 sha256:abc…  BPM           128
-sha256:abc…  Key           "8B"
+sha256:abc…  Key           "C Major"
 sha256:abc…  MainGenre     "Electronic"
 sha256:abc…  StyleDescr…   "Ambient"
 sha256:abc…  StyleDescr…   "Driving"
@@ -98,7 +98,7 @@ index tier is used. Indexes are always derived from facts and can be rebuilt.
 any_text  → OR across title/artist/album/label/genre
 artist    → StringQuery (Contains | Initialism | Regex)
 bpm       → NumericQuery (Exact | Range | Tolerance)
-key       → KeyQuery (Exact | Tolerance) — Camelot internally
+key       → KeyQuery (Steps | Span) over a typed Key — Camelot wheel math
 duration  → DurationQuery (Exact | AtLeast | AtMost | Range | WithPrecision)
 genre     → StringQuery against MainGenre
 style     → StringQuery against any StyleDescriptor

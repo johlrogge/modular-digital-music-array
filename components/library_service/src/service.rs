@@ -5,9 +5,9 @@
 use crate::identity::{identity_facts_for_blob, IdentityOpts};
 use crate::ipc::{
     bookmark_scope_mark, parse_request, AttributeList, BeatGridInfo, Bpm, ContentHash, CueInfo,
-    DurationSeconds, FactType, InboxPath, IngestAllItem, IngestResult, IpcServer, Key,
-    LibraryRequest, LibraryResponse, Mark, MarkWrite, OrphanInfo, OrphanReason, ProtocolError,
-    ServiceStatus, TrackInfo, TrackQuery, Unmark,
+    DurationSeconds, FactType, InboxPath, IngestAllItem, IngestResult, IpcServer, LibraryRequest,
+    LibraryResponse, Mark, MarkWrite, OrphanInfo, OrphanReason, ProtocolError, ServiceStatus,
+    TrackInfo, TrackQuery, Unmark,
 };
 use crate::pipeline::InboxFile;
 use crate::sources::{self, LibrarySources, ReleaseVersion};
@@ -2056,7 +2056,7 @@ impl LibraryService {
             album: t.album.clone(),
             duration: t.duration_seconds.map(DurationSeconds::new),
             bpm: t.bpm.and_then(|b| Bpm::from_f32(b).ok()),
-            key: t.key.as_ref().and_then(|k| Key::from_traditional(k).ok()),
+            key: t.key,
             blob_path: Some(t.blob_path.to_string_lossy().to_string()),
             cover_art_path: t
                 .cover_art_path
@@ -2349,7 +2349,7 @@ impl LibraryService {
                     genre: t.genre.as_deref(),
                     styles: &t.styles,
                     bpm: t.bpm,
-                    key: t.key.as_deref(),
+                    key: t.key,
                     duration: t.duration_seconds,
                     year: t.year,
                     source: t.source.as_deref(),
@@ -6412,6 +6412,44 @@ mod tests {
                 .any(|t| t.content_hash.as_str() == hash.as_str()),
             "deleted track must not appear in search_tracks"
         );
+    }
+
+    /// A key fact loaded through the projection is found by a Camelot key query
+    /// (the projection holds a typed `Key`, not its display string).
+    #[test]
+    fn search_by_key_finds_projected_track() {
+        use library_search::TrackQuery;
+        let a_minor = ContentHash::new("sha256:keysearch01");
+        let c_major = ContentHash::new("sha256:keysearch02");
+        let temp = write_facts_file(&[
+            (
+                a_minor.clone(),
+                MusicValue::Key("A Minor".parse().expect("valid key")),
+            ),
+            (
+                c_major.clone(),
+                MusicValue::Key("C Major".parse().expect("valid key")),
+            ),
+        ]);
+        let (service, _metadata_dir) = make_service_with_facts(temp.path());
+        let search = |key: &str| -> Vec<String> {
+            let query = TrackQuery {
+                key: Some(key.parse().expect("valid key query")),
+                ..Default::default()
+            };
+            let mut hashes: Vec<String> = service
+                .search_tracks(&query)
+                .iter()
+                .map(|t| t.content_hash.as_str().to_owned())
+                .collect();
+            hashes.sort();
+            hashes
+        };
+        assert_eq!(search("8A"), vec![a_minor.as_str().to_owned()]);
+        assert_eq!(search("Am"), vec![a_minor.as_str().to_owned()]);
+        assert_eq!(search("8B"), vec![c_major.as_str().to_owned()]);
+        assert_eq!(search("8A-1").len(), 2);
+        assert!(search("1A").is_empty());
     }
 
     /// get_track returns TrackNotFound for hidden tracks.

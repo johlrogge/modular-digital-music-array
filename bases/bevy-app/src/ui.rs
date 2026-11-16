@@ -124,7 +124,7 @@ pub fn ui_system(
             // Key filter
             ui.horizontal(|ui| {
                 ui.label("Key:");
-                ui.add(egui::TextEdit::singleline(&mut filter_state.key_text).hint_text("8A~"));
+                ui.add(egui::TextEdit::singleline(&mut filter_state.key_text).hint_text("8A+-1"));
             });
 
             // Energy filter

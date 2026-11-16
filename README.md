@@ -31,8 +31,11 @@ MDMA runs headlessly on a Pi 5 with an NVMe drive. You control it from your lapt
 mdma search --artist CBL --bpm "128+-4"
 
 # Filter by role, energy, and key — new in 0.25.0
-mdma search --role banger --bpm "128+-3" --key "8A~"
+mdma search --role banger --bpm "128+-3" --key "8A+-1"
 mdma search --energy "8..10" --genre Techno
+
+# Keys: 8A, 1m, Am, "A minor" (exact); 8A+-2, 8A+2, 8A-1 (steps round the Camelot
+# wheel, an A/B switch costs one step); 6A..10B (numbers clockwise, letters A or B)
 
 # Filter by when tracks were added (date expressions: ~ = today, ^week = start of week)
 mdma search --added "^week"
@@ -629,7 +632,7 @@ Pause/resume is immediate and resumes at the exact sample. Volume is applied at 
 ### Role and energy are searchable and hand-taggable
 
 ```bash
-mdma search --role banger --bpm "128+-3" --key "8A~"
+mdma search --role banger --bpm "128+-3" --key "8A+-1"
 mdma fact set sha256:<hash> role banger
 mdma fact set sha256:<hash> energy 9
 ```

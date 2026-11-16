@@ -92,6 +92,22 @@ impl PitchClass {
     pub fn as_number(&self) -> u8 {
         *self as u8
     }
+
+    /// Every pitch class in chromatic order (index == `as_number`).
+    const ALL: [PitchClass; 12] = [
+        PitchClass::C,
+        PitchClass::CSharp,
+        PitchClass::D,
+        PitchClass::DSharp,
+        PitchClass::E,
+        PitchClass::F,
+        PitchClass::FSharp,
+        PitchClass::G,
+        PitchClass::GSharp,
+        PitchClass::A,
+        PitchClass::ASharp,
+        PitchClass::B,
+    ];
 }
 
 /// Musical mode (Major or Minor)
@@ -108,6 +124,32 @@ impl FromStr for Mode {
             "M" | "major" | "Major" | "maj" | "Maj" => Ok(Mode::Major),
             "m" | "minor" | "Minor" | "min" | "Min" => Ok(Mode::Minor),
             _ => Err(Self::Err::InvalidNotation(format!("Unknown mode: {}", s))),
+        }
+    }
+}
+
+impl Mode {
+    /// Camelot wheel letter: `A` (minor) or `B` (major).
+    fn camelot_letter(self) -> char {
+        match self {
+            Mode::Major => 'B',
+            Mode::Minor => 'A',
+        }
+    }
+
+    /// Open Key letter: `d` (major) or `m` (minor).
+    fn open_key_letter(self) -> char {
+        match self {
+            Mode::Major => 'd',
+            Mode::Minor => 'm',
+        }
+    }
+
+    /// Spelled-out name, as used by the traditional notation.
+    fn name(self) -> &'static str {
+        match self {
+            Mode::Major => "Major",
+            Mode::Minor => "Minor",
         }
     }
 }
@@ -158,26 +200,12 @@ impl Key {
 
     /// Get traditional notation with sharps (e.g., "C# Major")
     pub fn to_traditional_sharp(&self) -> String {
-        format!(
-            "{} {}",
-            self.pitch.as_sharp(),
-            match self.mode {
-                Mode::Major => "Major",
-                Mode::Minor => "Minor",
-            }
-        )
+        format!("{} {}", self.pitch.as_sharp(), self.mode.name())
     }
 
     /// Get traditional notation with flats (e.g., "Db Major")
     pub fn to_traditional_flat(&self) -> String {
-        format!(
-            "{} {}",
-            self.pitch.as_flat(),
-            match self.mode {
-                Mode::Major => "Major",
-                Mode::Minor => "Minor",
-            }
-        )
+        format!("{} {}", self.pitch.as_flat(), self.mode.name())
     }
 
     /// Return the Camelot wheel number (1–12) for this key.
@@ -230,11 +258,7 @@ impl Key {
     /// # Ok::<(), KeyError>(())
     /// ```
     pub fn to_camelot(&self) -> String {
-        let letter = match self.mode {
-            Mode::Major => "B",
-            Mode::Minor => "A",
-        };
-        format!("{}{}", self.camelot_number(), letter)
+        format!("{}{}", self.camelot_number(), self.mode.camelot_letter())
     }
 
     /// Get Open Key notation (alternative DJ notation)
@@ -257,12 +281,7 @@ impl Key {
         // Formula: ((camelot + 4) mod 12) + 1
         let open_key_num = ((self.camelot_number() + 4) % 12) + 1;
 
-        let letter = match self.mode {
-            Mode::Major => "d",
-            Mode::Minor => "m",
-        };
-
-        format!("{}{}", open_key_num, letter)
+        format!("{}{}", open_key_num, self.mode.open_key_letter())
     }
 
     /// Parse from Camelot notation (e.g. "8B" = C Major, "8A" = A Minor).
@@ -298,36 +317,31 @@ impl Key {
             _ => return Err(KeyError::InvalidNotation(s.to_string())),
         };
 
-        // Camelot wheel reverse lookup
-        let pitch = match (number, mode) {
-            (8, Mode::Major) => PitchClass::C,
-            (5, Mode::Minor) => PitchClass::C,
-            (3, Mode::Major) => PitchClass::CSharp,
-            (12, Mode::Minor) => PitchClass::CSharp,
-            (10, Mode::Major) => PitchClass::D,
-            (7, Mode::Minor) => PitchClass::D,
-            (5, Mode::Major) => PitchClass::DSharp,
-            (2, Mode::Minor) => PitchClass::DSharp,
-            (12, Mode::Major) => PitchClass::E,
-            (9, Mode::Minor) => PitchClass::E,
-            (7, Mode::Major) => PitchClass::F,
-            (4, Mode::Minor) => PitchClass::F,
-            (2, Mode::Major) => PitchClass::FSharp,
-            (11, Mode::Minor) => PitchClass::FSharp,
-            (9, Mode::Major) => PitchClass::G,
-            (6, Mode::Minor) => PitchClass::G,
-            (4, Mode::Major) => PitchClass::GSharp,
-            (1, Mode::Minor) => PitchClass::GSharp,
-            (11, Mode::Major) => PitchClass::A,
-            (8, Mode::Minor) => PitchClass::A,
-            (6, Mode::Major) => PitchClass::ASharp,
-            (3, Mode::Minor) => PitchClass::ASharp,
-            (1, Mode::Major) => PitchClass::B,
-            (10, Mode::Minor) => PitchClass::B,
-            _ => return Err(KeyError::InvalidNotation(s.to_string())),
-        };
+        Self::from_wheel(number, mode).ok_or_else(|| KeyError::InvalidNotation(s.to_string()))
+    }
 
-        Ok(Self { pitch, mode })
+    /// The key at Camelot position `number` (1-12) in `mode`; `None` outside the wheel.
+    ///
+    /// The reverse of `camelot_number`, found by searching the 24 keys so the wheel
+    /// is only written down once.
+    fn from_wheel(number: u8, mode: Mode) -> Option<Self> {
+        PitchClass::ALL
+            .into_iter()
+            .map(|pitch| Self { pitch, mode })
+            .find(|key| key.camelot_number() == number)
+    }
+
+    /// Parse from Open Key notation (e.g. "1m" = A Minor, "1d" = C Major).
+    fn from_open_key(number: u8, mode: Mode) -> Option<Self> {
+        // Inverse of `to_open_key`: camelot = open + 7 (mod 12), with 0 meaning 12.
+        if !(1..=12).contains(&number) {
+            return None;
+        }
+        let camelot = match (number + 7) % 12 {
+            0 => 12,
+            n => n,
+        };
+        Self::from_wheel(camelot, mode)
     }
 
     pub fn pitch(&self) -> PitchClass {
@@ -336,6 +350,75 @@ impl Key {
 
     pub fn mode(&self) -> Mode {
         self.mode
+    }
+
+    /// The relative key: same Camelot number, other mode (8A <-> 8B).
+    pub fn relative(&self) -> Self {
+        // The relative minor sits a minor third below its major (9 semitones up mod 12).
+        let (mode, up) = match self.mode {
+            Mode::Major => (Mode::Minor, 9),
+            Mode::Minor => (Mode::Major, 3),
+        };
+        let pitch = PitchClass::ALL[((self.pitch.as_number() + up) % 12) as usize];
+        Self { pitch, mode }
+    }
+
+    /// True when the two keys are in different modes (A vs B on the wheel).
+    pub fn mode_differs(&self, other: Key) -> bool {
+        self.mode != other.mode
+    }
+
+    /// Clockwise steps around the Camelot wheel from `centre` to this key
+    /// (0-11, a fifth up per step); the wheel wraps, so 12A -> 1A is one step.
+    pub fn camelot_steps_from(&self, centre: Key) -> u8 {
+        (self.camelot_number() + 12 - centre.camelot_number()) % 12
+    }
+}
+
+impl FromStr for Key {
+    type Err = KeyError;
+
+    /// Parse any common notation, case-insensitively: Camelot (`8A`), Open Key
+    /// (`1m`, `1d`), short (`Am`, `C#`, `Eb`; no suffix means major) and long
+    /// (`A minor`, `C# Major`).
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let invalid = || KeyError::InvalidNotation(s.to_string());
+        let s = s.trim();
+
+        // Camelot / Open Key: case-insensitive.
+        let digits_end = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+        if digits_end > 0 {
+            let number: u8 = s[..digits_end].parse().map_err(|_| invalid())?;
+            let key = match s[digits_end..].to_ascii_lowercase().as_str() {
+                "a" => Self::from_wheel(number, Mode::Minor),
+                "b" => Self::from_wheel(number, Mode::Major),
+                "m" => Self::from_open_key(number, Mode::Minor),
+                "d" => Self::from_open_key(number, Mode::Major),
+                _ => None,
+            };
+            return key.ok_or_else(invalid);
+        }
+
+        // Pitch letter and accidental are case-insensitive...
+        let mut chars = s.chars();
+        let letter = chars.next().map(|c| c.to_ascii_uppercase());
+        let letter = letter.filter(|c| ('A'..='G').contains(c));
+        let letter = letter.ok_or_else(invalid)?;
+        let rest = chars.as_str();
+        let (accidental, rest) = match rest.chars().next().map(|c| c.to_ascii_lowercase()) {
+            Some(a @ ('#' | 'b')) => (Some(a), &rest[1..]),
+            _ => (None, rest),
+        };
+        let pitch_name: String = std::iter::once(letter).chain(accidental).collect();
+        let pitch = PitchClass::from_str(&pitch_name)?;
+
+        // ...but a single-letter mode is not: `m` is minor, `M` is major.
+        let mode = match rest.trim() {
+            "" => Mode::Major,
+            single if single.len() == 1 => Mode::from_str(single)?,
+            word => Mode::from_str(&word.to_ascii_lowercase())?,
+        };
+        Ok(Self { pitch, mode })
     }
 }
 
@@ -482,6 +565,82 @@ mod tests {
         assert!(Key::from_camelot("13B").is_err());
         assert!(Key::from_camelot("0A").is_err());
         assert!(Key::from_camelot("B").is_err());
+    }
+
+    #[rstest]
+    #[case("1A", "12A", 1)]
+    #[case("12A", "1A", 11)]
+    #[case("8A", "8A", 0)]
+    #[case("8B", "8A", 0)]
+    #[case("9A", "8A", 1)]
+    fn camelot_steps_wrap_12_to_1(#[case] key: &str, #[case] centre: &str, #[case] steps: u8) {
+        let key: Key = key.parse().unwrap();
+        let centre: Key = centre.parse().unwrap();
+        assert_eq!(key.camelot_steps_from(centre), steps);
+    }
+
+    #[test]
+    fn relative_flips_mode_and_keeps_number() {
+        let am: Key = "Am".parse().unwrap();
+        assert_eq!(am.relative().to_camelot(), "8B");
+        assert_eq!(am.relative().relative(), am);
+        assert!(am.mode_differs(am.relative()));
+    }
+
+    #[rstest]
+    #[case("8A", "A Minor")]
+    #[case("8a", "A Minor")]
+    #[case("8B", "C Major")]
+    #[case("12A", "C# Minor")]
+    #[case("1m", "A Minor")]
+    #[case("1d", "C Major")]
+    #[case("Am", "A Minor")]
+    #[case("am", "A Minor")]
+    #[case("A", "A Major")]
+    #[case("C#", "C# Major")]
+    #[case("Eb", "D# Major")]
+    #[case("eb", "D# Major")]
+    #[case("Bb", "A# Major")]
+    #[case("bb", "A# Major")]
+    #[case("Bbm", "A# Minor")]
+    #[case("bm", "B Minor")]
+    #[case("b", "B Major")]
+    #[case("A minor", "A Minor")]
+    #[case("a MINOR", "A Minor")]
+    #[case("C# major", "C# Major")]
+    #[case("Eb Major", "D# Major")]
+    #[case("CM", "C Major")]
+    #[case("C M", "C Major")]
+    fn key_from_str_accepts_every_notation(#[case] input: &str, #[case] sharp: &str) {
+        assert_eq!(input.parse::<Key>().unwrap().to_traditional_sharp(), sharp);
+    }
+
+    #[rstest]
+    #[case("")]
+    #[case("H")]
+    #[case("13A")]
+    #[case("0A")]
+    #[case("8")]
+    #[case("8C")]
+    #[case("13m")]
+    #[case("A sideways")]
+    // Enharmonic spellings with a natural pitch name are deliberately not accepted.
+    #[case("Cb")]
+    #[case("Fb")]
+    #[case("E#")]
+    #[case("B#")]
+    fn key_from_str_rejects_garbage(#[case] input: &str) {
+        assert!(input.parse::<Key>().is_err(), "{input}");
+    }
+
+    #[test]
+    fn open_key_round_trips_for_every_key() {
+        for n in 1..=12 {
+            for letter in ['A', 'B'] {
+                let key = Key::from_camelot(&format!("{n}{letter}")).unwrap();
+                assert_eq!(key.to_open_key().parse::<Key>().unwrap(), key);
+            }
+        }
     }
 
     #[test]

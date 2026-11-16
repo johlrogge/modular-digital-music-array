@@ -1,5 +1,5 @@
 use crate::query::{
-    CamelotLetter, DatePrecision, DateQuery, DurationQuery, DurationUnit, KeyQuery, NumericQuery,
+    DatePrecision, DateQuery, DurationQuery, DurationUnit, KeyQuery, NumericQuery, Reach,
     StringQuery,
 };
 use chrono::NaiveDate;
@@ -14,8 +14,10 @@ pub enum ParseError {
     InvalidNumeric(String),
     #[error("invalid duration query '{0}': expected e.g. '7m15s', '7m', '>5m', '<8m', '6m..8m'")]
     InvalidDuration(String),
-    #[error("invalid key query '{0}': expected Camelot (8B, 10A) or traditional (Am, C# major, A minor)")]
+    #[error("invalid key query '{0}': expected a key (8B, 1m, Am, C# major), steps (8A+-2, 8A+2, 8A-1) or a span (6A..10B)")]
     InvalidKey(String),
+    #[error("key query '{0}': the `~` suffix is gone; use steps like `8A+-2` (an A/B switch costs one step) or a span like `6A..10B`")]
+    KeyTilde(String),
     #[error("invalid date query '{0}'")]
     InvalidDateQuery(String),
     #[error("invalid role '{0}': expected one of opener, build-up, peak, banger, cool-down, closer, filler (case-insensitive)")]
@@ -34,7 +36,10 @@ impl ParseError {
                 "expected a duration such as `7m15s`, `7m`, `>5m`, `<8m` or `6m..8m`"
             }
             Self::InvalidKey(_) => {
-                "expected a Camelot key (`8B`, `10A`) or a traditional one (`Am`, `C# major`)"
+                "expected a key (`8B`, `1m`, `Am`, `C# major`), steps (`8A+-2`, `8A+2`, `8A-1`) or a span (`6A..10B`)"
+            }
+            Self::KeyTilde(_) => {
+                "the `~` suffix is gone; use steps like `8A+-2` (an A/B switch costs one step) or a span like `6A..10B`"
             }
             Self::InvalidDateQuery(_) => {
                 "expected a date such as `2026`, `2026-02`, `>2026-02` or `2026-01..2026-06`, a date expression, or `N/A`"
@@ -64,6 +69,15 @@ from_str_query!(NumericQuery, parse_numeric_query);
 from_str_query!(DurationQuery, parse_duration_query);
 from_str_query!(KeyQuery, parse_key_query);
 from_str_query!(DateQuery, parse_date_query);
+
+/// Lets `KeyQuery` serialise as its string form (`#[serde(try_from = "String")]`).
+impl TryFrom<String> for KeyQuery {
+    type Error = ParseError;
+
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        parse_key_query(&s)
+    }
+}
 
 impl FromStr for StringQuery {
     type Err = Infallible;
@@ -244,137 +258,56 @@ fn parse_duration_parts(s: &str) -> Result<(u32, Option<DurationUnit>), ParseErr
 
 /// Parse a key query string into a KeyQuery.
 ///
+/// A key is any notation `Key` parses (`8A`, `1m`, `Am`, `C#`, `A minor`).
+///
 /// Formats:
-/// - `"8B"`, `"10A"` → Camelot exact
-/// - `"Am"`, `"A minor"`, `"C# major"` → traditional notation (converted to Camelot)
-/// - `"8B+-1"` → symmetric tolerance
-/// - `"8B+1"` → up-only tolerance
-/// - `"8B-1"` → down-only tolerance
-/// - `"8B+-1~"` → tolerance with relative key included
+/// - `"8A"` → exact key (`down = up = 0`)
+/// - `"8A+-2"` (alias `"8A±2"`) → 2 steps either way
+/// - `"8A+2"` → 2 steps clockwise; `"8A-1"` → 1 step counter-clockwise
+///   (an A/B switch costs one step)
+/// - `"6A..10B"` → numbers 6 to 10 clockwise, letters A or B
+///
+/// The old `~` suffix is rejected with a pointer to the new syntax.
 pub fn parse_key_query(s: &str) -> Result<KeyQuery, ParseError> {
     let s = s.trim();
+    let invalid = || ParseError::InvalidKey(s.to_string());
 
-    let (s_notilde, include_relative) = if let Some(stripped) = s.strip_suffix('~') {
-        (stripped, true)
-    } else {
-        (s, false)
-    };
-
-    if let Some((base, up_s, down_s)) = split_tolerance(s_notilde, 2) {
-        let tol_up: u8 = up_s
-            .parse()
-            .map_err(|_| ParseError::InvalidKey(s.to_string()))?;
-        let tol_down: u8 = down_s
-            .parse()
-            .map_err(|_| ParseError::InvalidKey(s.to_string()))?;
-        let (number, letter) = parse_camelot_base(base, s)?;
-        return Ok(KeyQuery::Tolerance {
-            number,
-            letter,
-            tolerance_up: tol_up,
-            tolerance_down: tol_down,
-            include_relative,
-        });
+    if s.contains('~') {
+        return Err(ParseError::KeyTilde(s.to_string()));
     }
 
-    let (number, letter) = parse_camelot_base(s_notilde, s)?;
-    Ok(KeyQuery::Exact { number, letter })
-}
-
-/// Parse a bare key string (no tolerance suffix) to (camelot_number, CamelotLetter).
-fn parse_camelot_base(base: &str, original: &str) -> Result<(u8, CamelotLetter), ParseError> {
-    let base = base.trim();
-
-    // Try Camelot format: "8B", "10A"
-    if let Some(last) = base.chars().last() {
-        if last == 'A' || last == 'B' {
-            let num_str = &base[..base.len() - 1];
-            if let Ok(num) = num_str.parse::<u8>() {
-                if (1..=12).contains(&num) {
-                    let letter = if last == 'A' {
-                        CamelotLetter::A
-                    } else {
-                        CamelotLetter::B
-                    };
-                    return Ok((num, letter));
-                }
-            }
-        }
+    if let Some((from, to)) = s.split_once("..") {
+        let from = from.parse().map_err(|_| invalid())?;
+        let to = to.parse().map_err(|_| invalid())?;
+        return Ok(KeyQuery::Span { from, to });
     }
 
-    traditional_to_camelot(base).ok_or_else(|| ParseError::InvalidKey(original.to_string()))
-}
-
-/// Convert traditional key notation to (camelot_number, CamelotLetter).
-fn traditional_to_camelot(s: &str) -> Option<(u8, CamelotLetter)> {
-    let normalized = normalize_key_notation(&s.trim().to_lowercase());
-
-    // (normalized_key, camelot_number, is_minor)
-    // is_minor = true → CamelotLetter::A, false → CamelotLetter::B
-    let map: &[(&str, u8, bool)] = &[
-        // Minor keys → A
-        ("abm", 1, true),
-        ("g#m", 1, true),
-        ("ebm", 2, true),
-        ("d#m", 2, true),
-        ("bbm", 3, true),
-        ("a#m", 3, true),
-        ("fm", 4, true),
-        ("cm", 5, true),
-        ("gm", 6, true),
-        ("dm", 7, true),
-        ("am", 8, true),
-        ("em", 9, true),
-        ("bm", 10, true),
-        ("f#m", 11, true),
-        ("gbm", 11, true),
-        ("c#m", 12, true),
-        ("dbm", 12, true),
-        // Major keys → B
-        ("b", 1, false),
-        ("f#", 2, false),
-        ("gb", 2, false),
-        ("db", 3, false),
-        ("c#", 3, false),
-        ("ab", 4, false),
-        ("g#", 4, false),
-        ("eb", 5, false),
-        ("d#", 5, false),
-        ("bb", 6, false),
-        ("a#", 6, false),
-        ("f", 7, false),
-        ("c", 8, false),
-        ("g", 9, false),
-        ("d", 10, false),
-        ("a", 11, false),
-        ("e", 12, false),
+    // `+-` must be tried before `+` and `-`.
+    type Operator = (&'static str, fn(u8) -> Reach);
+    const STEP_OPERATORS: [Operator; 4] = [
+        ("+-", Reach::Both),
+        ("±", Reach::Both),
+        ("+", Reach::Up),
+        ("-", Reach::Down),
     ];
-
-    for (key, num, is_minor) in map {
-        if normalized == *key {
-            return Some((
-                *num,
-                if *is_minor {
-                    CamelotLetter::A
-                } else {
-                    CamelotLetter::B
-                },
-            ));
+    let (base, reach) = match s.find(['+', '-', '±']) {
+        Some(at) => {
+            let (base, op_and_steps) = s.split_at(at);
+            let (steps, reach) = STEP_OPERATORS
+                .iter()
+                .find_map(|(op, reach)| op_and_steps.strip_prefix(op).map(|steps| (steps, reach)))
+                .ok_or_else(invalid)?;
+            // Digits only: `u8::from_str` would accept a second sign (`8A-+1`).
+            if !steps.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(invalid());
+            }
+            let steps: u8 = steps.parse().map_err(|_| invalid())?;
+            (base, reach(steps))
         }
-    }
-    None
-}
-
-/// Normalize key notation: "a minor" → "am", "c# major" → "c#", "am" → "am".
-fn normalize_key_notation(s: &str) -> String {
-    let s = s.trim();
-    if let Some(key) = s.strip_suffix(" minor") {
-        return format!("{}m", key.trim().replace(' ', ""));
-    }
-    if let Some(key) = s.strip_suffix(" major") {
-        return key.trim().replace(' ', "").to_string();
-    }
-    s.replace(' ', "")
+        None => (s, Reach::Both(0)),
+    };
+    let centre = base.parse().map_err(|_| invalid())?;
+    Ok(KeyQuery::Steps { centre, reach })
 }
 
 /// Parse a CLI started/stopped date string into a `DateQuery`.
@@ -490,7 +423,10 @@ mod tests {
         ));
         assert!(matches!(
             "8B".parse::<KeyQuery>(),
-            Ok(KeyQuery::Exact { .. })
+            Ok(KeyQuery::Steps {
+                reach: Reach::Both(0),
+                ..
+            })
         ));
         assert!(matches!("N/A".parse::<DateQuery>(), Ok(DateQuery::NA)));
     }
@@ -611,80 +547,198 @@ mod tests {
         assert!(matches!(q, DurationQuery::Range(360, 450)));
     }
 
-    #[test]
-    fn key_camelot_exact() {
-        let q = parse_key_query("8B").unwrap();
-        assert!(matches!(
-            q,
-            KeyQuery::Exact {
-                number: 8,
-                letter: CamelotLetter::B
-            }
-        ));
+    /// Camelot names of every key the query matches, in wheel order (1A..12A, 1B..12B).
+    fn matching(query: &str) -> Vec<String> {
+        let q: KeyQuery = query.parse().unwrap();
+        ['A', 'B']
+            .into_iter()
+            .flat_map(|l| (1..=12).map(move |n| format!("{n}{l}")))
+            .filter(|k| q.matches(k.parse().unwrap()))
+            .collect()
+    }
+
+    fn names(keys: &[&str]) -> Vec<String> {
+        let mut v: Vec<String> = keys.iter().map(|s| s.to_string()).collect();
+        // Same wheel order as `matching`: A before B, numeric within a letter.
+        v.sort_by_key(|k| (k.ends_with('B'), k[..k.len() - 1].parse::<u8>().unwrap()));
+        v
+    }
+
+    #[rstest]
+    #[case("8A", &["8A"])]
+    #[case("1m", &["8A"])]
+    #[case("Am", &["8A"])]
+    #[case("A minor", &["8A"])]
+    #[case("C#", &["3B"])]
+    #[case("Eb", &["5B"])]
+    fn key_exact_matches_only_that_key(#[case] query: &str, #[case] expected: &[&str]) {
+        assert_eq!(matching(query), names(expected));
     }
 
     #[test]
-    fn key_traditional_minor() {
-        let q = parse_key_query("Am").unwrap();
-        assert!(matches!(
-            q,
-            KeyQuery::Exact {
-                number: 8,
-                letter: CamelotLetter::A
-            }
-        ));
+    fn key_steps_both_directions_with_mode_switch() {
+        assert_eq!(
+            matching("8A+-2"),
+            names(&["6A", "7A", "8A", "9A", "10A", "7B", "8B", "9B"])
+        );
     }
 
     #[test]
-    fn key_traditional_minor_long() {
-        let q = parse_key_query("A minor").unwrap();
-        assert!(matches!(
-            q,
-            KeyQuery::Exact {
-                number: 8,
-                letter: CamelotLetter::A
-            }
-        ));
+    fn key_steps_wrap_around_the_wheel() {
+        assert_eq!(matching("1A+-1"), names(&["12A", "1A", "2A", "1B"]));
     }
 
     #[test]
-    fn key_traditional_major() {
-        // C major = 8B
-        let q = parse_key_query("C").unwrap();
-        assert!(matches!(
-            q,
-            KeyQuery::Exact {
-                number: 8,
-                letter: CamelotLetter::B
-            }
-        ));
+    fn key_steps_mode_switch_costs_a_step() {
+        let m = matching("3A+-2");
+        for k in ["4B", "2B", "3B"] {
+            assert!(m.contains(&k.to_string()), "{k}");
+        }
+        assert!(!m.contains(&"5B".to_string()));
     }
 
     #[test]
-    fn key_camelot_tolerance_symmetric() {
-        let q = parse_key_query("8B+-1").unwrap();
-        assert!(matches!(
-            q,
-            KeyQuery::Tolerance {
-                number: 8,
-                letter: CamelotLetter::B,
-                tolerance_up: 1,
-                tolerance_down: 1,
-                include_relative: false,
-            }
-        ));
+    fn key_steps_clockwise_only() {
+        assert_eq!(matching("8A+2"), names(&["8A", "9A", "10A", "8B", "9B"]));
     }
 
     #[test]
-    fn key_camelot_tolerance_with_relative() {
-        let q = parse_key_query("8B+-1~").unwrap();
+    fn key_steps_counter_clockwise_only() {
+        assert_eq!(matching("8A-1"), names(&["7A", "8A", "8B"]));
+    }
+
+    #[test]
+    fn key_plus_minus_alias_is_accepted() {
+        assert_eq!(matching("8A±2"), matching("8A+-2"));
+    }
+
+    #[test]
+    fn key_span_within_one_letter() {
+        assert_eq!(matching("6A..10A"), names(&["6A", "7A", "8A", "9A", "10A"]));
+    }
+
+    #[test]
+    fn key_span_wraps_clockwise() {
+        assert_eq!(matching("11A..1A"), names(&["11A", "12A", "1A"]));
+    }
+
+    #[test]
+    fn key_span_letters_are_a_set_without_order() {
+        assert_eq!(matching("1A..1B"), names(&["1A", "1B"]));
+        assert_eq!(matching("1B..1A"), matching("1A..1B"));
+    }
+
+    #[test]
+    fn key_span_across_letters_has_ten_keys() {
+        assert_eq!(
+            matching("6A..10B"),
+            names(&["6A", "7A", "8A", "9A", "10A", "6B", "7B", "8B", "9B", "10B"])
+        );
+    }
+
+    #[test]
+    fn key_span_runs_the_long_way_round() {
+        assert_eq!(
+            matching("10A..6A"),
+            names(&["10A", "11A", "12A", "1A", "2A", "3A", "4A", "5A", "6A"])
+        );
+    }
+
+    #[test]
+    fn key_query_matches_every_spelling_of_the_same_key() {
+        let stored: music_primitives::Key = "A Minor".parse().unwrap();
+        for q in ["8A", "Am", "1m", "A minor"] {
+            assert!(q.parse::<KeyQuery>().unwrap().matches(stored), "{q}");
+        }
+        assert!(!"8B".parse::<KeyQuery>().unwrap().matches(stored));
+    }
+
+    #[test]
+    fn tilde_is_a_parse_error_pointing_to_new_syntax() {
+        let err = parse_key_query("8A+-1~").unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("`~` suffix is gone"), "{text}");
+        assert!(text.contains("8A+-2") && text.contains("6A..10B"), "{text}");
+        let reason = "8A+-1~".parse::<KeyQuery>().unwrap_err();
+        assert!(reason.contains("`~` suffix is gone"), "{reason}");
+    }
+
+    #[rstest]
+    #[case("~8A")]
+    #[case("8A~+-1")]
+    #[case("8A+-1~")]
+    fn tilde_anywhere_gets_the_specific_error(#[case] input: &str) {
         assert!(matches!(
-            q,
-            KeyQuery::Tolerance {
-                include_relative: true,
-                ..
-            }
+            parse_key_query(input),
+            Err(ParseError::KeyTilde(_))
         ));
+    }
+
+    #[rstest]
+    #[case("8A+")]
+    #[case("8A+x")]
+    #[case("8A..")]
+    #[case("..8A")]
+    #[case("8A..9A..10A")]
+    #[case("13A+1")]
+    #[case("")]
+    #[case("8A-+1")]
+    #[case("8A++1")]
+    #[case("8A+-+1")]
+    #[case("8A+-1-1")]
+    fn key_query_rejects_malformed(#[case] input: &str) {
+        assert!(input.parse::<KeyQuery>().is_err(), "{input}");
+    }
+
+    #[rstest]
+    #[case("8A")]
+    #[case("8A+-2")]
+    #[case("8A+3")]
+    #[case("8A-1")]
+    #[case("8A+0")]
+    #[case("8A-0")]
+    #[case("6A..10B")]
+    #[case("1B..1A")]
+    fn key_query_display_round_trips(#[case] input: &str) {
+        let q: KeyQuery = input.parse().unwrap();
+        assert_eq!(q.to_string(), input);
+        assert_eq!(q.to_string().parse::<KeyQuery>().unwrap(), q);
+    }
+
+    #[rstest]
+    #[case("8A", Reach::Both(0))]
+    #[case("8A+-2", Reach::Both(2))]
+    #[case("8A+3", Reach::Up(3))]
+    #[case("8A-1", Reach::Down(1))]
+    fn key_query_display_round_trips_every_reach(#[case] text: &str, #[case] reach: Reach) {
+        let q = KeyQuery::Steps {
+            centre: "8A".parse().unwrap(),
+            reach,
+        };
+        assert_eq!(q.to_string(), text);
+        assert_eq!(text.parse::<KeyQuery>().unwrap(), q);
+    }
+
+    #[rstest]
+    #[case("\"8A+-2\"")]
+    #[case("\"8A\"")]
+    #[case("\"8A+3\"")]
+    #[case("\"8A-1\"")]
+    #[case("\"6A..10B\"")]
+    fn key_query_json_round_trips_as_its_string_form(#[case] json: &str) {
+        let q: KeyQuery = serde_json::from_str(json).unwrap();
+        assert_eq!(serde_json::to_string(&q).unwrap(), json);
+    }
+
+    #[test]
+    fn key_query_json_rejects_a_bad_string() {
+        assert!(serde_json::from_str::<KeyQuery>("\"nonsense\"").is_err());
+    }
+
+    #[test]
+    fn key_query_display_normalises_notation() {
+        let q: KeyQuery = "A minor+-1".parse().unwrap();
+        assert_eq!(q.to_string(), "8A+-1");
     }
 
     #[rstest]
