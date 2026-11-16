@@ -15,6 +15,7 @@ interface = "mdma-client"
 # IPC clients
 library-ipc-client = { workspace = true }
 library-ipc-protocol = { workspace = true }
+library-projection = { workspace = true }
 library-search = { workspace = true }
 media-client = { workspace = true }
 media-protocol = { workspace = true }

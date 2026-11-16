@@ -275,7 +275,7 @@ pub enum EntryError {
     #[error("unknown track {hash}")]
     Unknown { hash: ContentHash },
 
-    #[error("ambiguous hash {hash}")]
+    #[error("ambiguous hash {hash}: {}", join_hashes(.candidates))]
     Ambiguous {
         hash: ContentHash,
         candidates: Vec<ContentHash>,
@@ -288,6 +288,26 @@ pub enum EntryError {
     },
 }
 
+/// The hashes as one space-separated list, for error messages.
+fn join_hashes(hashes: &[ContentHash]) -> String {
+    hashes
+        .iter()
+        .map(ContentHash::as_str)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+impl EntryError {
+    /// The stored token this error is about.
+    pub fn hash(&self) -> &ContentHash {
+        match self {
+            EntryError::Unknown { hash }
+            | EntryError::Ambiguous { hash, .. }
+            | EntryError::NotCanonical { hash, .. } => hash,
+        }
+    }
+}
+
 // ============================================================================
 // Protocol Errors
 // ============================================================================
@@ -297,6 +317,14 @@ pub enum EntryError {
 pub enum ProtocolError {
     #[error("track not found: {hash}")]
     TrackNotFound { hash: String },
+
+    /// A partial hash that starts several different tracks: the hash as given and
+    /// the full hash of every track it matches.
+    #[error("ambiguous hash '{hash}' matches {} tracks: {}", .candidates.len(), .candidates.join(", "))]
+    AmbiguousHash {
+        hash: String,
+        candidates: Vec<String>,
+    },
 
     #[error("inbox file not found: {path}")]
     InboxFileNotFound { path: String },
@@ -319,6 +347,16 @@ pub enum ProtocolError {
     /// The request bytes could not be parsed as a `LibraryRequest`.
     #[error("invalid request: {message}")]
     InvalidRequest { message: String },
+}
+
+impl ProtocolError {
+    /// `hash` starts every one of `candidates`, which are different tracks.
+    pub fn ambiguous_hash<'a>(hash: &str, candidates: impl IntoIterator<Item = &'a str>) -> Self {
+        ProtocolError::AmbiguousHash {
+            hash: hash.to_owned(),
+            candidates: candidates.into_iter().map(str::to_owned).collect(),
+        }
+    }
 }
 
 /// Parse one raw request. Bytes that do not parse give

@@ -1,14 +1,19 @@
 use crate::args::{parse_count, NewPlaylistArg, OrStdin, PlaylistArg, PlaylistInput, StdinDash};
 use crate::ctx::Ctx;
 use crate::local_complete::complete_playlists;
-use crate::output::interpret_library;
-use crate::stdin::{hashes_in, read_stdin_to_string, require_stdin_hashes_or_usage};
+use crate::output::{interpret_library, library_error};
+use crate::queue::resolve_for_playback;
+use crate::stdin::{read_stdin_to_string, require_stdin_hashes_or_usage};
 use bpaf::{construct, long, Parser};
 use color_eyre::eyre::{bail, eyre};
 use color_eyre::Result;
 use colored::Colorize;
 use hicli::Arg;
-use library_ipc_client::{ContentHash, LibraryResponse, PlaylistName};
+use library_ipc_client::{
+    entry_tracks, track_hashes, unresolved_entries, CanonicalHash, ClientError, ContentHash,
+    EntryTrackError, LibraryResponse, PlaylistEntry, PlaylistName, ProtocolError, TrackInfo,
+};
+use std::collections::HashSet;
 use std::num::NonZeroUsize;
 
 /// Current playlist name
@@ -128,32 +133,92 @@ pub(crate) fn list(ctx: &Ctx) -> Result<()> {
     )?;
 
     for name in &names {
-        let content = match library.request(&LibraryRequest::PlaylistGet { name: name.clone() }) {
-            Ok(LibraryResponse::PlaylistContent(c)) => c,
-            _ => continue,
+        let Some(entries) = entries_unless_removed(library.playlist_entries(name))? else {
+            continue;
         };
 
-        let hashes = hashes_in(&content);
-
-        let track_count = hashes.len();
-
-        let total_secs: u32 = hashes
-            .iter()
-            .filter_map(|h| {
-                let track = library.get_track(h).ok()?;
-                track.duration.map(|d| d.value())
-            })
-            .sum();
+        let total_secs =
+            playlist_seconds(&entries, |h| library.get_track(h)).map_err(library_error)?;
 
         let duration = DurationSeconds::new(total_secs);
         println!(
             "{}  {}  [{}]",
             name.to_string().bold(),
-            format!("{} tracks", track_count).green(),
+            tracks_label(entries.len(), unresolved_entries(&entries).count()).green(),
             duration
         );
     }
 
+    Ok(())
+}
+
+/// The entries of a playlist, or `None` when it was removed after the names were
+/// listed. Any other failure is an error: a playlist is never skipped silently.
+fn entries_unless_removed(
+    reply: Result<Vec<PlaylistEntry>, ClientError>,
+) -> Result<Option<Vec<PlaylistEntry>>> {
+    match reply {
+        Ok(entries) => Ok(Some(entries)),
+        Err(ClientError::Protocol(ProtocolError::PlaylistNotFound { .. })) => Ok(None),
+        Err(e) => Err(library_error(e)),
+    }
+}
+
+/// The total duration, in seconds, of the available entries of a playlist.
+///
+/// Unavailable entries add nothing (they are counted apart); a failed track
+/// lookup fails the sum.
+fn playlist_seconds<'a, E>(
+    entries: &'a [PlaylistEntry],
+    get_track: impl FnMut(&ContentHash) -> Result<TrackInfo, E> + 'a,
+) -> Result<u32, E> {
+    entry_tracks(entries, get_track)
+        .filter_map(|outcome| match outcome {
+            Ok(track) => Some(Ok(track.duration.map_or(0, |d| d.value()))),
+            Err(EntryTrackError::Unresolved(_)) => None,
+            Err(EntryTrackError::Lookup { source, .. }) => Some(Err(source)),
+        })
+        .sum()
+}
+
+/// "N tracks", with "(k unavailable)" after it when some entries are not available.
+fn tracks_label(total: usize, unavailable: usize) -> String {
+    match unavailable {
+        0 => format!("{total} tracks"),
+        k => format!("{total} tracks ({k} unavailable)"),
+    }
+}
+
+/// How many of the `input` tracks are among the available entries of a playlist.
+fn matching_inputs(input: &HashSet<CanonicalHash>, entries: &[PlaylistEntry]) -> usize {
+    let tracks: HashSet<CanonicalHash> = track_hashes(entries).into_iter().collect();
+    input.intersection(&tracks).count()
+}
+
+/// One line of `playlist entries`: the full hash, or why the entry is unavailable.
+fn entry_line(entry: &PlaylistEntry) -> String {
+    match entry {
+        PlaylistEntry::Track { hash } => hash.to_string(),
+        PlaylistEntry::Unresolved { error } => format!("unavailable: {error}"),
+    }
+}
+
+/// Print a playlist's entries: one line each, in order, the full hash or why not
+///
+/// A line that does not resolve is shown in its place, never dropped.
+///
+/// # Examples
+///
+/// ```sh
+/// mdma playlist entries friday
+/// ```
+#[hicli::command]
+pub(crate) fn entries(name: PlaylistArg, ctx: &Ctx) -> Result<()> {
+    let library = ctx.library()?;
+    let PlaylistArg(pname) = name;
+    for entry in library.playlist_entries(&pname).map_err(library_error)? {
+        println!("{}", entry_line(&entry));
+    }
     Ok(())
 }
 
@@ -209,17 +274,17 @@ pub(crate) fn get(name: PlaylistInput, ctx: &Ctx) -> Result<()> {
 #[hicli::command]
 pub(crate) fn contains(mode: ContainsMode, _stdin: StdinDash, ctx: &Ctx) -> Result<()> {
     use library_ipc_client::LibraryRequest;
-    use std::collections::HashSet;
 
     let library = ctx.library()?;
 
-    // 1. Read hashes from stdin
+    // 1. Read hashes from stdin, and resolve them to full hashes, as the entries are
     let input_hashes = require_stdin_hashes_or_usage(&[])?;
+    let input_hashes = resolve_for_playback(&library, &input_hashes)?;
 
     // 2. Determine threshold and invert
     let (threshold, invert) = mode.threshold(input_hashes.len());
 
-    let input_set: HashSet<&ContentHash> = input_hashes.iter().collect();
+    let input_set: HashSet<CanonicalHash> = input_hashes.into_iter().collect();
 
     // 3. Get all playlist names
     let names = interpret_library(
@@ -229,19 +294,11 @@ pub(crate) fn contains(mode: ContainsMode, _stdin: StdinDash, ctx: &Ctx) -> Resu
 
     // 4. For each playlist, count how many input hashes appear in it
     for pname in &names {
-        let content = match library.request(&LibraryRequest::PlaylistGet {
-            name: pname.clone(),
-        }) {
-            Ok(LibraryResponse::PlaylistContent(c)) => c,
-            _ => continue,
+        let Some(entries) = entries_unless_removed(library.playlist_entries(pname))? else {
+            continue;
         };
 
-        let playlist_hashes: HashSet<ContentHash> = hashes_in(&content).into_iter().collect();
-
-        let match_count = input_set
-            .iter()
-            .filter(|h| playlist_hashes.contains(**h))
-            .count();
+        let match_count = matching_inputs(&input_set, &entries);
 
         let should_print = if invert {
             match_count == 0
@@ -404,9 +461,10 @@ pub(crate) fn rename(args: RenameArgs, ctx: &Ctx) -> Result<()> {
 mod tests {
     use super::*;
 
+    use library_ipc_client::EntryError;
     use pretty_assertions::assert_eq;
 
-    use crate::test_support::{parses, run_arg, usage_error};
+    use crate::test_support::{parses, run_arg, track as track_info, usage_error};
 
     use crate::test_support::failure_text;
 
@@ -582,5 +640,138 @@ mod tests {
     #[test]
     fn contains_threshold_no_flag_inverts() {
         assert_eq!(ContainsMode::None.threshold(4), (1, true));
+    }
+
+    fn full(c: char) -> CanonicalHash {
+        CanonicalHash::try_from(ContentHash::new(format!(
+            "sha256:{}",
+            c.to_string().repeat(64)
+        )))
+        .unwrap()
+    }
+
+    fn track(c: char) -> PlaylistEntry {
+        PlaylistEntry::Track { hash: full(c) }
+    }
+
+    fn unknown(token: &str) -> PlaylistEntry {
+        PlaylistEntry::Unresolved {
+            error: EntryError::Unknown {
+                hash: ContentHash::new(token),
+            },
+        }
+    }
+
+    /// Only the available entries are matched: an unresolved entry is not counted,
+    /// even when the input holds a full hash that happens to be what it spelled.
+    ///
+    /// (Resolving the piped-in hashes to full ones is `LibraryBackend::resolve_for_playback`,
+    /// which needs a live library; there is no fake backend to test that step against.)
+    #[test]
+    fn contains_matches_available_entries_and_ignores_unresolved_ones() {
+        let entries = [track('a'), unknown("bbbbbbbb"), track('c')];
+        let input: HashSet<CanonicalHash> = [full('a'), full('b')].into_iter().collect();
+        assert_eq!(matching_inputs(&input, &entries), 1);
+    }
+
+    #[test]
+    fn contains_counts_an_input_once_however_often_the_playlist_repeats_it() {
+        let entries = [track('a'), track('a'), track('a')];
+        let input: HashSet<CanonicalHash> = [full('a'), full('c')].into_iter().collect();
+        assert_eq!(matching_inputs(&input, &entries), 1);
+    }
+
+    #[test]
+    fn unavailable_entries_are_counted_in_the_track_count() {
+        assert_eq!(tracks_label(5, 0), "5 tracks");
+        assert_eq!(tracks_label(5, 2), "5 tracks (2 unavailable)");
+    }
+
+    #[test]
+    fn unresolved_entries_are_reported_by_position() {
+        let entries = [
+            track('a'),
+            unknown("bbbbbbbb"),
+            track('c'),
+            unknown("dddddddd"),
+        ];
+        let lines: Vec<String> = unresolved_entries(&entries)
+            .map(|u| u.to_string())
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "entry 2: unknown track bbbbbbbb",
+                "entry 4: unknown track dddddddd"
+            ]
+        );
+        assert_eq!(unresolved_entries(&entries).count(), 2);
+    }
+
+    fn timed(secs: u32) -> TrackInfo {
+        TrackInfo {
+            duration: Some(library_ipc_client::DurationSeconds::new(secs)),
+            ..track_info("sha256:aa000001")
+        }
+    }
+
+    #[test]
+    fn playlist_seconds_sums_available_entries_and_skips_unresolved_ones() {
+        let entries = [track('a'), unknown("bbbbbbbb"), track('c'), track('a')];
+        let total = playlist_seconds(&entries, |h: &ContentHash| {
+            Ok::<_, String>(if h == full('c').as_content_hash() {
+                timed(100)
+            } else {
+                timed(10)
+            })
+        });
+        assert_eq!(total, Ok(120));
+    }
+
+    #[test]
+    fn playlist_seconds_fails_on_a_failed_lookup() {
+        let entries = [track('a'), track('c')];
+        let total = playlist_seconds(&entries, |h: &ContentHash| {
+            if h == full('c').as_content_hash() {
+                Err("socket closed".to_string())
+            } else {
+                Ok(timed(10))
+            }
+        });
+        assert_eq!(total, Err("socket closed".to_string()));
+    }
+
+    #[test]
+    fn a_removed_playlist_is_skipped_and_any_other_failure_is_not() {
+        let gone = ClientError::Protocol(ProtocolError::PlaylistNotFound {
+            name: "mix".to_string(),
+        });
+        assert_eq!(entries_unless_removed(Err(gone)).unwrap(), None);
+
+        let entries = vec![track('a')];
+        assert_eq!(
+            entries_unless_removed(Ok(entries.clone())).unwrap(),
+            Some(entries)
+        );
+
+        let broken = ClientError::Protocol(ProtocolError::Internal {
+            message: "disk on fire".to_string(),
+        });
+        assert_eq!(
+            failure_text(entries_unless_removed(Err(broken))),
+            "internal error: disk on fire"
+        );
+    }
+
+    #[test]
+    fn entries_lines_show_the_hash_or_why_it_is_unavailable() {
+        assert_eq!(
+            entry_line(&track('a')),
+            format!("sha256:{}", "a".repeat(64))
+        );
+        assert_eq!(
+            entry_line(&unknown("bbbbbbbb")),
+            "unavailable: unknown track bbbbbbbb"
+        );
     }
 }

@@ -9,6 +9,7 @@ mod pane;
 mod playlist_pane;
 mod playlists_pane;
 mod queue_pane;
+mod rows;
 mod search_pane;
 mod search_parse;
 mod selection;

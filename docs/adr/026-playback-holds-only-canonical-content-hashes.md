@@ -22,7 +22,7 @@ Builds on ADR-017 (play facts; its Context and §6.4 are corrected by this ADR),
 
 1. **Decided:** a client that sends a hash to playback resolves it first through the library, the single resolver, with `get_track(hash)` and the returned `content_hash`. There is no second prefix-resolution implementation.
 2. One helper does it for all clients: `library_ipc_client::resolve_full_hashes(hashes, get_track)`, returning `Vec<CanonicalHash>`. It resolves **all** hashes before any is returned and fails on the first that is unknown, ambiguous, or that the library answers with a hash that is not canonical (`ResolveError::NotCanonical`; legacy short-hash entities exist in the index). Nothing is sent until every hash resolves. Only QueueReplace and QueueRemove are atomic in playback; a client that sends QueueAppend or QueueNext once per hash relies on this up-front resolution to avoid a half-sent batch.
-   - **Decided:** input that is already canonical is returned unchanged, without asking the library. Only prefixes go to `get_track`. A queue entry whose track the library has lost (for example one shown as unavailable in `queue edit`) therefore survives a round-trip, and a canonical hash costs no lookup.
+   - **Superseded by the amendment 2026-11-16 (every ID is resolved):** **Decided:** input that is already canonical is returned unchanged, without asking the library. Only prefixes go to `get_track`. A queue entry whose track the library has lost (for example one shown as unavailable in `queue edit`) therefore survives a round-trip, and a canonical hash costs no lookup.
 3. Callers: every `mdma queue` subcommand that sends hashes (`next`, `append`, `remove`, `replace`, `edit`), the old web console's queue routes (append, remove, replace, playlist-to-queue), and the new console's `/api/queue/{next,last,edit}` and `/api/play-now` (once feature/console-redesign is merged). The BDD world resolves its tokens the same way (`library_hash`). `queue remove <short>` resolves too, so it matches the full hash in the queue. The console asks the library through the gateway client, not a direct library socket, so a fake gateway can stand in for both services.
 4. Library-bound commands keep sending prefixes; the library resolves them on arrival. `ContentHash` stays one type. The hash argument newtypes in the CLI still accept a prefix.
 5. The TUI takes hashes from `TrackInfo` values the library returned, but those can still be legacy short hashes, so it checks them too: every hash it sends to playback goes through the same helper (`LibraryBackend::resolve_for_playback`), which checks that it is canonical, and a failure is shown in the status line rather than dropped.
@@ -43,7 +43,7 @@ An old CLI sends prefixes; a new playback refuses them. Roll out the clients (CL
 - No new short-hash play lines are written. `TrackStarted`/`TrackStopped`/`PlayStarted`/`PlayStopped` entities from playback are full hashes from the playback release that carries this ADR.
 - **The #86 reader workaround stays.** The log still holds short-key lines written before this change; ADR-017 §6.4 keeps their entities as written, and library_projection keeps crediting 8- and 12-character keys when exactly one full key starts with them. It no longer needs to grow: nothing writes new ones. Its doc comments say where the lines come from.
 - A client that sends a prefix to the new playback gets an error that names the fix, instead of silent corruption.
-- A prefix for a track the library no longer knows cannot be sent through `queue edit` or `queue replace`: resolution fails on the first, naming it. Remove that line and save again. A full hash passes through unchanged.
+- A prefix for a track the library no longer knows cannot be sent through `queue edit` or `queue replace`: resolution fails on the first, naming it. Remove that line and save again. A full hash passes through unchanged. (**Superseded by the amendment 2026-11-16**: full hashes are resolved too.)
 - The console answers 422 with the resolver's message when the library refuses the hash (unknown, ambiguous, or answering with a non-full hash), and 503 when the library cannot be reached (a transport failure), before playback is contacted. The CLI reports both as the error text.
 - Persisted queue entries that were prefixes are dropped at the first start of the new playback, with a warning.
 - `queue edit` writes the full hash for entries the library cannot show, so they survive the round-trip. When a save is rejected, the edited text is kept in a file whose path is in the error.
@@ -56,3 +56,57 @@ An old CLI sends prefixes; a new playback refuses them. Roll out the clients (CL
 - **Normalise a prefix in playback by zero-padding or guessing.** Rejected: a prefix is only unique with the library's whole track set in view.
 - **Keep accepting prefixes and only widen the reader workaround.** Rejected: plays recorded under a prefix can move to another track later, so no reader can make them right.
 - **Split `ContentHash` into a prefix type and a full type across the codebase.** Rejected for now: library-bound commands send prefixes on purpose. Only the places that must hold full hashes use `CanonicalHash`.
+
+## Amendment 2026-11-16: every ID is resolved; PlaylistEntries
+
+Supersedes §1.2's "Decided: canonical input returned unchanged" and the Consequences line "A full hash passes through unchanged". Both stay above as written.
+
+### A1. Every ID is resolved against the set the command works on, with one matcher
+
+1. **Decided:** the matcher is always `library_projection::resolve_prefix`; the call site picks the set. Full hashes are resolved too, with no canonical shortcut: it should not matter whether an ID is a short or a full hash, since every ID is resolved.
+2. The sets:
+   - **Add** (`next`, `append`, play-now, playlist to queue): the library's visible tracks (`get_track`, through `resolve_full_hashes`).
+   - **Remove:** the queue's entries (`mdma_client::resolve_in_queue`). A stale entry can be removed by prefix.
+   - **Replace/edit:** queue and library in one resolution (`LibraryBackend::resolve_for_queue_replace`). A hash that names different tracks in the two sets is ambiguous. A stale queue entry survives; a new entry must exist in the library.
+3. An ambiguous prefix is a typed `ProtocolError::AmbiguousHash { hash, candidates }`.
+4. `mdma_client` depends on `library_projection` for the shared matcher.
+
+### A2. PlaylistEntries is the read model
+
+1. `LibraryRequest::PlaylistEntries` returns `Vec<PlaylistEntry>`, in file order, duplicates kept.
+2. `PlaylistEntry` is `Track { hash: CanonicalHash }` or `Unresolved { error: EntryError }`. `EntryError` is `Unknown`, `Ambiguous { candidates }` or `NotCanonical { found }`.
+3. It never drops entries and never writes. `library_projection::resolve_entry` resolves it; the library and the stub share it. `CanonicalHash` serde refuses prefixes.
+
+### A3. Playlist files are never canonicalised on read
+
+1. **Decided:** files keep the short or full hashes they were written with; they are not rewritten with long hashes. PlaylistGet stays verbatim.
+2. The ADR-004 successor repair is the only write-on-read (approved).
+3. ADR-027 edits work from the stored file.
+
+### A4. Playlist to queue goes through `entries_for_playback`
+
+The first unresolved entry fails the whole batch with its 1-based position (`UnplayableEntry`, "entry N: ..."). The console answers 422 and sends nothing.
+
+### A5. Unresolved rows stay in place in every client
+
+- The console shows unavailable rows.
+- CLI `list` shows "N tracks (k unavailable)"; `mdma playlist entries` lists every entry.
+- The TUI playlist and queue panes and bevy show unavailable rows.
+- A lookup that answers TrackNotFound becomes an unavailable row. Any other failure fails the load.
+
+### A6. TUI save format
+
+- An unresolved row is saved as `<token>  # <reason>`, the same for every error. The shared helper `track_formatter::unavailable_line` also produces it for CLI `queue edit`.
+- The first token stays live, so the next load reports the line again. It is never commented out or dropped, and survives cut, paste, move and undo.
+
+### A7. Console status codes
+
+- 422: a refused hash (unknown, ambiguous, not canonical, not in queue, ambiguous across sets).
+- 404: a missing playlist.
+- 503: a library or playback that cannot be reached.
+- 502: an old node or another protocol error.
+- **Known gap:** the gateway's "service unreachable" arrives as an untyped Internal error, so it is a 502 for now. #100 tracks a typed `GatewayResponse::ServiceUnreachable`.
+
+### A8. Deploy
+
+Gateway, library and console together, because they decode the new types (see ADR-029). Then the CLI and TUI. There is no PlaylistGet fallback.

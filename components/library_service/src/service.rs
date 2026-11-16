@@ -14,10 +14,9 @@ use crate::sources::{self, LibrarySources, ReleaseVersion};
 use acid_client::AcidClient;
 use event_protocol::{acid_event_from_topic_message, AcidEvent, TOPIC_ACID};
 use library_projection::{
-    ambiguity_message, apply_fact, distinct_retractions, hash_key, is_play_event,
-    is_provenance_tracked, project, remove_cancelled, resolve_entry, resolve_prefix,
-    resolve_visible, retain_live, retract_matches, try_parse_fact_line, IndexedTrackInfo,
-    MusicFact, PlayLog, Unresolved,
+    apply_fact, distinct_retractions, hash_key, is_play_event, is_provenance_tracked, project,
+    remove_cancelled, resolve_entry, resolve_prefix, resolve_visible, retain_live, retract_matches,
+    try_parse_fact_line, IndexedTrackInfo, MusicFact, PlayLog, Unresolved,
 };
 #[cfg(test)]
 use library_projection::{apply_fact_to_track, blob_path_for, IndexedCue};
@@ -2198,9 +2197,10 @@ impl LibraryService {
             Err(Unresolved::NotFound) => Err(ProtocolError::TrackNotFound {
                 hash: partial.as_str().to_owned(),
             }),
-            Err(Unresolved::Ambiguous(found)) => Err(ProtocolError::Internal {
-                message: ambiguity_message(partial.as_str(), &found),
-            }),
+            Err(Unresolved::Ambiguous(found)) => Err(ProtocolError::ambiguous_hash(
+                partial.as_str(),
+                found.iter().map(|t| t.content_hash.as_str()),
+            )),
         }
     }
 
@@ -2213,9 +2213,10 @@ impl LibraryService {
             Err(Unresolved::NotFound) => Err(ProtocolError::TrackNotFound {
                 hash: hash.as_str().to_owned(),
             }),
-            Err(Unresolved::Ambiguous(found)) => Err(ProtocolError::Internal {
-                message: ambiguity_message(hash.as_str(), &found),
-            }),
+            Err(Unresolved::Ambiguous(found)) => Err(ProtocolError::ambiguous_hash(
+                hash.as_str(),
+                found.iter().map(|t| t.content_hash.as_str()),
+            )),
         }
     }
 
@@ -3664,12 +3665,20 @@ mod tests {
 
         // Use "sha256:abcdef00" as the partial prefix that matches both hashes.
         let partial = ContentHash::new("sha256:abcdef00");
-        let result = service.resolve_hash(&partial);
-        assert!(
-            result.is_err(),
-            "expected Ambiguous error for genuine prefix collision, got: {:?}",
-            result
-        );
+        for result in [
+            service.resolve_hash(&partial).map(|_| ()),
+            service.get_track(&partial).map(|_| ()),
+        ] {
+            match result {
+                Err(ProtocolError::AmbiguousHash { hash, candidates }) => {
+                    assert_eq!(hash, partial.as_str());
+                    assert_eq!(candidates.len(), 2);
+                    assert!(candidates.contains(&hash_a.as_str().to_owned()));
+                    assert!(candidates.contains(&hash_b.as_str().to_owned()));
+                }
+                other => panic!("expected AmbiguousHash, got: {other:?}"),
+            }
+        }
     }
 
     #[test]

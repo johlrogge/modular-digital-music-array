@@ -18,6 +18,7 @@ audio-transcoder = { path = "../../components/audio_transcoder" }
 inbox-utils = { path = "../../components/inbox_utils" }
 library-ipc-client = { path = "../../components/library_ipc_client" }
 gateway-client = { path = "../../components/gateway_client" }
+mdma-client = { path = "../../components/mdma_client" }
 source-protocol = { path = "../../components/source_protocol" }
 event-protocol = { path = "../../components/event_protocol" }
 nng-transport = { path = "../../components/nng_transport" }

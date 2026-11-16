@@ -10,9 +10,7 @@ use crate::ipc::{
     MarkWrite, OrphanInfo, OrphanReason, PlaylistName, ProtocolError, ServiceStatus, TrackInfo,
     TrackQuery, Unmark,
 };
-use library_projection::{
-    ambiguity_message, resolve_entry, resolve_prefix, resolve_visible, HashedTrack, Unresolved,
-};
+use library_projection::{resolve_entry, resolve_prefix, resolve_visible, HashedTrack, Unresolved};
 use library_search::{matches_query, TrackFields};
 use music_facts::{FactSource, MusicValue};
 use music_primitives::{EnergyLevel, TrackRole};
@@ -718,9 +716,10 @@ impl LibraryService {
             Err(Unresolved::NotFound) => Err(ProtocolError::TrackNotFound {
                 hash: partial.as_str().to_owned(),
             }),
-            Err(Unresolved::Ambiguous(found)) => Err(ProtocolError::Internal {
-                message: ambiguity_message(partial.as_str(), &found),
-            }),
+            Err(Unresolved::Ambiguous(found)) => Err(ProtocolError::ambiguous_hash(
+                partial.as_str(),
+                found.iter().map(|t| t.content_hash.as_str()),
+            )),
         }
     }
 
@@ -733,9 +732,10 @@ impl LibraryService {
             Err(Unresolved::NotFound) => Err(ProtocolError::TrackNotFound {
                 hash: hash.as_str().to_owned(),
             }),
-            Err(Unresolved::Ambiguous(found)) => Err(ProtocolError::Internal {
-                message: ambiguity_message(hash.as_str(), &found),
-            }),
+            Err(Unresolved::Ambiguous(found)) => Err(ProtocolError::ambiguous_hash(
+                hash.as_str(),
+                found.iter().map(|t| t.content_hash.as_str()),
+            )),
         }
     }
 
@@ -944,6 +944,27 @@ mod tests {
 
     fn marked_any(svc: &LibraryService) -> Vec<String> {
         marked(svc, MarkFilter::Any)
+    }
+
+    #[test]
+    fn a_prefix_of_two_tracks_is_an_ambiguous_hash_not_an_internal_error() {
+        let a = format!("sha256:ab{}", "0".repeat(62));
+        let b = format!("sha256:ab{}", "1".repeat(62));
+        let svc = service_with_tracks(&[a.as_str(), b.as_str()]);
+        let partial = ContentHash::new("sha256:ab");
+        for result in [
+            svc.resolve_hash(&partial).map(|_| ()),
+            svc.get_track(&partial).map(|_| ()),
+        ] {
+            match result {
+                Err(ProtocolError::AmbiguousHash { hash, candidates }) => {
+                    assert_eq!(hash, "sha256:ab");
+                    assert_eq!(candidates.len(), 2);
+                    assert!(candidates.contains(&a) && candidates.contains(&b));
+                }
+                other => panic!("expected AmbiguousHash, got {other:?}"),
+            }
+        }
     }
 
     #[test]
