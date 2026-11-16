@@ -19,6 +19,33 @@ pub struct AudioOutputConfig {
     pub channels: Option<u32>,
 }
 
+/// Whether the audio output is actually pulling samples. Reported alongside
+/// transport state, never folded into it (see ADR-028).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputHealth {
+    /// No output stream exists.
+    Absent,
+    /// Stream created, no callback observed yet.
+    Starting,
+    /// Callbacks are arriving.
+    Running,
+    /// Callbacks have stopped (or never began) for too long.
+    Stalled,
+}
+
+/// The snake_case name used on the wire.
+impl Display for OutputHealth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            OutputHealth::Absent => "absent",
+            OutputHealth::Starting => "starting",
+            OutputHealth::Running => "running",
+            OutputHealth::Stalled => "stalled",
+        })
+    }
+}
+
 /// Identifies a playback session — spans from the first track playing to the queue emptying.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -170,6 +197,20 @@ impl Deck {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn output_health_serializes_snake_case() {
+        for (h, s) in [
+            (OutputHealth::Absent, "\"absent\""),
+            (OutputHealth::Starting, "\"starting\""),
+            (OutputHealth::Running, "\"running\""),
+            (OutputHealth::Stalled, "\"stalled\""),
+        ] {
+            assert_eq!(serde_json::to_string(&h).unwrap(), s);
+            assert_eq!(serde_json::from_str::<OutputHealth>(s).unwrap(), h);
+            assert_eq!(format!("\"{h}\""), s, "Display matches the wire name");
+        }
+    }
 
     mod volume {
         use super::*;
