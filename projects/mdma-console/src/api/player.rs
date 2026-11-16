@@ -7,7 +7,9 @@
 //! which carries no `deck` field yet (ADR-017 phase 1); nothing here targets another deck.
 
 use super::{
-    error_reply, fail, gw, json_or_500, queue_entries, resolve_for_playback, respond, send, Reply,
+    error_reply, fail, gw, json_or_failure, playback_failed, playback_failure_status,
+    queue_entries, resolve_for_playback, resolve_for_queue_replace, respond, send, PlaybackFailure,
+    Reply,
 };
 use crate::play_now::{
     queue_last_commands, queue_next_commands, require_idle, start_command, Busy,
@@ -112,17 +114,21 @@ fn output_of(client: &GatewayClient) -> Option<OutputHealth> {
 
 /// The loaded track. An answer that is not a `NowPlaying` is an error, never "idle": the idle
 /// guard must not pass on a reply it does not understand.
-fn now_of(client: &GatewayClient) -> Result<Option<ContentHash>, String> {
+fn now_of(client: &GatewayClient) -> Result<Option<ContentHash>, PlaybackFailure> {
     match send(client, &Command::NowPlaying)? {
         Some(ResponseData::NowPlaying(now)) => Ok(now),
-        other => Err(format!("Unexpected NowPlaying response: {other:?}")),
+        other => Err(PlaybackFailure::Unexpected(format!(
+            "Unexpected NowPlaying response: {other:?}"
+        ))),
     }
 }
 
-fn queue_of(client: &GatewayClient) -> Result<Vec<ContentHash>, String> {
+pub fn queue_of(client: &GatewayClient) -> Result<Vec<ContentHash>, PlaybackFailure> {
     match send(client, &Command::QueueList)? {
         Some(ResponseData::Queue(queue)) => Ok(queue),
-        other => Err(format!("Unexpected QueueList response: {other:?}")),
+        other => Err(PlaybackFailure::Unexpected(format!(
+            "Unexpected QueueList response: {other:?}"
+        ))),
     }
 }
 
@@ -131,36 +137,41 @@ fn strings(hashes: &[ContentHash]) -> Vec<String> {
 }
 
 /// Send `commands` in order, stopping at the first failure. Returns how many succeeded and the
-/// failure message, if any.
-fn send_all(client: &GatewayClient, commands: &[Command]) -> (usize, Option<String>) {
+/// failure, if any.
+fn send_all(client: &GatewayClient, commands: &[Command]) -> (usize, Option<PlaybackFailure>) {
     for (done, command) in commands.iter().enumerate() {
-        if let Err(message) = send(client, command) {
-            return (done, Some(message));
+        if let Err(failure) = send(client, command) {
+            return (done, Some(failure));
         }
     }
     (commands.len(), None)
 }
 
 /// Report `queued` insertions and the queue as it now is. No failure: 200 `{queued, queue}`.
-/// Some done: 207 `{queued, error, queue}`. None done: 500 `{error, queued: 0}`.
-fn batch_reply(client: &GatewayClient, queued: usize, failure: Option<String>) -> Reply {
+/// Some done: 207 `{queued, error, queue}`. None done: the failure's status
+/// ([`playback_failure_status`]) with `{error, queued: 0}`.
+fn batch_reply(client: &GatewayClient, queued: usize, failure: Option<PlaybackFailure>) -> Reply {
     match failure {
         None => match queue_of(client) {
             Ok(queue) => (
                 StatusCode::OK,
                 serde_json::json!({ "queued": queued, "queue": strings(&queue) }),
             ),
-            Err(message) => error_reply(StatusCode::INTERNAL_SERVER_ERROR, message),
+            Err(failure) => playback_failed(&failure),
         },
-        Some(error) if queued == 0 => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            serde_json::json!({ "error": error, "queued": 0 }),
+        Some(failure) if queued == 0 => (
+            playback_failure_status(&failure),
+            serde_json::json!({ "error": failure.to_string(), "queued": 0 }),
         ),
-        Some(error) => {
+        Some(failure) => {
             let queue = queue_of(client).map(|q| strings(&q)).unwrap_or_default();
             (
                 StatusCode::MULTI_STATUS,
-                serde_json::json!({ "queued": queued, "error": error, "queue": queue }),
+                serde_json::json!({
+                    "queued": queued,
+                    "error": failure.to_string(),
+                    "queue": queue
+                }),
             )
         }
     }
@@ -172,13 +183,18 @@ fn run_batch(client: &GatewayClient, commands: &[Command]) -> Reply {
     batch_reply(client, done, failure)
 }
 
-/// Everything was queued but the track could not be started: 500
-/// `{error, queued, stage: "start", queue}`.
-fn start_failed_reply(client: &GatewayClient, queued: usize, error: String) -> Reply {
+/// Everything was queued but the track could not be started: the failure's status
+/// ([`playback_failure_status`]) with `{error, queued, stage: "start", queue}`.
+fn start_failed_reply(client: &GatewayClient, queued: usize, failure: PlaybackFailure) -> Reply {
     let queue = queue_of(client).map(|q| strings(&q)).unwrap_or_default();
     (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        serde_json::json!({ "error": error, "queued": queued, "stage": "start", "queue": queue }),
+        playback_failure_status(&failure),
+        serde_json::json!({
+            "error": failure.to_string(),
+            "queued": queued,
+            "stage": "start",
+            "queue": queue
+        }),
     )
 }
 
@@ -192,7 +208,7 @@ fn api_player(transport: &TransportCache, snapshot: Snapshot) -> ApiPlayer {
     }
 }
 
-fn snapshot(client: &GatewayClient) -> Result<Snapshot, String> {
+fn snapshot(client: &GatewayClient) -> Result<Snapshot, PlaybackFailure> {
     Ok(Snapshot {
         now: now_of(client)?,
         queue: queue_of(client)?,
@@ -216,7 +232,7 @@ fn parse_hashes(hashes: Vec<String>) -> Result<Vec<ContentHash>, Response> {
 /// `GET /api/player`: `{state, now, queue, output}`.
 pub async fn player(State(state): State<Arc<AppState>>) -> Response {
     let read = gw(&state, snapshot).await;
-    json_or_500(read.map(|r| r.map(|snap| api_player(&state.transport, snap))))
+    json_or_failure(read.map(|r| r.map(|snap| api_player(&state.transport, snap))))
 }
 
 /// `POST /api/pause`: pause deck A, then answer like `GET /api/player`. The console remembers
@@ -227,7 +243,7 @@ pub async fn pause(State(state): State<Arc<AppState>>) -> Response {
         snapshot(client)
     })
     .await;
-    json_or_500(read.map(|r| {
+    json_or_failure(read.map(|r| {
         r.map(|snap| {
             if let Some(hash) = &snap.now {
                 state.transport.mark_paused(hash);
@@ -244,7 +260,7 @@ pub async fn resume(State(state): State<Arc<AppState>>) -> Response {
         snapshot(client)
     })
     .await;
-    json_or_500(read.map(|r| {
+    json_or_failure(read.map(|r| {
         r.map(|snap| {
             state.transport.clear();
             api_player(&state.transport, snap)
@@ -262,9 +278,10 @@ pub async fn queue_next(
         Ok(h) => h,
         Err(response) => return response,
     };
+    let resolver = Arc::clone(&state);
     respond(
         gw(&state, move |client| {
-            match resolve_for_playback(client, &hashes) {
+            match resolve_for_playback(&resolver, &hashes) {
                 Ok(full) => run_batch(client, &queue_next_commands(&full)),
                 Err(reply) => reply,
             }
@@ -283,9 +300,10 @@ pub async fn queue_last(
         Ok(h) => h,
         Err(response) => return response,
     };
+    let resolver = Arc::clone(&state);
     respond(
         gw(&state, move |client| {
-            match resolve_for_playback(client, &hashes) {
+            match resolve_for_playback(&resolver, &hashes) {
                 Ok(full) => run_batch(client, &queue_last_commands(&full)),
                 Err(reply) => reply,
             }
@@ -315,16 +333,17 @@ pub async fn play_now(
         Ok(h) => h,
         Err(response) => return response,
     };
+    let resolver = Arc::clone(&state);
     respond(
         gw(&state, move |client| {
             let now = match now_of(client) {
                 Ok(now) => now,
-                Err(message) => return error_reply(StatusCode::INTERNAL_SERVER_ERROR, message),
+                Err(failure) => return playback_failed(&failure),
             };
             if require_idle(now).is_err() {
                 return busy_reply();
             }
-            let hashes = match resolve_for_playback(client, &hashes) {
+            let hashes = match resolve_for_playback(&resolver, &hashes) {
                 Ok(full) => full,
                 Err(reply) => return reply,
             };
@@ -334,12 +353,12 @@ pub async fn play_now(
             }
             let again = match now_of(client) {
                 Ok(now) => now,
-                Err(message) => return start_failed_reply(client, queued, message),
+                Err(failure) => return start_failed_reply(client, queued, failure),
             };
             match require_idle(again) {
                 Ok(idle) => match send(client, &start_command(idle)) {
                     Ok(_) => batch_reply(client, queued, None),
-                    Err(message) => start_failed_reply(client, queued, message),
+                    Err(failure) => start_failed_reply(client, queued, failure),
                 },
                 Err(Busy::Loaded(_)) => {
                     let queue = queue_of(client).map(|q| strings(&q)).unwrap_or_default();
@@ -360,7 +379,7 @@ pub async fn start(State(state): State<Arc<AppState>>) -> Response {
         gw(&state, |client| {
             let now = match now_of(client) {
                 Ok(now) => now,
-                Err(message) => return error_reply(StatusCode::INTERNAL_SERVER_ERROR, message),
+                Err(failure) => return playback_failed(&failure),
             };
             match require_idle(now) {
                 Ok(idle) => run_batch(client, &[start_command(idle)]),
@@ -385,12 +404,14 @@ pub async fn queue_edit(
     State(state): State<Arc<AppState>>,
     Json(req): Json<EditRequest>,
 ) -> Response {
+    let resolver = Arc::clone(&state);
     respond(
         gw(&state, move |client| {
-            let current = match queue_of(client) {
-                Ok(q) => strings(&q),
-                Err(message) => return error_reply(StatusCode::INTERNAL_SERVER_ERROR, message),
+            let queue = match queue_of(client) {
+                Ok(q) => q,
+                Err(failure) => return playback_failed(&failure),
             };
+            let current = strings(&queue);
             if current != req.expect {
                 return (
                     StatusCode::CONFLICT,
@@ -398,19 +419,19 @@ pub async fn queue_edit(
                 );
             }
             let requested: Vec<ContentHash> = req.queue.into_iter().map(ContentHash::new).collect();
-            let entries = match resolve_for_playback(client, &requested) {
+            let entries = match resolve_for_queue_replace(&resolver, &queue, &requested) {
                 Ok(full) => queue_entries(full),
                 Err(reply) => return reply,
             };
-            if let Err(message) = send(client, &Command::QueueReplace { entries }) {
-                return error_reply(StatusCode::INTERNAL_SERVER_ERROR, message);
+            if let Err(failure) = send(client, &Command::QueueReplace { entries }) {
+                return playback_failed(&failure);
             }
             match queue_of(client) {
                 Ok(queue) => (
                     StatusCode::OK,
                     serde_json::json!({ "queue": strings(&queue) }),
                 ),
-                Err(message) => error_reply(StatusCode::INTERNAL_SERVER_ERROR, message),
+                Err(failure) => playback_failed(&failure),
             }
         })
         .await,
@@ -534,12 +555,13 @@ mod tests {
         "sha256:",
         "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
     );
-    /// A prefix the fake library resolves to `A`.
+    /// The fake library knows `A`, `B` and `C` (and `SHORT_A`), not `X`. A prefix it resolves to
+    /// `A`:
     const SHORT_A: &str = "sha256:aaaa";
 
     #[test]
     fn the_test_hashes_are_canonical() {
-        for h in [A, B, C, X] {
+        for h in [A, B, C, X, STALE_A] {
             assert!(
                 library_ipc_client::CanonicalHash::try_from(ContentHash::new(h)).is_ok(),
                 "{h}"
@@ -584,6 +606,9 @@ mod tests {
             } if hash.as_str() == SHORT_A => track_ok(A),
             GatewayRequest::Library {
                 request: LibraryRequest::GetTrack { hash },
+            } if [A, B, C].contains(&hash.as_str()) => track_ok(hash.as_str()),
+            GatewayRequest::Library {
+                request: LibraryRequest::GetTrack { hash },
             } => track_not_found(hash.as_str()),
             other => GatewayResponse::Error {
                 message: format!("unexpected {other:?}"),
@@ -622,7 +647,7 @@ mod tests {
     async fn an_unintelligible_now_playing_answer_does_not_pass_the_guard() {
         let gw = FakeGateway::start(|_| playback_ok(None));
         let res = send_post_json(test_app_with(gw.addr()), "/api/start", &json!({})).await;
-        assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
         assert_eq!(described(&gw), ["now"]);
     }
 
@@ -667,6 +692,9 @@ mod tests {
             GatewayRequest::Playback {
                 request: Command::QueueList,
             } => playback_ok(Some(ResponseData::Queue(vec![hash(A)]))),
+            GatewayRequest::Library {
+                request: LibraryRequest::GetTrack { hash },
+            } => track_ok(hash.as_str()),
             _ => playback_ok(None),
         });
         let res = send_post_json(
@@ -692,7 +720,7 @@ mod tests {
             &json!({"hashes": [A]}),
         )
         .await;
-        assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
         assert_eq!(
             body_json(res).await,
             json!({"error": "boom", "queued": 1, "stage": "start", "queue": [A]})
@@ -734,13 +762,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pause_failure_is_500_and_leaves_the_cache_alone() {
+    async fn a_refused_pause_is_502_and_leaves_the_cache_alone() {
         let gw = playback_script(Some(X), &[], |c| matches!(c, Command::Pause { .. }));
         let app = test_app_with(gw.addr());
         let res = send_post_json(app.clone(), "/api/pause", &json!({})).await;
-        assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(body_json(res).await, json!({"error": "boom"}));
         let res = send_get(app, "/api/player", None).await;
         assert_eq!(body_json(res).await["state"], "playing");
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_pause_answer_is_503() {
+        let gw = FakeGateway::start_unreadable_when(
+            |req| {
+                matches!(
+                    req,
+                    GatewayRequest::Playback {
+                        request: Command::Pause { .. }
+                    }
+                )
+            },
+            |_| playback_ok(None),
+        );
+        let res = send_post_json(test_app_with(gw.addr()), "/api/pause", &json!({})).await;
+        assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]
@@ -767,11 +813,33 @@ mod tests {
             described(&gw),
             [&format!("next {B}"), &format!("next {A}"), "list"]
         );
-        // Full hashes cost no library lookup.
-        assert!(gw
+        // Every hash is resolved by the library, full ones too (no pass-through).
+        let looked_up: Vec<String> = gw
             .requests()
-            .iter()
-            .all(|r| matches!(r, GatewayRequest::Playback { .. })));
+            .into_iter()
+            .filter_map(|r| match r {
+                GatewayRequest::Library {
+                    request: LibraryRequest::GetTrack { hash },
+                } => Some(hash.as_str().to_owned()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(looked_up, [A, B]);
+    }
+
+    #[tokio::test]
+    async fn a_full_hash_the_library_does_not_know_is_422_and_nothing_is_sent() {
+        // X is a well-formed full hash, but the library has no such track.
+        let gw = playback_script(Some(X), &[], never);
+        let res = send_post_json(
+            test_app_with(gw.addr()),
+            "/api/queue/next",
+            &json!({"hashes": [A, X]}),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(body_json(res).await["error"].as_str().unwrap().contains(X));
+        assert!(gw.commands().is_empty());
     }
 
     #[tokio::test]
@@ -839,13 +907,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_unreachable_library_is_503_on_an_api_route_and_nothing_is_sent() {
+    async fn a_library_failing_behind_the_gateway_is_502_on_an_api_route_and_nothing_is_sent() {
+        // The gateway's "library unreachable" arrives as `Internal`: a 502 until it is typed
+        // (#100), the one policy of `library_failure_status`.
         let gw = FakeGateway::start(|req| match req {
             GatewayRequest::Library { .. } => GatewayResponse::Error {
                 message: "library unavailable".into(),
             },
             _ => playback_ok(None),
         });
+        let res = send_post_json(
+            test_app_with(gw.addr()),
+            "/api/queue/next",
+            &json!({"hashes": [SHORT_A]}),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
+        assert!(gw.commands().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_library_answer_is_503_on_an_api_route_and_nothing_is_sent() {
+        let gw = FakeGateway::start_unreadable_when(
+            |req| matches!(req, GatewayRequest::Library { .. }),
+            |_| playback_ok(None),
+        );
         let res = send_post_json(
             test_app_with(gw.addr()),
             "/api/queue/next",
@@ -898,7 +984,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn queue_next_total_failure_is_an_error_status() {
+    async fn queue_next_total_refusal_is_502() {
         let gw = playback_script(None, &[], |c| matches!(c, Command::QueueNext { .. }));
         let res = send_post_json(
             test_app_with(gw.addr()),
@@ -906,7 +992,7 @@ mod tests {
             &json!({"hashes": [A]}),
         )
         .await;
-        assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
         assert_eq!(body_json(res).await["queued"], 0);
     }
 
@@ -994,6 +1080,80 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("sha256:dead"));
+        assert_eq!(described(&gw), ["list"]);
+    }
+
+    /// The queue holds an entry the library does not know (`X`): it may stay, a new unknown one
+    /// may not. The edit resolves against the live queue, not an empty one.
+    #[tokio::test]
+    async fn queue_edit_keeps_a_queued_entry_the_library_does_not_know() {
+        let gw = playback_script(Some(A), &[X], never);
+        let res = send_post_json(
+            test_app_with(gw.addr()),
+            "/api/queue/edit",
+            &json!({"expect": [X], "queue": [X, A]}),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            described(&gw),
+            ["list", &format!("replace {X},{A}"), "list"]
+        );
+    }
+
+    /// A queued entry that starts like `SHORT_A` but is another track than the library's `A`.
+    const STALE_A: &str = concat!(
+        "sha256:",
+        "aaaabbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    );
+
+    #[tokio::test]
+    async fn queue_edit_with_a_prefix_naming_different_tracks_in_queue_and_library_is_422() {
+        let gw = playback_script(Some(X), &[STALE_A], never);
+        let res = send_post_json(
+            test_app_with(gw.addr()),
+            "/api/queue/edit",
+            &json!({"expect": [STALE_A], "queue": [SHORT_A]}),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(described(&gw), ["list"]);
+    }
+
+    #[tokio::test]
+    async fn queue_edit_whose_replace_playback_refuses_is_502() {
+        let gw = playback_script(Some(X), &[A], |c| matches!(c, Command::QueueReplace { .. }));
+        let res = send_post_json(
+            test_app_with(gw.addr()),
+            "/api/queue/edit",
+            &json!({"expect": [A], "queue": [B]}),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(body_json(res).await, json!({"error": "boom"}));
+    }
+
+    #[tokio::test]
+    async fn queue_edit_with_an_unreadable_queue_read_is_503_and_sends_nothing() {
+        let gw = FakeGateway::start_unreadable_when(
+            |req| {
+                matches!(
+                    req,
+                    GatewayRequest::Playback {
+                        request: Command::QueueList
+                    }
+                )
+            },
+            |_| playback_ok(None),
+        );
+        let res = send_post_json(
+            test_app_with(gw.addr()),
+            "/api/queue/edit",
+            &json!({"expect": [A], "queue": [B]}),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+        // Only the read that could not be understood.
         assert_eq!(described(&gw), ["list"]);
     }
 

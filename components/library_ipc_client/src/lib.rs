@@ -314,6 +314,13 @@ impl LibraryClient {
         }
     }
 
+    /// Get a playlist's entries resolved to full hashes, in file order.
+    pub fn playlist_entries(&self, name: &PlaylistName) -> Result<Vec<PlaylistEntry>, ClientError> {
+        interpret_playlist_entries(
+            self.request(&LibraryRequest::PlaylistEntries { name: name.clone() })?,
+        )
+    }
+
     /// Create a new playlist with pre-formatted content.
     ///
     /// `content` must be in the canonical `{8hash}  {Artist} - {Title}  [{duration}]`
@@ -683,6 +690,19 @@ pub fn interpret_identity_backfill_status(
     }
 }
 
+/// Interpret the answer to `PlaylistEntries`.
+pub fn interpret_playlist_entries(
+    response: LibraryResponse,
+) -> Result<Vec<PlaylistEntry>, ClientError> {
+    match response {
+        LibraryResponse::PlaylistEntries(entries) => Ok(entries),
+        LibraryResponse::Error(e) => Err(ClientError::Protocol(e)),
+        _ => Err(ClientError::Protocol(ProtocolError::Internal {
+            message: "Unexpected response to PlaylistEntries".to_string(),
+        })),
+    }
+}
+
 // =========================================================================
 // Playlist content helpers
 // =========================================================================
@@ -690,13 +710,90 @@ pub fn interpret_identity_backfill_status(
 /// Parse hash-per-line playlist content. Skips empty lines and comment lines.
 /// Takes the first whitespace-separated token per line (hash may be followed by display info).
 pub fn content_to_hashes(content: &str) -> Vec<ContentHash> {
-    content
-        .lines()
-        .map(|line| line.trim())
-        .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .filter_map(|line| line.split_whitespace().next())
-        .map(ContentHash::new)
+    playlist_hashes(content).map(ContentHash::new).collect()
+}
+
+/// The hashes of a playlist's entries, for sending to playback, which holds
+/// only full hashes. Fails on the first unresolved entry, returning its
+/// position and why, so nothing is half sent.
+pub fn entries_for_playback(
+    entries: &[PlaylistEntry],
+) -> Result<Vec<CanonicalHash>, UnplayableEntry> {
+    match unresolved_entries(entries).next() {
+        Some(unplayable) => Err(unplayable),
+        None => Ok(track_hashes(entries)),
+    }
+}
+
+/// The full hash of each available entry of a playlist, in order.
+pub fn track_hashes(entries: &[PlaylistEntry]) -> Vec<CanonicalHash> {
+    entries
+        .iter()
+        .filter_map(|entry| match entry {
+            PlaylistEntry::Track { hash } => Some(hash.clone()),
+            PlaylistEntry::Unresolved { .. } => None,
+        })
         .collect()
+}
+
+/// The entries of a playlist that are not available, with their 1-based positions.
+pub fn unresolved_entries(entries: &[PlaylistEntry]) -> impl Iterator<Item = UnplayableEntry> + '_ {
+    entries
+        .iter()
+        .enumerate()
+        .filter_map(|(index, entry)| match entry {
+            PlaylistEntry::Track { .. } => None,
+            PlaylistEntry::Unresolved { error } => Some(UnplayableEntry {
+                position: index + 1,
+                error: error.clone(),
+            }),
+        })
+}
+
+/// Why an entry has no track: the library said it is unresolved, or looking
+/// up its track failed.
+#[derive(Debug, Error)]
+pub enum EntryTrackError<E> {
+    /// The library could not resolve the entry.
+    #[error("{0}")]
+    Unresolved(EntryError),
+    /// The entry resolved, but fetching its track failed.
+    #[error("cannot look up {hash}: {source}")]
+    Lookup {
+        hash: CanonicalHash,
+        #[source]
+        source: E,
+    },
+}
+
+/// The track of each entry of a playlist, in order and with duplicates.
+///
+/// Unresolved entries and failed lookups yield an error in their place, so the
+/// two stay distinguishable and no entry is dropped. `get_track` is called once
+/// per resolved entry, with its full hash.
+pub fn entry_tracks<'a, E>(
+    entries: &'a [PlaylistEntry],
+    mut get_track: impl FnMut(&ContentHash) -> Result<TrackInfo, E> + 'a,
+) -> impl Iterator<Item = Result<TrackInfo, EntryTrackError<E>>> + 'a {
+    entries.iter().map(move |entry| match entry {
+        PlaylistEntry::Track { hash } => {
+            get_track(hash.as_content_hash()).map_err(|source| EntryTrackError::Lookup {
+                hash: hash.clone(),
+                source,
+            })
+        }
+        PlaylistEntry::Unresolved { error } => Err(EntryTrackError::Unresolved(error.clone())),
+    })
+}
+
+/// A playlist entry that cannot be sent to playback.
+#[derive(Debug, Error, PartialEq)]
+#[error("entry {position}: {error}")]
+pub struct UnplayableEntry {
+    /// 1-based position among the playlist's track entries; comments and blank
+    /// lines are not counted.
+    pub position: usize,
+    pub error: EntryError,
 }
 
 /// A hash that could not be resolved to a full hash.
@@ -717,13 +814,30 @@ pub enum ResolveError {
         hash: ContentHash,
         returned: ContentHash,
     },
+    /// No entry of the playback queue starts with the hash.
+    #[error("cannot resolve {hash}: not in the queue")]
+    NotInQueue { hash: ContentHash },
+    /// Several different entries of the playback queue start with the hash.
+    #[error("cannot resolve {hash}: it matches several entries of the queue")]
+    AmbiguousInQueue { hash: ContentHash },
+    /// The hash names one entry of the queue and a different track of the library.
+    #[error("cannot resolve {hash}: it names {queued} in the queue and {library} in the library")]
+    AmbiguousAcrossQueueAndLibrary {
+        hash: ContentHash,
+        queued: CanonicalHash,
+        library: CanonicalHash,
+    },
 }
 
 impl ResolveError {
     /// The hash, as given, that failed to resolve.
     pub fn hash(&self) -> &ContentHash {
         match self {
-            ResolveError::Lookup { hash, .. } | ResolveError::NotCanonical { hash, .. } => hash,
+            ResolveError::Lookup { hash, .. }
+            | ResolveError::NotCanonical { hash, .. }
+            | ResolveError::NotInQueue { hash }
+            | ResolveError::AmbiguousInQueue { hash }
+            | ResolveError::AmbiguousAcrossQueueAndLibrary { hash, .. } => hash,
         }
     }
 
@@ -739,35 +853,40 @@ impl ResolveError {
     }
 }
 
-/// Resolve every hash, prefix or full, to the canonical hash of its track.
+/// Resolve one hash, prefix or full, to the canonical hash of its track.
 ///
-/// The one resolver for clients that send hashes to playback, which holds only
-/// full hashes. A hash that is already canonical is returned unchanged without
-/// asking the library; only prefixes go to `get_track`, the library's own
-/// prefix resolution. All hashes are resolved before any is returned, and the
-/// first that is unknown, ambiguous or resolves to a non-full hash fails the
-/// whole batch, so nothing is half sent.
+/// Every hash goes to `get_track`, the library's own resolution, whatever its
+/// length: a hash that does not name a visible track is refused, full or not.
+pub fn resolve_full_hash(
+    hash: &ContentHash,
+    get_track: impl FnOnce(&ContentHash) -> Result<TrackInfo, ClientError>,
+) -> Result<CanonicalHash, ResolveError> {
+    let track = get_track(hash).map_err(|source| ResolveError::Lookup {
+        hash: hash.clone(),
+        source,
+    })?;
+    CanonicalHash::try_from(track.content_hash).map_err(|NotCanonical(returned)| {
+        ResolveError::NotCanonical {
+            hash: hash.clone(),
+            returned,
+        }
+    })
+}
+
+/// Resolve every hash, prefix or full, to the canonical hash of its track, as
+/// [`resolve_full_hash`] does for one.
+///
+/// The resolver for clients that add hashes to playback, which holds only full
+/// hashes. All hashes are resolved before any is returned, and the first that is
+/// unknown, ambiguous or resolves to a non-full hash fails the whole batch, so
+/// nothing is half sent.
 pub fn resolve_full_hashes(
     hashes: &[ContentHash],
     get_track: impl Fn(&ContentHash) -> Result<TrackInfo, ClientError>,
 ) -> Result<Vec<CanonicalHash>, ResolveError> {
     hashes
         .iter()
-        .map(|hash| {
-            if let Ok(canonical) = CanonicalHash::try_from(hash.clone()) {
-                return Ok(canonical);
-            }
-            let track = get_track(hash).map_err(|source| ResolveError::Lookup {
-                hash: hash.clone(),
-                source,
-            })?;
-            CanonicalHash::try_from(track.content_hash).map_err(|NotCanonical(returned)| {
-                ResolveError::NotCanonical {
-                    hash: hash.clone(),
-                    returned,
-                }
-            })
-        })
+        .map(|hash| resolve_full_hash(hash, &get_track))
         .collect()
 }
 
@@ -814,12 +933,27 @@ mod tests {
     }
 
     #[test]
-    fn resolve_full_hashes_passes_canonical_input_through_without_a_lookup() {
-        let lookup = |_: &ContentHash| -> Result<TrackInfo, ClientError> {
-            panic!("a canonical hash must not be looked up")
+    fn resolve_full_hashes_looks_up_full_hashes_too() {
+        let asked = std::cell::RefCell::new(Vec::new());
+        let lookup = |h: &ContentHash| {
+            asked.borrow_mut().push(h.clone());
+            Ok(track_with(h.as_str()))
         };
         let got = resolve_full_hashes(&[ContentHash::new(full("c"))], lookup).unwrap();
         assert_eq!(got[0], ContentHash::new(full("c")));
+        assert_eq!(asked.into_inner(), vec![ContentHash::new(full("c"))]);
+    }
+
+    #[test]
+    fn resolve_full_hashes_refuses_an_unknown_full_hash() {
+        let lookup = |h: &ContentHash| -> Result<TrackInfo, ClientError> {
+            Err(ClientError::Protocol(ProtocolError::TrackNotFound {
+                hash: h.to_string(),
+            }))
+        };
+        let err = resolve_full_hashes(&[ContentHash::new(full("d"))], lookup).unwrap_err();
+        assert!(matches!(err, ResolveError::Lookup { .. }));
+        assert_eq!(err.hash(), &ContentHash::new(full("d")));
     }
 
     #[test]
@@ -868,6 +1002,114 @@ mod tests {
         .unwrap_err();
         assert_eq!(err.hash(), &ContentHash::new("unknown"));
         assert!(err.to_string().contains("cannot resolve unknown"), "{err}");
+    }
+
+    fn track_entry(tag: &str) -> PlaylistEntry {
+        PlaylistEntry::Track {
+            hash: CanonicalHash::try_from(ContentHash::new(full(tag))).unwrap(),
+        }
+    }
+
+    fn unknown_entry(token: &str) -> PlaylistEntry {
+        PlaylistEntry::Unresolved {
+            error: EntryError::Unknown {
+                hash: ContentHash::new(token),
+            },
+        }
+    }
+
+    #[test]
+    fn entries_for_playback_returns_tracks_in_order_with_duplicates() {
+        let entries = [track_entry("b"), track_entry("a"), track_entry("b")];
+        let got: Vec<ContentHash> = entries_for_playback(&entries)
+            .unwrap()
+            .into_iter()
+            .map(Into::into)
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ContentHash::new(full("b")),
+                ContentHash::new(full("a")),
+                ContentHash::new(full("b")),
+            ]
+        );
+    }
+
+    #[test]
+    fn entries_for_playback_fails_on_first_unresolved_with_its_position() {
+        let entries = [
+            track_entry("a"),
+            unknown_entry("first"),
+            track_entry("b"),
+            unknown_entry("second"),
+        ];
+        let unplayable = entries_for_playback(&entries).unwrap_err();
+        assert_eq!(unplayable.position, 2, "1-based");
+        assert_eq!(
+            unplayable.error,
+            EntryError::Unknown {
+                hash: ContentHash::new("first")
+            }
+        );
+        assert_eq!(unplayable.to_string(), "entry 2: unknown track first");
+    }
+
+    #[test]
+    fn entry_tracks_keeps_unresolved_and_lookup_failures_apart() {
+        let entries = [track_entry("a"), unknown_entry("gone"), track_entry("b")];
+        let bad = full("b");
+        let got: Vec<_> = entry_tracks(&entries, |h: &ContentHash| {
+            if h.as_str() == bad {
+                Err("boom".to_string())
+            } else {
+                Ok(track_with(h.as_str()))
+            }
+        })
+        .collect();
+        assert_eq!(got.len(), 3);
+        assert!(got[0].is_ok());
+        assert!(matches!(
+            &got[1],
+            Err(EntryTrackError::Unresolved(EntryError::Unknown { hash }))
+                if hash == &ContentHash::new("gone")
+        ));
+        match &got[2] {
+            Err(EntryTrackError::Lookup { hash, source }) => {
+                assert_eq!(hash.as_content_hash().as_str(), bad);
+                assert_eq!(source, "boom");
+            }
+            _ => panic!("expected a lookup failure"),
+        }
+    }
+
+    #[test]
+    fn entry_tracks_keeps_order_and_duplicates() {
+        let entries = [track_entry("b"), track_entry("a"), track_entry("b")];
+        let got: Vec<ContentHash> = entry_tracks(&entries, |h: &ContentHash| {
+            Ok::<_, String>(track_with(h.as_str()))
+        })
+        .map(|t| t.unwrap().content_hash)
+        .collect();
+        assert_eq!(
+            got,
+            vec![
+                ContentHash::new(full("b")),
+                ContentHash::new(full("a")),
+                ContentHash::new(full("b")),
+            ]
+        );
+    }
+
+    #[test]
+    fn unresolved_entries_number_positions_from_one() {
+        let entries = [
+            unknown_entry("first"),
+            track_entry("a"),
+            unknown_entry("second"),
+        ];
+        let positions: Vec<usize> = unresolved_entries(&entries).map(|u| u.position).collect();
+        assert_eq!(positions, vec![1, 3]);
     }
 
     #[test]

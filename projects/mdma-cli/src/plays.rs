@@ -53,7 +53,7 @@ pub(crate) enum PlaysOf {
 impl Arg for PlaysOf {
     /// `HASH|-` or `--recent N`.
     fn parser() -> impl Parser<Self> {
-        let track = <HashInput as Arg>::parser().map(Self::Track);
+        let track = HashInput::alternative(HashInput::HELP).map(Self::Track);
         let recent = <RecentCount as Arg>::parser().map(Self::Recent);
         construct!([track, recent])
     }

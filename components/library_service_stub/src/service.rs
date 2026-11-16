@@ -5,13 +5,15 @@
 //! ACID, ingestion, or file-system side effects.
 
 use crate::ipc::{
-    bookmark_scope_mark, parse_request, BeatGridInfo, Bpm, ContentHash, CueInfo, DurationSeconds,
-    FactType, IpcServer, LibraryRequest, LibraryResponse, Mark, MarkFilter, MarkWrite, OrphanInfo,
-    OrphanReason, PlaylistName, ProtocolError, ServiceStatus, TrackInfo, TrackQuery, Unmark,
+    bookmark_scope_mark, parse_request, playlist_hashes, BeatGridInfo, Bpm, ContentHash, CueInfo,
+    DurationSeconds, FactType, IpcServer, LibraryRequest, LibraryResponse, Mark, MarkFilter,
+    MarkWrite, OrphanInfo, OrphanReason, PlaylistName, ProtocolError, ServiceStatus, TrackInfo,
+    TrackQuery, Unmark,
 };
+use library_projection::{resolve_entry, resolve_prefix, resolve_visible, HashedTrack, Unresolved};
 use library_search::{TrackFields, TrackMatcher};
 use music_facts::{FactSource, MusicValue};
-use music_primitives::{EnergyLevel, TrackRole};
+use music_primitives::{EnergyLevel, Key, TrackRole};
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
@@ -63,7 +65,7 @@ struct IndexedTrack {
     styles: Vec<String>,
     duration_seconds: Option<u32>,
     bpm: Option<f32>,
-    key: Option<String>,
+    key: Option<Key>,
     year: Option<u32>,
     source: Option<String>,
     track_number: Option<u32>,
@@ -83,11 +85,21 @@ struct IndexedTrack {
     bookmarks: Vec<MusicValue>,
 }
 
-impl IndexedTrack {
+impl HashedTrack for IndexedTrack {
+    fn content_hash(&self) -> &str {
+        &self.content_hash
+    }
+
+    fn title(&self) -> Option<&str> {
+        self.title.as_deref()
+    }
+
     fn is_hidden(&self) -> bool {
         self.deleted_at.is_some()
     }
+}
 
+impl IndexedTrack {
     fn has_mark(&self, filter: &MarkFilter) -> bool {
         self.bookmarks
             .iter()
@@ -112,7 +124,7 @@ impl IndexedTrack {
             album: self.album.clone(),
             duration: self.duration_seconds.map(DurationSeconds::new),
             bpm: self.bpm.and_then(|b| Bpm::from_f32(b).ok()),
-            key: None,
+            key: self.key,
             blob_path: None,
             cover_art_path: None,
             track_number: self.track_number,
@@ -136,7 +148,7 @@ impl IndexedTrack {
             genre: self.genre.as_deref(),
             styles: &self.styles,
             bpm: self.bpm,
-            key: self.key.as_deref(),
+            key: self.key,
             duration: self.duration_seconds,
             year: self.year,
             source: self.source.as_deref(),
@@ -426,6 +438,22 @@ impl LibraryService {
                 }
             }
 
+            LibraryRequest::PlaylistEntries { name } => {
+                match self.playlists.lock().unwrap().get(name.as_str()) {
+                    Some(content) => {
+                        let tracks = self.tracks.lock().unwrap();
+                        LibraryResponse::PlaylistEntries(
+                            playlist_hashes(content)
+                                .map(|token| resolve_entry(&tracks, token))
+                                .collect(),
+                        )
+                    }
+                    None => LibraryResponse::Error(ProtocolError::PlaylistNotFound {
+                        name: name.to_string(),
+                    }),
+                }
+            }
+
             LibraryRequest::PlaylistNew { name, content } => {
                 let mut playlists = self.playlists.lock().unwrap();
                 if playlists.contains_key(name.as_str()) {
@@ -690,85 +718,34 @@ impl LibraryService {
         })
     }
 
-    /// Resolve a partial hash to a full hash (same algorithm as real service).
+    /// Resolve a partial hash to a full hash (the real service's `resolve_prefix`).
     fn resolve_hash(&self, partial: &ContentHash) -> Result<ContentHash, ProtocolError> {
-        let normalize = |h: &str| h.strip_prefix("sha256:").unwrap_or(h).to_lowercase();
-        let partial_clean = normalize(partial.as_str());
-
         let tracks = self.tracks.lock().unwrap();
-        let matches: Vec<_> = tracks
-            .iter()
-            .filter(|t| {
-                let hash = t
-                    .content_hash
-                    .as_str()
-                    .strip_prefix("sha256:")
-                    .unwrap_or(t.content_hash.as_str());
-                hash.to_lowercase().starts_with(&partial_clean)
-            })
-            .collect();
-
-        match matches.len() {
-            0 => Err(ProtocolError::TrackNotFound {
+        match resolve_prefix(&tracks, partial.as_str()) {
+            Ok(track) => Ok(ContentHash::new(track.content_hash.clone())),
+            Err(Unresolved::NotFound) => Err(ProtocolError::TrackNotFound {
                 hash: partial.as_str().to_owned(),
             }),
-            1 => Ok(ContentHash::new(matches[0].content_hash.clone())),
-            _ => {
-                // Check if all matches are the same content (prefix/full hash pair)
-                let normalized: Vec<String> = matches
-                    .iter()
-                    .map(|t| normalize(t.content_hash.as_str()))
-                    .collect();
-                let all_same = normalized.iter().all(|a| {
-                    normalized
-                        .iter()
-                        .all(|b| a.starts_with(b.as_str()) || b.starts_with(a.as_str()))
-                });
-                if all_same {
-                    let best = matches.iter().max_by_key(|t| t.content_hash.len()).unwrap();
-                    return Ok(ContentHash::new(best.content_hash.clone()));
-                }
-
-                // Genuinely ambiguous
-                let n = matches.len();
-                let examples: Vec<_> = matches
-                    .iter()
-                    .take(3)
-                    .map(|t| {
-                        let hash_str = t.content_hash.as_str();
-                        let short = hash_str.get(7..15).unwrap_or(hash_str);
-                        let name = t.title.as_deref().unwrap_or("Unknown");
-                        format!("  {} ({})", short, name)
-                    })
-                    .collect();
-                Err(ProtocolError::Internal {
-                    message: format!(
-                        "Ambiguous hash '{}' matches {} tracks:\n{}",
-                        partial.as_str(),
-                        n,
-                        examples.join("\n")
-                    ),
-                })
-            }
+            Err(Unresolved::Ambiguous(found)) => Err(ProtocolError::ambiguous_hash(
+                partial.as_str(),
+                found.iter().map(|t| t.content_hash.as_str()),
+            )),
         }
     }
 
     /// Look up a track by content hash (supports partial hashes).
     /// Returns TrackNotFound for hidden (deleted/superseded) tracks.
     fn get_track(&self, hash: &ContentHash) -> Result<TrackInfo, ProtocolError> {
-        let full_hash = self.resolve_hash(hash)?;
-
         let tracks = self.tracks.lock().unwrap();
-        let track = tracks.iter().find(|t| t.content_hash == full_hash.as_str());
-
-        match track {
-            Some(t) if t.is_hidden() => Err(ProtocolError::TrackNotFound {
+        match resolve_visible(&tracks, hash.as_str()) {
+            Ok(track) => Ok(track.to_track_info()),
+            Err(Unresolved::NotFound) => Err(ProtocolError::TrackNotFound {
                 hash: hash.as_str().to_owned(),
             }),
-            Some(t) => Ok(t.to_track_info()),
-            None => Err(ProtocolError::TrackNotFound {
-                hash: hash.as_str().to_owned(),
-            }),
+            Err(Unresolved::Ambiguous(found)) => Err(ProtocolError::ambiguous_hash(
+                hash.as_str(),
+                found.iter().map(|t| t.content_hash.as_str()),
+            )),
         }
     }
 
@@ -790,6 +767,7 @@ fn apply_fact(entry: &mut IndexedTrack, value: &MusicValue) {
         MusicValue::StyleDescriptor(v) => entry.styles.push(v.clone()),
         MusicValue::DurationSeconds(v) => entry.duration_seconds = Some(v.value()),
         MusicValue::Bpm(v) => entry.bpm = Some(v.as_f32()),
+        MusicValue::Key(v) => entry.key = Some(*v),
         MusicValue::Year(v) => entry.year = Some(v.value()),
         MusicValue::TrackNumber(v) => entry.track_number = Some(v.value()),
         MusicValue::DiscNumber(v) => entry.disc_number = Some(v.value()),
@@ -827,7 +805,7 @@ fn apply_fact(entry: &mut IndexedTrack, value: &MusicValue) {
         MusicValue::Role(v) => entry.role = Some(*v),
         MusicValue::Energy(v) => entry.energy = Some(*v),
         MusicValue::Bookmarked { .. } => entry.bookmarks.push(value.clone()),
-        _ => {} // ignore all other facts (key, format, cover art, timestamps, etc.)
+        _ => {} // ignore all other facts (format, cover art, timestamps, etc.)
     }
 }
 
@@ -881,6 +859,7 @@ pub fn spawn_fact_subscriber(_service: Arc<LibraryService>) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ipc::{CanonicalHash, EntryError, PlaylistEntry};
 
     fn empty_service() -> Arc<LibraryService> {
         LibraryService::from_metadata_dir(PathBuf::from("/nonexistent"))
@@ -1002,6 +981,64 @@ mod tests {
 
     fn marked_any(svc: &LibraryService) -> Vec<String> {
         marked(svc, MarkFilter::Any)
+    }
+
+    #[test]
+    fn a_prefix_of_two_tracks_is_an_ambiguous_hash_not_an_internal_error() {
+        let a = format!("sha256:ab{}", "0".repeat(62));
+        let b = format!("sha256:ab{}", "1".repeat(62));
+        let svc = service_with_tracks(&[a.as_str(), b.as_str()]);
+        let partial = ContentHash::new("sha256:ab");
+        for result in [
+            svc.resolve_hash(&partial).map(|_| ()),
+            svc.get_track(&partial).map(|_| ()),
+        ] {
+            match result {
+                Err(ProtocolError::AmbiguousHash { hash, candidates }) => {
+                    assert_eq!(hash, "sha256:ab");
+                    assert_eq!(candidates.len(), 2);
+                    assert!(candidates.contains(&a) && candidates.contains(&b));
+                }
+                other => panic!("expected AmbiguousHash, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn search_by_key_finds_projected_track() {
+        let svc = service_with_tracks(&["sha256:aaaa", "sha256:bbbb", "sha256:cccc"]);
+        for (i, key) in ["A Minor", "C Major", "E Minor"].iter().enumerate() {
+            let mut tracks = svc.tracks.lock().unwrap();
+            apply_fact(
+                &mut tracks[i],
+                &MusicValue::Key(key.parse().expect("valid key")),
+            );
+        }
+        let search = |key: &str| {
+            let query = TrackQuery {
+                key: Some(key.parse().expect("valid key query")),
+                ..Default::default()
+            };
+            match svc.handle_request(LibraryRequest::Search { query }) {
+                LibraryResponse::SearchResults(tracks) => {
+                    let mut hashes: Vec<String> = tracks
+                        .iter()
+                        .map(|t| t.content_hash.as_str().to_owned())
+                        .collect();
+                    hashes.sort();
+                    hashes
+                }
+                other => panic!("expected SearchResults, got {other:?}"),
+            }
+        };
+        assert_eq!(search("8A"), vec!["sha256:aaaa"]);
+        // 8B is a mode switch away (one step); 9A is one step clockwise.
+        assert_eq!(search("8A-1"), vec!["sha256:aaaa", "sha256:bbbb"]);
+        assert_eq!(
+            search("8A+-1"),
+            vec!["sha256:aaaa", "sha256:bbbb", "sha256:cccc"]
+        );
+        assert!(search("1A").is_empty());
     }
 
     #[test]
@@ -1561,6 +1598,116 @@ mod tests {
             });
         }
         assert_eq!(list(&svc), vec!["alpha".to_string(), "zeta".to_string()]);
+    }
+
+    // The PlaylistEntries contract, as the real service's tests state it.
+
+    fn full_hash(prefix: &str, fill: char) -> String {
+        format!(
+            "sha256:{prefix}{}",
+            fill.to_string().repeat(64 - prefix.len())
+        )
+    }
+
+    fn track_entry(hash: &str) -> PlaylistEntry {
+        PlaylistEntry::Track {
+            hash: CanonicalHash::try_from(ContentHash::new(hash)).unwrap(),
+        }
+    }
+
+    /// A stub holding tracks `aaaa..` and two sharing the prefix `ab`, with the
+    /// playlist `set` holding `content`.
+    fn service_with_playlist(content: &str) -> Arc<LibraryService> {
+        let svc = service_with_tracks(&[
+            &full_hash("aaaa", 'a'),
+            &full_hash("ab", '1'),
+            &full_hash("ab", '2'),
+        ]);
+        svc.handle_request(LibraryRequest::PlaylistNew {
+            name: name("set"),
+            content: content.to_string(),
+        });
+        svc
+    }
+
+    fn playlist_entries(svc: &LibraryService, playlist: &str) -> LibraryResponse {
+        svc.handle_request(LibraryRequest::PlaylistEntries {
+            name: name(playlist),
+        })
+    }
+
+    fn entries_of(resp: LibraryResponse) -> Vec<PlaylistEntry> {
+        match resp {
+            LibraryResponse::PlaylistEntries(entries) => entries,
+            other => panic!("expected PlaylistEntries, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn playlist_entries_keep_order_and_duplicates_of_mixed_short_and_full_lines() {
+        let a = full_hash("aaaa", 'a');
+        let b1 = full_hash("ab", '1');
+        let content =
+            format!("# a set\naaaaaaaa  Artist - Title  [3:00]\n\n{b1}\nsha256:aaaa\n{a}\n");
+        let svc = service_with_playlist(&content);
+        assert_eq!(
+            entries_of(playlist_entries(&svc, "set")),
+            vec![
+                track_entry(&a),
+                track_entry(&b1),
+                track_entry(&a),
+                track_entry(&a),
+            ]
+        );
+    }
+
+    #[test]
+    fn playlist_entries_report_unresolved_entries_in_place() {
+        let a = full_hash("aaaa", 'a');
+        let svc = service_with_playlist("ffffffff\naaaaaaaa\nab\n");
+        assert_eq!(
+            entries_of(playlist_entries(&svc, "set")),
+            vec![
+                PlaylistEntry::Unresolved {
+                    error: EntryError::Unknown {
+                        hash: ContentHash::new("ffffffff")
+                    }
+                },
+                track_entry(&a),
+                PlaylistEntry::Unresolved {
+                    error: EntryError::Ambiguous {
+                        hash: ContentHash::new("ab"),
+                        candidates: vec![
+                            ContentHash::new(full_hash("ab", '1')),
+                            ContentHash::new(full_hash("ab", '2')),
+                        ],
+                    }
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn playlist_entries_leave_the_file_byte_identical() {
+        let content =
+            "# a set\r\naaaaaaaa  Artist - Title\n\nffffffff\n  ab\t x\nno newline at end";
+        let svc = service_with_playlist(content);
+        let _ = playlist_entries(&svc, "set");
+        let resp = svc.handle_request(LibraryRequest::PlaylistGet { name: name("set") });
+        assert!(matches!(resp, LibraryResponse::PlaylistContent(c) if c == content));
+    }
+
+    #[test]
+    fn playlist_entries_of_missing_playlist_is_playlist_not_found() {
+        let svc = service_with_playlist("");
+        let resp = playlist_entries(&svc, "nope");
+        assert!(
+            matches!(
+                resp,
+                LibraryResponse::Error(ProtocolError::PlaylistNotFound { .. })
+            ),
+            "{resp:?}"
+        );
     }
 
     #[test]

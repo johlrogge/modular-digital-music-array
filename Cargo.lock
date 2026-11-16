@@ -5720,6 +5720,7 @@ version = "0.4.0"
 dependencies = [
  "chrono",
  "library-ipc-protocol",
+ "library-projection",
  "library-search",
  "music-facts",
  "music-primitives",
@@ -6141,6 +6142,7 @@ dependencies = [
  "libc",
  "library-ipc-client",
  "library-ipc-protocol",
+ "library-projection",
  "library-search",
  "media-client",
  "media-protocol",
@@ -6177,6 +6179,7 @@ dependencies = [
  "inbox-utils",
  "library-ipc-client",
  "library-search",
+ "mdma-client",
  "media-protocol",
  "nng",
  "nng-transport",

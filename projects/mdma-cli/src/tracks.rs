@@ -1,5 +1,6 @@
 use crate::args::{parse_count, value_and_dash, HashInput, StdinDash};
 use crate::ctx::Ctx;
+use crate::fact_filter::{facts_block, FactsArgs, KindFilter};
 use crate::local_complete::complete_marks;
 use crate::output::{
     each_track, for_each_track, format_track_line, library_error, mark_outcome, marked_header,
@@ -294,22 +295,25 @@ fn print_track_details(track: TrackInfo) {
 /// that can't be found is reported on stderr, the rest are still shown, and the exit
 /// code is 1.
 ///
+/// With --include, only facts of those kinds are shown; with --exclude, facts of those
+/// kinds are left out (and win over --include). Both repeat, and ignore case.
+///
 /// # Examples
 ///
 /// ```sh
 /// mdma facts abcd1234
-/// mdma search --artist CBL | mdma facts -
+/// mdma facts --include=BPM --include=Key abcd1234
+/// mdma search --artist CBL | mdma facts --exclude=TrackStarted -
 /// ```
 #[hicli::command]
-pub(crate) fn facts(hash: HashInput, ctx: &Ctx) -> Result<hicli::Success> {
+pub(crate) fn facts(args: FactsArgs, ctx: &Ctx) -> Result<hicli::Success> {
     let library = ctx.library()?;
-    let hashes = hashes_of_input(hash)?;
+    let hashes = hashes_of_input(args.hash)?;
+    let filter = KindFilter::new(args.include, args.exclude);
     each_track(hashes, |content_hash| {
         library.get_facts(content_hash).map(|(full_hash, facts)| {
-            println!("Facts for: {}", full_hash.as_str());
-            println!("{}", "=".repeat(65));
-            for (fact_type, fact_value) in facts {
-                println!("{:20} | {}", fact_type, fact_value);
+            for line in facts_block(full_hash.as_str(), &facts, &filter) {
+                println!("{line}");
             }
         })
     })

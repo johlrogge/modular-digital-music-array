@@ -92,7 +92,7 @@ export function matchQuery(f, text = "") {
   if (f.bmin || f.bmax) p.set("bpm", (f.bmin || "0") + ".." + (f.bmax || "999"));
   if (f.key) {
     const [note, mode] = f.key.split(" ");
-    p.set("key", note + (mode === "min" ? "m" : "") + (f.compat ? "+-1~" : ""));
+    p.set("key", note + (mode === "min" ? "m" : "") + (f.compat ? "+-1" : ""));
   }
   if (f.added !== "any") {
     const days = Number(f.added);

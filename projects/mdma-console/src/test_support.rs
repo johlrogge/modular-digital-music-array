@@ -18,10 +18,10 @@ pub fn test_app() -> Router {
     test_app_with(DEAD_GATEWAY)
 }
 
-/// The whole application with its gateway client pointed at `gateway_addr`.
-pub fn test_app_with(gateway_addr: &str) -> Router {
+/// The app state with its gateway client pointed at `gateway_addr`.
+pub fn test_state(gateway_addr: &str) -> Arc<AppState> {
     let (tx, _) = tokio::sync::broadcast::channel(4);
-    let state = Arc::new(AppState::new(
+    Arc::new(AppState::new(
         "ipc:///nonexistent/library.sock".into(),
         gateway_addr.into(),
         "bandcamp".into(),
@@ -29,8 +29,12 @@ pub fn test_app_with(gateway_addr: &str) -> Router {
         std::path::PathBuf::from("/nonexistent"),
         std::path::PathBuf::from("/nonexistent/cookies"),
         std::path::PathBuf::from("/nonexistent/conf"),
-    ));
-    crate::app(state)
+    ))
+}
+
+/// The whole application with its gateway client pointed at `gateway_addr`.
+pub fn test_app_with(gateway_addr: &str) -> Router {
+    crate::app(test_state(gateway_addr))
 }
 
 /// GET `path` on `app`, optionally asking for an encoding (e.g. "gzip").
@@ -174,8 +178,18 @@ pub struct FakeGateway {
 
 impl FakeGateway {
     /// Bind the socket and start answering. The socket is listening when this returns.
-    pub fn start<F>(mut script: F) -> Self
+    pub fn start<F>(script: F) -> Self
     where
+        F: FnMut(&GatewayRequest) -> GatewayResponse + Send + 'static,
+    {
+        Self::start_unreadable_when(|_| false, script)
+    }
+
+    /// As [`start`](Self::start), but a request `unreadable` accepts is answered with bytes that
+    /// are not a gateway response at all: what a client sees as a transport failure.
+    pub fn start_unreadable_when<U, F>(mut unreadable: U, mut script: F) -> Self
+    where
+        U: FnMut(&GatewayRequest) -> bool + Send + 'static,
         F: FnMut(&GatewayRequest) -> GatewayResponse + Send + 'static,
     {
         let dir = tempfile::tempdir().unwrap();
@@ -197,15 +211,18 @@ impl FakeGateway {
                         Ok(m) => m,
                         Err(_) => continue, // timed out: check the stop flag
                     };
-                    let response = match serde_json::from_slice::<GatewayRequest>(&msg) {
+                    let bytes = match serde_json::from_slice::<GatewayRequest>(&msg) {
+                        Ok(req) if unreadable(&req) => {
+                            recorded.lock().unwrap().push(req);
+                            b"not a response".to_vec()
+                        }
                         Ok(req) => {
                             let response = script(&req);
                             recorded.lock().unwrap().push(req);
-                            response
+                            serde_json::to_vec(&response).unwrap()
                         }
-                        Err(e) => GatewayResponse::invalid_request(e),
+                        Err(e) => serde_json::to_vec(&GatewayResponse::invalid_request(e)).unwrap(),
                     };
-                    let bytes = serde_json::to_vec(&response).unwrap();
                     let _ = socket.send(nng::Message::from(&bytes[..]));
                 }
             })

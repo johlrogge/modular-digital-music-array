@@ -4,18 +4,18 @@
 
 use crate::identity::{identity_facts_for_blob, IdentityOpts};
 use crate::ipc::{
-    bookmark_scope_mark, parse_request, AttributeList, BeatGridInfo, Bpm, ContentHash, CueInfo,
-    DurationSeconds, FactType, InboxPath, IngestAllItem, IngestResult, IpcServer, Key,
-    LibraryRequest, LibraryResponse, Mark, MarkWrite, OrphanInfo, OrphanReason, ProtocolError,
-    ServiceStatus, TrackInfo, TrackQuery, Unmark,
+    bookmark_scope_mark, parse_request, playlist_hashes, AttributeList, BeatGridInfo, Bpm,
+    ContentHash, CueInfo, DurationSeconds, FactType, InboxPath, IngestAllItem, IngestResult,
+    IpcServer, LibraryRequest, LibraryResponse, Mark, MarkWrite, OrphanInfo, OrphanReason,
+    PlaylistName, ProtocolError, ServiceStatus, TrackInfo, TrackQuery, Unmark,
 };
 use crate::pipeline::InboxFile;
 use crate::sources::{self, LibrarySources, ReleaseVersion};
 use acid_client::AcidClient;
 use event_protocol::{acid_event_from_topic_message, AcidEvent, TOPIC_ACID};
 use library_projection::{
-    ambiguity_message, apply_fact, distinct_retractions, hash_key, is_play_event,
-    is_provenance_tracked, project, remove_cancelled, resolve_prefix, retain_live, retract_matches,
+    apply_fact, distinct_retractions, hash_key, is_play_event, is_provenance_tracked, project,
+    remove_cancelled, resolve_entry, resolve_prefix, resolve_visible, retain_live, retract_matches,
     try_parse_fact_line, IndexedTrackInfo, MusicFact, PlayLog, Unresolved,
 };
 #[cfg(test)]
@@ -1070,20 +1070,22 @@ impl LibraryService {
                 LibraryResponse::PlaylistNames(names)
             }
 
-            LibraryRequest::PlaylistGet { name } => {
-                let path = self.resolve_playlist_path(&name);
-                match std::fs::read_to_string(&path) {
-                    Ok(content) => {
-                        // Lazy repair: follow Replaces chain for any unresolvable hash lines.
-                        // If a repair is found the playlist file is amended in place (one-time heal).
-                        let repaired = self.repair_playlist_content(&content, &path);
-                        LibraryResponse::PlaylistContent(repaired)
-                    }
-                    Err(_) => LibraryResponse::Error(ProtocolError::PlaylistNotFound {
-                        name: name.to_string(),
-                    }),
+            LibraryRequest::PlaylistGet { name } => match self.read_playlist(&name) {
+                Ok(content) => LibraryResponse::PlaylistContent(content),
+                Err(e) => LibraryResponse::Error(e),
+            },
+
+            LibraryRequest::PlaylistEntries { name } => match self.read_playlist(&name) {
+                Ok(content) => {
+                    let tracks = self.tracks.lock().unwrap();
+                    LibraryResponse::PlaylistEntries(
+                        playlist_hashes(&content)
+                            .map(|token| resolve_entry(&tracks, token))
+                            .collect(),
+                    )
                 }
-            }
+                Err(e) => LibraryResponse::Error(e),
+            },
 
             LibraryRequest::PlaylistNew { name, content } => {
                 let path = self.resolve_playlist_path(&name);
@@ -2066,7 +2068,7 @@ impl LibraryService {
             album: t.album.clone(),
             duration: t.duration_seconds.map(DurationSeconds::new),
             bpm: t.bpm.and_then(|b| Bpm::from_f32(b).ok()),
-            key: t.key.as_ref().and_then(|k| Key::from_traditional(k).ok()),
+            key: t.key,
             blob_path: Some(t.blob_path.to_string_lossy().to_string()),
             cover_art_path: t
                 .cover_art_path
@@ -2205,30 +2207,26 @@ impl LibraryService {
             Err(Unresolved::NotFound) => Err(ProtocolError::TrackNotFound {
                 hash: partial.as_str().to_owned(),
             }),
-            Err(Unresolved::Ambiguous(found)) => Err(ProtocolError::Internal {
-                message: ambiguity_message(partial.as_str(), &found),
-            }),
+            Err(Unresolved::Ambiguous(found)) => Err(ProtocolError::ambiguous_hash(
+                partial.as_str(),
+                found.iter().map(|t| t.content_hash.as_str()),
+            )),
         }
     }
 
     /// Get track by hash from in-memory index (supports partial hashes).
     /// Returns TrackNotFound for hidden (deleted/superseded) tracks.
     fn get_track(&self, hash: &ContentHash) -> Result<TrackInfo, ProtocolError> {
-        let full_hash = self.resolve_hash(hash)?;
-
         let tracks = self.tracks.lock().unwrap();
-        let track = tracks
-            .iter()
-            .find(|t| t.content_hash.as_str() == full_hash.as_str());
-
-        match track {
-            Some(t) if t.is_hidden() => Err(ProtocolError::TrackNotFound {
+        match resolve_visible(&tracks, hash.as_str()) {
+            Ok(track) => Ok(self.to_track_info(track)),
+            Err(Unresolved::NotFound) => Err(ProtocolError::TrackNotFound {
                 hash: hash.as_str().to_owned(),
             }),
-            Some(t) => Ok(self.to_track_info(t)),
-            None => Err(ProtocolError::TrackNotFound {
-                hash: hash.as_str().to_owned(),
-            }),
+            Err(Unresolved::Ambiguous(found)) => Err(ProtocolError::ambiguous_hash(
+                hash.as_str(),
+                found.iter().map(|t| t.content_hash.as_str()),
+            )),
         }
     }
 
@@ -2360,7 +2358,7 @@ impl LibraryService {
                     genre: t.genre.as_deref(),
                     styles: &t.styles,
                     bpm: t.bpm,
-                    key: t.key.as_deref(),
+                    key: t.key,
                     duration: t.duration_seconds,
                     year: t.year,
                     source: t.source.as_deref(),
@@ -2714,8 +2712,7 @@ impl LibraryService {
                     let is_live = {
                         let tracks = self.tracks.lock().unwrap();
                         tracks.iter().any(|t| {
-                            let h = normalize(t.content_hash.as_str());
-                            h == next_clean && t.deleted_at.is_none()
+                            normalize(t.content_hash.as_str()) == next_clean && !t.is_hidden()
                         })
                     };
 
@@ -2736,6 +2733,18 @@ impl LibraryService {
         None
     }
 
+    /// Read a playlist's content verbatim, after the lazy repair: follow the
+    /// Replaces chain for any unresolvable hash line; a repair amends the playlist
+    /// file in place (one-time heal).
+    fn read_playlist(&self, name: &PlaylistName) -> Result<String, ProtocolError> {
+        let path = self.resolve_playlist_path(name);
+        let content =
+            std::fs::read_to_string(&path).map_err(|_| ProtocolError::PlaylistNotFound {
+                name: name.to_string(),
+            })?;
+        Ok(self.repair_playlist_content(&content, &path))
+    }
+
     /// Scan a playlist's content, follow the Replaces chain for any unresolvable
     /// hash, amend lines to the live successor, and persist the file if anything changed.
     ///
@@ -2743,32 +2752,28 @@ impl LibraryService {
     fn repair_playlist_content(&self, content: &str, plist_path: &std::path::Path) -> String {
         use std::io::Write;
 
-        let normalize = |h: &str| h.strip_prefix("sha256:").unwrap_or(h).to_lowercase();
-
         let mut changed = false;
         let new_lines: Vec<String> = content
             .lines()
             .map(|line| {
-                let token = line.split_whitespace().next().unwrap_or("");
-                if token.is_empty() {
+                let Some(token) = playlist_hashes(line).next() else {
                     return line.to_string();
-                }
-
-                let token_clean = normalize(token);
-                // Build a ContentHash from the token to try resolve_hash
-                let candidate = ContentHash::new(token);
-
-                // Is this hash already live?
-                let is_live = {
-                    let tracks = self.tracks.lock().unwrap();
-                    tracks.iter().any(|t| {
-                        let h = normalize(t.content_hash.as_str());
-                        (h.starts_with(&token_clean) || token_clean.starts_with(&h))
-                            && t.deleted_at.is_none()
-                    })
                 };
 
-                if is_live {
+                let candidate = ContentHash::new(token);
+
+                // Live: the token resolves to a visible track. Ambiguous: leave it.
+                // Unknown or hidden: try the Replaces chain.
+                let leave_alone = {
+                    let tracks = self.tracks.lock().unwrap();
+                    match resolve_prefix(&tracks, token) {
+                        Ok(track) => !track.is_hidden(),
+                        Err(Unresolved::Ambiguous(_)) => true,
+                        Err(Unresolved::NotFound) => false,
+                    }
+                };
+
+                if leave_alone {
                     return line.to_string();
                 }
 
@@ -2780,9 +2785,8 @@ impl LibraryService {
                     }
                     Some(successor) => {
                         changed = true;
-                        // Replace only the hash token; preserve rest of line verbatim
-                        let rest = line[token.len()..].to_string();
-                        format!("{}{}", successor.as_str(), rest)
+                        // Replace only the hash token; preserve the rest of the line verbatim
+                        line.replacen(token, successor.as_str(), 1)
                     }
                 }
             })
@@ -3697,12 +3701,20 @@ mod tests {
 
         // Use "sha256:abcdef00" as the partial prefix that matches both hashes.
         let partial = ContentHash::new("sha256:abcdef00");
-        let result = service.resolve_hash(&partial);
-        assert!(
-            result.is_err(),
-            "expected Ambiguous error for genuine prefix collision, got: {:?}",
-            result
-        );
+        for result in [
+            service.resolve_hash(&partial).map(|_| ()),
+            service.get_track(&partial).map(|_| ()),
+        ] {
+            match result {
+                Err(ProtocolError::AmbiguousHash { hash, candidates }) => {
+                    assert_eq!(hash, partial.as_str());
+                    assert_eq!(candidates.len(), 2);
+                    assert!(candidates.contains(&hash_a.as_str().to_owned()));
+                    assert!(candidates.contains(&hash_b.as_str().to_owned()));
+                }
+                other => panic!("expected AmbiguousHash, got: {other:?}"),
+            }
+        }
     }
 
     #[test]
@@ -6450,6 +6462,44 @@ mod tests {
         );
     }
 
+    /// A key fact loaded through the projection is found by a Camelot key query
+    /// (the projection holds a typed `Key`, not its display string).
+    #[test]
+    fn search_by_key_finds_projected_track() {
+        use library_search::TrackQuery;
+        let a_minor = ContentHash::new("sha256:keysearch01");
+        let c_major = ContentHash::new("sha256:keysearch02");
+        let temp = write_facts_file(&[
+            (
+                a_minor.clone(),
+                MusicValue::Key("A Minor".parse().expect("valid key")),
+            ),
+            (
+                c_major.clone(),
+                MusicValue::Key("C Major".parse().expect("valid key")),
+            ),
+        ]);
+        let (service, _metadata_dir) = make_service_with_facts(temp.path());
+        let search = |key: &str| -> Vec<String> {
+            let query = TrackQuery {
+                key: Some(key.parse().expect("valid key query")),
+                ..Default::default()
+            };
+            let mut hashes: Vec<String> = service
+                .search_tracks(&query)
+                .iter()
+                .map(|t| t.content_hash.as_str().to_owned())
+                .collect();
+            hashes.sort();
+            hashes
+        };
+        assert_eq!(search("8A"), vec![a_minor.as_str().to_owned()]);
+        assert_eq!(search("Am"), vec![a_minor.as_str().to_owned()]);
+        assert_eq!(search("8B"), vec![c_major.as_str().to_owned()]);
+        assert_eq!(search("8A-1").len(), 2);
+        assert!(search("1A").is_empty());
+    }
+
     /// get_track returns TrackNotFound for hidden tracks.
     #[test]
     fn get_track_rejects_hidden_tracks() {
@@ -8118,6 +8168,214 @@ mod tests {
         }
 
         (service, metadata_dir, acid_handle)
+    }
+
+    // ---- PlaylistEntries -----------------------------------------------------
+
+    fn full_hash(prefix: &str, fill: char) -> String {
+        format!(
+            "sha256:{prefix}{}",
+            fill.to_string().repeat(64 - prefix.len())
+        )
+    }
+
+    fn track_entry(hash: &str) -> library_ipc_protocol::PlaylistEntry {
+        library_ipc_protocol::PlaylistEntry::Track {
+            hash: library_ipc_protocol::CanonicalHash::try_from(ContentHash::new(hash)).unwrap(),
+        }
+    }
+
+    fn unresolved_entry(
+        error: library_ipc_protocol::EntryError,
+    ) -> library_ipc_protocol::PlaylistEntry {
+        library_ipc_protocol::PlaylistEntry::Unresolved { error }
+    }
+
+    /// A service holding tracks `aaaa..` and two sharing the prefix `ab`, with
+    /// the playlist `set` holding `content`; also the playlist's path.
+    fn service_with_playlist(
+        content: &str,
+    ) -> (
+        Arc<LibraryService>,
+        std::path::PathBuf,
+        tempfile::TempDir,
+        AcidGuard,
+    ) {
+        let tracks = [
+            (ContentHash::new(full_hash("aaaa", 'a')), "A"),
+            (ContentHash::new(full_hash("ab", '1')), "B1"),
+            (ContentHash::new(full_hash("ab", '2')), "B2"),
+        ];
+        let (service, metadata_dir, acid) = make_service_with_replaces(&tracks, &[]);
+        let path = metadata_dir.path().join("playlists").join("set.plist");
+        std::fs::write(&path, content).unwrap();
+        (service, path, metadata_dir, acid)
+    }
+
+    fn playlist_entries(
+        service: &LibraryService,
+        name: &str,
+    ) -> Vec<library_ipc_protocol::PlaylistEntry> {
+        let name = PlaylistName::new(name).unwrap();
+        match service.handle_request(LibraryRequest::PlaylistEntries { name }) {
+            LibraryResponse::PlaylistEntries(entries) => entries,
+            other => panic!("expected PlaylistEntries, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn playlist_entries_keep_order_and_duplicates_of_mixed_short_and_full_lines() {
+        let a = full_hash("aaaa", 'a');
+        let b1 = full_hash("ab", '1');
+        let content =
+            format!("# a set\naaaaaaaa  Artist - Title  [3:00]\n\n{b1}\nsha256:aaaa\n{a}\n");
+        let (service, _path, _dir, _acid) = service_with_playlist(&content);
+        assert_eq!(
+            playlist_entries(&service, "set"),
+            vec![
+                track_entry(&a),
+                track_entry(&b1),
+                track_entry(&a),
+                track_entry(&a),
+            ]
+        );
+    }
+
+    #[test]
+    fn playlist_entries_report_unresolved_entries_in_place() {
+        use library_ipc_protocol::EntryError;
+        let a = full_hash("aaaa", 'a');
+        let content = "ffffffff\naaaaaaaa\nab\n";
+        let (service, _path, _dir, _acid) = service_with_playlist(content);
+        assert_eq!(
+            playlist_entries(&service, "set"),
+            vec![
+                unresolved_entry(EntryError::Unknown {
+                    hash: ContentHash::new("ffffffff")
+                }),
+                track_entry(&a),
+                unresolved_entry(EntryError::Ambiguous {
+                    hash: ContentHash::new("ab"),
+                    candidates: vec![
+                        ContentHash::new(full_hash("ab", '1')),
+                        ContentHash::new(full_hash("ab", '2')),
+                    ],
+                }),
+            ]
+        );
+    }
+
+    #[test]
+    fn playlist_entries_leave_the_file_byte_identical() {
+        let content =
+            "# a set\r\naaaaaaaa  Artist - Title\n\nffffffff\n  ab\t x\nno newline at end";
+        let (service, path, _dir, _acid) = service_with_playlist(content);
+        let _ = playlist_entries(&service, "set");
+        assert_eq!(std::fs::read(&path).unwrap(), content.as_bytes());
+    }
+
+    #[test]
+    fn playlist_entries_of_missing_playlist_is_playlist_not_found() {
+        let (service, _path, _dir, _acid) = service_with_playlist("");
+        let name = PlaylistName::new("nope").unwrap();
+        let resp = service.handle_request(LibraryRequest::PlaylistEntries { name });
+        assert!(
+            matches!(
+                resp,
+                LibraryResponse::Error(ProtocolError::PlaylistNotFound { .. })
+            ),
+            "{resp:?}"
+        );
+    }
+
+    #[test]
+    fn playlist_entries_of_a_replaced_track_name_its_successor() {
+        let old = ContentHash::new(full_hash("aaaa", 'a'));
+        let new = ContentHash::new(full_hash("bbbb", 'b'));
+        let (service, metadata_dir, _acid) =
+            make_service_with_replaces(&[(new.clone(), "New")], &[(new.clone(), old.clone())]);
+        let path = metadata_dir.path().join("playlists").join("set.plist");
+        std::fs::write(&path, format!("{}\n", old.as_str())).unwrap();
+        assert_eq!(
+            playlist_entries(&service, "set"),
+            vec![track_entry(new.as_str())]
+        );
+    }
+
+    /// Repair of one playlist (name `set`) holding `token`, in a service whose index holds
+    /// `live` and `hidden` hashes, and a live `successor` as (new, old) hash: `new`
+    /// asserts `Replaces(old)`.
+    fn repaired_line(
+        token: &str,
+        live: &[&str],
+        hidden: &[&str],
+        successor: Option<(&ContentHash, &ContentHash)>,
+    ) -> String {
+        let live_tracks: Vec<(ContentHash, &str)> = live
+            .iter()
+            .map(|h| (ContentHash::new(*h), "Live"))
+            .chain(successor.map(|(new, _)| (new.clone(), "New")))
+            .collect();
+        let replaces: Vec<(ContentHash, ContentHash)> = successor
+            .map(|(new, old)| (new.clone(), old.clone()))
+            .into_iter()
+            .collect();
+        let (service, metadata_dir, _acid) = make_service_with_replaces(&live_tracks, &replaces);
+        {
+            let mut tracks = service.tracks.lock().unwrap();
+            for hash in hidden {
+                let mut entry = IndexedTrackInfo::new_empty((*hash).to_owned());
+                entry.deleted_at = Some(chrono::Utc::now());
+                tracks.push(entry);
+            }
+        }
+        let path = metadata_dir.path().join("playlists").join("set.plist");
+        std::fs::write(&path, format!("{token}\n")).unwrap();
+        let name = PlaylistName::new("set").unwrap();
+        match service.handle_request(LibraryRequest::PlaylistGet { name }) {
+            LibraryResponse::PlaylistContent(content) => content,
+            other => panic!("expected PlaylistContent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lazy_repair_full_token_with_only_a_legacy_short_entry_follows_replaces() {
+        let token = full_hash("aaaaaaaa", 'a');
+        let legacy = "aaaaaaaa";
+        let new = ContentHash::new(full_hash("bbbb", 'b'));
+        let old = ContentHash::new(token.clone());
+        let healed = repaired_line(&token, &[legacy], &[], Some((&new, &old)));
+        assert_eq!(healed, format!("{}\n", new.as_str()));
+        // With no chain the line stays as it was.
+        let unchanged = repaired_line(&token, &[legacy], &[], None);
+        assert_eq!(unchanged, format!("{token}\n"));
+    }
+
+    #[test]
+    fn lazy_repair_ambiguous_token_of_only_hidden_tracks_is_left_unchanged() {
+        let (a, b) = (full_hash("ab", '1'), full_hash("ab", '2'));
+        let new = ContentHash::new(full_hash("bbbb", 'b'));
+        let old = ContentHash::new("ab");
+        let line = repaired_line("ab", &[], &[&a, &b], Some((&new, &old)));
+        assert_eq!(line, "ab\n");
+    }
+
+    #[test]
+    fn lazy_repair_leaves_a_commented_hash_alone() {
+        let hash_a = ContentHash::new("sha256:lazy_repair_a_0009");
+        let hash_b = ContentHash::new("sha256:lazy_repair_b_0009");
+        let (service, metadata_dir, _acid) = make_service_with_replaces(
+            &[(hash_b.clone(), "Track B")],
+            &[(hash_b.clone(), hash_a.clone())],
+        );
+        let plist_path = metadata_dir.path().join("playlists").join("set.plist");
+        let content = format!("# {}\n", hash_a.as_str());
+        std::fs::write(&plist_path, &content).unwrap();
+
+        let name = PlaylistName::new("set").unwrap();
+        let resp = service.handle_request(LibraryRequest::PlaylistGet { name });
+        assert!(matches!(resp, LibraryResponse::PlaylistContent(c) if c == content));
+        assert_eq!(std::fs::read_to_string(&plist_path).unwrap(), content);
     }
 
     /// 1-hop repair: A (retracted/not-in-index) → B (live).

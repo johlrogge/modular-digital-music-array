@@ -1,9 +1,8 @@
 use crate::query::{
-    CamelotLetter, DatePrecision, DateQuery, DurationQuery, DurationUnit, KeyQuery, NumericQuery,
-    StringQuery, TrackQuery,
+    DatePrecision, DateQuery, DurationQuery, DurationUnit, NumericQuery, StringQuery, TrackQuery,
 };
 use chrono::{DateTime, Datelike, NaiveDate, Utc};
-use music_primitives::TrackRole;
+use music_primitives::{Key, TrackRole};
 use regex::Regex;
 
 /// Flat track fields used to evaluate a `TrackQuery`.
@@ -17,8 +16,7 @@ pub struct TrackFields<'a> {
     /// StyleDescriptor — multiple per track; style query matches if any matches.
     pub styles: &'a [String],
     pub bpm: Option<f32>,
-    /// Key stored as display string (e.g. "8B", "Am").
-    pub key: Option<&'a str>,
+    pub key: Option<Key>,
     /// Duration in seconds.
     pub duration: Option<u32>,
     pub year: Option<u32>,
@@ -167,7 +165,7 @@ impl TrackMatcher {
         }
 
         if let Some(kq) = &query.key {
-            if !track.key.is_some_and(|k| matches_key(kq, k)) {
+            if !track.key.is_some_and(|k| kq.matches(k)) {
                 return false;
             }
         }
@@ -340,26 +338,6 @@ fn period_end(date: NaiveDate, prec: DatePrecision) -> NaiveDate {
         }
         DatePrecision::YearMonthDay => date,
     }
-}
-
-/// Key matching stub: compares the Camelot string against the stored key display string.
-///
-/// Full Camelot tolerance math (circular arithmetic on the wheel) is deferred.
-fn matches_key(query: &KeyQuery, key_str: &str) -> bool {
-    // TODO: full Camelot tolerance math (circular arithmetic on the wheel)
-    let (number, letter) = match query {
-        KeyQuery::Exact { number, letter } => (number, letter),
-        KeyQuery::Tolerance { number, letter, .. } => (number, letter),
-    };
-    let target = format!(
-        "{}{}",
-        number,
-        match letter {
-            CamelotLetter::A => "A",
-            CamelotLetter::B => "B",
-        }
-    );
-    key_str.eq_ignore_ascii_case(&target) || key_str.to_uppercase().contains(&target.to_uppercase())
 }
 
 #[cfg(test)]
@@ -837,6 +815,23 @@ mod tests {
     // =========================================================================
     // Energy query tests
     // =========================================================================
+
+    #[test]
+    fn key_query_matches_real_key_not_display_string() {
+        // The projection stores "A Minor" (display); the query says 8A (Camelot).
+        let mut fields = empty_fields();
+        fields.key = Some("A Minor".parse().unwrap());
+        let query = |q: &str| TrackQuery {
+            key: Some(q.parse().unwrap()),
+            ..Default::default()
+        };
+        assert!(matches_query(&query("8A"), &fields));
+        assert!(matches_query(&query("8A+-1"), &fields));
+        assert!(matches_query(&query("6A..10B"), &fields));
+        assert!(!matches_query(&query("8B"), &fields));
+        assert!(!matches_query(&query("1A"), &fields));
+        assert!(!matches_query(&query("8A"), &empty_fields()));
+    }
 
     #[test]
     fn energy_exact_match() {

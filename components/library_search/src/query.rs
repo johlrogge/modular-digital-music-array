@@ -1,6 +1,7 @@
 use chrono::NaiveDate;
-use music_primitives::TrackRole;
+use music_primitives::{Key, TrackRole};
 use serde::{Deserialize, Serialize};
+use std::fmt;
 
 /// Search query for tracks. Implicit AND across all non-None fields.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -116,31 +117,87 @@ pub enum DurationUnit {
     Seconds,
 }
 
-/// Musical key matching — always resolved to Camelot internally for tolerance math.
-/// Traditional notation ("Am", "A minor") is converted to Camelot at parse time.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Musical key matching on the Camelot wheel. Any notation `Key` parses is accepted.
+///
+/// Every key's distance from the centre costs 1 per step around the wheel plus 1 for
+/// an A/B (mode) switch; `+` goes clockwise (a fifth up), `-` counter-clockwise.
+///
+/// On the wire a query is its string form (`"8A+-2"`), the same text the CLI accepts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(into = "String", try_from = "String")]
 pub enum KeyQuery {
-    /// Exact Camelot position. Parsed from "8B", "Am", "A minor".
-    Exact { number: u8, letter: CamelotLetter },
-    /// Asymmetric tolerance on the Camelot number circle.
-    /// `"8B+-1"` → up: 1, down: 1 → {7B, 8B, 9B}
-    /// `"8B+1"`  → up: 1, down: 0 → {8B, 9B}
-    /// `"8B-1"`  → up: 0, down: 1 → {7B, 8B}
-    /// `"8B+-1~"` → up: 1, down: 1, include_relative → {7A, 7B, 8A, 8B, 9A, 9B}
-    Tolerance {
-        number: u8,
-        letter: CamelotLetter,
-        tolerance_up: u8,
-        tolerance_down: u8,
-        /// `~` suffix: also include the relative key (cross the A/B boundary)
-        include_relative: bool,
-    },
+    /// `centre` and how far from it to reach.
+    Steps { centre: Key, reach: Reach },
+    /// `"6A..10B"`: numbers run clockwise from `from` to `to` (inclusive, wrapping);
+    /// letters are the set {from's, to's}.
+    Span { from: Key, to: Key },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum CamelotLetter {
-    A,
-    B,
+/// How many wheel steps a `KeyQuery::Steps` reaches from its centre.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reach {
+    /// `"8A+-2"`: 2 steps either way. `Both(0)` is the exact key, written `"8A"`.
+    Both(u8),
+    /// `"8A+2"`: 2 steps clockwise (a fifth up per step).
+    Up(u8),
+    /// `"8A-1"`: 1 step counter-clockwise.
+    Down(u8),
+}
+
+impl Reach {
+    /// Steps reachable (clockwise, counter-clockwise).
+    fn up_down(self) -> (u8, u8) {
+        match self {
+            Reach::Both(n) => (n, n),
+            Reach::Up(n) => (n, 0),
+            Reach::Down(n) => (0, n),
+        }
+    }
+}
+
+impl KeyQuery {
+    /// Whether `key` satisfies the query.
+    pub fn matches(&self, key: Key) -> bool {
+        match *self {
+            KeyQuery::Steps { centre, reach } => {
+                let (up, down) = reach.up_down();
+                let cw = key.camelot_steps_from(centre);
+                let ccw = centre.camelot_steps_from(key);
+                let switch = u8::from(key.mode_differs(centre));
+                cw + switch <= up || ccw + switch <= down
+            }
+            KeyQuery::Span { from, to } => {
+                key.camelot_steps_from(from) <= to.camelot_steps_from(from)
+                    && (key.mode() == from.mode() || key.mode() == to.mode())
+            }
+        }
+    }
+}
+
+impl fmt::Display for KeyQuery {
+    /// Canonical form that parses back to an equal query.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            KeyQuery::Steps { centre, reach } => {
+                let c = centre.to_camelot();
+                match reach {
+                    Reach::Both(0) => write!(f, "{c}"),
+                    Reach::Both(n) => write!(f, "{c}+-{n}"),
+                    Reach::Up(n) => write!(f, "{c}+{n}"),
+                    Reach::Down(n) => write!(f, "{c}-{n}"),
+                }
+            }
+            KeyQuery::Span { from, to } => {
+                write!(f, "{}..{}", from.to_camelot(), to.to_camelot())
+            }
+        }
+    }
+}
+
+impl From<KeyQuery> for String {
+    fn from(query: KeyQuery) -> String {
+        query.to_string()
+    }
 }
 
 /// Date precision used in started/stopped date queries.

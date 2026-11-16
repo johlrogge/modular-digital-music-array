@@ -12,10 +12,12 @@ use axum::{
 use clap::Parser;
 use color_eyre::Result;
 use futures::stream::Stream;
-use gateway_client::{Command, GatewayClient};
+use gateway_client::{Command, GatewayClient, LibraryRequest, LibraryResponse};
 use library_ipc_client::{
-    ContentHash, FactType, LibraryClient, PlaylistName, TrackInfo, TrackQuery,
+    ClientError, ContentHash, EntryTrackError, FactType, LibraryClient, PlaylistName,
+    ProtocolError, TrackInfo, TrackQuery,
 };
+use mdma_client::LibraryBackend;
 use media_protocol::{AudioSinkInfo, Deck, ResponseData, SourceName};
 use nng::options::Options;
 use source_protocol::{DownloadState, SourceRequest, SourceResponse};
@@ -513,11 +515,7 @@ async fn ingest_all(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 
             Json(json_results).into_response()
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": e.to_string()})),
-        )
-            .into_response(),
+        Err(e) => api::failure_response(e),
     }
 }
 
@@ -527,47 +525,66 @@ async fn ingest_all(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 
 #[allow(clippy::result_large_err)]
 fn require_gateway(state: &AppState) -> Result<GatewayClient, axum::response::Response> {
-    state.gateway_client().ok_or_else(|| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({"error": "Gateway not available"})),
-        )
-            .into_response()
-    })
+    state
+        .gateway_client()
+        .ok_or_else(|| api::reply_response(api::gateway_unavailable()))
 }
 
-/// The canonical hash of each of `hashes`, resolved by the library.
-///
-/// Playback holds only full hashes (ADR-026), so every hash bound for it goes
-/// through here first. The first that is unknown, ambiguous or not resolvable
-/// to a full hash fails the lot (422), before anything is sent to playback. A
-/// library that cannot be reached is a 503. The resolver itself is shared with
-/// the `/api` handlers (`api::resolve_for_playback`).
+/// The library, reached through the gateway by mdma_client's one gateway path
+/// (so a gateway that rejects a request maps the same here as in the CLI).
+/// A gateway that cannot be reached is a 503.
+#[allow(clippy::result_large_err)]
+fn require_library(state: &AppState) -> Result<LibraryBackend, axum::response::Response> {
+    api::library_backend(state).map_err(api::reply_response)
+}
+
+/// The entries of the playback queue now. A playback service that cannot say
+/// is classified by [`api::playback_failure_status`].
+#[allow(clippy::result_large_err)]
+fn current_queue(client: &GatewayClient) -> Result<Vec<ContentHash>, axum::response::Response> {
+    api::player::queue_of(client).map_err(api::failure_response)
+}
+
+/// Resolve `hashes` for adding to the queue (the `/api` routes use the same
+/// resolver: [`api::resolve_for_playback`]).
 #[allow(clippy::result_large_err)]
 fn resolve_for_playback(
-    gateway: &GatewayClient,
+    state: &AppState,
     hashes: &[ContentHash],
 ) -> Result<Vec<library_ipc_client::CanonicalHash>, axum::response::Response> {
-    api::resolve_for_playback(gateway, hashes).map_err(|reply| api::respond(Ok(reply)))
+    api::resolve_for_playback(state, hashes).map_err(api::reply_response)
+}
+
+/// Resolve `hashes` for making them the whole queue (see
+/// [`api::resolve_for_queue_replace`]).
+#[allow(clippy::result_large_err)]
+fn resolve_for_queue_replace(
+    state: &AppState,
+    client: &GatewayClient,
+    hashes: &[ContentHash],
+) -> Result<Vec<library_ipc_client::CanonicalHash>, axum::response::Response> {
+    let queue = current_queue(client)?;
+    api::resolve_for_queue_replace(state, &queue, hashes).map_err(api::reply_response)
+}
+
+/// Resolve `hashes` for removing: against the entries the queue holds, so one
+/// whose track has left the library can be removed.
+#[allow(clippy::result_large_err)]
+fn resolve_in_current_queue(
+    client: &GatewayClient,
+    hashes: &[ContentHash],
+) -> Result<Vec<library_ipc_client::CanonicalHash>, axum::response::Response> {
+    mdma_client::resolve_in_queue(&current_queue(client)?, hashes)
+        .map_err(|e| api::reply_response(api::resolve_failed(e)))
 }
 
 fn playback_success_or_error(
     client: &GatewayClient,
     command: &Command,
 ) -> axum::response::Response {
-    use gateway_client::Response;
-    match client.playback_command(command) {
-        Ok(Response::Ok { .. }) => Json(serde_json::json!({"success": true})).into_response(),
-        Ok(Response::Err { message }) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": message})),
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": e.to_string()})),
-        )
-            .into_response(),
+    match api::send(client, command) {
+        Ok(_) => Json(serde_json::json!({"success": true})).into_response(),
+        Err(failure) => api::failure_response(failure),
     }
 }
 
@@ -576,13 +593,7 @@ fn source_request_or_error(
     state: &AppState,
     request: &SourceRequest,
 ) -> Result<SourceResponse, axum::response::Response> {
-    let client = state.gateway_client().ok_or_else(|| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({"error": "Gateway not available"})),
-        )
-            .into_response()
-    })?;
+    let client = require_gateway(state)?;
     match client.source_request(&state.source_name, request) {
         Ok(SourceResponse::Error(e)) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -912,27 +923,12 @@ async fn player_session(State(state): State<Arc<AppState>>) -> impl IntoResponse
         Err(e) => return e,
     };
 
-    use gateway_client::Response;
-    match client.playback_command(&Command::GetSession) {
-        Ok(Response::Ok { data }) => match data {
-            Some(media_protocol::ResponseData::Session(Some(id))) => {
-                Json(serde_json::json!({"session": id})).into_response()
-            }
-            Some(media_protocol::ResponseData::Session(None)) | None => {
-                Json(serde_json::json!({"session": null})).into_response()
-            }
-            _ => Json(serde_json::json!({"session": null})).into_response(),
-        },
-        Ok(Response::Err { message }) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": message})),
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": e.to_string()})),
-        )
-            .into_response(),
+    match api::send(&client, &Command::GetSession) {
+        Ok(Some(ResponseData::Session(Some(id)))) => {
+            Json(serde_json::json!({"session": id})).into_response()
+        }
+        Ok(_) => Json(serde_json::json!({"session": null})).into_response(),
+        Err(failure) => api::failure_response(failure),
     }
 }
 
@@ -942,37 +938,26 @@ async fn player_now_playing(State(state): State<Arc<AppState>>) -> impl IntoResp
         Err(e) => return e,
     };
 
-    use gateway_client::Response;
-    match client.playback_command(&Command::NowPlaying) {
-        Ok(Response::Ok { data }) => match data {
-            Some(ResponseData::NowPlaying(Some(hash))) => {
-                let track = state
-                    .library_client()
-                    .and_then(|lib| lib.get_track(&hash).ok());
-                match track {
-                    Some(t) => Json(serde_json::json!({
-                        "playing": true,
-                        "track": TrackInfoJson::from_track_info(&t)
-                    }))
-                    .into_response(),
-                    None => Json(serde_json::json!({
-                        "playing": true,
-                        "track": { "content_hash": hash.as_str() }
-                    }))
-                    .into_response(),
-                }
+    match api::send(&client, &Command::NowPlaying) {
+        Ok(Some(ResponseData::NowPlaying(Some(hash)))) => {
+            let track = state
+                .library_client()
+                .and_then(|lib| lib.get_track(&hash).ok());
+            match track {
+                Some(t) => Json(serde_json::json!({
+                    "playing": true,
+                    "track": TrackInfoJson::from_track_info(&t)
+                }))
+                .into_response(),
+                None => Json(serde_json::json!({
+                    "playing": true,
+                    "track": { "content_hash": hash.as_str() }
+                }))
+                .into_response(),
             }
-            Some(ResponseData::NowPlaying(None)) | None => {
-                Json(serde_json::json!({"playing": false})).into_response()
-            }
-            _ => Json(serde_json::json!({"playing": false})).into_response(),
-        },
-        Ok(Response::Err { .. }) => Json(serde_json::json!({"playing": false})).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": e.to_string()})),
-        )
-            .into_response(),
+        }
+        Ok(_) => Json(serde_json::json!({"playing": false})).into_response(),
+        Err(failure) => api::failure_response(failure),
     }
 }
 
@@ -982,33 +967,25 @@ async fn player_queue(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         Err(e) => return e,
     };
 
-    use gateway_client::Response;
-    match client.playback_command(&Command::QueueList) {
-        Ok(Response::Ok { data }) => match data {
-            Some(ResponseData::Queue(hashes)) => {
-                let tracks: Vec<serde_json::Value> = hashes
-                    .iter()
-                    .map(|hash| {
-                        let track = state
-                            .library_client()
-                            .and_then(|lib| lib.get_track(hash).ok());
-                        match track {
-                            Some(t) => serde_json::to_value(TrackInfoJson::from_track_info(&t))
-                                .unwrap_or(serde_json::json!({"content_hash": hash.as_str()})),
-                            None => serde_json::json!({"content_hash": hash.as_str()}),
-                        }
-                    })
-                    .collect();
-                Json(tracks).into_response()
-            }
-            _ => Json(serde_json::json!([])).into_response(),
-        },
-        Ok(Response::Err { .. }) => Json(serde_json::json!([])).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": e.to_string()})),
-        )
-            .into_response(),
+    match api::send(&client, &Command::QueueList) {
+        Ok(Some(ResponseData::Queue(hashes))) => {
+            let tracks: Vec<serde_json::Value> = hashes
+                .iter()
+                .map(|hash| {
+                    let track = state
+                        .library_client()
+                        .and_then(|lib| lib.get_track(hash).ok());
+                    match track {
+                        Some(t) => serde_json::to_value(TrackInfoJson::from_track_info(&t))
+                            .unwrap_or(serde_json::json!({"content_hash": hash.as_str()})),
+                        None => serde_json::json!({"content_hash": hash.as_str()}),
+                    }
+                })
+                .collect();
+            Json(tracks).into_response()
+        }
+        Ok(_) => Json(serde_json::json!([])).into_response(),
+        Err(failure) => api::failure_response(failure),
     }
 }
 
@@ -1025,7 +1002,7 @@ async fn player_queue_append(
         Ok(c) => c,
         Err(e) => return e,
     };
-    let hash = match resolve_for_playback(&gw, &[ContentHash::new(req.hash)]) {
+    let hash = match resolve_for_playback(&state, &[ContentHash::new(req.hash)]) {
         Ok(mut resolved) => resolved.remove(0),
         Err(e) => return e,
     };
@@ -1053,7 +1030,7 @@ async fn player_queue_remove(
         Err(e) => return e,
     };
     let requested: Vec<ContentHash> = req.hashes.into_iter().map(ContentHash::new).collect();
-    let hashes = match resolve_for_playback(&client, &requested) {
+    let hashes = match resolve_in_current_queue(&client, &requested) {
         Ok(hashes) => hashes.into_iter().map(ContentHash::from).collect(),
         Err(e) => return e,
     };
@@ -1075,7 +1052,7 @@ async fn player_queue_replace(
         Err(e) => return e,
     };
     let requested: Vec<ContentHash> = req.hashes.into_iter().map(ContentHash::new).collect();
-    let entries = match resolve_for_playback(&client, &requested) {
+    let entries = match resolve_for_queue_replace(&state, &client, &requested) {
         Ok(hashes) => api::queue_entries(hashes),
         Err(e) => return e,
     };
@@ -1144,22 +1121,10 @@ async fn player_audio_outputs(State(state): State<Arc<AppState>>) -> impl IntoRe
         Err(e) => return e,
     };
 
-    use gateway_client::Response;
-    match client.playback_command(&Command::ListAudioOutputs) {
-        Ok(Response::Ok { data }) => match data {
-            Some(ResponseData::AudioOutputs(sinks)) => Json(sinks).into_response(),
-            _ => Json(Vec::<AudioSinkInfo>::new()).into_response(),
-        },
-        Ok(Response::Err { message }) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": message})),
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": e.to_string()})),
-        )
-            .into_response(),
+    match api::send(&client, &Command::ListAudioOutputs) {
+        Ok(Some(ResponseData::AudioOutputs(sinks))) => Json(sinks).into_response(),
+        Ok(_) => Json(Vec::<AudioSinkInfo>::new()).into_response(),
+        Err(failure) => api::failure_response(failure),
     }
 }
 
@@ -1169,26 +1134,12 @@ async fn player_audio_output(State(state): State<Arc<AppState>>) -> impl IntoRes
         Err(e) => return e,
     };
 
-    use gateway_client::Response;
-    match client.playback_command(&Command::GetAudioOutput) {
-        Ok(Response::Ok { data }) => match data {
-            Some(ResponseData::AudioOutput(config)) => Json(config).into_response(),
-            _ => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "Unexpected response"})),
-            )
-                .into_response(),
-        },
-        Ok(Response::Err { message }) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": message})),
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": e.to_string()})),
-        )
-            .into_response(),
+    match api::send(&client, &Command::GetAudioOutput) {
+        Ok(Some(ResponseData::AudioOutput(config))) => Json(config).into_response(),
+        Ok(_) => api::failure_response(api::PlaybackFailure::Unexpected(
+            "Unexpected response".to_string(),
+        )),
+        Err(failure) => api::failure_response(failure),
     }
 }
 
@@ -1233,68 +1184,61 @@ async fn player_events(
 // Library Browse Handlers (by artist / album)
 // =============================================================================
 
+/// One library request through the gateway. A failure is already the response, classified by
+/// [`api::library_failure_status`] like every other route's.
+#[allow(clippy::result_large_err)]
+fn library_answer(
+    state: &AppState,
+    request: &LibraryRequest,
+) -> Result<LibraryResponse, axum::response::Response> {
+    let client = require_gateway(state)?;
+    api::library(&client, request).map_err(api::failure_response)
+}
+
+/// The tracks matching `query`, or the failure response.
+#[allow(clippy::result_large_err)]
+fn search_tracks(
+    state: &AppState,
+    query: TrackQuery,
+) -> Result<Vec<library_ipc_client::TrackInfo>, axum::response::Response> {
+    match library_answer(state, &LibraryRequest::Search { query })? {
+        LibraryResponse::SearchResults(tracks) => Ok(tracks),
+        _ => Err(api::failure_response(api::unexpected_library_response())),
+    }
+}
+
+fn tracks_json(tracks: &[library_ipc_client::TrackInfo]) -> axum::response::Response {
+    Json(
+        tracks
+            .iter()
+            .map(TrackInfoJson::from_track_info)
+            .collect::<Vec<_>>(),
+    )
+    .into_response()
+}
+
 /// Shared helper: fetch all values for a fact type and return them sorted case-insensitively.
 fn library_fact_values(state: &AppState, fact_type: &str) -> axum::response::Response {
-    use gateway_client::{LibraryRequest, LibraryResponse};
-    let client = match require_gateway(state) {
-        Ok(c) => c,
-        Err(e) => return e,
-    };
-    match client.library_request(&LibraryRequest::GetFactValues {
-        fact_type: FactType::new(fact_type),
-    }) {
+    match library_answer(
+        state,
+        &LibraryRequest::GetFactValues {
+            fact_type: FactType::new(fact_type),
+        },
+    ) {
         Ok(LibraryResponse::FactValues(mut values)) => {
             values.sort_by_key(|a| a.to_lowercase());
             Json(values).into_response()
         }
-        Ok(LibraryResponse::Error(e)) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": e.to_string()})),
-        )
-            .into_response(),
-        Ok(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": "Unexpected library response"})),
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": e.to_string()})),
-        )
-            .into_response(),
+        Ok(_) => api::failure_response(api::unexpected_library_response()),
+        Err(response) => response,
     }
 }
 
 /// Shared helper: search tracks by a pre-built query and return them as JSON.
 fn library_search_tracks(state: &AppState, query: TrackQuery) -> axum::response::Response {
-    use gateway_client::{LibraryRequest, LibraryResponse};
-    let client = match require_gateway(state) {
-        Ok(c) => c,
-        Err(e) => return e,
-    };
-    match client.library_request(&LibraryRequest::Search { query }) {
-        Ok(LibraryResponse::SearchResults(tracks)) => Json(
-            tracks
-                .iter()
-                .map(TrackInfoJson::from_track_info)
-                .collect::<Vec<_>>(),
-        )
-        .into_response(),
-        Ok(LibraryResponse::Error(e)) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": e.to_string()})),
-        )
-            .into_response(),
-        Ok(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": "Unexpected library response"})),
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": e.to_string()})),
-        )
-            .into_response(),
+    match search_tracks(state, query) {
+        Ok(tracks) => tracks_json(&tracks),
+        Err(response) => response,
     }
 }
 
@@ -1321,17 +1265,12 @@ async fn library_album_tracks_handler(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> axum::response::Response {
-    use gateway_client::{LibraryRequest, LibraryResponse};
-    let client = match require_gateway(&state) {
-        Ok(c) => c,
-        Err(e) => return e,
-    };
     let query = TrackQuery {
         album: Some(library_search::parse_string_query(&name)),
         ..Default::default()
     };
-    match client.library_request(&LibraryRequest::Search { query }) {
-        Ok(LibraryResponse::SearchResults(mut tracks)) => {
+    match search_tracks(&state, query) {
+        Ok(mut tracks) => {
             tracks.sort_by(|a, b| {
                 let disc_a = a.disc_number.unwrap_or(1);
                 let disc_b = b.disc_number.unwrap_or(1);
@@ -1339,29 +1278,9 @@ async fn library_album_tracks_handler(
                     .cmp(&disc_b)
                     .then_with(|| a.track_number.cmp(&b.track_number))
             });
-            Json(
-                tracks
-                    .iter()
-                    .map(TrackInfoJson::from_track_info)
-                    .collect::<Vec<_>>(),
-            )
-            .into_response()
+            tracks_json(&tracks)
         }
-        Ok(LibraryResponse::Error(e)) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": e.to_string()})),
-        )
-            .into_response(),
-        Ok(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": "Unexpected library response"})),
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": e.to_string()})),
-        )
-            .into_response(),
+        Err(response) => response,
     }
 }
 
@@ -1370,12 +1289,7 @@ async fn library_album_tracks_handler(
 // =============================================================================
 
 async fn library_playlists_handler(State(state): State<Arc<AppState>>) -> axum::response::Response {
-    use gateway_client::{LibraryRequest, LibraryResponse};
-    let client = match require_gateway(&state) {
-        Ok(c) => c,
-        Err(e) => return e,
-    };
-    match client.library_request(&LibraryRequest::PlaylistList) {
+    match library_answer(&state, &LibraryRequest::PlaylistList) {
         Ok(LibraryResponse::PlaylistNames(names)) => {
             let json: Vec<serde_json::Value> = names
                 .iter()
@@ -1383,21 +1297,8 @@ async fn library_playlists_handler(State(state): State<Arc<AppState>>) -> axum::
                 .collect();
             Json(json).into_response()
         }
-        Ok(LibraryResponse::Error(e)) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": e.to_string()})),
-        )
-            .into_response(),
-        Ok(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": "Unexpected library response"})),
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": e.to_string()})),
-        )
-            .into_response(),
+        Ok(_) => api::failure_response(api::unexpected_library_response()),
+        Err(response) => response,
     }
 }
 
@@ -1405,7 +1306,6 @@ async fn library_playlist_tracks_handler(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> axum::response::Response {
-    use gateway_client::{LibraryRequest, LibraryResponse};
     let playlist_name = match PlaylistName::new(&name) {
         Ok(n) => n,
         Err(e) => {
@@ -1416,58 +1316,43 @@ async fn library_playlist_tracks_handler(
                 .into_response()
         }
     };
-    let client = match require_gateway(&state) {
-        Ok(c) => c,
+    let library = match require_library(&state) {
+        Ok(l) => l,
         Err(e) => return e,
     };
-    match client.library_request(&LibraryRequest::PlaylistGet {
-        name: playlist_name,
-    }) {
-        Ok(LibraryResponse::PlaylistContent(content)) => {
-            let hashes = library_ipc_client::content_to_hashes(&content);
-            let lib = match state.library_client() {
-                Some(c) => c,
-                None => {
-                    return (
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        Json(serde_json::json!({"error": "Library service not available"})),
-                    )
-                        .into_response()
-                }
-            };
-            let tracks: Vec<serde_json::Value> = hashes
-                .iter()
-                .filter_map(|hash| lib.get_track(hash).ok())
-                .map(|t| {
-                    serde_json::to_value(TrackInfoJson::from_track_info(&t))
-                        .unwrap_or(serde_json::json!({}))
-                })
-                .collect();
-            Json(tracks).into_response()
+    let entries = match library.playlist_entries(&playlist_name) {
+        Ok(entries) => entries,
+        Err(e) => return api::failure_response(e),
+    };
+    // One row per entry, in position: an entry without a track is an
+    // unavailable row, never dropped. Only a `TrackNotFound` lookup (or an entry
+    // that did not resolve) is such a row; any other failed lookup fails the
+    // response, as `api::library_failure_status` classifies it (an `Internal` from a
+    // gateway whose library is unreachable is a known gap, #100).
+    let mut rows = Vec::with_capacity(entries.len());
+    for track in library_ipc_client::entry_tracks(&entries, |hash| library.get_track(hash)) {
+        match track {
+            Ok(t) => rows.push(
+                serde_json::to_value(TrackInfoJson::from_track_info(&t))
+                    .unwrap_or(serde_json::json!({})),
+            ),
+            Err(
+                e @ (EntryTrackError::Unresolved(_)
+                | EntryTrackError::Lookup {
+                    source: ClientError::Protocol(ProtocolError::TrackNotFound { .. }),
+                    ..
+                }),
+            ) => rows.push(serde_json::json!({"unavailable": true, "error": e.to_string()})),
+            Err(EntryTrackError::Lookup { source, .. }) => return api::failure_response(source),
         }
-        Ok(LibraryResponse::Error(e)) => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": e.to_string()})),
-        )
-            .into_response(),
-        Ok(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": "Unexpected library response"})),
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": e.to_string()})),
-        )
-            .into_response(),
     }
+    Json(rows).into_response()
 }
 
 async fn library_playlist_queue_replace_handler(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> axum::response::Response {
-    use gateway_client::{LibraryRequest, LibraryResponse};
     let playlist_name = match PlaylistName::new(&name) {
         Ok(n) => n,
         Err(e) => {
@@ -1482,38 +1367,24 @@ async fn library_playlist_queue_replace_handler(
         Ok(c) => c,
         Err(e) => return e,
     };
-    let hashes = match client.library_request(&LibraryRequest::PlaylistGet {
-        name: playlist_name,
-    }) {
-        Ok(LibraryResponse::PlaylistContent(content)) => {
-            library_ipc_client::content_to_hashes(&content)
-        }
-        Ok(LibraryResponse::Error(e)) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({"error": e.to_string()})),
-            )
-                .into_response()
-        }
-        Ok(_) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "Unexpected library response"})),
-            )
-                .into_response()
-        }
+    let library = match require_library(&state) {
+        Ok(l) => l,
+        Err(e) => return e,
+    };
+    let entries = match library.playlist_entries(&playlist_name) {
+        Ok(entries) => entries,
+        Err(e) => return api::failure_response(e),
+    };
+    // The library resolved every entry; one that is not a track fails the lot.
+    let entries = match library_ipc_client::entries_for_playback(&entries) {
+        Ok(hashes) => api::queue_entries(hashes),
         Err(e) => {
             return (
-                StatusCode::INTERNAL_SERVER_ERROR,
+                StatusCode::UNPROCESSABLE_ENTITY,
                 Json(serde_json::json!({"error": e.to_string()})),
             )
                 .into_response()
         }
-    };
-    // Playlist lines carry short hashes: resolve them before playback sees them.
-    let entries = match resolve_for_playback(&client, &hashes) {
-        Ok(hashes) => api::queue_entries(hashes),
-        Err(e) => return e,
     };
     playback_success_or_error(&client, &Command::QueueReplace { entries })
 }
@@ -1541,35 +1412,7 @@ async fn library_search_handler(
         return Json(serde_json::json!([])).into_response();
     }
 
-    // Use the gateway client to route library search through the gateway
-    let client = match require_gateway(&state) {
-        Ok(c) => c,
-        Err(e) => return e,
-    };
-
-    use gateway_client::{LibraryRequest, LibraryResponse};
-    match client.library_request(&LibraryRequest::Search { query }) {
-        Ok(LibraryResponse::SearchResults(tracks)) => {
-            let json_tracks: Vec<TrackInfoJson> =
-                tracks.iter().map(TrackInfoJson::from_track_info).collect();
-            Json(json_tracks).into_response()
-        }
-        Ok(LibraryResponse::Error(e)) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": e.to_string()})),
-        )
-            .into_response(),
-        Ok(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": "Unexpected library response"})),
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": e.to_string()})),
-        )
-            .into_response(),
-    }
+    library_search_tracks(&state, query)
 }
 
 // =============================================================================
@@ -2355,7 +2198,9 @@ async fn cover_art(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{library_ok, playback_ok, track_not_found, track_ok, FakeGateway};
+    use crate::test_support::{
+        library_ok, playback_ok, track_not_found, track_ok, FakeGateway as ScriptedGateway,
+    };
     use library_ipc_client::{Bpm, ContentHash, DurationSeconds, Key};
     use pretty_assertions::assert_eq;
     use source_protocol::{AuthStatus, QueueState, SourceResponse, SourceStatus};
@@ -2365,57 +2210,216 @@ mod tests {
     const FULL_A: &str = "sha256:9fb4105e0a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5";
     const FULL_B: &str = "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
 
+    /// The known full hashes `token` is a prefix of.
+    fn find(token: &str) -> Vec<&'static str> {
+        let wanted = token.trim_start_matches("sha256:");
+        [FULL_A, FULL_B]
+            .into_iter()
+            .filter(|t| t.trim_start_matches("sha256:").starts_with(wanted))
+            .collect()
+    }
+
+    /// The one playlist the fake library has.
+    const PLAYLIST: &str = "friday";
+    /// A playlist name the fake library answers as an old library would,
+    /// not understanding the request.
+    const OLD_LIBRARY_PLAYLIST: &str = "old";
+    /// A playlist name the fake gateway rejects at the envelope, as an old
+    /// gateway does a request it cannot parse.
+    const REJECTED_PLAYLIST: &str = "rejected";
+
+    /// What the library says of one playlist line: the full hash of the one
+    /// track it is a prefix of, else unknown.
+    fn entry_of(token: &str) -> library_ipc_client::PlaylistEntry {
+        match find(token).as_slice() {
+            [one] => library_ipc_client::PlaylistEntry::Track {
+                hash: library_ipc_client::CanonicalHash::try_from(ContentHash::new(*one)).unwrap(),
+            },
+            _ => library_ipc_client::PlaylistEntry::Unresolved {
+                error: library_ipc_client::EntryError::Unknown {
+                    hash: ContentHash::new(token),
+                },
+            },
+        }
+    }
+
+    /// What a test changes about the fake library and playback while the
+    /// gateway runs.
+    #[derive(Default)]
+    struct Knobs {
+        lost: std::sync::Mutex<Vec<&'static str>>,
+        broken: std::sync::atomic::AtomicBool,
+        failing: std::sync::atomic::AtomicBool,
+        queue: std::sync::Mutex<Vec<&'static str>>,
+        unreadable_queue: std::sync::atomic::AtomicBool,
+        refusing: std::sync::atomic::AtomicBool,
+    }
+
     /// A gateway that answers library lookups by prefix (or, with the library
-    /// down, with a gateway error), serves one playlist, and answers every
-    /// playback command with success.
-    fn fake_gateway(library_up: bool, playlist: &str) -> FakeGateway {
-        use gateway_client::{GatewayRequest, GatewayResponse, LibraryRequest, LibraryResponse};
-        let playlist = playlist.to_string();
-        FakeGateway::start(move |req| match req {
-            GatewayRequest::Library {
-                request: LibraryRequest::GetTrack { hash },
-            } if library_up => {
-                let wanted = hash.as_str().trim_start_matches("sha256:");
-                let found: Vec<&str> = [FULL_A, FULL_B]
-                    .into_iter()
-                    .filter(|t| t.trim_start_matches("sha256:").starts_with(wanted))
-                    .collect();
-                match found.as_slice() {
-                    [one] => track_ok(one),
-                    _ => track_not_found(hash.as_str()),
-                }
-            }
-            GatewayRequest::Library {
-                request: LibraryRequest::GetTrack { .. },
-            } => GatewayResponse::Error {
-                message: "library unavailable".to_string(),
-            },
-            GatewayRequest::Library {
-                request: LibraryRequest::PlaylistGet { .. },
-            } => library_ok(LibraryResponse::PlaylistContent(playlist.clone())),
-            GatewayRequest::Playback { .. } => playback_ok(None),
-            other => GatewayResponse::Error {
-                message: format!("the fake gateway does not answer {other:?}"),
-            },
-        })
+    /// down, with a gateway error), serves one playlist's entries, and records
+    /// the playback commands it is sent: the shared scripted gateway with the
+    /// knobs these tests turn.
+    struct ResolvingGateway {
+        gateway: ScriptedGateway,
+        knobs: Arc<Knobs>,
     }
 
-    fn state_of(gateway: &FakeGateway) -> State<Arc<AppState>> {
-        let dir = std::path::PathBuf::from("/nonexistent/mdma-console-test");
-        State(Arc::new(AppState::new(
-            "ipc:///nonexistent/mdma-console-test/library.sock".to_string(),
-            gateway.addr().to_string(),
-            "bandcamp".to_string(),
-            broadcast::channel(1).0,
-            dir.clone(),
-            dir.join("cookies.json"),
-            dir.join("bandcamp.conf"),
-        )))
-    }
+    impl ResolvingGateway {
+        /// From now on every track lookup fails inside the library (`Internal`).
+        fn fail_track_lookups(&self) {
+            self.knobs
+                .failing
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
 
-    /// The playback commands the gateway received, as JSON.
-    fn sent(gateway: &FakeGateway) -> Vec<serde_json::Value> {
-        gateway.commands().iter().map(queue_command).collect()
+        /// From now on playback lists `hashes` as its queue (they need not be
+        /// in the library).
+        fn set_queue(&self, hashes: &[&'static str]) {
+            *self.knobs.queue.lock().unwrap() = hashes.to_vec();
+        }
+
+        /// From now on every track lookup is answered with something that is not
+        /// a gateway response (a transport failure); entries still answer.
+        fn break_track_lookups(&self) {
+            self.knobs
+                .broken
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        /// From now on a read of the playback queue is answered with something
+        /// that is not a gateway response (a transport failure).
+        fn break_queue_reads(&self) {
+            self.knobs
+                .unreadable_queue
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        /// From now on playback refuses every command that changes the queue.
+        fn refuse_queue_changes(&self) {
+            self.knobs
+                .refusing
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        /// From now on the library lists `hash` in playlists but cannot give its track.
+        fn forget(&self, hash: &'static str) {
+            self.knobs.lost.lock().unwrap().push(hash);
+        }
+
+        fn start(library_up: bool, playlist: &str) -> Self {
+            use gateway_client::{
+                GatewayRequest, GatewayResponse, LibraryRequest, LibraryResponse,
+            };
+            use library_ipc_client::ProtocolError;
+            use std::sync::atomic::Ordering::SeqCst;
+            let knobs = Arc::new(Knobs::default());
+            let broken = Arc::clone(&knobs);
+            let answering = Arc::clone(&knobs);
+            let playlist = playlist.to_string();
+            let gateway = ScriptedGateway::start_unreadable_when(
+                move |req| match req {
+                    GatewayRequest::Library {
+                        request: LibraryRequest::GetTrack { .. },
+                    } => broken.broken.load(SeqCst),
+                    GatewayRequest::Playback {
+                        request: Command::QueueList,
+                    } => broken.unreadable_queue.load(SeqCst),
+                    _ => false,
+                },
+                move |req| match req {
+                    GatewayRequest::Library {
+                        request: LibraryRequest::GetTrack { hash },
+                    } if library_up => {
+                        let found: Vec<&str> = find(hash.as_str())
+                            .into_iter()
+                            .filter(|t| !answering.lost.lock().unwrap().contains(t))
+                            .collect();
+                        if answering.failing.load(SeqCst) {
+                            library_ok(LibraryResponse::Error(ProtocolError::Internal {
+                                message: "boom".to_string(),
+                            }))
+                        } else {
+                            match found.as_slice() {
+                                [one] => track_ok(one),
+                                [] => track_not_found(hash.as_str()),
+                                several => library_ok(LibraryResponse::Error(
+                                    ProtocolError::ambiguous_hash(
+                                        hash.as_str(),
+                                        several.iter().copied(),
+                                    ),
+                                )),
+                            }
+                        }
+                    }
+                    GatewayRequest::Library {
+                        request: LibraryRequest::PlaylistEntries { name },
+                    } if library_up => match name.as_str() {
+                        PLAYLIST => library_ok(LibraryResponse::PlaylistEntries(
+                            library_ipc_client::playlist_hashes(&playlist)
+                                .map(entry_of)
+                                .collect(),
+                        )),
+                        REJECTED_PLAYLIST => GatewayResponse::Error {
+                            message: "Invalid request: unknown variant `playlist_entries`"
+                                .to_string(),
+                        },
+                        OLD_LIBRARY_PLAYLIST => {
+                            library_ok(LibraryResponse::Error(ProtocolError::InvalidRequest {
+                                message: "unknown variant `playlist_entries`".to_string(),
+                            }))
+                        }
+                        _ => library_ok(LibraryResponse::Error(ProtocolError::PlaylistNotFound {
+                            name: name.to_string(),
+                        })),
+                    },
+                    GatewayRequest::Library {
+                        request:
+                            LibraryRequest::GetTrack { .. } | LibraryRequest::PlaylistEntries { .. },
+                    } => GatewayResponse::Error {
+                        message: "library unavailable".to_string(),
+                    },
+                    GatewayRequest::Playback {
+                        request: Command::QueueList,
+                    } => playback_ok(Some(ResponseData::Queue(
+                        answering
+                            .queue
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .map(|h| ContentHash::new(*h))
+                            .collect(),
+                    ))),
+                    GatewayRequest::Playback {
+                        request: Command::QueueReplace { .. } | Command::QueueRemove { .. },
+                    } if answering.refusing.load(SeqCst) => {
+                        crate::test_support::playback_err("queue is locked")
+                    }
+                    GatewayRequest::Playback { .. } => playback_ok(None),
+                    other => GatewayResponse::Error {
+                        message: format!("the fake gateway does not answer {other:?}"),
+                    },
+                },
+            );
+            Self { gateway, knobs }
+        }
+
+        /// The app state with its gateway pointed here.
+        fn state(&self) -> State<Arc<AppState>> {
+            State(crate::test_support::test_state(self.gateway.addr()))
+        }
+
+        /// The playback commands the gateway received, as JSON, without the reads
+        /// of the queue (`QueueList`): every handler that resolves against the
+        /// queue reads it first, so these are what a handler changed, not what it
+        /// looked at.
+        fn sent(&self) -> Vec<serde_json::Value> {
+            self.gateway
+                .commands()
+                .iter()
+                .filter(|c| !matches!(c, Command::QueueList))
+                .map(queue_command)
+                .collect()
+        }
     }
 
     fn queue_command(command: &Command) -> serde_json::Value {
@@ -2435,9 +2439,9 @@ mod tests {
 
     #[tokio::test]
     async fn queue_append_sends_the_full_hash_for_a_short_one() {
-        let gateway = fake_gateway(true, "");
+        let gateway = ResolvingGateway::start(true, "");
         let response = player_queue_append(
-            state_of(&gateway),
+            gateway.state(),
             Json(QueueAppendRequest {
                 hash: "9fb4105e".to_string(),
             }),
@@ -2446,7 +2450,7 @@ mod tests {
         .into_response();
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
-            sent(&gateway),
+            gateway.sent(),
             vec![queue_command(&Command::QueueAppend {
                 hash: ContentHash::new(FULL_A),
                 source: SourceName::audio(),
@@ -2456,9 +2460,9 @@ mod tests {
 
     #[tokio::test]
     async fn queue_append_of_an_unknown_hash_is_422_and_sends_nothing() {
-        let gateway = fake_gateway(true, "");
+        let gateway = ResolvingGateway::start(true, "");
         let response = player_queue_append(
-            state_of(&gateway),
+            gateway.state(),
             Json(QueueAppendRequest {
                 hash: "deadbeef".to_string(),
             }),
@@ -2467,14 +2471,123 @@ mod tests {
         .into_response();
         assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
         assert!(error_text(response).await.contains("deadbeef"));
-        assert_eq!(sent(&gateway), Vec::<serde_json::Value>::new());
+        assert_eq!(gateway.sent(), Vec::<serde_json::Value>::new());
+    }
+
+    /// A full hash the fake library does not have.
+    const FULL_GONE: &str =
+        "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+
+    #[tokio::test]
+    async fn queue_append_refuses_an_unknown_full_hash() {
+        let gateway = ResolvingGateway::start(true, "");
+        let response = player_queue_append(
+            gateway.state(),
+            Json(QueueAppendRequest {
+                hash: FULL_GONE.to_string(),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(error_text(response).await.contains(FULL_GONE));
+        assert_eq!(gateway.sent(), Vec::<serde_json::Value>::new());
     }
 
     #[tokio::test]
-    async fn queue_append_with_the_library_down_is_503_and_sends_nothing() {
-        let gateway = fake_gateway(false, "");
+    async fn queue_remove_resolves_a_stale_queue_entry_by_prefix() {
+        let gateway = ResolvingGateway::start(true, "");
+        gateway.set_queue(&[FULL_A, FULL_GONE]);
+        let response = player_queue_remove(
+            gateway.state(),
+            Json(QueueRemoveRequest {
+                hashes: vec!["dddddddd".to_string()],
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            gateway.sent(),
+            vec![queue_command(&Command::QueueRemove {
+                hashes: vec![ContentHash::new(FULL_GONE)],
+            })]
+        );
+    }
+
+    #[tokio::test]
+    async fn queue_remove_of_a_hash_that_is_not_queued_is_422_and_sends_nothing() {
+        // FULL_B is in the library but not in the queue.
+        let gateway = ResolvingGateway::start(true, "");
+        gateway.set_queue(&[FULL_A]);
+        let response = player_queue_remove(
+            gateway.state(),
+            Json(QueueRemoveRequest {
+                hashes: vec![FULL_B.to_string()],
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(gateway.sent(), Vec::<serde_json::Value>::new());
+    }
+
+    #[tokio::test]
+    async fn queue_replace_keeps_a_stale_queue_entry_and_refuses_a_new_unknown_one() {
+        let gateway = ResolvingGateway::start(true, "");
+        gateway.set_queue(&[FULL_A, FULL_GONE]);
+        let kept = player_queue_replace(
+            gateway.state(),
+            Json(QueueReplaceRequest {
+                hashes: vec![FULL_GONE.to_string(), "9fb4105e".to_string()],
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(kept.status(), StatusCode::OK);
+        assert_eq!(
+            gateway.sent(),
+            vec![queue_command(&Command::QueueReplace {
+                entries: vec![entry(FULL_GONE), entry(FULL_A)],
+            })]
+        );
+
+        gateway.set_queue(&[FULL_A]);
+        let refused = player_queue_replace(
+            gateway.state(),
+            Json(QueueReplaceRequest {
+                hashes: vec![FULL_GONE.to_string()],
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(refused.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(gateway.sent().len(), 1, "nothing more sent");
+    }
+
+    #[tokio::test]
+    async fn queue_append_with_the_library_down_is_502_and_sends_nothing() {
+        // The gateway's "library unreachable" arrives as `Internal`, so it is a
+        // 502 until it is typed (#100).
+        let gateway = ResolvingGateway::start(false, "");
         let response = player_queue_append(
-            state_of(&gateway),
+            gateway.state(),
+            Json(QueueAppendRequest {
+                hash: "9fb4105e".to_string(),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(gateway.sent(), Vec::<serde_json::Value>::new());
+    }
+
+    #[tokio::test]
+    async fn queue_append_with_a_transport_failure_is_503_and_sends_nothing() {
+        let gateway = ResolvingGateway::start(true, "");
+        gateway.break_track_lookups();
+        let response = player_queue_append(
+            gateway.state(),
             Json(QueueAppendRequest {
                 hash: "9fb4105e".to_string(),
             }),
@@ -2482,14 +2595,52 @@ mod tests {
         .await
         .into_response();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(sent(&gateway), Vec::<serde_json::Value>::new());
+        assert_eq!(gateway.sent(), Vec::<serde_json::Value>::new());
+    }
+
+    #[tokio::test]
+    async fn queue_append_of_an_ambiguous_prefix_is_422_and_sends_nothing() {
+        // "sha256:" starts both FULL_A and FULL_B.
+        let gateway = ResolvingGateway::start(true, "");
+        let response = player_queue_append(
+            gateway.state(),
+            Json(QueueAppendRequest {
+                hash: "sha256:".to_string(),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(error_text(response).await.contains("ambiguous"));
+        assert_eq!(gateway.sent(), Vec::<serde_json::Value>::new());
+    }
+
+    /// A queued hash that starts like FULL_A but is a different (stale) track.
+    const STALE_LIKE_A: &str =
+        "sha256:9fb4105effffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+
+    #[tokio::test]
+    async fn queue_replace_of_a_prefix_naming_different_tracks_in_queue_and_library_is_422() {
+        let gateway = ResolvingGateway::start(true, "");
+        gateway.set_queue(&[STALE_LIKE_A]);
+        let response = player_queue_replace(
+            gateway.state(),
+            Json(QueueReplaceRequest {
+                hashes: vec!["9fb4105e".to_string()],
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(gateway.sent(), Vec::<serde_json::Value>::new());
     }
 
     #[tokio::test]
     async fn queue_remove_sends_full_hashes() {
-        let gateway = fake_gateway(true, "");
+        let gateway = ResolvingGateway::start(true, "");
+        gateway.set_queue(&[FULL_A, FULL_B]);
         let response = player_queue_remove(
-            state_of(&gateway),
+            gateway.state(),
             Json(QueueRemoveRequest {
                 hashes: vec!["9fb4105e".to_string(), FULL_B.to_string()],
             }),
@@ -2498,7 +2649,7 @@ mod tests {
         .into_response();
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
-            sent(&gateway),
+            gateway.sent(),
             vec![queue_command(&Command::QueueRemove {
                 hashes: vec![ContentHash::new(FULL_A), ContentHash::new(FULL_B)],
             })]
@@ -2507,9 +2658,9 @@ mod tests {
 
     #[tokio::test]
     async fn queue_replace_sends_full_hashes() {
-        let gateway = fake_gateway(true, "");
+        let gateway = ResolvingGateway::start(true, "");
         let response = player_queue_replace(
-            state_of(&gateway),
+            gateway.state(),
             Json(QueueReplaceRequest {
                 hashes: vec!["9fb4105e".to_string(), "12345678".to_string()],
             }),
@@ -2518,7 +2669,7 @@ mod tests {
         .into_response();
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
-            sent(&gateway),
+            gateway.sent(),
             vec![queue_command(&Command::QueueReplace {
                 entries: vec![entry(FULL_A), entry(FULL_B)],
             })]
@@ -2527,9 +2678,9 @@ mod tests {
 
     #[tokio::test]
     async fn queue_replace_with_one_unknown_hash_is_422_and_sends_nothing() {
-        let gateway = fake_gateway(true, "");
+        let gateway = ResolvingGateway::start(true, "");
         let response = player_queue_replace(
-            state_of(&gateway),
+            gateway.state(),
             Json(QueueReplaceRequest {
                 hashes: vec!["9fb4105e".to_string(), "deadbeef".to_string()],
             }),
@@ -2538,21 +2689,94 @@ mod tests {
         .into_response();
         assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
         assert!(error_text(response).await.contains("deadbeef"));
-        assert_eq!(sent(&gateway), Vec::<serde_json::Value>::new());
+        assert_eq!(gateway.sent(), Vec::<serde_json::Value>::new());
+    }
+
+    #[tokio::test]
+    async fn queue_replace_with_an_unreadable_queue_read_is_503_and_sends_nothing() {
+        let gateway = ResolvingGateway::start(true, "");
+        gateway.break_queue_reads();
+        let response = player_queue_replace(
+            gateway.state(),
+            Json(QueueReplaceRequest {
+                hashes: vec!["9fb4105e".to_string()],
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(gateway.sent(), Vec::<serde_json::Value>::new());
+    }
+
+    #[tokio::test]
+    async fn queue_remove_with_an_unreadable_queue_read_is_503_and_sends_nothing() {
+        let gateway = ResolvingGateway::start(true, "");
+        gateway.break_queue_reads();
+        let response = player_queue_remove(
+            gateway.state(),
+            Json(QueueRemoveRequest {
+                hashes: vec!["9fb4105e".to_string()],
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(gateway.sent(), Vec::<serde_json::Value>::new());
+    }
+
+    #[tokio::test]
+    async fn a_queue_change_playback_refuses_is_502_with_its_message() {
+        let gateway = ResolvingGateway::start(true, "");
+        gateway.set_queue(&[FULL_A]);
+        gateway.refuse_queue_changes();
+        let replace = player_queue_replace(
+            gateway.state(),
+            Json(QueueReplaceRequest {
+                hashes: vec!["9fb4105e".to_string()],
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(replace.status(), StatusCode::BAD_GATEWAY);
+        assert!(error_text(replace).await.contains("queue is locked"));
+
+        let remove = player_queue_remove(
+            gateway.state(),
+            Json(QueueRemoveRequest {
+                hashes: vec!["9fb4105e".to_string()],
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(remove.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn the_legacy_library_handlers_classify_failures_like_the_api_routes() {
+        // The fake gateway answers no fact-value or search request with anything but a gateway
+        // error, which arrives as `Internal`: a 502, not the 500 these handlers used to give.
+        let gateway = ResolvingGateway::start(true, "");
+        let response = library_artists_handler(gateway.state()).await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let response =
+            library_artist_tracks_handler(gateway.state(), Path("Carbon".to_string())).await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let response = library_playlists_handler(gateway.state()).await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     }
 
     #[tokio::test]
     async fn playlist_queue_replace_skips_comments_and_sends_full_hashes() {
-        let gateway = fake_gateway(
+        let gateway = ResolvingGateway::start(
             true,
             "# my playlist\n\n9fb4105e  Artist - Title  [3:45]\n12345678\n",
         );
         let response =
-            library_playlist_queue_replace_handler(state_of(&gateway), Path("friday".to_string()))
+            library_playlist_queue_replace_handler(gateway.state(), Path("friday".to_string()))
                 .await;
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
-            sent(&gateway),
+            gateway.sent(),
             vec![queue_command(&Command::QueueReplace {
                 entries: vec![entry(FULL_A), entry(FULL_B)],
             })]
@@ -2560,24 +2784,147 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn playlist_queue_replace_with_an_unknown_hash_is_422_and_sends_nothing() {
-        let gateway = fake_gateway(true, "9fb4105e\ndeadbeef\n");
+    async fn playlist_tracks_of_a_missing_playlist_is_404() {
+        let gateway = ResolvingGateway::start(true, "9fb4105e\n");
         let response =
-            library_playlist_queue_replace_handler(state_of(&gateway), Path("friday".to_string()))
-                .await;
-        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
-        assert!(error_text(response).await.contains("deadbeef"));
-        assert_eq!(sent(&gateway), Vec::<serde_json::Value>::new());
+            library_playlist_tracks_handler(gateway.state(), Path("nothere".to_string())).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(error_text(response).await.contains("nothere"));
     }
 
     #[tokio::test]
-    async fn playlist_queue_replace_with_the_library_down_is_503_and_sends_nothing() {
-        let gateway = fake_gateway(false, "9fb4105e\n");
+    async fn playlist_tracks_from_an_old_library_is_502() {
+        let gateway = ResolvingGateway::start(true, "9fb4105e\n");
+        let response = library_playlist_tracks_handler(
+            gateway.state(),
+            Path(OLD_LIBRARY_PLAYLIST.to_string()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn playlist_tracks_with_the_library_down_is_502() {
+        // The gateway answers with an error message: a protocol error, not a transport one.
+        let gateway = ResolvingGateway::start(false, "9fb4105e\n");
         let response =
-            library_playlist_queue_replace_handler(state_of(&gateway), Path("friday".to_string()))
+            library_playlist_tracks_handler(gateway.state(), Path(PLAYLIST.to_string())).await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn playlist_tracks_from_a_gateway_that_rejects_the_request_is_502() {
+        let gateway = ResolvingGateway::start(true, "9fb4105e\n");
+        let response =
+            library_playlist_tracks_handler(gateway.state(), Path(REJECTED_PLAYLIST.to_string()))
                 .await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert!(error_text(response).await.contains("Invalid request"));
+    }
+
+    #[tokio::test]
+    async fn playlist_tracks_with_a_track_lookup_transport_failure_is_503() {
+        let gateway = ResolvingGateway::start(true, "9fb4105e\n");
+        gateway.break_track_lookups();
+        let response =
+            library_playlist_tracks_handler(gateway.state(), Path(PLAYLIST.to_string())).await;
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(sent(&gateway), Vec::<serde_json::Value>::new());
+    }
+
+    #[test]
+    fn library_failures_are_classified_by_one_policy() {
+        use library_ipc_client::ProtocolError;
+        let protocol = |e: ProtocolError| api::library_failure_status(&ClientError::Protocol(e));
+        assert_eq!(
+            protocol(ProtocolError::PlaylistNotFound { name: "x".into() }),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            protocol(ProtocolError::ambiguous_hash("ab", ["abc", "abd"])),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        assert_eq!(
+            protocol(ProtocolError::TrackNotFound { hash: "x".into() }),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        assert_eq!(
+            protocol(ProtocolError::InvalidRequest {
+                message: "x".into()
+            }),
+            StatusCode::BAD_GATEWAY
+        );
+        assert_eq!(
+            protocol(ProtocolError::Internal {
+                message: "x".into()
+            }),
+            StatusCode::BAD_GATEWAY
+        );
+    }
+
+    #[tokio::test]
+    async fn playlist_tracks_with_a_track_lookup_failing_in_the_library_is_502() {
+        // Only TrackNotFound is a row; any other lookup error fails the response.
+        let gateway = ResolvingGateway::start(true, "9fb4105e\n");
+        gateway.fail_track_lookups();
+        let response =
+            library_playlist_tracks_handler(gateway.state(), Path(PLAYLIST.to_string())).await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn playlist_tracks_with_a_track_the_library_lost_is_an_unavailable_row() {
+        // The entry resolved to a full hash the library then does not know.
+        let gateway = ResolvingGateway::start(true, "9fb4105e\n");
+        gateway.forget(FULL_A);
+        let response =
+            library_playlist_tracks_handler(gateway.state(), Path(PLAYLIST.to_string())).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_str(&error_text(response).await).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["unavailable"], true);
+        assert!(rows[0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("cannot look up"));
+    }
+
+    #[tokio::test]
+    async fn playlist_queue_replace_with_an_unresolved_entry_is_422_and_sends_nothing() {
+        let gateway = ResolvingGateway::start(true, "9fb4105e\n# note\ndeadbeef\n");
+        let response =
+            library_playlist_queue_replace_handler(gateway.state(), Path("friday".to_string()))
+                .await;
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let text = error_text(response).await;
+        assert!(text.contains("entry 2"), "{text}");
+        assert!(text.contains("deadbeef"), "{text}");
+        assert_eq!(gateway.sent(), Vec::<serde_json::Value>::new());
+    }
+
+    #[tokio::test]
+    async fn library_playlist_tracks_show_unresolved_rows_instead_of_dropping() {
+        let gateway = ResolvingGateway::start(true, "9fb4105e\ndeadbeef\n12345678\n");
+        let response =
+            library_playlist_tracks_handler(gateway.state(), Path("friday".to_string())).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_str(&error_text(response).await).unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0]["content_hash"], FULL_A);
+        assert_eq!(rows[1]["unavailable"], true);
+        assert!(rows[1]["error"].as_str().unwrap().contains("deadbeef"));
+        assert_eq!(rows[2]["content_hash"], FULL_B);
+    }
+
+    #[tokio::test]
+    async fn playlist_queue_replace_with_the_library_down_is_502_and_sends_nothing() {
+        let gateway = ResolvingGateway::start(false, "9fb4105e\n");
+        let response =
+            library_playlist_queue_replace_handler(gateway.state(), Path("friday".to_string()))
+                .await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(gateway.sent(), Vec::<serde_json::Value>::new());
     }
 
     fn make_source_status() -> SourceStatus {

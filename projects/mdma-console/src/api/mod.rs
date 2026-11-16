@@ -9,7 +9,8 @@ use axum::{
 };
 use gateway_client::Response as PlaybackResponse;
 use gateway_client::{Command, GatewayClient, LibraryRequest, LibraryResponse};
-use library_ipc_client::{CanonicalHash, ContentHash};
+use library_ipc_client::{CanonicalHash, ClientError, ContentHash, ProtocolError, ResolveError};
+use mdma_client::{map_gw_to_lib_error, LibraryBackend};
 use media_protocol::{ResponseData, SourceName};
 use serde::Serialize;
 use std::sync::Arc;
@@ -55,12 +56,104 @@ pub fn fail(status: StatusCode, message: String) -> Response {
     respond(Ok(error_reply(status, message)))
 }
 
-/// 200 with `value` as JSON; a playback/library error is a 500 `{error}`; an unreachable
-/// gateway is the response `gw` already built.
-pub fn json_or_500<T: Serialize>(reply: Result<Result<T, String>, Response>) -> Response {
+/// 503 `{error: "Gateway not available"}`: the one reply for a gateway that cannot be reached.
+pub fn gateway_unavailable() -> Reply {
+    error_reply(StatusCode::SERVICE_UNAVAILABLE, "Gateway not available")
+}
+
+/// Why a playback command did not give its answer.
+#[derive(Debug)]
+pub enum PlaybackFailure {
+    /// The gateway or playback service could not be reached, or its answer was unreadable.
+    Unreachable(gateway_client::ClientError),
+    /// The playback service refused the command.
+    Refused(String),
+    /// The gateway answered with an error, or the answer was not the one asked for (an old node).
+    Unexpected(String),
+}
+
+impl std::fmt::Display for PlaybackFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PlaybackFailure::Unreachable(e) => write!(f, "{e}"),
+            PlaybackFailure::Refused(message) | PlaybackFailure::Unexpected(message) => {
+                f.write_str(message)
+            }
+        }
+    }
+}
+
+impl From<gateway_client::ClientError> for PlaybackFailure {
+    fn from(e: gateway_client::ClientError) -> Self {
+        match e {
+            gateway_client::ClientError::Service(message) => PlaybackFailure::Unexpected(message),
+            other => PlaybackFailure::Unreachable(other),
+        }
+    }
+}
+
+/// The one policy for a playback command that failed, shared by every route:
+/// - the playback service cannot be reached: 503;
+/// - it refused the command, or answered something unexpected: 502.
+pub fn playback_failure_status(failure: &PlaybackFailure) -> StatusCode {
+    match failure {
+        PlaybackFailure::Unreachable(_) => StatusCode::SERVICE_UNAVAILABLE,
+        PlaybackFailure::Refused(_) | PlaybackFailure::Unexpected(_) => StatusCode::BAD_GATEWAY,
+    }
+}
+
+/// A playback or library call that failed; each is classified by its own policy.
+#[derive(Debug)]
+pub enum Failure {
+    Playback(PlaybackFailure),
+    Library(ClientError),
+}
+
+impl From<PlaybackFailure> for Failure {
+    fn from(f: PlaybackFailure) -> Self {
+        Failure::Playback(f)
+    }
+}
+
+impl From<ClientError> for Failure {
+    fn from(e: ClientError) -> Self {
+        Failure::Library(e)
+    }
+}
+
+impl Failure {
+    /// The status and `{error}` body this failure answers with.
+    pub fn reply(&self) -> Reply {
+        match self {
+            Failure::Playback(f) => playback_failed(f),
+            Failure::Library(e) => library_failed(e),
+        }
+    }
+}
+
+/// The reply for a playback command that failed ([`playback_failure_status`]).
+pub fn playback_failed(failure: &PlaybackFailure) -> Reply {
+    error_reply(playback_failure_status(failure), failure.to_string())
+}
+
+/// The reply for a library call that failed ([`library_failure_status`]).
+pub fn library_failed(error: &ClientError) -> Reply {
+    error_reply(library_failure_status(error), error.to_string())
+}
+
+/// A failed call as a response, for the handlers that answer with a `Response`.
+pub fn failure_response(failure: impl Into<Failure>) -> Response {
+    reply_response(failure.into().reply())
+}
+
+/// 200 with `value` as JSON; a failed playback or library call is answered by its classifier
+/// ([`Failure::reply`]); an unreachable gateway is the response `gw` already built.
+pub fn json_or_failure<T: Serialize, E: Into<Failure>>(
+    reply: Result<Result<T, E>, Response>,
+) -> Response {
     match reply {
         Ok(Ok(value)) => Json(value).into_response(),
-        Ok(Err(message)) => fail(StatusCode::INTERNAL_SERVER_ERROR, message),
+        Ok(Err(failure)) => failure_response(failure),
         Err(response) => response,
     }
 }
@@ -77,55 +170,95 @@ where
     match tokio::task::spawn_blocking(move || state.gateway_client().map(|client| f(&client))).await
     {
         Ok(Some(value)) => Ok(value),
-        Ok(None) => Err(fail(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Gateway not available".to_string(),
-        )),
+        Ok(None) => Err(reply_response(gateway_unavailable())),
         Err(e) => Err(fail(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
     }
 }
 
-/// One playback command; a service error or a transport failure is an `Err` message.
-pub fn send(client: &GatewayClient, command: &Command) -> Result<Option<ResponseData>, String> {
-    match client.playback_command(command) {
-        Ok(PlaybackResponse::Ok { data }) => Ok(data),
-        Ok(PlaybackResponse::Err { message }) => Err(message),
-        Err(e) => Err(e.to_string()),
+/// One playback command; the playback service's answer, or why there is none.
+pub fn send(
+    client: &GatewayClient,
+    command: &Command,
+) -> Result<Option<ResponseData>, PlaybackFailure> {
+    match client.playback_command(command)? {
+        PlaybackResponse::Ok { data } => Ok(data),
+        PlaybackResponse::Err { message } => Err(PlaybackFailure::Refused(message)),
     }
 }
 
-/// A track by hash (or prefix), asked of the library through the gateway.
-fn gateway_get_track(
-    gateway: &GatewayClient,
-    hash: &ContentHash,
-) -> Result<library_ipc_client::TrackInfo, library_ipc_client::ClientError> {
-    use library_ipc_client::{ClientError, ProtocolError};
-    match gateway.library_request(&LibraryRequest::GetTrack { hash: hash.clone() })? {
-        LibraryResponse::Track(track) => Ok(*track),
-        LibraryResponse::Error(e) => Err(ClientError::Protocol(e)),
-        _ => Err(ClientError::Protocol(ProtocolError::Internal {
-            message: "Unexpected response to GetTrack".to_string(),
-        })),
+/// A reply as a response (for the handlers that answer with a `Response`).
+pub fn reply_response(reply: Reply) -> Response {
+    respond(Ok(reply))
+}
+
+/// The library, reached through the gateway by mdma_client's one gateway path (so a gateway that
+/// rejects a request maps the same here as in the CLI). A gateway that cannot be reached is a 503.
+pub fn library_backend(state: &AppState) -> Result<LibraryBackend, Reply> {
+    LibraryBackend::connect_gateway(&state.gateway).map_err(|_| gateway_unavailable())
+}
+
+/// The one policy for a library call that failed, shared by every route:
+/// - transport (the gateway or library cannot be reached): 503;
+/// - no such playlist: 404;
+/// - input the library refused (an unknown or ambiguous hash, ...): 422;
+/// - anything else (`InvalidRequest` from an old node, `Internal`): 502.
+///
+/// A gateway's "library service unreachable" still arrives as `Internal`, so it is a 502 rather
+/// than a 503 until it is typed (#100).
+pub fn library_failure_status(error: &ClientError) -> StatusCode {
+    match error {
+        ClientError::Transport(_) => StatusCode::SERVICE_UNAVAILABLE,
+        ClientError::Protocol(ProtocolError::PlaylistNotFound { .. }) => StatusCode::NOT_FOUND,
+        ClientError::Protocol(
+            ProtocolError::AmbiguousHash { .. }
+            | ProtocolError::TrackNotFound { .. }
+            | ProtocolError::InboxFileNotFound { .. }
+            | ProtocolError::PlaylistAlreadyExists { .. }
+            | ProtocolError::InvalidPlaylistName { .. },
+        ) => StatusCode::UNPROCESSABLE_ENTITY,
+        ClientError::Protocol(
+            ProtocolError::IngestionFailed { .. }
+            | ProtocolError::Internal { .. }
+            | ProtocolError::InvalidRequest { .. },
+        ) => StatusCode::BAD_GATEWAY,
     }
 }
 
-/// The canonical hash of each of `hashes`: the one resolver for everything bound for playback
-/// (ADR-026). Canonical hashes pass through without a lookup; the first hash the library cannot
-/// resolve fails the lot with 422 `{error}` naming it, or 503 when the library cannot be
-/// reached, before anything is sent.
+/// The reply for a hash that did not resolve: a library lookup that failed is classified by
+/// [`library_failure_status`]; any other refusal (not in the queue, ambiguous in or across the
+/// queue and library, not full) is a 422.
+pub fn resolve_failed(e: ResolveError) -> Reply {
+    let status = match &e {
+        ResolveError::Lookup { source, .. } => library_failure_status(source),
+        _ => StatusCode::UNPROCESSABLE_ENTITY,
+    };
+    error_reply(status, e.to_string())
+}
+
+/// The canonical hash of each of `hashes`, for adding to the queue: the one resolver for
+/// everything bound for playback (ADR-026). Every hash is looked up in the library, full ones
+/// too; the first it cannot resolve fails the lot with `{error}` naming it ([`resolve_failed`]),
+/// before anything is sent.
 pub fn resolve_for_playback(
-    gateway: &GatewayClient,
+    state: &AppState,
     hashes: &[ContentHash],
 ) -> Result<Vec<CanonicalHash>, Reply> {
-    library_ipc_client::resolve_full_hashes(hashes, |hash| gateway_get_track(gateway, hash))
-        .map_err(|e| {
-            let status = if e.is_transport() {
-                StatusCode::SERVICE_UNAVAILABLE
-            } else {
-                StatusCode::UNPROCESSABLE_ENTITY
-            };
-            error_reply(status, e.to_string())
-        })
+    library_backend(state)?
+        .resolve_for_playback(hashes)
+        .map_err(resolve_failed)
+}
+
+/// Like [`resolve_for_playback`], for making `hashes` the whole `queue` (an edit or a replace):
+/// entries the queue holds stay even when their track has left the library, new ones must exist
+/// in it.
+pub fn resolve_for_queue_replace(
+    state: &AppState,
+    queue: &[ContentHash],
+    hashes: &[ContentHash],
+) -> Result<Vec<CanonicalHash>, Reply> {
+    library_backend(state)?
+        .resolve_for_queue_replace(queue, hashes)
+        .map_err(resolve_failed)
 }
 
 /// Queue entries for resolved `hashes`, all from the audio source.
@@ -136,14 +269,25 @@ pub fn queue_entries(hashes: Vec<CanonicalHash>) -> Vec<(ContentHash, SourceName
         .collect()
 }
 
-/// One library request; a library error answer is folded into `Err`.
+/// One library request, mapped as mdma_client maps it everywhere: the library's own error
+/// answer is a protocol error, a gateway that rejects the request is one too, and only a failed
+/// transport is a transport error.
 pub fn library(
     client: &GatewayClient,
     request: &LibraryRequest,
-) -> Result<LibraryResponse, String> {
-    match client.library_request(request) {
-        Ok(LibraryResponse::Error(e)) => Err(e.to_string()),
-        Ok(response) => Ok(response),
-        Err(e) => Err(e.to_string()),
+) -> Result<LibraryResponse, ClientError> {
+    match client
+        .library_request(request)
+        .map_err(map_gw_to_lib_error)?
+    {
+        LibraryResponse::Error(e) => Err(ClientError::Protocol(e)),
+        response => Ok(response),
     }
+}
+
+/// The library answered with something other than the answer to the request.
+pub fn unexpected_library_response() -> ClientError {
+    ClientError::Protocol(ProtocolError::Internal {
+        message: "Unexpected library response".to_string(),
+    })
 }

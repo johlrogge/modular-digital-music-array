@@ -3,7 +3,7 @@
 //! `ApiTrack` is the one track shape the browser sees. Its field names are exactly the ones
 //! `static/js/logic.js` reads; the old UI keeps using `TrackInfoJson` and is not affected.
 
-use super::{fail, gw, json_or_500, library};
+use super::{fail, gw, json_or_failure, library, unexpected_library_response};
 use crate::AppState;
 use axum::{
     extract::{Query, State},
@@ -11,7 +11,7 @@ use axum::{
     response::Response,
 };
 use gateway_client::{GatewayClient, LibraryRequest, LibraryResponse};
-use library_ipc_client::{StringQuery, TrackInfo, TrackQuery};
+use library_ipc_client::{ClientError, StringQuery, TrackInfo, TrackQuery};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -56,13 +56,13 @@ pub fn track_query_from(params: &SearchParams) -> Result<TrackQuery, String> {
 
 /// `GET /api/tracks`: the whole catalogue in one response.
 pub async fn tracks(State(state): State<Arc<AppState>>) -> Response {
-    json_or_500(
+    json_or_failure(
         gw(&state, |client| {
             match library(client, &LibraryRequest::ListTracks { limit: None })? {
                 LibraryResponse::Tracks(tracks) => {
                     Ok(tracks.iter().map(ApiTrack::from).collect::<Vec<_>>())
                 }
-                _ => Err("Unexpected library response".to_string()),
+                _ => Err(unexpected_library_response()),
             }
         })
         .await,
@@ -77,17 +77,17 @@ struct ApiPlaylist {
 
 /// `GET /api/playlists`: every playlist with its hashes, over one gateway connection.
 pub async fn playlists(State(state): State<Arc<AppState>>) -> Response {
-    let reply = gw(&state, |client| -> Result<Vec<ApiPlaylist>, String> {
+    let reply = gw(&state, |client| -> Result<Vec<ApiPlaylist>, ClientError> {
         let names = match library(client, &LibraryRequest::PlaylistList)? {
             LibraryResponse::PlaylistNames(names) => names,
-            _ => return Err("Unexpected library response".to_string()),
+            _ => return Err(unexpected_library_response()),
         };
         let mut out = Vec::with_capacity(names.len());
         for name in names {
             let content =
                 match library(client, &LibraryRequest::PlaylistGet { name: name.clone() })? {
                     LibraryResponse::PlaylistContent(content) => content,
-                    _ => return Err("Unexpected library response".to_string()),
+                    _ => return Err(unexpected_library_response()),
                 };
             out.push(ApiPlaylist {
                 name: name.as_str().to_owned(),
@@ -100,7 +100,7 @@ pub async fn playlists(State(state): State<Arc<AppState>>) -> Response {
         Ok(out)
     })
     .await;
-    json_or_500(reply)
+    json_or_failure(reply)
 }
 
 /// `GET /api/tracks/match?bpm=&key=&added=&q=&artist=`: hashes of the tracks the library says
@@ -114,7 +114,7 @@ pub async fn tracks_match(
         Ok(q) => q,
         Err(response) => return response,
     };
-    json_or_500(gw(&state, move |client| track_search(client, query)).await)
+    json_or_failure(gw(&state, move |client| track_search(client, query)).await)
 }
 
 /// The query for `params`, or the 400 response for a filter the library cannot parse and for no
@@ -129,23 +129,23 @@ fn required_query(params: &SearchParams) -> Result<TrackQuery, Response> {
 }
 
 /// Hashes of the tracks matching `query`, as the library finds them.
-fn track_search(client: &GatewayClient, query: TrackQuery) -> Result<Vec<String>, String> {
+fn track_search(client: &GatewayClient, query: TrackQuery) -> Result<Vec<String>, ClientError> {
     match library(client, &LibraryRequest::Search { query })? {
         LibraryResponse::SearchResults(tracks) => Ok(tracks
             .iter()
             .map(|t| t.content_hash.as_str().to_owned())
             .collect()),
-        _ => Err("Unexpected library response".to_string()),
+        _ => Err(unexpected_library_response()),
     }
 }
 
 /// Names of the playlists the library matches by name. The matching is the library's.
-fn playlist_search(client: &GatewayClient, query: StringQuery) -> Result<Vec<String>, String> {
+fn playlist_search(client: &GatewayClient, query: StringQuery) -> Result<Vec<String>, ClientError> {
     match library(client, &LibraryRequest::PlaylistSearch { query })? {
         LibraryResponse::PlaylistNames(names) => {
             Ok(names.iter().map(|n| n.as_str().to_owned()).collect())
         }
-        _ => Err("Unexpected library response".to_string()),
+        _ => Err(unexpected_library_response()),
     }
 }
 
@@ -178,7 +178,7 @@ pub async fn library_match(
         ..query.clone()
     };
     let text = query.any_text.clone();
-    json_or_500(
+    json_or_failure(
         gw(&state, move |client| {
             let tracks = track_search(client, query)?;
             let filter_tracks = match &text {
@@ -189,7 +189,7 @@ pub async fn library_match(
                 Some(text) => Some(playlist_search(client, text)?),
                 None => None,
             };
-            Ok(LibraryMatch {
+            Ok::<_, ClientError>(LibraryMatch {
                 tracks,
                 filter_tracks,
                 playlists,
@@ -324,7 +324,7 @@ mod tests {
 
         let q = track_query_from(&SearchParams {
             bpm: Some("120..130".into()),
-            key: Some("Am+-1~".into()),
+            key: Some("Am+-1".into()),
             added: Some(">2026-10-01".into()),
             ..Default::default()
         })
@@ -340,6 +340,11 @@ mod tests {
                 key: Some("H#".into()),
                 ..Default::default()
             },
+            // The `~` suffix is gone from the key grammar: `+-1` already means the mixes-well set.
+            SearchParams {
+                key: Some("Am+-1~".into()),
+                ..Default::default()
+            },
             SearchParams {
                 added: Some("whenever".into()),
                 ..Default::default()
@@ -350,7 +355,7 @@ mod tests {
     }
 
     /// Every format the narrow bar sends (lanes M3): ranges with open ends as 0 or 999,
-    /// traditional key notation with and without the mix-well suffix, and `>date`.
+    /// traditional key notation with and without the mix-well suffix (`+-1`), and `>date`.
     #[test]
     fn query_accepts_every_format_the_narrow_bar_sends() {
         let param = |bpm: Option<&str>, key: Option<&str>, added: Option<&str>| SearchParams {
@@ -368,7 +373,7 @@ mod tests {
             "C", "C#", "D", "Eb", "E", "F", "F#", "G", "Ab", "A", "Bb", "B",
         ] {
             for mode in ["", "m"] {
-                for suffix in ["", "+-1~"] {
+                for suffix in ["", "+-1"] {
                     let key = format!("{note}{mode}{suffix}");
                     let q = track_query_from(&param(None, Some(&key), None))
                         .unwrap_or_else(|e| panic!("key {key}: {e}"));
@@ -414,12 +419,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn api_tracks_library_error_is_500() {
+    async fn api_tracks_library_error_is_502() {
+        // The gateway's "library unreachable" arrives as `Internal` (#100): a 502.
         let gw = FakeGateway::start(|_| GatewayResponse::Error {
             message: "down".into(),
         });
         let res = send_get(test_app_with(gw.addr()), "/api/tracks", None).await;
-        assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
+        assert!(body_json(res).await["error"]
+            .as_str()
+            .unwrap()
+            .contains("down"));
+    }
+
+    #[tokio::test]
+    async fn api_tracks_with_an_unreadable_library_answer_is_503() {
+        let gw = FakeGateway::start_unreadable_when(|_| true, |_| playback_ok(None));
+        let res = send_get(test_app_with(gw.addr()), "/api/tracks", None).await;
+        assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]
@@ -637,7 +654,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn library_match_bad_filter_is_400_and_library_error_is_500() {
+    async fn library_match_bad_filter_is_400_and_library_error_is_502() {
         let gw = library_match_gateway();
         let res = send_get(
             test_app_with(gw.addr()),
@@ -652,7 +669,7 @@ mod tests {
             message: "down".into(),
         });
         let res = send_get(test_app_with(down.addr()), "/api/library/match?q=CBL", None).await;
-        assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
     }
 
     /// The console forwards the trimmed text as the library's own string query. Matching is the

@@ -6,13 +6,13 @@
 
 // Re-export types used in the protocol so clients don't need to depend on music-facts
 pub use music_facts::{
-    Bpm, ContentHash, CueKind, DurationSeconds, FactSource, Key, Mark, MarkFilter, MarkName,
-    MarkNameError, MusicValue,
+    Bpm, ContentHash, CueKind, DurationSeconds, FactKind, FactSource, Key, Mark, MarkFilter,
+    MarkName, MarkNameError, MusicValue,
 };
-pub use music_primitives::{EnergyLevel, TrackRole};
+pub use music_primitives::{CanonicalHash, EnergyLevel, TrackRole};
 // Re-export query types so clients can use them without depending on library-search directly
 pub use library_search::{
-    CamelotLetter, DurationQuery, DurationUnit, KeyQuery, NumericQuery, StringQuery, TrackQuery,
+    DurationQuery, DurationUnit, KeyQuery, NumericQuery, StringQuery, TrackQuery,
 };
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -63,7 +63,7 @@ pub enum AttributeListError {
 /// is already known to name something (a typo would otherwise retract nothing).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "Vec<FactType>", into = "Vec<FactType>")]
-pub struct AttributeList(Vec<FactType>);
+pub struct AttributeList(Vec<FactKind>);
 
 impl AttributeList {
     pub fn try_new<S: AsRef<str>>(
@@ -79,10 +79,10 @@ impl AttributeList {
 
     /// Whether `value` is of one of the listed attributes.
     pub fn contains(&self, value: &MusicValue) -> bool {
-        self.0.iter().any(|a| a.as_str() == value.display_name())
+        self.0.contains(&value.kind())
     }
 
-    pub fn as_slice(&self) -> &[FactType] {
+    pub fn as_slice(&self) -> &[FactKind] {
         &self.0
     }
 }
@@ -94,19 +94,21 @@ impl TryFrom<Vec<FactType>> for AttributeList {
         if names.is_empty() {
             return Err(AttributeListError::Empty);
         }
-        if let Some(unknown) = names
+        let kinds = names
             .iter()
-            .find(|n| !MusicValue::ATTRIBUTE_NAMES.contains(&n.as_str()))
-        {
-            return Err(AttributeListError::Unknown(unknown.to_string()));
-        }
-        Ok(Self(names))
+            .map(|n| {
+                n.as_str()
+                    .parse::<FactKind>()
+                    .map_err(|_| AttributeListError::Unknown(n.to_string()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self(kinds))
     }
 }
 
 impl From<AttributeList> for Vec<FactType> {
     fn from(list: AttributeList) -> Self {
-        list.0
+        list.0.iter().map(|k| FactType::new(k.as_str())).collect()
     }
 }
 
@@ -243,6 +245,72 @@ impl std::fmt::Display for PlaylistName {
 }
 
 // ============================================================================
+// Playlist Entries
+// ============================================================================
+
+/// The hash tokens of a playlist file, in order, duplicates kept.
+///
+/// Skips blank lines and `#` comments; a line's hash is its first whitespace
+/// token. The one reader of the playlist line format, so every consumer
+/// agrees on which lines are entries.
+pub fn playlist_hashes(content: &str) -> impl Iterator<Item = &str> {
+    content
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .filter_map(|line| line.split_whitespace().next())
+}
+
+/// One playlist line as the library resolved it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status")]
+pub enum PlaylistEntry {
+    /// The line names this track.
+    Track { hash: CanonicalHash },
+    /// The line could not be resolved to one track.
+    Unresolved { error: EntryError },
+}
+
+/// Why a playlist line did not resolve to a track. `hash` is the stored token.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Error)]
+pub enum EntryError {
+    #[error("unknown track {hash}")]
+    Unknown { hash: ContentHash },
+
+    #[error("ambiguous hash {hash}: {}", join_hashes(.candidates))]
+    Ambiguous {
+        hash: ContentHash,
+        candidates: Vec<ContentHash>,
+    },
+
+    #[error("library holds only a non-full hash {found} for {hash}")]
+    NotCanonical {
+        hash: ContentHash,
+        found: ContentHash,
+    },
+}
+
+/// The hashes as one space-separated list, for error messages.
+fn join_hashes(hashes: &[ContentHash]) -> String {
+    hashes
+        .iter()
+        .map(ContentHash::as_str)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+impl EntryError {
+    /// The stored token this error is about.
+    pub fn hash(&self) -> &ContentHash {
+        match self {
+            EntryError::Unknown { hash }
+            | EntryError::Ambiguous { hash, .. }
+            | EntryError::NotCanonical { hash, .. } => hash,
+        }
+    }
+}
+
+// ============================================================================
 // Protocol Errors
 // ============================================================================
 
@@ -251,6 +319,14 @@ impl std::fmt::Display for PlaylistName {
 pub enum ProtocolError {
     #[error("track not found: {hash}")]
     TrackNotFound { hash: String },
+
+    /// A partial hash that starts several different tracks: the hash as given and
+    /// the full hash of every track it matches.
+    #[error("ambiguous hash '{hash}' matches {} tracks: {}", .candidates.len(), .candidates.join(", "))]
+    AmbiguousHash {
+        hash: String,
+        candidates: Vec<String>,
+    },
 
     #[error("inbox file not found: {path}")]
     InboxFileNotFound { path: String },
@@ -273,6 +349,16 @@ pub enum ProtocolError {
     /// The request bytes could not be parsed as a `LibraryRequest`.
     #[error("invalid request: {message}")]
     InvalidRequest { message: String },
+}
+
+impl ProtocolError {
+    /// `hash` starts every one of `candidates`, which are different tracks.
+    pub fn ambiguous_hash<'a>(hash: &str, candidates: impl IntoIterator<Item = &'a str>) -> Self {
+        ProtocolError::AmbiguousHash {
+            hash: hash.to_owned(),
+            candidates: candidates.into_iter().map(str::to_owned).collect(),
+        }
+    }
 }
 
 /// Parse one raw request. Bytes that do not parse give
@@ -394,6 +480,9 @@ pub enum LibraryRequest {
 
     /// Get playlist content verbatim.
     PlaylistGet { name: PlaylistName },
+
+    /// Get a playlist's entries resolved to full hashes, in file order.
+    PlaylistEntries { name: PlaylistName },
 
     /// Create a new playlist (fails if it already exists).
     PlaylistNew { name: PlaylistName, content: String },
@@ -612,6 +701,10 @@ pub enum LibraryResponse {
 
     /// Verbatim playlist content.
     PlaylistContent(String),
+
+    /// A playlist's entries in file order, duplicates kept; the position is
+    /// the index.
+    PlaylistEntries(Vec<PlaylistEntry>),
 
     /// Bookmark written successfully.
     BookmarkWritten,
@@ -1020,6 +1113,50 @@ mod tests {
             Err(ProtocolError::InvalidRequest { message }) => message,
             other => panic!("expected InvalidRequest, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn playlist_hashes_skip_comments_and_blanks_and_take_first_token() {
+        let content = "# a comment\n\nsha256:aaa  Artist - Title\n   \n  bbb\t# trailing\n#sha256:ccc\nsha256:aaa\n";
+        let hashes: Vec<&str> = playlist_hashes(content).collect();
+        assert_eq!(hashes, vec!["sha256:aaa", "bbb", "sha256:aaa"]);
+    }
+
+    #[test]
+    fn playlist_entries_response_roundtrips_json() {
+        let full = CanonicalHash::try_from(ContentHash::new(format!("sha256:{}", "ab".repeat(32))))
+            .unwrap();
+        let entries = vec![
+            PlaylistEntry::Track { hash: full },
+            PlaylistEntry::Unresolved {
+                error: EntryError::Unknown {
+                    hash: ContentHash::new("dead"),
+                },
+            },
+            PlaylistEntry::Unresolved {
+                error: EntryError::Ambiguous {
+                    hash: ContentHash::new("9f"),
+                    candidates: vec![
+                        ContentHash::new("sha256:9f1"),
+                        ContentHash::new("sha256:9f2"),
+                    ],
+                },
+            },
+            PlaylistEntry::Unresolved {
+                error: EntryError::NotCanonical {
+                    hash: ContentHash::new("9fb4"),
+                    found: ContentHash::new("9fb4105e"),
+                },
+            },
+        ];
+        let json =
+            serde_json::to_string(&LibraryResponse::PlaylistEntries(entries.clone())).unwrap();
+        let decoded: LibraryResponse = serde_json::from_str(&json).unwrap();
+        match decoded {
+            LibraryResponse::PlaylistEntries(back) => assert_eq!(back, entries),
+            other => panic!("expected PlaylistEntries, got {other:?}"),
+        }
+        assert!(json.contains(r#""status":"Track""#), "{json}");
     }
 
     #[test]
@@ -1738,6 +1875,16 @@ mod tests {
             serde_json::to_string(&AttributeList::try_new(["Album"]).unwrap()).unwrap(),
             r#"["Album"]"#
         );
+    }
+
+    #[test]
+    fn attribute_list_keeps_the_canonical_spelling() {
+        let list = AttributeList::try_new(["title", "BPM", "bpm"]).unwrap();
+        assert_eq!(
+            serde_json::to_string(&list).unwrap(),
+            r#"["Title","BPM","BPM"]"#
+        );
+        assert!(list.contains(&MusicValue::Title(music_facts::Title::new("t"))));
     }
 
     #[test]

@@ -138,6 +138,15 @@ pub fn format_track_line(track: &TrackInfo) -> String {
     }
 }
 
+/// Format the playlist line for an entry that cannot be resolved.
+///
+/// Format: `{token}  # {reason}`. The first whitespace token is what the line
+/// parses back to and the trailing comment is ignored, so the entry survives
+/// a round-trip. The only place that decides this format.
+pub fn unavailable_line(token: impl std::fmt::Display, reason: impl std::fmt::Display) -> String {
+    format!("{token}  # {reason}")
+}
+
 /// Columns available in the parameterized track table renderer.
 ///
 /// Used by `mdma view` to specify which fields to show and in what order.
@@ -361,6 +370,14 @@ pub fn format_playlist_content(tracks: &[TrackInfo]) -> String {
 mod tests {
     use super::*;
     use library_ipc_protocol::{ContentHash, TrackInfo};
+
+    #[test]
+    fn unavailable_line_is_the_token_then_the_reason_as_a_comment() {
+        assert_eq!(
+            unavailable_line("sha256:dead", "track not found"),
+            "sha256:dead  # track not found"
+        );
+    }
 
     fn make_track(
         hash: &str,

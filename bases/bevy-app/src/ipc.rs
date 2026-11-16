@@ -4,9 +4,13 @@ use std::sync::{
 };
 
 use bevy::prelude::*;
-use mdma_client::{ContentHash, LibraryBackend, PlaylistName, TrackInfo, TrackQuery};
+use mdma_client::{
+    entry_tracks, ContentHash, EntryError, EntryTrackError, LibraryBackend, LibraryClientError,
+    PlaylistEntry, PlaylistName, ProtocolError, TrackInfo, TrackQuery,
+};
 
 use crate::config::DjWorkspaceConfig;
+use crate::playlists::PlaylistRow;
 
 // =========================================================================
 // Public protocol types
@@ -28,7 +32,7 @@ pub enum IpcEvent {
     Playlists(Vec<PlaylistName>),
     PlaylistTracks {
         name: PlaylistName,
-        tracks: Vec<TrackInfo>,
+        rows: Vec<PlaylistRow>,
     },
     SearchResults(Vec<TrackInfo>),
     RequestFailed {
@@ -43,8 +47,9 @@ pub enum IpcEvent {
 
 pub(crate) trait LibraryPort {
     fn playlist_list(&self) -> Result<Vec<PlaylistName>, String>;
-    fn playlist_get(&self, name: &PlaylistName) -> Result<Vec<ContentHash>, String>;
-    fn get_track(&self, hash: &ContentHash) -> Result<TrackInfo, String>;
+    fn playlist_entries(&self, name: &PlaylistName) -> Result<Vec<PlaylistEntry>, String>;
+    /// The typed error, so "track not found" can be told from other failures.
+    fn get_track(&self, hash: &ContentHash) -> Result<TrackInfo, LibraryClientError>;
     fn search(&self, query: &TrackQuery) -> Result<Vec<TrackInfo>, String>;
 }
 
@@ -53,12 +58,12 @@ impl LibraryPort for LibraryBackend {
         self.playlist_list().map_err(|e| e.to_string())
     }
 
-    fn playlist_get(&self, name: &PlaylistName) -> Result<Vec<ContentHash>, String> {
-        self.playlist_get(name).map_err(|e| e.to_string())
+    fn playlist_entries(&self, name: &PlaylistName) -> Result<Vec<PlaylistEntry>, String> {
+        self.playlist_entries(name).map_err(|e| e.to_string())
     }
 
-    fn get_track(&self, hash: &ContentHash) -> Result<TrackInfo, String> {
-        self.get_track(hash).map_err(|e| e.to_string())
+    fn get_track(&self, hash: &ContentHash) -> Result<TrackInfo, LibraryClientError> {
+        self.get_track(hash)
     }
 
     fn search(&self, query: &TrackQuery) -> Result<Vec<TrackInfo>, String> {
@@ -70,11 +75,41 @@ impl LibraryPort for LibraryBackend {
 // Pure request→event mapping
 // =========================================================================
 
+/// Turn entries into rows, keeping every entry at its position.
+///
+/// An entry the library could not resolve becomes an unavailable row, and so
+/// does one whose track lookup answers "track not found". Any other failed
+/// lookup fails the whole load: it is not an answer about the entry, so it
+/// must not be shown as one.
+fn playlist_rows(
+    entries: &[PlaylistEntry],
+    port: &impl LibraryPort,
+) -> Result<Vec<PlaylistRow>, String> {
+    entry_tracks(entries, |hash| port.get_track(hash))
+        .map(|outcome| match outcome {
+            Ok(track) => Ok(PlaylistRow::Track(track)),
+            Err(EntryTrackError::Unresolved(error)) => {
+                Ok(PlaylistRow::Unavailable(error.to_string()))
+            }
+            Err(EntryTrackError::Lookup {
+                hash,
+                source: LibraryClientError::Protocol(ProtocolError::TrackNotFound { .. }),
+            }) => Ok(PlaylistRow::Unavailable(
+                EntryError::Unknown {
+                    hash: hash.as_content_hash().clone(),
+                }
+                .to_string(),
+            )),
+            Err(error @ EntryTrackError::Lookup { .. }) => Err(error.to_string()),
+        })
+        .collect()
+}
+
 /// Map a single IpcRequest to an IpcEvent using the given port.
 ///
-/// GetPlaylistTracks resolves each hash individually; hashes that fail
-/// get_track are skipped with a tracing::warn! (matching the pattern in
-/// LibraryBackend::resolve_and_format_playlist).
+/// GetPlaylistTracks lists the playlist's entries and looks up each resolved
+/// one. Unresolved entries stay in place as unavailable rows; a failed lookup
+/// is a RequestFailed.
 pub(crate) fn handle_request(port: &impl LibraryPort, req: IpcRequest) -> IpcEvent {
     match req {
         IpcRequest::ListPlaylists => match port.playlist_list() {
@@ -85,28 +120,18 @@ pub(crate) fn handle_request(port: &impl LibraryPort, req: IpcRequest) -> IpcEve
             },
         },
 
-        IpcRequest::GetPlaylistTracks(name) => match port.playlist_get(&name) {
+        IpcRequest::GetPlaylistTracks(name) => match port.playlist_entries(&name) {
             Err(e) => IpcEvent::RequestFailed {
                 context: format!("GetPlaylistTracks({})", name.as_str()),
                 message: e,
             },
-            Ok(hashes) => {
-                let tracks: Vec<TrackInfo> = hashes
-                    .iter()
-                    .filter_map(|h| match port.get_track(h) {
-                        Ok(t) => Some(t),
-                        Err(e) => {
-                            tracing::warn!(
-                                hash = h.as_str(),
-                                error = %e,
-                                "Skipping unresolvable track hash in playlist"
-                            );
-                            None
-                        }
-                    })
-                    .collect();
-                IpcEvent::PlaylistTracks { name, tracks }
-            }
+            Ok(entries) => match playlist_rows(&entries, port) {
+                Ok(rows) => IpcEvent::PlaylistTracks { name, rows },
+                Err(message) => IpcEvent::RequestFailed {
+                    context: format!("GetPlaylistTracks({})", name.as_str()),
+                    message,
+                },
+            },
         },
 
         IpcRequest::Search(query) => match port.search(&query) {
@@ -227,13 +252,13 @@ pub fn poll_ipc_events(
             Ok(IpcEvent::Playlists(names)) => {
                 playlist_state.names = names;
             }
-            Ok(IpcEvent::PlaylistTracks { name, tracks }) => {
+            Ok(IpcEvent::PlaylistTracks { name, rows }) => {
                 // Ignore stale responses from a previously-selected playlist.
                 let current_name = playlist_state
                     .selected
                     .and_then(|idx| playlist_state.names.get(idx));
                 if current_name.map(|n| n == &name).unwrap_or(false) {
-                    playlist_state.tracks = tracks;
+                    playlist_state.rows = rows;
                     playlist_state.loading = false;
                 } else {
                     tracing::debug!(
@@ -275,8 +300,8 @@ mod tests {
 
     struct FakeLibraryPort {
         playlists: Vec<PlaylistName>,
-        /// playlist name -> list of hashes (as strings)
-        playlist_tracks: HashMap<String, Vec<String>>,
+        /// playlist name -> its entries, in order
+        playlist_entries: HashMap<String, Vec<PlaylistEntry>>,
         /// hash -> Ok(TrackInfo) or Err(message)
         tracks: HashMap<String, Result<TrackInfo, String>>,
         search_result: Result<Vec<TrackInfo>, String>,
@@ -286,7 +311,7 @@ mod tests {
         fn new() -> Self {
             Self {
                 playlists: vec![],
-                playlist_tracks: HashMap::new(),
+                playlist_entries: HashMap::new(),
                 tracks: HashMap::new(),
                 search_result: Ok(vec![]),
             }
@@ -295,6 +320,26 @@ mod tests {
 
     fn make_playlist_name(s: &str) -> PlaylistName {
         PlaylistName::new(s).expect("valid playlist name in test")
+    }
+
+    /// A full canonical hash made of one repeated hex digit.
+    fn full_hash(c: char) -> String {
+        format!("sha256:{}", c.to_string().repeat(64))
+    }
+
+    fn track_entry(c: char) -> PlaylistEntry {
+        PlaylistEntry::Track {
+            hash: mdma_client::CanonicalHash::try_from(ContentHash::new(full_hash(c)))
+                .expect("canonical test hash"),
+        }
+    }
+
+    fn unknown_entry(token: &str) -> PlaylistEntry {
+        PlaylistEntry::Unresolved {
+            error: mdma_client::EntryError::Unknown {
+                hash: ContentHash::new(token),
+            },
+        }
     }
 
     fn make_track(hash: &str, title: &str) -> TrackInfo {
@@ -320,23 +365,39 @@ mod tests {
         }
     }
 
+    /// What each row shows: a track's title, or the unavailable text.
+    fn row_labels(rows: &[PlaylistRow]) -> Vec<String> {
+        rows.iter()
+            .map(|row| match row {
+                PlaylistRow::Track(track) => track.title.clone().unwrap_or_default(),
+                PlaylistRow::Unavailable(reason) => format!("unavailable: {reason}"),
+            })
+            .collect()
+    }
+
     impl LibraryPort for FakeLibraryPort {
         fn playlist_list(&self) -> Result<Vec<PlaylistName>, String> {
             Ok(self.playlists.clone())
         }
 
-        fn playlist_get(&self, name: &PlaylistName) -> Result<Vec<ContentHash>, String> {
-            match self.playlist_tracks.get(name.as_str()) {
-                Some(hashes) => Ok(hashes.iter().map(ContentHash::new).collect()),
+        fn playlist_entries(&self, name: &PlaylistName) -> Result<Vec<PlaylistEntry>, String> {
+            match self.playlist_entries.get(name.as_str()) {
+                Some(entries) => Ok(entries.clone()),
                 None => Err(format!("Playlist not found: {}", name.as_str())),
             }
         }
 
-        fn get_track(&self, hash: &ContentHash) -> Result<TrackInfo, String> {
+        /// A registered `Err(message)` is a library failure; a track that was
+        /// never registered is "track not found".
+        fn get_track(&self, hash: &ContentHash) -> Result<TrackInfo, LibraryClientError> {
             match self.tracks.get(hash.as_str()) {
                 Some(Ok(t)) => Ok(t.clone()),
-                Some(Err(e)) => Err(e.clone()),
-                None => Err(format!("Track not found: {}", hash.as_str())),
+                Some(Err(message)) => Err(LibraryClientError::Protocol(ProtocolError::Internal {
+                    message: message.clone(),
+                })),
+                None => Err(LibraryClientError::Protocol(ProtocolError::TrackNotFound {
+                    hash: hash.as_str().to_string(),
+                })),
             }
         }
 
@@ -373,10 +434,10 @@ mod tests {
             fn playlist_list(&self) -> Result<Vec<PlaylistName>, String> {
                 Err("socket dead".to_string())
             }
-            fn playlist_get(&self, _: &PlaylistName) -> Result<Vec<ContentHash>, String> {
+            fn playlist_entries(&self, _: &PlaylistName) -> Result<Vec<PlaylistEntry>, String> {
                 unimplemented!()
             }
-            fn get_track(&self, _: &ContentHash) -> Result<TrackInfo, String> {
+            fn get_track(&self, _: &ContentHash) -> Result<TrackInfo, LibraryClientError> {
                 unimplemented!()
             }
             fn search(&self, _: &TrackQuery) -> Result<Vec<TrackInfo>, String> {
@@ -398,63 +459,107 @@ mod tests {
     fn get_playlist_tracks_returns_all_tracks_when_all_resolve() {
         let mut port = FakeLibraryPort::new();
         let pname = make_playlist_name("deep-house");
-        port.playlist_tracks.insert(
+        port.playlist_entries.insert(
             "deep-house".to_string(),
-            vec!["sha256:aaa".to_string(), "sha256:bbb".to_string()],
+            vec![track_entry('a'), track_entry('b')],
         );
-        port.tracks.insert(
-            "sha256:aaa".to_string(),
-            Ok(make_track("sha256:aaa", "Track A")),
-        );
-        port.tracks.insert(
-            "sha256:bbb".to_string(),
-            Ok(make_track("sha256:bbb", "Track B")),
-        );
+        port.tracks
+            .insert(full_hash('a'), Ok(make_track(&full_hash('a'), "Track A")));
+        port.tracks
+            .insert(full_hash('b'), Ok(make_track(&full_hash('b'), "Track B")));
 
         let evt = handle_request(&port, IpcRequest::GetPlaylistTracks(pname.clone()));
 
         match evt {
-            IpcEvent::PlaylistTracks { name, tracks } => {
+            IpcEvent::PlaylistTracks { name, rows } => {
                 assert_eq!(name.as_str(), "deep-house");
-                assert_eq!(tracks.len(), 2);
-                assert_eq!(tracks[0].title.as_deref(), Some("Track A"));
-                assert_eq!(tracks[1].title.as_deref(), Some("Track B"));
+                assert_eq!(row_labels(&rows), vec!["Track A", "Track B"]);
             }
             other => panic!("Expected PlaylistTracks, got {:?}", other),
         }
     }
 
     #[test]
-    fn get_playlist_tracks_skips_failed_hash_and_returns_rest() {
+    fn get_playlist_tracks_keeps_unresolved_entries_in_place_as_unavailable_rows() {
         let mut port = FakeLibraryPort::new();
         let pname = make_playlist_name("mixed");
-        port.playlist_tracks.insert(
+        port.playlist_entries.insert(
             "mixed".to_string(),
-            vec![
-                "sha256:good".to_string(),
-                "sha256:bad".to_string(),
-                "sha256:also-good".to_string(),
-            ],
+            vec![track_entry('a'), unknown_entry("dead"), track_entry('c')],
         );
         port.tracks.insert(
-            "sha256:good".to_string(),
-            Ok(make_track("sha256:good", "Good Track")),
+            full_hash('a'),
+            Ok(make_track(&full_hash('a'), "Good Track")),
         );
         port.tracks
-            .insert("sha256:bad".to_string(), Err("not found".to_string()));
-        port.tracks.insert(
-            "sha256:also-good".to_string(),
-            Ok(make_track("sha256:also-good", "Also Good")),
-        );
+            .insert(full_hash('c'), Ok(make_track(&full_hash('c'), "Also Good")));
 
         let evt = handle_request(&port, IpcRequest::GetPlaylistTracks(pname));
 
         match evt {
-            IpcEvent::PlaylistTracks { name: _, tracks } => {
-                // The failed hash is skipped; two successful tracks returned.
-                assert_eq!(tracks.len(), 2);
-                assert_eq!(tracks[0].title.as_deref(), Some("Good Track"));
-                assert_eq!(tracks[1].title.as_deref(), Some("Also Good"));
+            IpcEvent::PlaylistTracks { name: _, rows } => {
+                assert_eq!(
+                    row_labels(&rows),
+                    vec!["Good Track", "unavailable: unknown track dead", "Also Good"]
+                );
+            }
+            other => panic!("Expected PlaylistTracks, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn get_playlist_tracks_lookup_failure_maps_to_request_failed() {
+        let mut port = FakeLibraryPort::new();
+        let pname = make_playlist_name("broken");
+        port.playlist_entries.insert(
+            "broken".to_string(),
+            vec![track_entry('a'), track_entry('b')],
+        );
+        port.tracks.insert(
+            full_hash('a'),
+            Ok(make_track(&full_hash('a'), "Good Track")),
+        );
+        port.tracks
+            .insert(full_hash('b'), Err("library unreachable".to_string()));
+
+        let evt = handle_request(&port, IpcRequest::GetPlaylistTracks(pname));
+
+        match evt {
+            IpcEvent::RequestFailed { context, message } => {
+                assert_eq!(context, "GetPlaylistTracks(broken)");
+                assert!(message.contains("library unreachable"));
+            }
+            other => panic!("Expected RequestFailed, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn get_playlist_tracks_keeps_an_entry_the_library_has_no_track_for_as_unavailable() {
+        let mut port = FakeLibraryPort::new();
+        port.playlist_entries.insert(
+            "stale".to_string(),
+            vec![track_entry('a'), track_entry('b')],
+        );
+        // 'a' is never registered, so the library answers "track not found".
+        port.tracks.insert(
+            full_hash('b'),
+            Ok(make_track(&full_hash('b'), "Still Here")),
+        );
+
+        let evt = handle_request(
+            &port,
+            IpcRequest::GetPlaylistTracks(make_playlist_name("stale")),
+        );
+
+        match evt {
+            IpcEvent::PlaylistTracks { rows, .. } => {
+                assert_eq!(
+                    row_labels(&rows),
+                    vec![
+                        format!("unavailable: unknown track {}", full_hash('a')),
+                        "Still Here".to_string()
+                    ]
+                );
             }
             other => panic!("Expected PlaylistTracks, got {:?}", other),
         }
