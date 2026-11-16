@@ -28,12 +28,6 @@ export function artBg(name) {
   return `${pat}, ${base}`;
 }
 
-/** Fake catalogue number printed on big sleeves. */
-export function catNo(name) {
-  const x = fnv(String(name));
-  return `MD-${("000" + (x % 9999)).slice(-4)}  ${["A", "B", "AA", "EP", "LP"][(x >>> 13) % 5]}`;
-}
-
 /** URL of a track's cover. Only request it when the track has_cover. */
 export function coverUrl(hash) {
   return `/cover/${encodeURIComponent(hash)}`;
@@ -43,7 +37,6 @@ export function coverUrl(hash) {
 export function setArt(el, name) {
   el.style.backgroundImage = artBg(name);
   el.textContent = initials(name);
-  el.setAttribute("data-cat", catNo(name));
 }
 
 /**

@@ -22,6 +22,7 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/api/tracks", get(library::tracks))
         .route("/api/tracks/match", get(library::tracks_match))
         .route("/api/playlists", get(library::playlists))
+        .route("/api/playlists/match", get(library::playlists_match))
         .route("/api/player", get(player::player))
         .route("/api/pause", post(player::pause))
         .route("/api/resume", post(player::resume))

@@ -3,9 +3,9 @@
 // lists.js and narrow.js supply the rows, cards and the narrowing bar.
 import { h, icon, route, routeFallback, appInfo, store, onView, toast, enc, plural } from "./core.js";
 import { art } from "./art.js";
-import { narrow, groupAlbums, groupArtists, sortTracks, collate } from "./logic.js";
+import { groupAlbums, groupArtists, sortTracks, collate } from "./logic.js";
 import { pagedList, thead, bulkBar, albumCard, artistCard, playlistCard, playlistTracks, recentAlbums } from "./lists.js";
-import { narrowBar, matchSet, matchQuery, isNarrowed, filterCount, setSort } from "./narrow.js";
+import { narrowBar, matchSet, matchPlaylists, matchQuery, isNarrowed, filterCount, setSort, latest } from "./narrow.js";
 
 const GRID_LIMIT = 120;
 let toastedFor = null; // the filter query whose failure was already toasted
@@ -106,8 +106,9 @@ function viewLibrary(root, params, query) {
   root.appendChild(region);
 
   let alive = true;
-  let token = 0;
+  const next = latest(); // a slower earlier search reply must not overwrite a newer one
   let list = null;
+  let bar = null;
 
   function placeholder() {
     const n = { tracks: store.order.length, albums: groupAlbums(catalogue()).length, artists: groupArtists(catalogue()).length };
@@ -121,26 +122,40 @@ function viewLibrary(root, params, query) {
 
   /** (Re)build bar, tabs and list. `keep`: a re-render for the same query, so keep rows and scroll. */
   async function build(rebuildBar, keep) {
-    const mine = ++token;
+    const fresh = next();
     if (rebuildBar || !barHolder.firstChild) {
+      if (bar) bar.dispose();
       barHolder.innerHTML = "";
       const hint = tab !== "tracks" && filterCount() ? "Showing " + tab + " with at least one matching track" : null;
-      barHolder.appendChild(narrowBar({ key: KEY, placeholder: placeholder(), sort: tab === "tracks", onChange: () => build(false, false), hint }));
+      bar = narrowBar({ key: KEY, placeholder: placeholder(), sort: tab === "tracks", onChange: () => build(false, false), hint });
+      barHolder.appendChild(bar);
     }
+    // Capture the query state now: only these values are used after the await below.
+    const text = store.nb[KEY] || "";
+    const f = store.f;
+    const narrowed = isNarrowed(KEY);
+    const nFilters = filterCount(f);
     let set = null;
+    let names = null;
+    let filterOnly = null;
     let failed = false;
     try {
-      set = await matchSet();
+      // All matching is the server's: text and filters for tracks, the text alone for playlist names.
+      [set, names, filterOnly] = await Promise.all([
+        matchSet(text, f),
+        matchPlaylists(text),
+        text.trim() && nFilters ? matchSet("", f) : null,
+      ]);
     } catch (e) {
       failed = true;
-      const qs = matchQuery();
-      if (toastedFor !== qs) {
-        toastedFor = qs; // once per filter state, not on every re-render
-        toast("Couldn't apply filters");
+      const qs = matchQuery(f, text);
+      if (fresh() && toastedFor !== qs) {
+        toastedFor = qs; // once per search state, not on every re-render
+        toast("Couldn't search");
       }
     }
     if (!failed) toastedFor = null;
-    if (!alive || mine !== token) return;
+    if (!alive || !fresh()) return;
 
     const initial = keep && list ? list.count() : 0;
     const scrollY = window.scrollY;
@@ -148,13 +163,13 @@ function viewLibrary(root, params, query) {
     list = null;
     region.innerHTML = "";
 
-    const narrowed = isNarrowed(KEY);
-    const text = store.nb[KEY] || "";
-    // Text narrowing here; tempo, key and added come from the server's set.
-    const tracks = failed ? [] : narrow(catalogue(), text).filter((t) => !set || set.has(t.hash));
+    // The server's set already covers text, tempo, key and added.
+    const tracks = failed ? [] : catalogue().filter((t) => !set || set.has(t.hash));
     const matched = new Set(tracks.map((t) => t.hash));
-    const q = text.trim().toLowerCase();
-    const playlists = store.playlists.filter((p) => !narrowed || p.hashes.some((x) => matched.has(x)) || (q && p.name.toLowerCase().includes(q) && (!set || p.hashes.some((x) => set.has(x)))));
+    // A playlist shows if it holds a matching track, or its name matched (and, with filters on, it holds a track passing them).
+    const playlists = store.playlists.filter(
+      (p) => !narrowed || p.hashes.some((x) => matched.has(x)) || (names && names.has(p.name) && (!filterOnly || p.hashes.some((x) => filterOnly.has(x)))),
+    );
     const albums = tab === "albums" || narrowed ? groupAlbums(tracks) : [];
     const artists = tab === "artists" || narrowed ? groupArtists(tracks) : [];
     const counts = { tracks: tracks.length, albums: albums.length, artists: artists.length, playlists: playlists.length };
@@ -175,12 +190,12 @@ function viewLibrary(root, params, query) {
     region.appendChild(box);
 
     if (failed) {
-      box.appendChild(emptyBox("Filters unavailable", "The player didn't answer. Remove the filters or try again in a moment."));
+      box.appendChild(emptyBox("Search unavailable", "The library didn't answer. Try again in a moment."));
     } else if (!store.order.length) {
       box.appendChild(emptyBox("No music yet", "Your library is empty or still loading."));
     } else if (!counts[tab]) {
       box.appendChild(
-        filterCount()
+        nFilters
           ? emptyBox("Nothing matches these filters", "Try a wider tempo range or turn on keys that mix well.")
           : emptyBox("No matches", "Check the spelling, or try another tab: the counts show where your words were found."),
       );
@@ -212,6 +227,7 @@ function viewLibrary(root, params, query) {
 
   return () => {
     alive = false;
+    if (bar) bar.dispose();
     if (list) list.destroy();
   };
 }

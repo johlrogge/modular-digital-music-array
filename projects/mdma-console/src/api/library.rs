@@ -29,7 +29,12 @@ pub struct SearchParams {
 /// Build the library query for `params`. Empty values count as absent; a value the library's
 /// query syntax rejects is an error message for a 400.
 pub fn track_query_from(params: &SearchParams) -> Result<TrackQuery, String> {
-    let given = |v: &Option<String>| v.clone().filter(|s| !s.is_empty());
+    let given = |v: &Option<String>| {
+        v.as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+    };
     let mut query = TrackQuery::default();
     if let Some(q) = given(&params.q) {
         query.any_text = Some(library_search::parse_string_query(&q));
@@ -127,6 +132,38 @@ pub async fn tracks_match(
                 LibraryResponse::SearchResults(tracks) => Ok(tracks
                     .iter()
                     .map(|t| t.content_hash.as_str().to_owned())
+                    .collect::<Vec<_>>()),
+                _ => Err("Unexpected library response".to_string()),
+            }
+        })
+        .await,
+    )
+}
+
+/// The one parameter of `GET /api/playlists/match`.
+#[derive(Debug, Default, Deserialize)]
+pub struct TextParams {
+    q: Option<String>,
+}
+
+/// `GET /api/playlists/match?q=`: names of the playlists whose name matches `q` under the
+/// library's text rules (`library_search::StringMatcher`, the same as the track search).
+/// 400 for a missing, empty or blank `q`.
+pub async fn playlists_match(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<TextParams>,
+) -> Response {
+    let Some(q) = params.q.as_deref().map(str::trim).filter(|q| !q.is_empty()) else {
+        return fail(StatusCode::BAD_REQUEST, "no filter given".to_string());
+    };
+    let matcher = library_search::StringMatcher::new(&library_search::parse_string_query(q));
+    json_or_500(
+        gw(&state, move |client| {
+            match library(client, &LibraryRequest::PlaylistList)? {
+                LibraryResponse::PlaylistNames(names) => Ok(names
+                    .iter()
+                    .filter(|name| matcher.matches(name.as_str()))
+                    .map(|name| name.as_str().to_owned())
                     .collect::<Vec<_>>()),
                 _ => Err("Unexpected library response".to_string()),
             }
@@ -446,6 +483,123 @@ mod tests {
         .await;
         assert_eq!(res.status(), StatusCode::OK);
         assert_eq!(body_json(res).await, json!(["sha256:a", "sha256:b"]));
+    }
+
+    #[tokio::test]
+    async fn match_with_only_q_succeeds_and_returns_the_hash() {
+        let gw = FakeGateway::start(|req| match req {
+            GatewayRequest::Library {
+                request: LibraryRequest::Search { query },
+            } if query.any_text.is_some() && query.bpm.is_none() => {
+                library_ok(LibraryResponse::SearchResults(vec![bare("sha256:cbl")]))
+            }
+            other => GatewayResponse::Error {
+                message: format!("unexpected {other:?}"),
+            },
+        });
+        let res = send_get(test_app_with(gw.addr()), "/api/tracks/match?q=CBL", None).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(body_json(res).await, json!(["sha256:cbl"]));
+    }
+
+    fn playlists_gateway() -> FakeGateway {
+        FakeGateway::start(|req| match req {
+            GatewayRequest::Library {
+                request: LibraryRequest::PlaylistList,
+            } => library_ok(LibraryResponse::PlaylistNames(vec![
+                // Playlist names cannot hold spaces; hyphens are the word breaks.
+                PlaylistName::new("Carbon-Based-Lifeforms").unwrap(),
+                PlaylistName::new("warmup").unwrap(),
+            ])),
+            other => GatewayResponse::Error {
+                message: format!("unexpected {other:?}"),
+            },
+        })
+    }
+
+    #[tokio::test]
+    async fn playlist_match_uses_the_library_text_rules() {
+        let gw = playlists_gateway();
+        let res = send_get(test_app_with(gw.addr()), "/api/playlists/match?q=CBL", None).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(body_json(res).await, json!(["Carbon-Based-Lifeforms"]));
+
+        // Lower case is a plain "contains": no initialism, so no match.
+        let res = send_get(test_app_with(gw.addr()), "/api/playlists/match?q=cbl", None).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(body_json(res).await, json!([]));
+
+        let res = send_get(
+            test_app_with(gw.addr()),
+            "/api/playlists/match?q=warm",
+            None,
+        )
+        .await;
+        assert_eq!(body_json(res).await, json!(["warmup"]));
+    }
+
+    #[tokio::test]
+    async fn playlist_match_without_q_is_400_without_calling_the_library() {
+        let gw = playlists_gateway();
+        for qs in ["", "q=", "q=%20", "q=%20%20"] {
+            let res = send_get(
+                test_app_with(gw.addr()),
+                &format!("/api/playlists/match?{qs}"),
+                None,
+            )
+            .await;
+            assert_eq!(res.status(), StatusCode::BAD_REQUEST, "{qs}");
+        }
+        assert!(gw.requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn playlist_match_trims_the_text() {
+        let gw = playlists_gateway();
+        let res = send_get(
+            test_app_with(gw.addr()),
+            "/api/playlists/match?q=%20warm%20",
+            None,
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(body_json(res).await, json!(["warmup"]));
+    }
+
+    #[tokio::test]
+    async fn playlist_match_library_error_is_500() {
+        let gw = FakeGateway::start(|_| GatewayResponse::Error {
+            message: "down".into(),
+        });
+        let res = send_get(
+            test_app_with(gw.addr()),
+            "/api/playlists/match?q=warm",
+            None,
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn blank_text_params_count_as_absent() {
+        for blank in ["", " ", "  \t"] {
+            let q = track_query_from(&SearchParams {
+                q: Some(blank.into()),
+                artist: Some(blank.into()),
+                bpm: Some(blank.into()),
+                ..Default::default()
+            })
+            .unwrap();
+            assert!(q.is_empty(), "{blank:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn tracks_match_with_blank_q_is_400() {
+        let gw = FakeGateway::start(|_| playback_ok(None));
+        let res = send_get(test_app_with(gw.addr()), "/api/tracks/match?q=%20", None).await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert!(gw.requests().is_empty());
     }
 
     #[tokio::test]

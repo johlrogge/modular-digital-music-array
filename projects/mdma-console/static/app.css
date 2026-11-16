@@ -95,8 +95,6 @@ main{padding:0 var(--gutter) calc(var(--tabbar-h) + var(--bar-h) + 40px + env(sa
 
 /* ================= ART (placeholder + cover) ================= */
 .art{position:relative;aspect-ratio:1;border-radius:var(--r-sm);overflow:hidden;flex:none;display:flex;align-items:flex-end;padding:8%;color:var(--art-ink);font-weight:800;letter-spacing:-.04em;line-height:.9;background:var(--surface-2);user-select:none;box-shadow:inset 0 0 0 1px var(--art-line)}
-.art::before{content:attr(data-cat);position:absolute;top:8%;left:8%;right:8%;display:flex;justify-content:space-between;font:500 var(--fs-xs)/1 var(--font-mono);letter-spacing:.08em;opacity:.75}
-.art.sm::before,.track .art::before,.trow .art::before,.qrow .art::before,.npbar .art::before,.quick .art::before,.rail .art::before,.art.round::before{display:none}
 .art.round{border-radius:50%;align-items:center;justify-content:center;padding:0}
 .art img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
 
@@ -406,6 +404,13 @@ details.more summary{cursor:pointer;min-height:44px;display:flex;align-items:cen
 /* ================= BULK BAR (narrowed lists can be queued as a set) ================= */
 .bulk{display:flex;align-items:center;justify-content:space-between;gap:var(--s-2);flex-wrap:wrap;padding:var(--s-2) var(--s-3);margin:var(--s-2) 0 var(--s-3);border-radius:var(--r-sm);background:var(--surface);box-shadow:inset 0 0 0 1px var(--line)}
 .bulk .kicker{color:var(--text-2)}
+
+/* ================= FILTERED INDICATOR (Up next narrowed by search or filters) ================= */
+.qfilter{display:flex;align-items:center;justify-content:space-between;gap:var(--s-2);flex-wrap:wrap;padding:var(--s-2) var(--s-3);margin:var(--s-2) 0 var(--s-3);border-radius:var(--r-sm);background:var(--surface-2);box-shadow:inset 3px 0 0 var(--accent-strong)}
+.qfilter .msg{font-family:var(--font-mono);font-size:var(--fs-xs);letter-spacing:.06em;text-transform:uppercase;color:var(--text)}
+.qfilter .sub{display:block;margin-top:2px;color:var(--text-3)}
+.qfilter .btn{min-height:36px}
+.filtered .qrow .handle{opacity:.25;cursor:not-allowed}
 
 /* ================= COLLECTION HEADER (album / playlist / artist) ================= */
 .coll{display:grid;grid-template-columns:minmax(120px,200px) 1fr;gap:var(--s-5);align-items:end;margin:var(--s-2) 0 var(--s-3)}

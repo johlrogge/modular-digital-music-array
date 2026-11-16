@@ -9,7 +9,7 @@ use crate::ipc::{
     FactType, IpcServer, LibraryRequest, LibraryResponse, Mark, MarkFilter, MarkWrite, OrphanInfo,
     OrphanReason, PlaylistName, ProtocolError, ServiceStatus, TrackInfo, TrackQuery, Unmark,
 };
-use library_search::{matches_query, TrackFields};
+use library_search::{TrackFields, TrackMatcher};
 use music_facts::{FactSource, MusicValue};
 use music_primitives::{EnergyLevel, TrackRole};
 use std::collections::{HashMap, HashSet};
@@ -764,7 +764,8 @@ impl LibraryService {
 
     /// Search tracks against a `TrackQuery` (hidden tracks excluded).
     fn search_tracks(&self, query: &TrackQuery) -> Vec<TrackInfo> {
-        self.tracks_where(|t| matches_query(query, &t.as_fields()), None)
+        let matcher = TrackMatcher::new(query);
+        self.tracks_where(|t| matcher.matches(&t.as_fields()), None)
     }
 }
 

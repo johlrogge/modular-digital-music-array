@@ -64,7 +64,8 @@ impl TrackQuery {
 ///
 /// Detection rules in `parse_string_query`:
 /// 1. Starts and ends with `/` → `Regex` (slashes stripped)
-/// 2. No spaces AND 2+ uppercase letters AND not all-caps → `Initialism`
+/// 2. No spaces AND 2+ uppercase letters → `Initialism`
+///    (CamelCase like "CarbBased" and all-caps like "CBL" alike)
 /// 3. Otherwise → `Contains`
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum StringQuery {

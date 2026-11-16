@@ -7,7 +7,7 @@
 // Player shape: GET /api/player is { state: "idle"|"playing"|"paused"|"loading", now: hash|null, queue: [hash] }.
 //
 // Anything that decides what is heard (idle guard, filter semantics, queue CAS) is enforced in
-// Rust; this file only narrows, sorts, pages and groups.
+// Rust (text search included: the browser never matches text); this file only sorts, pages and groups.
 
 const collator = new Intl.Collator(undefined, { sensitivity: "base", numeric: true });
 
@@ -15,8 +15,6 @@ const collator = new Intl.Collator(undefined, { sensitivity: "base", numeric: tr
 export function collate(a, b) {
   return collator.compare(String(a ?? ""), String(b ?? ""));
 }
-
-const lc = (s) => String(s ?? "").toLowerCase();
 
 /** 32-bit FNV-1a of a string, as an unsigned integer. */
 export function fnv(str) {
@@ -42,19 +40,6 @@ export function trackTitle(t) {
 /** True when nothing is loaded. The server's `state` is the only source of truth: paused and loading are busy. */
 export function isIdle(player) {
   return !player || player.state === "idle";
-}
-
-/** Case-insensitive substring match of a query against title, artist and album (null fields never match "null"). */
-export function textMatch(track, query) {
-  const q = lc(query).trim();
-  if (!q) return true;
-  return [track.title, track.artist, track.album].map(lc).join(" ").includes(q);
-}
-
-/** Narrow tracks by text. An empty query returns the input unchanged. */
-export function narrow(tracks, query) {
-  const q = String(query ?? "").trim();
-  return q ? tracks.filter((t) => textMatch(t, q)) : tracks;
 }
 
 // Each key function yields a string (collated) or a number (subtracted).

@@ -20,7 +20,7 @@ use library_projection::{
 };
 #[cfg(test)]
 use library_projection::{apply_fact_to_track, blob_path_for, IndexedCue};
-use library_search::{matches_query, TrackFields};
+use library_search::{TrackFields, TrackMatcher};
 #[cfg(test)]
 use music_facts::MarkFilter;
 use music_facts::MusicValue;
@@ -2335,6 +2335,7 @@ impl LibraryService {
         if query.started.is_some() || query.stopped.is_some() {
             self.refresh_event_timestamps();
         }
+        let matcher = TrackMatcher::new(query);
         let tracks = self.tracks.lock().unwrap();
 
         tracks
@@ -2359,7 +2360,7 @@ impl LibraryService {
                     role: t.role,
                     energy: t.energy.map(u8::from),
                 };
-                matches_query(query, &fields)
+                matcher.matches(&fields)
             })
             .map(|t| self.to_track_info(t))
             .collect()

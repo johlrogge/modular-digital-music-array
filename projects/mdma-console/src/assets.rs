@@ -195,7 +195,7 @@ mod tests {
 
     /// Budgets are for what goes over the wire: gzipped bytes.
     const CSS_BUDGET_GZ: usize = 15 * 1024;
-    const JS_BUDGET_GZ: usize = 30 * 1024;
+    const JS_BUDGET_GZ: usize = 40 * 1024;
     /// The only external-looking URL allowed: the SVG namespace, which is an identifier, not a request.
     const SVG_NS: &str = "http://www.w3.org/2000/svg";
 

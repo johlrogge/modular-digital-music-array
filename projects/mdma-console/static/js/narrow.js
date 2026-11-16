@@ -1,7 +1,7 @@
 // The one narrowing bar: text field (scoped by view key in store.nb), Sort button, Filters button
 // with a count badge, and removable chips for the active filters. It also owns the filters sheet
-// (#fsheet in app.html) and sorting. BPM / key / added matching is never done here: the server
-// answers GET /api/tracks/match and views intersect that set with their text narrowing.
+// (#fsheet in app.html) and sorting. Nothing is matched here or anywhere in the browser: text,
+// BPM, key and added all go to the server (GET /api/tracks/match, GET /api/playlists/match).
 //
 // store.nb, store.f and store.sort persist in sessionStorage. Changing filters or sort emits
 // "filters" (views re-render on it); typing only calls the bar's onChange.
@@ -61,9 +61,11 @@ export function isNarrowed(key) {
   return !!(store.nb[key] || "").trim() || filterCount() > 0;
 }
 
-/** Query string for GET /api/tracks/match, or "" when no filter is on. */
-export function matchQuery(f = store.f) {
+/** Query string for GET /api/tracks/match: the search text as `q` plus the filters; "" when neither is on. */
+export function matchQuery(f = store.f, text = "") {
   const p = new URLSearchParams();
+  const q = String(text || "").trim();
+  if (q) p.set("q", q);
   if (f.bmin || f.bmax) p.set("bpm", (f.bmin || "0") + ".." + (f.bmax || "999"));
   if (f.key) {
     const [note, mode] = f.key.split(" ");
@@ -76,25 +78,68 @@ export function matchQuery(f = store.f) {
   return p.toString();
 }
 
-let cached = { qs: null, promise: null };
-on("tracks", () => (cached = { qs: null, promise: null })); // the catalogue changed: ask again
+// The one lookup path for server-side matching: tracks and playlists both go through lookup().
+// Answers are cached by the full request string (about 32, oldest evicted) so backspacing is
+// instant; in-flight requests are cached too, so identical asks share one request.
+const CACHE_MAX = 32;
+const cache = new Map(); // "path?qs" -> Promise<Set>
+on("tracks", () => cache.clear()); // the catalogue changed: ask again
+on("playlists", () => {
+  // Only playlist-name answers are stale; track answers stay.
+  for (const url of [...cache.keys()]) if (url.startsWith("/api/playlists/match")) cache.delete(url);
+});
+
+function lookup(path, qs) {
+  const url = path + "?" + qs;
+  const hit = cache.get(url);
+  if (hit) {
+    cache.delete(url); // LRU: re-insert as the newest
+    cache.set(url, hit);
+    return hit;
+  }
+  const promise = api(url).then((list) => new Set(list));
+  cache.set(url, promise);
+  if (cache.size > CACHE_MAX) cache.delete(cache.keys().next().value);
+  promise.catch(() => {
+    if (cache.get(url) === promise) cache.delete(url); // never keep a failure
+  });
+  return promise;
+}
 
 /**
- * Hashes matching the active filters, as a Set; null when no filter is on (everything matches).
+ * Hashes of the tracks matching the search text and the active filters, as a Set; null when
+ * neither is on (everything matches). The server does all matching, the text included.
  * Rejects if the server could not answer; callers must not show unfiltered results then.
- * One request per distinct filter state, not per keystroke.
  */
-export function matchSet(f = store.f) {
-  const qs = matchQuery(f);
-  if (!qs) return Promise.resolve(null);
-  if (cached.qs !== qs) {
-    const promise = api("/api/tracks/match?" + qs).then((list) => new Set(list));
-    cached = { qs, promise };
-    promise.catch(() => {
-      if (cached.promise === promise) cached = { qs: null, promise: null };
-    });
-  }
-  return cached.promise;
+export function matchSet(text = "", f = store.f) {
+  const qs = matchQuery(f, text);
+  return qs ? lookup("/api/tracks/match", qs) : Promise.resolve(null);
+}
+
+/** Names of the playlists the server matches by name for `text`, as a Set; null for empty text. */
+export function matchPlaylists(text = "") {
+  const q = String(text || "").trim();
+  return q ? lookup("/api/playlists/match", new URLSearchParams({ q }).toString()) : Promise.resolve(null);
+}
+
+/**
+ * Stale-reply guard. `const next = latest()`; each `const fresh = next()` starts a new round and
+ * makes every earlier `fresh()` return false, so a slower earlier reply can be dropped.
+ */
+export function latest() {
+  let n = 0;
+  return () => {
+    const mine = ++n;
+    return () => mine === n;
+  };
+}
+
+/** Reset the search text of view `key` and every filter. Emits "filters" so views rebuild. */
+export function clearNarrowing(key) {
+  store.nb[key] = "";
+  store.f = { bmin: "", bmax: "", key: "", compat: false, added: "any" };
+  persist();
+  emit("filters");
 }
 
 /* ============================================================ sort */
@@ -250,7 +295,7 @@ function clearFilter(clear) {
  * The narrowing bar for a view.
  * o.key: view key in store.nb. o.placeholder. o.onChange: called (debounced) when the text changes.
  * o.sort: true to show the Sort button (opens a menu; changing it emits "filters").
- * o.hint: small line under the chips. Returns an element with focusInput().
+ * o.hint: small line under the chips. Returns an element with focusInput() and dispose().
  */
 export function narrowBar(o) {
   const input = h("input", {
@@ -314,5 +359,6 @@ export function narrowBar(o) {
   const bar = h("div", { class: "nb" }, [row, chips]);
   if (o.hint) bar.appendChild(h("div", { class: "hint", text: o.hint }));
   bar.focusInput = () => input.focus();
+  bar.dispose = () => clearTimeout(timer); // call from the view's cleanup: no stray search after leaving
   return bar;
 }

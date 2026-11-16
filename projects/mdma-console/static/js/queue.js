@@ -8,6 +8,9 @@ import { moveToNext, removeAt, reorder, isIdle, trackTitle } from "./logic.js";
 import { art } from "./art.js";
 import { $, $$, actions, confirmDlg, enc, fmt, h, icon, on, onView, openMenu, plural, route, store } from "./core.js";
 import { swipe } from "./lists.js";
+import { narrowBar, matchSet, latest, clearNarrowing } from "./narrow.js";
+
+const KEY = "queue"; // the Up next view's key in store.nb
 
 /* ------------------------------------------------------------ rows */
 
@@ -83,11 +86,22 @@ function queueRow(snap, i, draggable) {
   return row;
 }
 
+/** The bar that says Up next is filtered, how much is shown, why reordering is off, and clears it. */
+function filterBar(shown, total, failed, onClear) {
+  return h("div", { class: "qfilter", role: "status" }, [
+    h("div", { class: "msg" }, [
+      "Showing " + shown + " of " + total + " · filtered",
+      h("span", { class: "sub", text: failed ? "Search failed, nothing shown" : "Reordering is off while filtered" }),
+    ]),
+    h("button", { class: "btn ghost", onclick: onClear }, ["Show all"]),
+  ]);
+}
+
 /**
  * Render the Up next rows into `box`. opts.showNow: include the Now playing row.
- * TODO(P2, narrow.js): the narrowing bar filters by title/artist/album; compute `visible` (indices
- * into `snap`) from it here and pass draggable=false while a filter is active. Until then every
- * index is visible and reordering is always on.
+ * opts.narrow (the Up next view only): { set, failed, onClear }. `set` is the server's Set of
+ * matching hashes (null: no search or filter on); a row is visible when its hash is in it. While
+ * narrowed (or failed) the filtered bar shows and drag-reordering is off. The side panels never narrow.
  */
 function renderRows(box, opts = {}) {
   const p = store.player;
@@ -110,8 +124,15 @@ function renderRows(box, opts = {}) {
     box.appendChild(h("div", { class: "empty", html: "<b>Nothing queued</b>Open any track and choose Queue next or Queue last." }));
     return;
   }
-  const visible = snap.map((_, i) => i); // TODO(P2, narrow.js): filter here
-  for (const i of visible) box.appendChild(queueRow(snap, i, true));
+  const nw = opts.narrow;
+  const filtered = !!nw && !!nw.set;
+  box.classList.toggle("filtered", filtered);
+  const visible = [];
+  snap.forEach((hash, i) => {
+    if (!filtered || nw.set.has(hash)) visible.push(i);
+  });
+  if (filtered) box.appendChild(filterBar(visible.length, snap.length, nw.failed, nw.onClear));
+  for (const i of visible) box.appendChild(queueRow(snap, i, !filtered));
 }
 
 /* ------------------------------------------------------------ clear + badges */
@@ -159,14 +180,43 @@ route(
   (root) => {
     const clear = h("button", { class: "btn ghost", onclick: clearQueue }, [icon("trash", "sm"), "Clear"]);
     root.appendChild(h("div", { class: "topbar" }, [h("h1", { text: "Up next" }), clear]));
-    // TODO(P2, narrow.js): mount the narrowing bar for the "queue" view key here.
+    const barHolder = h("div");
     const box = h("div", { class: "qview" });
+    root.appendChild(barHolder);
     root.appendChild(box);
-    const build = () => renderRows(box, { showNow: true });
-    build();
-    onView("queue", build);
-    onView("player", build);
-    onView("tracks", build);
+    let alive = true;
+    let bar = null;
+    const next = latest(); // a slower earlier search reply must not overwrite a newer one
+    const onClear = () => clearNarrowing(KEY);
+
+    async function build(rebuildBar) {
+      const fresh = next();
+      if (rebuildBar || !bar) {
+        if (bar) bar.dispose();
+        barHolder.innerHTML = "";
+        bar = narrowBar({ key: KEY, placeholder: "Filter Up next", onChange: () => build(false) });
+        barHolder.appendChild(bar);
+      }
+      let narrow = { set: null, failed: false, onClear };
+      try {
+        narrow.set = await matchSet(store.nb[KEY] || "");
+      } catch (e) {
+        narrow = { set: new Set(), failed: true, onClear }; // never show an unfiltered list on failure
+      }
+      if (!alive || !fresh()) return;
+      renderRows(box, { showNow: true, narrow });
+    }
+    build(true);
+    // Queue, player and catalogue changes keep the bar (and its typing) as it is.
+    onView("queue", () => build(false));
+    onView("player", () => build(false));
+    onView("tracks", () => build(false));
+    // Filters changed (or Clear): new query, rebuild the bar too (badge, chips, text).
+    onView("filters", () => build(true));
+    return () => {
+      alive = false;
+      if (bar) bar.dispose();
+    };
   },
   { nav: "queue" },
 );

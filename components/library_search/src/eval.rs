@@ -33,143 +33,190 @@ pub struct TrackFields<'a> {
 }
 
 /// Evaluate a `TrackQuery` against a set of track fields, respecting `query.not`.
+///
+/// Compiles the query on every call; to test many tracks build a [`TrackMatcher`] once.
 pub fn matches_query(query: &TrackQuery, track: &TrackFields) -> bool {
-    let matched = matches_query_inner(query, track);
-    if query.not {
-        !matched
-    } else {
-        matched
+    TrackMatcher::new(query).matches(track)
+}
+
+/// A `StringQuery` compiled once: the one implementation of the text rules, for a single
+/// string (a playlist name) or, through [`TrackMatcher`], for track fields.
+///
+/// A regex that does not compile matches nothing.
+#[derive(Debug, Clone)]
+pub struct StringMatcher(Compiled);
+
+#[derive(Debug, Clone)]
+enum Compiled {
+    /// Lower-cased words; all must occur in the string.
+    Contains(Vec<String>),
+    /// Initialism or regex; `None` when the pattern is invalid.
+    Pattern(Option<Regex>),
+}
+
+impl StringMatcher {
+    pub fn new(query: &StringQuery) -> Self {
+        Self(match query {
+            StringQuery::Contains(q) => {
+                Compiled::Contains(q.split_whitespace().map(str::to_lowercase).collect())
+            }
+            StringQuery::Initialism(q) => {
+                Compiled::Pattern(Regex::new(&build_initialism_regex(q)).ok())
+            }
+            StringQuery::Regex(pattern) => Compiled::Pattern(Regex::new(pattern).ok()),
+        })
+    }
+
+    pub fn matches(&self, field: &str) -> bool {
+        match &self.0 {
+            Compiled::Contains(words) => {
+                let lower = field.to_lowercase();
+                words.iter().all(|w| lower.contains(w.as_str()))
+            }
+            Compiled::Pattern(re) => re.as_ref().is_some_and(|re| re.is_match(field)),
+        }
+    }
+}
+
+/// A `TrackQuery` compiled once: build it per query, not per track.
+#[derive(Debug, Clone)]
+pub struct TrackMatcher {
+    query: TrackQuery,
+    any_text: Option<StringMatcher>,
+    artist: Option<StringMatcher>,
+    title: Option<StringMatcher>,
+    album: Option<StringMatcher>,
+    label: Option<StringMatcher>,
+    genre: Option<StringMatcher>,
+    style: Option<StringMatcher>,
+}
+
+impl TrackMatcher {
+    pub fn new(query: &TrackQuery) -> Self {
+        let compile = |q: &Option<StringQuery>| q.as_ref().map(StringMatcher::new);
+        Self {
+            any_text: compile(&query.any_text),
+            artist: compile(&query.artist),
+            title: compile(&query.title),
+            album: compile(&query.album),
+            label: compile(&query.label),
+            genre: compile(&query.genre),
+            style: compile(&query.style),
+            query: query.clone(),
+        }
+    }
+
+    /// Evaluate against a track's fields, respecting `query.not`.
+    pub fn matches(&self, track: &TrackFields) -> bool {
+        let matched = self.matches_inner(track);
+        if self.query.not {
+            !matched
+        } else {
+            matched
+        }
+    }
+
+    /// Returns `true` only if ALL non-None query fields match.
+    /// `any_text` uses OR semantics across title/artist/album/label/genre.
+    fn matches_inner(&self, track: &TrackFields) -> bool {
+        let query = &self.query;
+        if let Some(m) = &self.any_text {
+            let text_fields = [
+                track.title,
+                track.artist,
+                track.album,
+                track.label,
+                track.genre,
+            ];
+            if !text_fields.iter().any(|f| f.is_some_and(|s| m.matches(s))) {
+                return false;
+            }
+        }
+
+        if !check_text(self.artist.as_ref(), track.artist)
+            || !check_text(self.title.as_ref(), track.title)
+            || !check_text(self.album.as_ref(), track.album)
+            || !check_text(self.label.as_ref(), track.label)
+            || !check_text(self.genre.as_ref(), track.genre)
+        {
+            return false;
+        }
+
+        if let Some(m) = &self.style {
+            if !track.styles.iter().any(|s| m.matches(s.as_str())) {
+                return false;
+            }
+        }
+
+        if let Some(nq) = &query.bpm {
+            if !track.bpm.is_some_and(|b| matches_numeric(nq, b)) {
+                return false;
+            }
+        }
+
+        if let Some(nq) = &query.year {
+            if !track.year.is_some_and(|y| matches_numeric(nq, y as f32)) {
+                return false;
+            }
+        }
+
+        if let Some(dq) = &query.duration {
+            if !track.duration.is_some_and(|d| matches_duration(dq, d)) {
+                return false;
+            }
+        }
+
+        if let Some(kq) = &query.key {
+            if !track.key.is_some_and(|k| matches_key(kq, k)) {
+                return false;
+            }
+        }
+
+        if let Some(src) = &query.source {
+            if !track.source.is_some_and(|s| s.eq_ignore_ascii_case(src)) {
+                return false;
+            }
+        }
+
+        if let Some(q) = &query.started {
+            if !matches_date(q, track.last_started) {
+                return false;
+            }
+        }
+
+        if let Some(q) = &query.stopped {
+            if !matches_date(q, track.last_stopped) {
+                return false;
+            }
+        }
+
+        if let Some(q) = &query.added {
+            if !matches_date(q, track.added) {
+                return false;
+            }
+        }
+
+        if let Some(role) = query.role {
+            if !track.role.is_some_and(|r| r == role) {
+                return false;
+            }
+        }
+
+        if let Some(nq) = &query.energy {
+            if !track.energy.is_some_and(|e| matches_numeric(nq, e as f32)) {
+                return false;
+            }
+        }
+
+        true
     }
 }
 
 /// Returns true if there is no string query constraint, or if the track field matches.
-fn check_text(query_field: Option<&StringQuery>, track_field: Option<&str>) -> bool {
-    match query_field {
+fn check_text(matcher: Option<&StringMatcher>, track_field: Option<&str>) -> bool {
+    match matcher {
         None => true,
-        Some(sq) => track_field.is_some_and(|s| matches_string(sq, s)),
-    }
-}
-
-/// Returns `true` only if ALL non-None query fields match.
-/// `any_text` uses OR semantics across title/artist/album/label/genre.
-fn matches_query_inner(query: &TrackQuery, track: &TrackFields) -> bool {
-    if let Some(sq) = &query.any_text {
-        let text_fields = [
-            track.title,
-            track.artist,
-            track.album,
-            track.label,
-            track.genre,
-        ];
-        if !text_fields
-            .iter()
-            .any(|f| f.is_some_and(|s| matches_string(sq, s)))
-        {
-            return false;
-        }
-    }
-
-    if !check_text(query.artist.as_ref(), track.artist) {
-        return false;
-    }
-    if !check_text(query.title.as_ref(), track.title) {
-        return false;
-    }
-    if !check_text(query.album.as_ref(), track.album) {
-        return false;
-    }
-    if !check_text(query.label.as_ref(), track.label) {
-        return false;
-    }
-    if !check_text(query.genre.as_ref(), track.genre) {
-        return false;
-    }
-
-    if let Some(sq) = &query.style {
-        if !track.styles.iter().any(|s| matches_string(sq, s.as_str())) {
-            return false;
-        }
-    }
-
-    if let Some(nq) = &query.bpm {
-        if !track.bpm.is_some_and(|b| matches_numeric(nq, b)) {
-            return false;
-        }
-    }
-
-    if let Some(nq) = &query.year {
-        if !track.year.is_some_and(|y| matches_numeric(nq, y as f32)) {
-            return false;
-        }
-    }
-
-    if let Some(dq) = &query.duration {
-        if !track.duration.is_some_and(|d| matches_duration(dq, d)) {
-            return false;
-        }
-    }
-
-    if let Some(kq) = &query.key {
-        if !track.key.is_some_and(|k| matches_key(kq, k)) {
-            return false;
-        }
-    }
-
-    if let Some(src) = &query.source {
-        if !track.source.is_some_and(|s| s.eq_ignore_ascii_case(src)) {
-            return false;
-        }
-    }
-
-    if let Some(q) = &query.started {
-        if !matches_date(q, track.last_started) {
-            return false;
-        }
-    }
-
-    if let Some(q) = &query.stopped {
-        if !matches_date(q, track.last_stopped) {
-            return false;
-        }
-    }
-
-    if let Some(q) = &query.added {
-        if !matches_date(q, track.added) {
-            return false;
-        }
-    }
-
-    if let Some(role) = query.role {
-        if !track.role.is_some_and(|r| r == role) {
-            return false;
-        }
-    }
-
-    if let Some(nq) = &query.energy {
-        if !track.energy.is_some_and(|e| matches_numeric(nq, e as f32)) {
-            return false;
-        }
-    }
-
-    true
-}
-
-fn matches_string(query: &StringQuery, field: &str) -> bool {
-    match query {
-        StringQuery::Contains(q) => {
-            let field_lower = field.to_lowercase();
-            q.split_whitespace()
-                .all(|word| field_lower.contains(&word.to_lowercase()))
-        }
-        StringQuery::Initialism(q) => {
-            let pattern = build_initialism_regex(q);
-            Regex::new(&pattern)
-                .map(|re| re.is_match(field))
-                .unwrap_or(false)
-        }
-        StringQuery::Regex(pattern) => Regex::new(pattern)
-            .map(|re| re.is_match(field))
-            .unwrap_or(false),
+        Some(m) => track_field.is_some_and(|s| m.matches(s)),
     }
 }
 
@@ -342,6 +389,94 @@ mod tests {
         }
     }
 
+    fn sm(q: &str) -> StringMatcher {
+        StringMatcher::new(&crate::parse::parse_string_query(q))
+    }
+
+    #[test]
+    fn upper_case_initialism_parses_and_matches_the_artist() {
+        let q = crate::parse::parse_string_query("CBL");
+        assert!(matches!(q, StringQuery::Initialism(_)));
+        let query = TrackQuery {
+            any_text: Some(q),
+            ..Default::default()
+        };
+        let mut fields = empty_fields();
+        fields.artist = Some("Carbon Based Lifeforms");
+        assert!(TrackMatcher::new(&query).matches(&fields));
+        fields.artist = Some("Rymden");
+        assert!(!TrackMatcher::new(&query).matches(&fields));
+    }
+
+    #[test]
+    fn lower_case_cbl_is_contains_and_does_not_match() {
+        let q = crate::parse::parse_string_query("cbl");
+        assert!(matches!(q, StringQuery::Contains(_)));
+        let query = TrackQuery {
+            any_text: Some(q),
+            ..Default::default()
+        };
+        let mut fields = empty_fields();
+        fields.artist = Some("Carbon Based Lifeforms");
+        assert!(!TrackMatcher::new(&query).matches(&fields));
+    }
+
+    #[test]
+    fn regex_matches_through_the_compiled_matcher() {
+        let q = crate::parse::parse_string_query("/^(?i)carbon/");
+        assert!(matches!(q, StringQuery::Regex(_)));
+        let query = TrackQuery {
+            title: Some(q),
+            ..Default::default()
+        };
+        let matcher = TrackMatcher::new(&query);
+        let mut fields = empty_fields();
+        fields.title = Some("Carbon Based Lifeforms");
+        assert!(matcher.matches(&fields));
+        fields.title = Some("Rymden carbon");
+        assert!(!matcher.matches(&fields));
+    }
+
+    #[test]
+    fn invalid_regex_matches_nothing() {
+        assert!(!sm("/(/").matches("anything"));
+    }
+
+    #[rstest]
+    #[case("CBL", "Carbon Based Lifeforms", true)]
+    #[case("CBL", "Rymden", false)]
+    #[case("cbl", "Carbon Based Lifeforms", false)]
+    #[case("carbon based", "Carbon Based Lifeforms", true)]
+    #[case("carbon rymden", "Carbon Based Lifeforms", false)]
+    #[case("/^carbon/", "Carbon Based Lifeforms", false)]
+    #[case("/^(?i)carbon/", "Carbon Based Lifeforms", true)]
+    fn string_matcher_rules(#[case] q: &str, #[case] text: &str, #[case] expected: bool) {
+        assert_eq!(sm(q).matches(text), expected, "{q} vs {text}");
+    }
+
+    #[rstest]
+    #[case("Carbon Based", "carbon based lifeforms", true)]
+    #[case("CARBON", "carbon based lifeforms", true)]
+    #[case("Carbon Rymden", "carbon based lifeforms", false)]
+    fn contains_ignores_case_of_query_words(
+        #[case] q: &str,
+        #[case] text: &str,
+        #[case] expected: bool,
+    ) {
+        let sq = StringQuery::Contains(q.to_string());
+        assert_eq!(
+            StringMatcher::new(&sq).matches(text),
+            expected,
+            "{q} vs {text}"
+        );
+    }
+
+    #[test]
+    fn string_matcher_cbl_matches_playlist_name() {
+        assert!(sm("CBL").matches("Carbon Based Lifeforms"));
+        assert!(!sm("cbl").matches("Carbon Based Lifeforms"));
+    }
+
     #[test]
     fn empty_query_matches_everything() {
         assert!(matches_query(&TrackQuery::default(), &empty_fields()));
@@ -374,7 +509,7 @@ mod tests {
     #[case("Carbon Only", false)]
     fn contains_all_words_required(#[case] field: &str, #[case] expected: bool) {
         let sq = StringQuery::Contains("carbon lifeforms".to_string());
-        assert_eq!(matches_string(&sq, field), expected);
+        assert_eq!(StringMatcher::new(&sq).matches(field), expected);
     }
 
     #[rstest]
@@ -383,7 +518,7 @@ mod tests {
     #[case("Rymden Vild och Vacker", false)]
     fn initialism_match(#[case] field: &str, #[case] expected: bool) {
         let sq = StringQuery::Initialism("CarbBased".to_string());
-        assert_eq!(matches_string(&sq, field), expected);
+        assert_eq!(StringMatcher::new(&sq).matches(field), expected);
     }
 
     #[rstest]
@@ -391,7 +526,7 @@ mod tests {
     #[case("Rymden", false)]
     fn regex_match(#[case] field: &str, #[case] expected: bool) {
         let sq = StringQuery::Regex("^Carbon.*".to_string());
-        assert_eq!(matches_string(&sq, field), expected);
+        assert_eq!(StringMatcher::new(&sq).matches(field), expected);
     }
 
     #[test]
@@ -423,22 +558,34 @@ mod tests {
     }
 
     #[rstest]
-    #[case(Some("Rymden"), None, true)]
-    #[case(None, Some("Rymden - Something"), true)]
-    #[case(None, Some("Carbon Based Lifeforms"), false)]
+    #[case("artist", "Rymden", true)]
+    #[case("title", "Rymden - Something", true)]
+    #[case("album", "Rymden Live", true)]
+    #[case("label", "Rymden Records", true)]
+    #[case("genre", "Rymden Jazz", true)]
+    #[case("style", "Rymden", false)]
+    #[case("title", "Carbon Based Lifeforms", false)]
     fn any_text_or_semantics(
-        #[case] artist: Option<&'static str>,
-        #[case] title: Option<&'static str>,
+        #[case] field: &str,
+        #[case] value: &'static str,
         #[case] expected: bool,
     ) {
         let query = TrackQuery {
             any_text: Some(StringQuery::Contains("rymden".to_string())),
             ..Default::default()
         };
+        let styles = vec![value.to_string()];
         let mut fields = empty_fields();
-        fields.artist = artist;
-        fields.title = title;
-        assert_eq!(matches_query(&query, &fields), expected);
+        match field {
+            "artist" => fields.artist = Some(value),
+            "title" => fields.title = Some(value),
+            "album" => fields.album = Some(value),
+            "label" => fields.label = Some(value),
+            "genre" => fields.genre = Some(value),
+            "style" => fields.styles = &styles,
+            other => panic!("unknown field {other}"),
+        }
+        assert_eq!(matches_query(&query, &fields), expected, "{field}: {value}");
     }
 
     #[test]
