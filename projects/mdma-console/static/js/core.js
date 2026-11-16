@@ -28,7 +28,7 @@
 export const store = {
   tracks: new Map(), // hash -> Track (see logic.js for the shape)
   order: [], // hashes, catalogue order
-  playlists: [], // [{ name, hashes }]
+  playlists: [], // [{ name, hashes: [full hash, file order, duplicates kept], unavailable: count of lines without a track }]
   player: { state: "idle", now: null, queue: [], offline: false, position: null, output: null }, // state: idle|playing|paused|loading; output: absent|starting|running|stalled|null (unknown)
   nb: {}, // per-view narrowing text, keyed by view key
   f: {}, // per-view filters keyed by view key (like nb); absent means none. Read with narrow.js filtersOf(key). Sticky for the session
@@ -332,7 +332,7 @@ export async function loadCatalogue() {
   }
 }
 
-/** Fetch playlists ([{ name, hashes }]) into store.playlists. Fires "playlists". */
+/** Fetch playlists ([{ name, hashes, unavailable }]) into store.playlists. Fires "playlists". */
 export async function loadPlaylists() {
   try {
     store.playlists = await api("/api/playlists");

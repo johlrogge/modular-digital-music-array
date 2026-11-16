@@ -115,8 +115,7 @@ export function groupAlbums(tracks) {
   const out = [...map.values()];
   for (const a of out) {
     a.tracks.sort(albumOrder);
-    const first = a.tracks.find((t) => t.has_cover);
-    a.cover = first ? first.hash : null;
+    a.cover = coverOf(a.tracks);
     a.artist = a.tracks[0].artist;
   }
   return out.sort((a, b) => collate(a.name, b.name));
@@ -142,7 +141,7 @@ export function groupArtists(tracks) {
 
 /**
  * The playlists to show for one narrowing state. Set algebra on the server's answers; no text is
- * matched here. `playlists` is [{ name, hashes }]. `narrowed`: text or a filter is on.
+ * matched here. `playlists` is [{ name, hashes: [full hash], unavailable }]. `narrowed`: text or a filter is on.
  * `matched`: Set of hashes of the tracks matching text and filters together. `names`: Set of
  * playlist names the server matched by name, or null without text. `filterOnly`: Set of hashes
  * passing the filters alone, or null when text or filters are missing (no filters to also pass).
@@ -161,6 +160,61 @@ export function visiblePlaylists(playlists, { narrowed, matched, names, filterOn
       (names && names.has(p.name) && (!filterOnly || p.hashes.some((x) => filterOnly.has(x)))),
   );
 }
+
+/**
+ * A track the console's catalogue does not have (yet): every ApiTrack key null, no cover. The
+ * server resolved it, so it exists and is playable; the next "tracks" event heals the row.
+ */
+export function placeholderTrack(hash) {
+  return {
+    hash,
+    title: null,
+    artist: null,
+    album: null,
+    track_number: null,
+    disc: null,
+    bpm: null,
+    key: null,
+    duration_secs: null,
+    added: null,
+    has_cover: false,
+  };
+}
+
+/** The hash of the first of `tracks` that has a cover, or null. */
+export function coverOf(tracks) {
+  const t = tracks.find((x) => x.has_cover);
+  return t ? t.hash : null;
+}
+
+/**
+ * The rows of a playlist page, one per line of GET /api/playlists/{name} in file order (duplicates
+ * kept), each tagged by `kind`. `entries` is [{ status: "Track", hash } | { status: "Unresolved",
+ * token, reason }]; `trackOf(hash)` is the catalogue lookup. A resolved line is
+ * { kind: "track", pos, ...track } (a placeholder when the catalogue lacks the hash); an
+ * unresolved one is { kind: "unresolved", pos, token, reason }. `pos` is the 1-based line number.
+ */
+export function playlistRows(entries, trackOf) {
+  const ROW = {
+    Track: (e, pos) => ({ kind: "track", pos, ...(trackOf(e.hash) || placeholderTrack(e.hash)) }),
+    Unresolved: (e, pos) => ({ kind: "unresolved", pos, token: e.token, reason: e.reason }),
+  };
+  return entries.map((e, i) => ROW[e.status](e, i + 1));
+}
+
+/**
+ * The rows that have a track, and how many were left out: { tracks, skipped }.
+ * PROVISIONAL (pending Joakim, versus ADR-026 A4's fail-the-batch): unresolved playlist lines are
+ * skipped, and the toasts say how many (skippedNote). This is the one home of that rule; every
+ * queue action takes its tracks from here.
+ */
+export function playable(rows) {
+  const tracks = rows.filter((r) => r.kind !== "unresolved");
+  return { tracks, skipped: rows.length - tracks.length };
+}
+
+/** What a toast adds to its subject when `skipped` unavailable rows were left out of a queue action. */
+export const skippedNote = (skipped) => (skipped > 0 ? " (" + skipped + " unavailable skipped)" : "");
 
 /**
  * Number of active filter groups in `f` ({ bmin, bmax, key, compat, added }, all fields present):

@@ -3,7 +3,7 @@
 // lists.js and narrow.js supply the rows, cards and the narrowing bar.
 import { h, icon, route, routeFallback, appInfo, store, onView, enc, plural } from "./core.js";
 import { art } from "./art.js";
-import { groupAlbums, groupArtists, sortTracks, collate, visiblePlaylists } from "./logic.js";
+import { groupAlbums, groupArtists, sortTracks, collate, visiblePlaylists, coverOf } from "./logic.js";
 import { pagedList, thead, bulkBar, emptyNote, albumCard, artistCard, playlistCard, playlistTracks, recentAlbums } from "./lists.js";
 import { narrowedView, matchLibrary, filterCount, setSort, LIBRARY_KEY, SEARCH_FAILED_NOTE, FILTERS_EMPTY_NOTE } from "./narrow.js";
 
@@ -59,8 +59,7 @@ function viewHome(root) {
     const playlists = store.playlists;
     const quick = h("div", { class: "quick hello", style: "margin-top:var(--s-4)" });
     for (const p of playlists.slice(0, 4)) {
-      const first = playlistTracks(p).find((t) => t.has_cover);
-      quick.appendChild(h("a", { href: "#/playlist/" + enc(p.name), style: "text-decoration:none;color:inherit" }, [art(p.name, { cover: first ? first.hash : null }), h("span", { text: p.name })]));
+      quick.appendChild(h("a", { href: "#/playlist/" + enc(p.name), style: "text-decoration:none;color:inherit" }, [art(p.name, { cover: coverOf(playlistTracks(p)) }), h("span", { text: p.name })]));
     }
     for (const a of albums.slice(0, 4)) {
       quick.appendChild(h("a", { href: "#/album/" + enc(a.name), style: "text-decoration:none;color:inherit" }, [art(a.name, { cover: a.cover }), h("span", { text: a.name })]));

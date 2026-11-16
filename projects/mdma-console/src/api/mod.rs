@@ -25,6 +25,7 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/api/tracks/match", get(library::tracks_match))
         .route("/api/library/match", get(library::library_match))
         .route("/api/playlists", get(library::playlists))
+        .route("/api/playlists/:name", get(library::playlist))
         .route("/api/player", get(player::player))
         .route("/api/pause", post(player::pause))
         .route("/api/resume", post(player::resume))
@@ -158,21 +159,51 @@ pub fn json_or_failure<T: Serialize, E: Into<Failure>>(
     }
 }
 
-/// Run `f` against a fresh gateway connection on a blocking thread, so the NNG round trips do
-/// not hold up an async worker. 503 when the gateway cannot be reached.
+/// Connect with `connect` and run `f` against the connection, on a blocking thread so the NNG
+/// round trips do not hold up an async worker. A connection that cannot be made is the reply
+/// `connect` gives.
+#[allow(clippy::result_large_err)]
+async fn blocking<C: 'static, T, F>(
+    state: &Arc<AppState>,
+    connect: fn(&AppState) -> Result<C, Reply>,
+    f: F,
+) -> Result<T, Response>
+where
+    T: Send + 'static,
+    F: FnOnce(&C) -> T + Send + 'static,
+{
+    let state = Arc::clone(state);
+    match tokio::task::spawn_blocking(move || connect(&state).map(|c| f(&c))).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(reply)) => Err(reply_response(reply)),
+        Err(e) => Err(fail(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+    }
+}
+
+/// Run `f` against a fresh gateway connection. 503 when the gateway cannot be reached.
 #[allow(clippy::result_large_err)]
 pub async fn gw<T, F>(state: &Arc<AppState>, f: F) -> Result<T, Response>
 where
     T: Send + 'static,
     F: FnOnce(&GatewayClient) -> T + Send + 'static,
 {
-    let state = Arc::clone(state);
-    match tokio::task::spawn_blocking(move || state.gateway_client().map(|client| f(&client))).await
-    {
-        Ok(Some(value)) => Ok(value),
-        Ok(None) => Err(reply_response(gateway_unavailable())),
-        Err(e) => Err(fail(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
-    }
+    blocking(
+        state,
+        |s| s.gateway_client().ok_or_else(gateway_unavailable),
+        f,
+    )
+    .await
+}
+
+/// Run `f` against the library as [`library_backend`] reaches it. 503 when the gateway cannot be
+/// reached.
+#[allow(clippy::result_large_err)]
+pub async fn lib<T, F>(state: &Arc<AppState>, f: F) -> Result<T, Response>
+where
+    T: Send + 'static,
+    F: FnOnce(&LibraryBackend) -> T + Send + 'static,
+{
+    blocking(state, library_backend, f).await
 }
 
 /// One playback command; the playback service's answer, or why there is none.

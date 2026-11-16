@@ -4,7 +4,7 @@
 // Play now is offered only when logic.isIdle(store.player) (paused counts as playing).
 import { h, icon, store, actions, enc, fmt, fmtTotal, plural, openMenu, onView } from "./core.js";
 import { art } from "./art.js";
-import { isIdle, groupAlbums, trackTitle, sortTracks } from "./logic.js";
+import { isIdle, groupAlbums, trackTitle, sortTracks, skippedNote, placeholderTrack, coverOf } from "./logic.js";
 import { narrowedView, matchSet, setSort, SEARCH_FAILED_NOTE, FILTERS_EMPTY_NOTE } from "./narrow.js";
 
 const PAGE = 60;
@@ -102,13 +102,37 @@ const dateOf = (added) => (added ? String(added).slice(0, 10) : "");
 const bpmOf = (t) => (t.bpm == null ? "" : String(Math.round(t.bpm)));
 
 /**
- * One track as <li> (put it in a ul.trows). opts (the "row" shape): lead "number" (track number)
- * or "art" (default); sub "artist" (default) or "album" under the title; extra(t, i): menu items
+ * A playlist line the library could not resolve ({ kind: "unresolved", pos, token, reason }), in
+ * its place: dimmed, the reason under the usual fallback title, and no actions. The cells match a
+ * track row's so the desktop columns line up.
+ */
+function unavailableRow(t, opts) {
+  const numbered = opts.lead === "number";
+  const title = trackTitle(t);
+  return h("li", { style: "position:relative" }, [
+    h(
+      "div",
+      { class: "trow unavailable" + (numbered ? " numbered" : ""), "aria-label": title + ", unavailable. " + t.reason },
+      [
+        h("span", { class: "no", text: numbered ? String(opts.number(t)) : "" }),
+        h("div", { style: "min-width:0" }, [h("div", { class: "t", text: title }), h("div", { class: "m", text: t.reason })]),
+        ...Array.from({ length: 5 }, () => h("span", { class: "c" })),
+        h("div", { class: "end" }),
+      ],
+    ),
+  ]);
+}
+
+/**
+ * One track as <li> (put it in a ul.trows). opts (the "row" shape): lead "number" (the text of
+ * number(t): a playlist's line number, an album's track number) or "art" (default); sub "artist"
+ * (default) or "album" under the title; extra(t, i): menu items
  * spliced in after Queue last, where `i` is the row's index (a list may hold a track twice).
  * Tap/click opens the action menu; N / L queue next / last from the keyboard; on phones swipe
  * right past ~96px queues last.
  */
 export function trackRow(t, opts = {}, index = 0) {
+  if (t.kind === "unresolved") return unavailableRow(t, opts);
   const numbered = opts.lead === "number";
   const now = store.player.now;
   const current = now === t.hash && !isIdle(store.player);
@@ -128,7 +152,7 @@ export function trackRow(t, opts = {}, index = 0) {
     },
     [
       numbered
-        ? h("span", { class: "no", text: current ? "▶" : t.track_number ? String(t.track_number) : "" })
+        ? h("span", { class: "no", text: current ? "▶" : String(opts.number(t)) })
         : art(t.album || title, { cover: t.has_cover ? t.hash : null }),
       h("div", { style: "min-width:0" }, [
         h("div", { class: "t", text: title }),
@@ -289,16 +313,19 @@ export function pagedList(container, tracks, opts = {}) {
  * The one set of buttons that act on a list of tracks: Play now ONLY while idle (a click never
  * interrupts playback), Queue next, Queue last (primary while something plays). `subject` names
  * the set in the toasts; opts.suffix is appended to the labels (e.g. " · 5").
+ * `{ tracks, skipped }` is logic.playable's answer (the one home of the skip rule); the toasts
+ * add how many were skipped.
  */
-export function queueButtons(tracks, subject, { suffix = "" } = {}) {
+export function queueButtons({ tracks, skipped }, subject, { suffix = "" } = {}) {
   const idle = isIdle(store.player);
   const hashes = hashesOf(tracks);
+  const what = subject + skippedNote(skipped);
   const row = h("div", { class: "btn-row" });
   if (idle) {
-    row.appendChild(h("button", { class: "btn primary", onclick: () => actions.playNow(hashes, subject) }, [icon("play", "fill sm"), "Play now" + suffix]));
+    row.appendChild(h("button", { class: "btn primary", onclick: () => actions.playNow(hashes, what) }, [icon("play", "fill sm"), "Play now" + suffix]));
   }
-  row.appendChild(h("button", { class: "btn" + (idle ? "" : " primary"), onclick: () => actions.queueNext(hashes, subject) }, [icon("next-up", "sm"), "Queue next" + suffix]));
-  row.appendChild(h("button", { class: "btn", onclick: () => actions.queueLast(hashes, subject) }, [icon("plus", "sm"), "Queue last" + suffix]));
+  row.appendChild(h("button", { class: "btn" + (idle ? "" : " primary"), onclick: () => actions.queueNext(hashes, what) }, [icon("next-up", "sm"), "Queue next" + suffix]));
+  row.appendChild(h("button", { class: "btn", onclick: () => actions.queueLast(hashes, what) }, [icon("plus", "sm"), "Queue last" + suffix]));
   return row;
 }
 
@@ -306,7 +333,7 @@ export function queueButtons(tracks, subject, { suffix = "" } = {}) {
 export function bulkBar(tracks) {
   if (!tracks.length) return null;
   const what = plural(tracks.length, "track");
-  return h("div", { class: "bulk" }, [h("span", { class: "kicker", text: what + " match" }), queueButtons(tracks, what)]);
+  return h("div", { class: "bulk" }, [h("span", { class: "kicker", text: what + " match" }), queueButtons({ tracks, skipped: 0 }, what)]);
 }
 
 /** A note in place of rows. link: { href, text } adds a link after the text. */
@@ -427,8 +454,9 @@ export function narrowedTracks(o) {
  * A collection card. Tapping the card follows `href` (the collection's page) and never plays.
  * The corner button is a play button only when idle; otherwise it opens the Queue next / last
  * menu. artOpts goes to art() (round, cover); tracksFn returns the collection's tracks lazily.
+ * `subject` names the collection in toasts and the menu (default: its name).
  */
-export function card(name, meta, artOpts, tracksFn, href) {
+export function card(name, meta, artOpts, tracksFn, href, subject = name) {
   const idle = isIdle(store.player);
   const fab = idle
     ? h("button", { class: "play-fab", "aria-label": "Play " + name }, [icon("play", "fill sm")])
@@ -436,8 +464,8 @@ export function card(name, meta, artOpts, tracksFn, href) {
   fab.addEventListener("click", (e) => {
     e.stopPropagation();
     e.preventDefault(); // the card is a link
-    if (idle) actions.playNow(hashesOf(tracksFn()), name);
-    else collMenu(fab, tracksFn(), name);
+    if (idle) actions.playNow(hashesOf(tracksFn()), subject);
+    else collMenu(fab, tracksFn(), subject);
   });
   return h("a", { class: "card", href, style: "text-decoration:none;color:inherit" }, [
     h("div", { class: "art-wrap" }, [art(name, artOpts || {}), fab]),
@@ -446,9 +474,14 @@ export function card(name, meta, artOpts, tracksFn, href) {
   ]);
 }
 
-/** Tracks of a playlist, joined with the catalogue (hashes the catalogue lacks are dropped). */
+/** Tracks of a playlist ({ name, hashes: [full], unavailable }), joined with the catalogue (a hash it lacks is a placeholder track). */
 export function playlistTracks(pl) {
-  return pl.hashes.map((hash) => store.tracks.get(hash)).filter(Boolean);
+  return pl.hashes.map((hash) => store.tracks.get(hash) || placeholderTrack(hash));
+}
+
+/** "N songs" and, only when there are any, "k unavailable": the one line for playlist cards and the playlist page. */
+export function songCounts(songs, unavailable) {
+  return [plural(songs, "song"), unavailable > 0 && unavailable + " unavailable"].filter(Boolean).join(" · ");
 }
 
 /** Card for an album as grouped by logic.groupAlbums. */
@@ -456,11 +489,17 @@ export function albumCard(a) {
   return card(a.name, a.artist || "", { cover: a.cover }, () => a.tracks, "#/album/" + enc(a.name));
 }
 
-/** Card for a playlist ({ name, hashes }). */
+/** Card for a playlist ({ name, hashes, unavailable }). */
 export function playlistCard(pl) {
   const tracks = playlistTracks(pl);
-  const cover = tracks.find((t) => t.has_cover);
-  return card(pl.name, plural(tracks.length, "song"), { cover: cover ? cover.hash : null }, () => playlistTracks(pl), "#/playlist/" + enc(pl.name));
+  return card(
+    pl.name,
+    songCounts(pl.hashes.length, pl.unavailable),
+    { cover: coverOf(tracks) },
+    () => playlistTracks(pl),
+    "#/playlist/" + enc(pl.name),
+    pl.name + skippedNote(pl.unavailable),
+  );
 }
 
 /** Card for an artist as grouped by logic.groupArtists. */

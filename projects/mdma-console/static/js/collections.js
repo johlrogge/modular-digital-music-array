@@ -1,21 +1,23 @@
 // Album, artist and playlist pages. A collection page is three parts: a back link, a header
 // (collectionHeader: art, title, buttons) and a track pane (lists.js narrowedTracks: the narrowing
 // bar and the rows). collectionPage() composes them; the album and artist pages are
-// configurations of it, and the playlist page will be one too. Clicks never interrupt playback:
-// the buttons come from lists.js queueButtons, where Play now exists only while idle.
+// configurations of it, and so is the playlist page (playlist.js). Clicks never interrupt playback:
+// the buttons come from lists.js queueButtons, where Play now exists only while idle. NO_MUSIC and
+// missing() are the notes shared by every page that needs the catalogue (playlist.js too).
 import { h, icon, route, store, enc, plural, fmtTotal, actions, confirmDlg, openMenu } from "./core.js";
 import { art } from "./art.js";
-import { albumOrder, groupAlbums, isIdle } from "./logic.js";
-import { queueButtons, narrowedTracks, emptyNote, albumCard } from "./lists.js";
+import { albumOrder, groupAlbums, isIdle, playable, skippedNote, coverOf } from "./logic.js";
+import { queueButtons, narrowedTracks, albumCard } from "./lists.js";
 
 const catalogue = () => store.order.map((hash) => store.tracks.get(hash)).filter(Boolean);
-const LIBRARY_LINK = { href: "#/library", text: "Back to Library" };
+export const LIBRARY_LINK = { href: "#/library", text: "Back to Library" };
 
-/** Replace Up next with the tracks: asks first, and the toast offers Undo. */
-function replaceUpNext(tracks, subject) {
+/** Replace Up next with `tracks` ({ tracks, skipped } from logic.playable): asks first, and the toast offers Undo. */
+function replaceUpNext({ tracks, skipped }, subject) {
   const hashes = tracks.map((t) => t.hash);
-  confirmDlg("Replace Up next?", "Up next will be replaced by " + subject + " (" + plural(hashes.length, "song") + "). You can undo it.", "Replace", () =>
-    actions.replaceQueue(store.player.queue.slice(), hashes, "Replaced Up next with " + subject),
+  const what = subject + skippedNote(skipped);
+  confirmDlg("Replace Up next?", "Up next will be replaced by " + what + " (" + plural(hashes.length, "song") + "). You can undo it.", "Replace", () =>
+    actions.replaceQueue(store.player.queue.slice(), hashes, "Replaced Up next with " + what),
   );
 }
 
@@ -27,14 +29,16 @@ function replaceUpNext(tracks, subject) {
  */
 export function collectionHeader(cfg, all, rows, narrowed) {
   const idle = isIdle(store.player);
-  const subject = narrowed ? plural(rows.length, "song") + " from " + cfg.name : cfg.name;
+  const set = playable(rows);
+  const { tracks } = set;
+  const subject = narrowed ? plural(tracks.length, "song") + " from " + cfg.name : cfg.name;
   let btns = h("div", { class: "btn-row" });
-  if (rows.length) {
-    btns = queueButtons(rows, subject, { suffix: narrowed ? " · " + rows.length : "" });
+  if (tracks.length) {
+    btns = queueButtons(set, subject, { suffix: narrowed ? " · " + tracks.length : "" });
     const more = h("button", { class: "icon-btn", "aria-label": "More actions", "aria-haspopup": "menu" }, [icon("more", "sm")]);
     more.addEventListener("click", (e) => {
       e.stopPropagation();
-      openMenu(more, [["queue", "Replace Up next…", () => replaceUpNext(rows, subject)]], [cfg.name, plural(rows.length, "song") + " · " + fmtTotal(rows)]);
+      openMenu(more, [["queue", "Replace Up next…", () => replaceUpNext(set, subject)]], [cfg.name, plural(tracks.length, "song") + " · " + fmtTotal(tracks)]);
     });
     btns.appendChild(more);
   }
@@ -46,7 +50,7 @@ export function collectionHeader(cfg, all, rows, narrowed) {
       h("h1", { text: cfg.name }),
       h("div", { class: "sub" }, [byline, byline ? " · " : null, cfg.stats(all)]),
       btns,
-      rows.length && !idle ? h("div", { class: "idle-note", text: "Something is playing, so these add to Up next" }) : null,
+      tracks.length && !idle ? h("div", { class: "idle-note", text: "Something is playing, so these add to Up next" }) : null,
     ]),
   ]);
 }
@@ -71,13 +75,13 @@ export function collectionPage(root, o) {
   return () => pane.dispose();
 }
 
-/** The note for a page whose name the library does not have (or whose catalogue is not loaded yet). */
-const missing = (noun, name) => () =>
-  store.order.length
-    ? [noun + " not found", "There is no " + noun.toLowerCase() + " called “" + name + "” in your library. ", LIBRARY_LINK]
-    : ["No music yet", "Your library is empty or still loading. ", LIBRARY_LINK];
+export const NO_MUSIC = ["No music yet", "Your library is empty or still loading. ", LIBRARY_LINK];
 
-const NONE = ["Nothing here matches", "Clear the text or the filters to see everything again."];
+/** The note for a page whose name the library does not have (or whose catalogue is not loaded yet). */
+export const missing = (noun, name) => () =>
+  store.order.length ? [noun + " not found", "There is no " + noun.toLowerCase() + " called “" + name + "” in your library. ", LIBRARY_LINK] : NO_MUSIC;
+
+export const NONE = ["Nothing here matches", "Clear the text or the filters to see everything again."];
 
 /* ============================================================ album */
 
@@ -96,7 +100,7 @@ function viewAlbum(root, params) {
     header: {
       label: "Album",
       name,
-      art: { round: false, cover: (all) => (all.find((t) => t.has_cover) || {}).hash || null },
+      art: { round: false, cover: coverOf },
       byline: albumByline,
       stats: (all) => plural(all.length, "song") + " · " + fmtTotal(all),
     },
@@ -106,7 +110,7 @@ function viewAlbum(root, params) {
       placeholder: "Filter this album",
       tracks: () => albumTracks(name),
       order: "natural",
-      row: { lead: "number", sub: "artist" },
+      row: { lead: "number", number: (t) => t.track_number || "", sub: "artist" },
       empty: { missing: missing("Album", name), none: NONE },
     },
   });
@@ -151,15 +155,6 @@ function viewArtist(root, params) {
   });
 }
 
-/* ============================================================ playlist (placeholder) */
-
-function comingSoon(what) {
-  return (root) => {
-    root.appendChild(h("div", { class: "topbar" }, [h("h1", { text: what })]));
-    root.appendChild(emptyNote("Coming soon", "This page is not built yet. ", LIBRARY_LINK));
-  };
-}
-
 route("album/:name", viewAlbum, { nav: "library" });
 route("artist/:name", viewArtist, { nav: "library" });
-route("playlist/:name", comingSoon("Playlist"), { nav: "library" });
+// The playlist page is playlist.js: a collectionPage too, with its own route.
