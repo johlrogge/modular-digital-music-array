@@ -2,9 +2,10 @@
 // Every click that can change what is heard goes through core's `actions`; nothing here calls a
 // playback route. A plain tap on a row or card opens a menu or a page and NEVER plays.
 // Play now is offered only when logic.isIdle(store.player) (paused counts as playing).
-import { h, icon, store, actions, enc, fmt, fmtTotal, plural, openMenu } from "./core.js";
+import { h, icon, store, actions, enc, fmt, fmtTotal, plural, openMenu, onView } from "./core.js";
 import { art } from "./art.js";
-import { isIdle, groupAlbums, trackTitle } from "./logic.js";
+import { isIdle, groupAlbums, trackTitle, sortTracks } from "./logic.js";
+import { narrowedView, matchSet, setSort, SEARCH_FAILED_NOTE, FILTERS_EMPTY_NOTE } from "./narrow.js";
 
 const PAGE = 60;
 const SWIPE_THRESHOLD = 96;
@@ -101,11 +102,14 @@ const dateOf = (added) => (added ? String(added).slice(0, 10) : "");
 const bpmOf = (t) => (t.bpm == null ? "" : String(Math.round(t.bpm)));
 
 /**
- * One track as <li> (put it in a ul.trows). opts: numbered (show track number instead of art),
- * hideArtist (show the album under the title, for artist pages). Tap/click opens the action menu;
- * N / L queue next / last from the keyboard; on phones swipe right past ~96px queues last.
+ * One track as <li> (put it in a ul.trows). opts (the "row" shape): lead "number" (track number)
+ * or "art" (default); sub "artist" (default) or "album" under the title; extra(t, i): menu items
+ * spliced in after Queue last, where `i` is the row's index (a list may hold a track twice).
+ * Tap/click opens the action menu; N / L queue next / last from the keyboard; on phones swipe
+ * right past ~96px queues last.
  */
-export function trackRow(t, opts = {}) {
+export function trackRow(t, opts = {}, index = 0) {
+  const numbered = opts.lead === "number";
   const now = store.player.now;
   const current = now === t.hash && !isIdle(store.player);
   const title = trackTitle(t);
@@ -116,19 +120,19 @@ export function trackRow(t, opts = {}) {
   const row = h(
     "div",
     {
-      class: "trow" + (opts.numbered ? " numbered" : "") + (current ? " current" : ""),
+      class: "trow" + (numbered ? " numbered" : "") + (current ? " current" : ""),
       tabindex: "0",
       role: "button",
       "aria-haspopup": "menu",
       "aria-label": title + (t.artist ? " by " + t.artist : "") + ". Opens actions.",
     },
     [
-      opts.numbered
+      numbered
         ? h("span", { class: "no", text: current ? "▶" : t.track_number ? String(t.track_number) : "" })
         : art(t.album || title, { cover: t.has_cover ? t.hash : null }),
       h("div", { style: "min-width:0" }, [
         h("div", { class: "t", text: title }),
-        h("div", { class: "m" }, [opts.hideArtist ? t.album || "" : t.artist || "", tech ? h("span", { class: "tech", text: tech }) : null]),
+        h("div", { class: "m" }, [opts.sub === "album" ? t.album || "" : t.artist || "", tech ? h("span", { class: "tech", text: tech }) : null]),
       ]),
       h("span", { class: "c", text: t.album || "" }),
       h("span", { class: "c num", text: bpmOf(t) }),
@@ -154,7 +158,7 @@ export function trackRow(t, opts = {}) {
   const open = (e) => {
     if (e) e.stopPropagation();
     row.classList.add("sel");
-    trackMenu(window.innerWidth >= 1024 ? more : row, t, null, { onClose: () => row.classList.remove("sel") });
+    trackMenu(window.innerWidth >= 1024 ? more : row, t, opts.extra ? opts.extra(t, index) : null, { onClose: () => row.classList.remove("sel") });
   };
   more.addEventListener("click", open);
   row.addEventListener("click", (e) => {
@@ -251,7 +255,7 @@ export function pagedList(container, tracks, opts = {}) {
   let io = null;
   const page = (n) => {
     const end = Math.min(tracks.length, shown + n);
-    for (let i = shown; i < end; i++) ul.appendChild(trackRow(tracks[i], opts));
+    for (let i = shown; i < end; i++) ul.appendChild(trackRow(tracks[i], opts, i));
     shown = end;
     more.textContent = shown < tracks.length ? "Showing " + shown + " of " + tracks.length + " · loading more…" : plural(tracks.length, "track");
   };
@@ -282,21 +286,139 @@ export function pagedList(container, tracks, opts = {}) {
 /* ============================================================ bulk bar */
 
 /**
- * Bar offered when a list is narrowed: acts on exactly the tracks passed in (the visible ones).
- * Returns null for an empty list. `label` names the set when playing now.
+ * The one set of buttons that act on a list of tracks: Play now ONLY while idle (a click never
+ * interrupts playback), Queue next, Queue last (primary while something plays). `subject` names
+ * the set in the toasts; opts.suffix is appended to the labels (e.g. " · 5").
  */
-export function bulkBar(tracks, label) {
-  if (!tracks.length) return null;
+export function queueButtons(tracks, subject, { suffix = "" } = {}) {
   const idle = isIdle(store.player);
   const hashes = hashesOf(tracks);
-  const what = plural(tracks.length, "track");
   const row = h("div", { class: "btn-row" });
   if (idle) {
-    row.appendChild(h("button", { class: "btn primary", onclick: () => actions.playNow(hashes, label) }, [icon("play", "fill sm"), "Play now"]));
+    row.appendChild(h("button", { class: "btn primary", onclick: () => actions.playNow(hashes, subject) }, [icon("play", "fill sm"), "Play now" + suffix]));
   }
-  row.appendChild(h("button", { class: "btn" + (idle ? "" : " primary"), onclick: () => actions.queueNext(hashes, what) }, [icon("next-up", "sm"), "Queue next"]));
-  row.appendChild(h("button", { class: "btn", onclick: () => actions.queueLast(hashes, what) }, [icon("plus", "sm"), "Queue last"]));
-  return h("div", { class: "bulk" }, [h("span", { class: "kicker", text: what + " match" }), row]);
+  row.appendChild(h("button", { class: "btn" + (idle ? "" : " primary"), onclick: () => actions.queueNext(hashes, subject) }, [icon("next-up", "sm"), "Queue next" + suffix]));
+  row.appendChild(h("button", { class: "btn", onclick: () => actions.queueLast(hashes, subject) }, [icon("plus", "sm"), "Queue last" + suffix]));
+  return row;
+}
+
+/** Bar offered when a list is narrowed: acts on exactly the tracks passed in (the visible ones). Null for an empty list. */
+export function bulkBar(tracks) {
+  if (!tracks.length) return null;
+  const what = plural(tracks.length, "track");
+  return h("div", { class: "bulk" }, [h("span", { class: "kicker", text: what + " match" }), queueButtons(tracks, what)]);
+}
+
+/** A note in place of rows. link: { href, text } adds a link after the text. */
+export function emptyNote(title, text, link) {
+  return h("div", { class: "empty" }, [h("b", { text: title }), text, link ? h("a", { class: "link", href: link.href, text: link.text }) : null]);
+}
+
+/* ============================================================ narrowed track pane */
+
+/**
+ * A narrowing bar and a track list, with no page chrome: what an album, artist or playlist page
+ * (and later the workbench) is made of. Subscribes to "tracks" and "player" itself; call
+ * dispose() from the view's cleanup.
+ * o.key: view key. o.instance: the name shown (resets the key's narrowing when it changes).
+ * o.placeholder. o.tracks(): the tracks in natural order, evaluated on each draw; empty when
+ * unknown or the catalogue is not loaded. o.order: "natural" keeps o.tracks() order (no Sort
+ * button); "global" follows the global sort.
+ * o.row: { lead: "number"|"art", sub: "artist"|"album", extra(t, i) } as for trackRow.
+ * o.above(rows): node between the bar and the column header, or null.
+ * o.empty: { missing() -> [title, text, link?] when o.tracks() is empty, none: [title, text] when
+ * the text leaves nothing }. Filters and failed searches use the standard notes.
+ * o.onChange({ all, rows, narrowed, failed }): after every draw; rows are the displayed tracks in
+ * displayed order, which is what buttons next to the pane must act on.
+ * Returns { el, rows(), refresh(opts), dispose() }.
+ */
+export function narrowedTracks(o) {
+  const row = o.row || {};
+  const global = o.order === "global";
+  const el = h("div");
+  let view = null;
+  let list = null;
+  let known = null;
+  let shown = [];
+
+  function stop() {
+    if (view) view.dispose();
+    view = null;
+    if (list) list.destroy();
+    list = null;
+  }
+
+  function report(info) {
+    shown = info.rows;
+    if (o.onChange) o.onChange(info);
+  }
+
+  function mount() {
+    stop();
+    el.innerHTML = "";
+    const all = o.tracks();
+    known = all.length > 0;
+    if (!known) {
+      el.appendChild(emptyNote(...o.empty.missing()));
+      report({ all, rows: [], narrowed: false, failed: false });
+      return;
+    }
+    const region = h("div");
+
+    function draw(state, { keep, narrowed, nFilters }) {
+      const everything = o.tracks();
+      const failed = state.kind === "failed";
+      const set = state.kind === "matched" ? state.data : null;
+      // The server's set covers text, tempo, key and added; here it is only intersected.
+      const ts = failed ? [] : everything.filter((t) => !set || set.has(t.hash));
+      const rows = global ? sortTracks(ts, store.sort.by, store.sort.dir) : ts;
+
+      const initial = keep && list ? list.count() : 0;
+      const scrollY = window.scrollY;
+      if (list) list.destroy();
+      list = null;
+      region.innerHTML = "";
+      if (failed) {
+        region.appendChild(emptyNote(...SEARCH_FAILED_NOTE));
+      } else if (!rows.length) {
+        region.appendChild(emptyNote(...(nFilters ? FILTERS_EMPTY_NOTE : o.empty.none)));
+      } else {
+        const above = o.above ? o.above(rows) : null;
+        if (above) region.appendChild(above);
+        region.appendChild(thead({ numbered: row.lead === "number", sortable: global, onSort: (by) => setSort(by) }));
+        list = pagedList(region, rows, { ...row, initial });
+      }
+      if (keep) window.scrollTo(0, scrollY);
+      report({ all: everything, rows, narrowed: narrowed && !failed, failed });
+    }
+
+    view = narrowedView({ key: o.key, instance: o.instance, placeholder: o.placeholder, sort: global, fetch: matchSet, render: draw });
+    el.appendChild(view.el);
+    el.appendChild(region);
+    view.refresh({ bar: true });
+  }
+
+  mount();
+
+  // The catalogue may arrive after the pane opens, or lose the tracks. Same state: keep rows and
+  // scroll, and leave the bar alone while typing. Idle changes redraw the buttons beside it.
+  const offs = [
+    onView("tracks", () => {
+      if (!known || o.tracks().length === 0) mount(); // still missing (the note may change), or gone
+      else if (view) view.refresh({ bar: !view.el.contains(document.activeElement), keep: true });
+    }),
+    onView("player", () => view && view.refresh({ keep: true })),
+  ];
+
+  return {
+    el,
+    rows: () => shown,
+    refresh: (opts) => view && view.refresh(opts),
+    dispose() {
+      for (const off of offs) off();
+      stop();
+    },
+  };
 }
 
 /* ============================================================ cards */

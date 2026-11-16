@@ -4,8 +4,8 @@
 import { h, icon, route, routeFallback, appInfo, store, onView, enc, plural } from "./core.js";
 import { art } from "./art.js";
 import { groupAlbums, groupArtists, sortTracks, collate, visiblePlaylists } from "./logic.js";
-import { pagedList, thead, bulkBar, albumCard, artistCard, playlistCard, playlistTracks, recentAlbums } from "./lists.js";
-import { narrowedView, matchLibrary, filterCount, setSort, LIBRARY_KEY, SEARCH_FAILED_NOTE } from "./narrow.js";
+import { pagedList, thead, bulkBar, emptyNote, albumCard, artistCard, playlistCard, playlistTracks, recentAlbums } from "./lists.js";
+import { narrowedView, matchLibrary, filterCount, setSort, LIBRARY_KEY, SEARCH_FAILED_NOTE, FILTERS_EMPTY_NOTE } from "./narrow.js";
 
 const GRID_LIMIT = 120;
 
@@ -108,10 +108,6 @@ function viewLibrary(root, params, query) {
     return "Filter " + plural(n[tab], tab.slice(0, -1));
   }
 
-  function emptyBox(title, text) {
-    return h("div", { class: "empty" }, [h("b", { text: title }), text]);
-  }
-
   /** Draw tabs and list for the server's answer. `keep`: a re-render for the same query, so keep rows and scroll. */
   function draw(state, { keep, narrowed, nFilters }) {
     const failed = state.kind === "failed";
@@ -150,18 +146,18 @@ function viewLibrary(root, params, query) {
     region.appendChild(box);
 
     if (failed) {
-      box.appendChild(emptyBox(...SEARCH_FAILED_NOTE));
+      box.appendChild(emptyNote(...SEARCH_FAILED_NOTE));
     } else if (!store.order.length) {
-      box.appendChild(emptyBox("No music yet", "Your library is empty or still loading."));
+      box.appendChild(emptyNote("No music yet", "Your library is empty or still loading."));
     } else if (!counts[tab]) {
       box.appendChild(
         nFilters
-          ? emptyBox("Nothing matches these filters", "Try a wider tempo range or turn on keys that mix well.")
-          : emptyBox("No matches", "Check the spelling, or try another tab: the counts show where your words were found."),
+          ? emptyNote(...FILTERS_EMPTY_NOTE)
+          : emptyNote("No matches", "Check the spelling, or try another tab: the counts show where your words were found."),
       );
     } else if (tab === "tracks") {
       const sorted = sortTracks(tracks, store.sort.by, store.sort.dir);
-      if (narrowed) box.appendChild(bulkBar(sorted, "your selection"));
+      if (narrowed) box.appendChild(bulkBar(sorted));
       box.appendChild(thead({ sortable: true, onSort: (by) => setSort(by) }));
       list = pagedList(box, sorted, { initial });
     } else {

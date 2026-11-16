@@ -18,7 +18,7 @@ export const LIBRARY_KEY = "lib";
 /* ============================================================ persistence */
 
 // "mdma-f" held ONE filters object for the whole app; the map per view key is "mdma-f.v2".
-const STORE_KEYS = { nb: "mdma-nb", f: "mdma-f.v2", sort: "mdma-sort" };
+const STORE_KEYS = { nb: "mdma-nb", f: "mdma-f.v2", ni: "mdma-ni", sort: "mdma-sort" };
 const LEGACY_FILTERS = "mdma-f";
 
 function restore() {
@@ -184,6 +184,20 @@ export function clearNarrowing(key) {
   store.f[key] = emptyFilters();
   persist();
   emit("filters", key);
+}
+
+/**
+ * A page of kind `key` is about to show `instance` (an album or artist name). If the narrowing
+ * state in store.nb / store.f belongs to another instance, or to none known (store.ni unset, e.g.
+ * state left from before), that view's text and filters start over (ADR 029). Never emits: the
+ * caller has not built its bar yet. Persisted, so it also holds across a reload.
+ */
+export function claimNarrowing(key, instance) {
+  if (store.ni[key] === instance) return;
+  delete store.nb[key];
+  delete store.f[key];
+  store.ni[key] = instance;
+  persist();
 }
 
 /* ============================================================ sort */
@@ -415,13 +429,17 @@ function narrowBar(o) {
 
 /** What a view shows in place of rows when the server did not answer. */
 export const SEARCH_FAILED_NOTE = ["Search unavailable", "The library didn't answer. Try again in a moment."];
+/** What a view shows in place of rows when the filters leave nothing. */
+export const FILTERS_EMPTY_NOTE = ["Nothing matches these filters", "Try a wider tempo range or turn on keys that mix well."];
 
 /**
  * The controller of a narrowed view: owns the narrowing bar, the stale-reply guard, the debounce
  * disposal and the one failure policy. It subscribes to events itself, so the view MUST call
  * dispose() from its cleanup.
  *
- * o.key: view key. o.placeholder, o.hint: as for narrowBar; each may be a function, evaluated
+ * o.key: view key. o.instance: for pages of one album, artist or the like: the name shown; another
+ * name than the one the state belongs to resets this key's text and filters, before the first
+ * bar is built (see claimNarrowing). o.placeholder, o.hint: as for narrowBar; each may be a function, evaluated
  * whenever the bar is rebuilt. o.sort: boolean, true shows the Sort button and makes the view
  * follow the global sort; a view that keeps its own order leaves it off and never refreshes on
  * a sort change. o.fetch(text, f): Promise of the server's answer for the view's text and
@@ -443,6 +461,7 @@ export const SEARCH_FAILED_NOTE = ["Search unavailable", "The library didn't ans
  * refreshes by itself when its key's filters change ("filters") and, with o.sort, on "sort".
  */
 export function narrowedView(o) {
+  if (o.instance !== undefined) claimNarrowing(o.key, o.instance);
   const el = h("div");
   const val = (v) => (typeof v === "function" ? v() : v);
   const next = latest();
