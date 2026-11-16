@@ -1,13 +1,16 @@
 use event_protocol::PlaybackEvent;
-use media_protocol::ContentHash;
+use media_protocol::CanonicalHash;
 use music_facts::{MusicValue, StartReason, StopReason};
 use playback_primitives::{SessionId, SourceName};
+
+// Playback state and play facts hold only canonical hashes (ADR-026); events
+// carry the wire `ContentHash`, converted from them at the point of emission.
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum PlaybackState {
     Idle,
-    Playing { hash: ContentHash },
-    Paused { hash: ContentHash },
+    Playing { hash: CanonicalHash },
+    Paused { hash: CanonicalHash },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -16,12 +19,12 @@ pub enum PlaybackEffect {
     PauseEngine,
     PlayEngine,
     LoadAndPlay {
-        hash: ContentHash,
+        hash: CanonicalHash,
         source: SourceName,
     },
     EmitEvent(PlaybackEvent),
     WriteFact {
-        hash: ContentHash,
+        hash: CanonicalHash,
         value: MusicValue,
     },
 }
@@ -43,7 +46,7 @@ impl PlaybackStateMachine {
         &self.state
     }
 
-    pub fn current_hash(&self) -> Option<&ContentHash> {
+    pub fn current_hash(&self) -> Option<&CanonicalHash> {
         match &self.state {
             PlaybackState::Idle => None,
             PlaybackState::Playing { hash } | PlaybackState::Paused { hash } => Some(hash),
@@ -84,7 +87,7 @@ impl PlaybackStateMachine {
 
     /// Start playing a track popped from the queue. If a track is currently
     /// Playing or Paused, its stop is recorded and the new load cuts it off.
-    pub fn play_queue(&mut self, hash: ContentHash, source: SourceName) -> Vec<PlaybackEffect> {
+    pub fn play_queue(&mut self, hash: CanonicalHash, source: SourceName) -> Vec<PlaybackEffect> {
         let mut effects = Vec::new();
 
         // Record the stop of whatever is currently playing/paused.
@@ -97,7 +100,7 @@ impl PlaybackStateMachine {
                     value: MusicValue::TrackStopped(StopReason::OnRequest),
                 });
                 effects.push(PlaybackEffect::EmitEvent(PlaybackEvent::TrackStopped {
-                    hash: h.clone(),
+                    hash: h.into(),
                 }));
             }
             PlaybackState::Idle => {}
@@ -118,7 +121,7 @@ impl PlaybackStateMachine {
             value: MusicValue::TrackStarted(StartReason::ByQueue),
         });
         effects.push(PlaybackEffect::EmitEvent(PlaybackEvent::TrackStarted {
-            hash: hash.clone(),
+            hash: hash.into(),
         }));
 
         effects
@@ -135,7 +138,7 @@ impl PlaybackStateMachine {
                         hash: hash.clone(),
                         value: MusicValue::TrackStopped(StopReason::OnRequest),
                     },
-                    PlaybackEffect::EmitEvent(PlaybackEvent::TrackStopped { hash: hash.clone() }),
+                    PlaybackEffect::EmitEvent(PlaybackEvent::TrackStopped { hash: hash.into() }),
                 ];
                 self.maybe_end_session(&mut effects);
                 effects
@@ -145,7 +148,7 @@ impl PlaybackStateMachine {
     }
 
     /// Skip the current track and optionally start the next.
-    pub fn skip(&mut self, next: Option<(ContentHash, SourceName)>) -> Vec<PlaybackEffect> {
+    pub fn skip(&mut self, next: Option<(CanonicalHash, SourceName)>) -> Vec<PlaybackEffect> {
         let mut effects = Vec::new();
 
         match self.state.clone() {
@@ -160,7 +163,7 @@ impl PlaybackStateMachine {
                     value: MusicValue::TrackStopped(StopReason::OnSkip),
                 });
                 effects.push(PlaybackEffect::EmitEvent(PlaybackEvent::TrackStopped {
-                    hash: h.clone(),
+                    hash: h.into(),
                 }));
 
                 match next {
@@ -178,7 +181,7 @@ impl PlaybackStateMachine {
                             value: MusicValue::TrackStarted(StartReason::ByQueue),
                         });
                         effects.push(PlaybackEffect::EmitEvent(PlaybackEvent::TrackStarted {
-                            hash: next_hash.clone(),
+                            hash: next_hash.into(),
                         }));
                     }
                     None => {
@@ -202,7 +205,7 @@ impl PlaybackStateMachine {
                         value: MusicValue::TrackStarted(StartReason::ByQueue),
                     });
                     effects.push(PlaybackEffect::EmitEvent(PlaybackEvent::TrackStarted {
-                        hash: next_hash.clone(),
+                        hash: next_hash.into(),
                     }));
                 }
                 // Idle + None => no-op
@@ -219,7 +222,7 @@ impl PlaybackStateMachine {
                 self.state = PlaybackState::Paused { hash: hash.clone() };
                 vec![
                     PlaybackEffect::PauseEngine,
-                    PlaybackEffect::EmitEvent(PlaybackEvent::TrackPaused { hash: hash.clone() }),
+                    PlaybackEffect::EmitEvent(PlaybackEvent::TrackPaused { hash: hash.into() }),
                 ]
             }
             PlaybackState::Paused { .. } | PlaybackState::Idle => vec![],
@@ -233,7 +236,7 @@ impl PlaybackStateMachine {
                 self.state = PlaybackState::Playing { hash: hash.clone() };
                 vec![
                     PlaybackEffect::PlayEngine,
-                    PlaybackEffect::EmitEvent(PlaybackEvent::TrackResumed { hash: hash.clone() }),
+                    PlaybackEffect::EmitEvent(PlaybackEvent::TrackResumed { hash: hash.into() }),
                 ]
             }
             PlaybackState::Playing { .. } | PlaybackState::Idle => vec![],
@@ -246,7 +249,11 @@ impl PlaybackStateMachine {
     ///
     /// `from` is the track the caller observed as current. If the state moved
     /// on in the meantime (e.g. a skip), this is a no-op.
-    pub fn track_advanced(&mut self, from: &ContentHash, next: ContentHash) -> Vec<PlaybackEffect> {
+    pub fn track_advanced(
+        &mut self,
+        from: &CanonicalHash,
+        next: CanonicalHash,
+    ) -> Vec<PlaybackEffect> {
         let mut effects = Vec::new();
 
         if let PlaybackState::Playing { hash } = self.state.clone() {
@@ -258,7 +265,7 @@ impl PlaybackStateMachine {
                 value: MusicValue::TrackStopped(StopReason::OnCompletion),
             });
             effects.push(PlaybackEffect::EmitEvent(PlaybackEvent::TrackStopped {
-                hash,
+                hash: hash.into(),
             }));
             self.state = PlaybackState::Playing { hash: next.clone() };
             // Session continues.
@@ -267,7 +274,7 @@ impl PlaybackStateMachine {
                 value: MusicValue::TrackStarted(StartReason::ByQueue),
             });
             effects.push(PlaybackEffect::EmitEvent(PlaybackEvent::TrackStarted {
-                hash: next,
+                hash: next.into(),
             }));
         }
 
@@ -280,8 +287,8 @@ impl PlaybackStateMachine {
     /// moved on in the meantime (e.g. a skip), this is a no-op.
     pub fn track_ended(
         &mut self,
-        finished: &ContentHash,
-        next: Option<(ContentHash, SourceName)>,
+        finished: &CanonicalHash,
+        next: Option<(CanonicalHash, SourceName)>,
     ) -> Vec<PlaybackEffect> {
         let mut effects = Vec::new();
 
@@ -292,7 +299,7 @@ impl PlaybackStateMachine {
                     value: MusicValue::TrackStopped(StopReason::OnCompletion),
                 });
                 effects.push(PlaybackEffect::EmitEvent(PlaybackEvent::TrackStopped {
-                    hash: hash.clone(),
+                    hash: hash.into(),
                 }));
 
                 match next {
@@ -310,7 +317,7 @@ impl PlaybackStateMachine {
                             value: MusicValue::TrackStarted(StartReason::ByQueue),
                         });
                         effects.push(PlaybackEffect::EmitEvent(PlaybackEvent::TrackStarted {
-                            hash: next_hash.clone(),
+                            hash: next_hash.into(),
                         }));
                     }
                     None => {
@@ -338,12 +345,20 @@ mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
 
-    fn hash_a() -> ContentHash {
-        ContentHash::new("sha256:aaaaaa")
+    fn hash_a() -> CanonicalHash {
+        CanonicalHash::try_from(media_protocol::ContentHash::new(format!(
+            "sha256:{}",
+            "a".repeat(64)
+        )))
+        .unwrap()
     }
 
-    fn hash_b() -> ContentHash {
-        ContentHash::new("sha256:bbbbbb")
+    fn hash_b() -> CanonicalHash {
+        CanonicalHash::try_from(media_protocol::ContentHash::new(format!(
+            "sha256:{}",
+            "b".repeat(64)
+        )))
+        .unwrap()
     }
 
     fn source_a() -> SourceName {

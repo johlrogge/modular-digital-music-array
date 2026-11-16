@@ -45,7 +45,8 @@ impl Display for SessionId {
     }
 }
 
-pub use music_primitives::ContentHash;
+// Full and short forms of a content hash live in music_primitives.
+pub use music_primitives::{CanonicalHash, ContentHash, NotCanonical};
 
 #[derive(Debug, Error)]
 pub enum PlaybackError {

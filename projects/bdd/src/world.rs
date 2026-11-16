@@ -86,6 +86,22 @@ impl MdmaWorld {
         &self.env.as_ref().unwrap().library
     }
 
+    /// The full hash the library gives the track `token` names (a prefix or the
+    /// full hash). Playback takes only full hashes, so scenarios that queue a
+    /// track say which one with a token and queue what the library returns.
+    /// Panics when the library does not know the track.
+    pub fn library_hash(&mut self, token: &str) -> ContentHash {
+        let resolved = self
+            .library()
+            .resolve_for_playback(&[ContentHash::new(token)])
+            .unwrap_or_else(|e| panic!("{e}"));
+        resolved
+            .into_iter()
+            .next()
+            .map(Into::into)
+            .expect("one hash in, one out")
+    }
+
     /// Get a reference to the playback client. Panics if env not booted.
     pub fn playback(&mut self) -> &PlaybackBackend {
         self.ensure_env();

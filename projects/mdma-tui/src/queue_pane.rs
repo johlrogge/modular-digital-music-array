@@ -14,6 +14,15 @@ use ratatui::{
 };
 use std::rc::Rc;
 
+/// What to tell the user after asking playback to remove tracks: what playback
+/// reports it removed, which can be fewer than were asked for (or none).
+fn removed_message(removed: usize) -> String {
+    match removed {
+        0 => "Nothing removed from queue".to_string(),
+        n => format!("Removed {n} track(s) from queue"),
+    }
+}
+
 /// Minimal proof-of-life pane that shows the current playback queue.
 #[allow(dead_code)]
 #[derive(Clone)]
@@ -97,11 +106,17 @@ impl Pane for QueuePane {
                 if hashes.is_empty() {
                     return PaneAction::Consumed;
                 }
-                let count = hashes.len();
-                match self.playback.queue_remove(hashes) {
-                    Ok(_) => {
+                let resolved = match self.library.resolve_for_playback(&hashes) {
+                    Ok(resolved) => resolved,
+                    Err(e) => return PaneAction::Error(format!("Remove failed: {e}")),
+                };
+                match self
+                    .playback
+                    .queue_remove(resolved.into_iter().map(ContentHash::from).collect())
+                {
+                    Ok(removed) => {
                         self.refresh();
-                        PaneAction::Info(format!("Removed {} track(s) from queue", count))
+                        PaneAction::Info(removed_message(removed))
                     }
                     Err(e) => PaneAction::Error(format!("Remove failed: {e}")),
                 }
@@ -154,12 +169,13 @@ impl Pane for QueuePane {
     }
 
     fn accept_tracks(&mut self, hashes: &[ContentHash]) -> PaneAction {
+        let resolved = match self.library.resolve_for_playback(hashes) {
+            Ok(resolved) => resolved,
+            Err(e) => return PaneAction::Error(e.to_string()),
+        };
         let mut errors = Vec::new();
-        for hash in hashes {
-            if let Err(e) = self
-                .playback
-                .queue_append(hash.clone(), SourceName::audio())
-            {
+        for hash in &resolved {
+            if let Err(e) = self.playback.queue_append(hash.into(), SourceName::audio()) {
                 errors.push(format!("{e}"));
             }
         }
@@ -191,5 +207,20 @@ impl Pane for QueuePane {
 
     fn clone_box(&self) -> Box<dyn Pane> {
         Box::new(self.clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::removed_message;
+
+    #[test]
+    fn removed_message_reports_what_was_removed() {
+        assert_eq!(removed_message(3), "Removed 3 track(s) from queue");
+    }
+
+    #[test]
+    fn removed_message_says_so_when_nothing_was_removed() {
+        assert_eq!(removed_message(0), "Nothing removed from queue");
     }
 }

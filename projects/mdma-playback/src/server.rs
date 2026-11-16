@@ -3,7 +3,9 @@ use crate::playback_state::{PlaybackEffect, PlaybackState, PlaybackStateMachine}
 use acid_client::AcidClient;
 use color_eyre::Result;
 use event_protocol::{to_topic_message, PlaybackEvent};
-use media_protocol::{Command, Response, ResponseData, SourceName};
+use media_protocol::{
+    require_canonical, CanonicalHash, Command, ContentHash, Response, ResponseData, SourceName,
+};
 use music_facts::{FactSource, MusicValue};
 use nng::Socket;
 use serde::{Deserialize, Serialize};
@@ -31,14 +33,16 @@ fn is_read_only(command: &Command) -> bool {
     )
 }
 
+/// A queued track. Playback holds only canonical hashes (ADR-026): resolving
+/// a prefix is the library's job, done by the client before it sends.
 struct QueueEntry {
-    hash: media_protocol::ContentHash,
+    hash: CanonicalHash,
     source: SourceName,
 }
 
-fn write_fact(acid_client: &AcidClient, hash: &media_protocol::ContentHash, value: MusicValue) {
+fn write_fact(acid_client: &AcidClient, hash: &CanonicalHash, value: MusicValue) {
     let source = FactSource::new("mdma-playback", env!("CARGO_PKG_VERSION"), "Unknown");
-    if let Err(e) = acid_client.write_music_facts(hash, &[(value, source)]) {
+    if let Err(e) = acid_client.write_music_facts(hash.as_content_hash(), &[(value, source)]) {
         warn!("Failed to write fact via ACID: {}", e);
     }
 }
@@ -115,10 +119,13 @@ impl Server {
 
         let mut queue = VecDeque::new();
         for e in entries {
-            queue.push_back(QueueEntry {
-                hash: media_protocol::ContentHash::new(e.hash),
-                source: e.source,
-            });
+            match CanonicalHash::try_from(ContentHash::new(e.hash)) {
+                Ok(hash) => queue.push_back(QueueEntry {
+                    hash,
+                    source: e.source,
+                }),
+                Err(e) => warn!("Dropping persisted queue entry: {e}"),
+            }
         }
         info!("Restored {} track(s) from queue file", queue.len());
         queue
@@ -185,6 +192,10 @@ impl Server {
     }
 
     async fn handle_command(&self, command: Command) -> Response {
+        // A command carrying a prefix is refused whole before anything runs.
+        if let Err(refusal) = command.check_canonical() {
+            return refusal;
+        }
         match command {
             // ---------------------------------------------------------------
             // Deprecated low-level deck commands — not supported in split-architecture mode.
@@ -247,6 +258,10 @@ impl Server {
             }
             Command::QueueNext { hash, source } => {
                 info!("Queue next: hash={:?} source={:?}", hash, source);
+                let hash = match require_canonical(hash) {
+                    Ok(hash) => hash,
+                    Err(refusal) => return refusal,
+                };
                 let mut queue = self.queue.lock().await;
                 queue.push_front(QueueEntry { hash, source });
                 self.queue_changed(&queue);
@@ -254,18 +269,22 @@ impl Server {
             }
             Command::QueueAppend { hash, source } => {
                 info!("Queue append: hash={:?} source={:?}", hash, source);
+                let hash = match require_canonical(hash) {
+                    Ok(hash) => hash,
+                    Err(refusal) => return refusal,
+                };
                 let mut queue = self.queue.lock().await;
                 queue.push_back(QueueEntry { hash, source });
                 self.queue_changed(&queue);
                 self.ok_response()
             }
             Command::QueueList => {
-                let hashes: Vec<media_protocol::ContentHash> = self
+                let hashes: Vec<ContentHash> = self
                     .queue
                     .lock()
                     .await
                     .iter()
-                    .map(|e| e.hash.clone())
+                    .map(|e| e.hash.clone().into())
                     .collect();
                 debug!("Queue list: {} items", hashes.len());
                 Response::Ok {
@@ -280,6 +299,14 @@ impl Server {
                 self.ok_response()
             }
             Command::QueueRemove { hashes } => {
+                let hashes = match hashes
+                    .into_iter()
+                    .map(require_canonical)
+                    .collect::<Result<Vec<_>, _>>()
+                {
+                    Ok(hashes) => hashes,
+                    Err(refusal) => return refusal,
+                };
                 let mut queue = self.queue.lock().await;
                 let before = queue.len();
                 queue.retain(|e| !hashes.contains(&e.hash));
@@ -291,11 +318,20 @@ impl Server {
                 }
             }
             Command::QueueReplace { entries } => {
+                // All or nothing: one prefix keeps the old queue.
+                let entries = match entries
+                    .into_iter()
+                    .map(|(hash, source)| {
+                        require_canonical(hash).map(|hash| QueueEntry { hash, source })
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+                {
+                    Ok(entries) => entries,
+                    Err(refusal) => return refusal,
+                };
                 let mut queue = self.queue.lock().await;
                 queue.clear();
-                for (hash, source) in entries {
-                    queue.push_back(QueueEntry { hash, source });
-                }
+                queue.extend(entries);
                 self.queue_changed(&queue);
                 info!("Queue replaced with {} entries", queue.len());
                 self.ok_response()
@@ -339,7 +375,8 @@ impl Server {
                 }
             }
             Command::NowPlaying => {
-                let hash = self.state.lock().await.current_hash().cloned();
+                let hash: Option<ContentHash> =
+                    self.state.lock().await.current_hash().map(Into::into);
                 debug!("Now playing: {:?}", hash);
                 Response::Ok {
                     data: Some(ResponseData::NowPlaying(hash)),
@@ -469,7 +506,7 @@ async fn execute_effects(
             PlaybackEffect::LoadAndPlay { hash, source: _ } => {
                 // Phase 4: single source, always route to mdma-audio
                 let client = audio.lock().await;
-                client.load(hash.clone()).inspect_err(|e| {
+                client.load(hash.clone().into()).inspect_err(|e| {
                     warn!("Failed to load {}: {}", hash, e);
                 })?;
                 client.play().inspect_err(|e| {
@@ -552,10 +589,7 @@ fn pop_front_and_publish(
 /// The same track twice in a row is not preloaded: a gapless switch from `a`
 /// to `a` is invisible to the poll (audible == current), so that case goes
 /// through the normal finished -> load path instead.
-fn desired_preload(
-    state: &PlaybackState,
-    queue: &VecDeque<QueueEntry>,
-) -> Option<media_protocol::ContentHash> {
+fn desired_preload(state: &PlaybackState, queue: &VecDeque<QueueEntry>) -> Option<CanonicalHash> {
     match state {
         PlaybackState::Playing { hash } | PlaybackState::Paused { hash } => queue
             .front()
@@ -567,15 +601,15 @@ fn desired_preload(
 
 #[derive(Debug, Clone, PartialEq)]
 enum PreloadAction {
-    Preload(media_protocol::ContentHash),
+    Preload(CanonicalHash),
     Clear,
 }
 
 /// What to send to the audio source so its preload matches `desired`, given
 /// the last value we sent. `None` when already in sync.
 fn preload_action(
-    desired: Option<&media_protocol::ContentHash>,
-    last_sent: Option<&media_protocol::ContentHash>,
+    desired: Option<&CanonicalHash>,
+    last_sent: Option<&CanonicalHash>,
 ) -> Option<PreloadAction> {
     if desired == last_sent {
         return None;
@@ -590,7 +624,7 @@ fn preload_action(
 enum PollAction {
     Nothing,
     /// The audio source switched to the preloaded track by itself (gapless).
-    Advanced(media_protocol::ContentHash),
+    Advanced(CanonicalHash),
     /// The track finished with no switch; fall back to load-and-play.
     Finished,
 }
@@ -608,9 +642,9 @@ enum PollAction {
 /// A switch wins over `Finished`: the next tick sees the new track's state.
 fn classify_poll(
     finished: bool,
-    heard: Option<&media_protocol::ContentHash>,
-    known_next: &[media_protocol::ContentHash],
-    current: &media_protocol::ContentHash,
+    heard: Option<&CanonicalHash>,
+    known_next: &[CanonicalHash],
+    current: &CanonicalHash,
 ) -> PollAction {
     match heard {
         Some(h) if h != current && known_next.contains(h) => PollAction::Advanced(h.clone()),
@@ -620,10 +654,7 @@ fn classify_poll(
 }
 
 /// Record a hash the source may switch to next (no-op for `None` or a known hash).
-fn remember_next(
-    known_next: &mut Vec<media_protocol::ContentHash>,
-    hash: Option<&media_protocol::ContentHash>,
-) {
+fn remember_next(known_next: &mut Vec<CanonicalHash>, hash: Option<&CanonicalHash>) {
     let Some(h) = hash else {
         return;
     };
@@ -633,7 +664,7 @@ fn remember_next(
 }
 
 /// Remove the first queue entry with `hash`. Returns whether one was removed.
-fn remove_first(queue: &mut VecDeque<QueueEntry>, hash: &media_protocol::ContentHash) -> bool {
+fn remove_first(queue: &mut VecDeque<QueueEntry>, hash: &CanonicalHash) -> bool {
     match queue.iter().position(|e| &e.hash == hash) {
         Some(i) => {
             queue.remove(i);
@@ -653,8 +684,8 @@ fn remove_first(queue: &mut VecDeque<QueueEntry>, hash: &media_protocol::Content
 fn advance_and_dequeue(
     sm: &mut PlaybackStateMachine,
     queue: &mut VecDeque<QueueEntry>,
-    current: &media_protocol::ContentHash,
-    heard: media_protocol::ContentHash,
+    current: &CanonicalHash,
+    heard: CanonicalHash,
 ) -> (Vec<PlaybackEffect>, bool) {
     let effects = sm.track_advanced(current, heard.clone());
     if effects.is_empty() {
@@ -673,7 +704,7 @@ fn advance_and_dequeue(
 fn finish_and_dequeue(
     sm: &mut PlaybackStateMachine,
     queue: &mut VecDeque<QueueEntry>,
-    finished: &media_protocol::ContentHash,
+    finished: &CanonicalHash,
 ) -> (Vec<PlaybackEffect>, Option<QueueEntry>) {
     let next = queue.front().map(|e| (e.hash.clone(), e.source.clone()));
     let effects = sm.track_ended(finished, next);
@@ -690,8 +721,8 @@ async fn reconcile_preload(
     audio: &Arc<Mutex<StreamClient>>,
     queue: &Arc<Mutex<VecDeque<QueueEntry>>>,
     state: &PlaybackState,
-    last_sent: &mut Option<media_protocol::ContentHash>,
-    known_next: &mut Vec<media_protocol::ContentHash>,
+    last_sent: &mut Option<CanonicalHash>,
+    known_next: &mut Vec<CanonicalHash>,
 ) {
     let desired = {
         let q = queue.lock().await;
@@ -702,7 +733,7 @@ async fn reconcile_preload(
     };
     let client = audio.lock().await;
     match action {
-        PreloadAction::Preload(hash) => match client.preload(hash.clone()) {
+        PreloadAction::Preload(hash) => match client.preload(hash.clone().into()) {
             Ok(()) => {
                 remember_next(known_next, Some(&hash));
                 *last_sent = Some(hash);
@@ -751,10 +782,10 @@ async fn auto_advance_task(
 ) {
     let mut tick: u8 = 0;
     // Last preload value sent to the source, and the track it was sent for.
-    let mut last_sent: Option<media_protocol::ContentHash> = None;
-    let mut last_current: Option<media_protocol::ContentHash> = None;
+    let mut last_sent: Option<CanonicalHash> = None;
+    let mut last_current: Option<CanonicalHash> = None;
     // Hashes the source may switch to while `last_current` plays (see `classify_poll`).
-    let mut known: Vec<media_protocol::ContentHash> = Vec::new();
+    let mut known: Vec<CanonicalHash> = Vec::new();
     loop {
         tokio::time::sleep(Duration::from_millis(200)).await;
         tick = tick.wrapping_add(1);
@@ -772,7 +803,7 @@ async fn auto_advance_task(
                         publish_event_on_socket(
                             &event_pub,
                             &PlaybackEvent::PositionUpdate {
-                                hash: h.clone(),
+                                hash: h.into(),
                                 position_ms,
                                 duration_ms,
                             },
@@ -805,8 +836,14 @@ async fn auto_advance_task(
             match audio.lock().await.loaded() {
                 Ok(Some(ref info)) => (
                     matches!(info.state, StreamPlaybackState::Finished),
-                    info.content_hash.clone(),
-                    info.preloaded.clone(),
+                    // A hash the source reports that is not canonical is not one
+                    // we queued, so it is as good as not reported.
+                    info.content_hash
+                        .clone()
+                        .and_then(|h| CanonicalHash::try_from(h).ok()),
+                    info.preloaded
+                        .clone()
+                        .and_then(|h| CanonicalHash::try_from(h).ok()),
                     info.position_ms,
                     info.duration_ms,
                 ),
@@ -948,7 +985,7 @@ mod tests {
         {
             let mut q = server.queue.lock().await;
             q.push_back(QueueEntry {
-                hash: media_protocol::ContentHash::new("sha256:queued"),
+                hash: h("queued"),
                 source: SourceName::audio(),
             });
         }
@@ -956,8 +993,7 @@ mod tests {
         // Drive state machine to Paused.
         {
             let mut sm = server.state.lock().await;
-            let hash = media_protocol::ContentHash::new("sha256:paused_track");
-            sm.play_queue(hash, SourceName::audio());
+            sm.play_queue(h("paused_track"), SourceName::audio());
             sm.pause();
         }
 
@@ -1007,8 +1043,7 @@ mod tests {
         // Drive the state machine directly into Paused.
         {
             let mut sm = server.state.lock().await;
-            let hash = media_protocol::ContentHash::new("sha256:test");
-            sm.play_queue(hash, SourceName::audio());
+            sm.play_queue(h("test"), SourceName::audio());
             sm.pause();
         }
 
@@ -1035,8 +1070,173 @@ mod tests {
     // Gapless pure helpers
     // -------------------------------------------------------------------------
 
-    fn h(s: &str) -> media_protocol::ContentHash {
-        media_protocol::ContentHash::new(s)
+    /// The full hash a test names by `label`: its bytes in hex, zero-padded.
+    fn full(label: &str) -> ContentHash {
+        let hex: String = label.bytes().map(|b| format!("{b:02x}")).collect();
+        ContentHash::new(format!("sha256:{hex:0<64}"))
+    }
+
+    fn h(label: &str) -> CanonicalHash {
+        CanonicalHash::try_from(full(label)).unwrap()
+    }
+
+    /// A prefix, as the CLI used to send (12 hex).
+    fn short() -> ContentHash {
+        ContentHash::new("9fb4105e0a1b")
+    }
+
+    async fn queued(server: &Server) -> Vec<ContentHash> {
+        match server.handle_command(Command::QueueList).await {
+            Response::Ok {
+                data: Some(ResponseData::Queue(hashes)),
+            } => hashes,
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    fn assert_refused(response: Response) {
+        match response {
+            Response::Err { message } => {
+                assert!(message.contains("not a full content hash"), "{message}");
+                assert!(message.contains("9fb4105e0a1b"), "{message}");
+                assert!(
+                    message.contains("resolve it through the library"),
+                    "{message}"
+                );
+            }
+            other => panic!("expected Err, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn queue_next_refuses_a_short_hash_and_leaves_the_queue() {
+        let server = make_server();
+        server.queue.lock().await.push_back(entry("a"));
+        let response = server
+            .handle_command(Command::QueueNext {
+                hash: short(),
+                source: SourceName::audio(),
+            })
+            .await;
+        assert_refused(response);
+        assert_eq!(queued(&server).await, vec![full("a")]);
+    }
+
+    #[tokio::test]
+    async fn queue_append_refuses_a_short_hash_and_leaves_the_queue() {
+        let server = make_server();
+        server.queue.lock().await.push_back(entry("a"));
+        let response = server
+            .handle_command(Command::QueueAppend {
+                hash: short(),
+                source: SourceName::audio(),
+            })
+            .await;
+        assert_refused(response);
+        assert_eq!(queued(&server).await, vec![full("a")]);
+    }
+
+    #[tokio::test]
+    async fn queue_replace_refuses_a_short_hash_and_leaves_the_queue() {
+        let server = make_server();
+        server.queue.lock().await.push_back(entry("a"));
+        let response = server
+            .handle_command(Command::QueueReplace {
+                entries: vec![(short(), SourceName::audio())],
+            })
+            .await;
+        assert_refused(response);
+        assert_eq!(queued(&server).await, vec![full("a")]);
+    }
+
+    #[tokio::test]
+    async fn queue_replace_is_all_or_nothing() {
+        let server = make_server();
+        server.queue.lock().await.push_back(entry("a"));
+        let response = server
+            .handle_command(Command::QueueReplace {
+                entries: vec![
+                    (full("b"), SourceName::audio()),
+                    (short(), SourceName::audio()),
+                ],
+            })
+            .await;
+        assert_refused(response);
+        assert_eq!(queued(&server).await, vec![full("a")]);
+    }
+
+    #[tokio::test]
+    async fn queue_remove_refuses_a_short_hash_and_removes_nothing() {
+        let server = make_server();
+        server.queue.lock().await.extend([entry("a"), entry("b")]);
+        let response = server
+            .handle_command(Command::QueueRemove {
+                hashes: vec![full("a"), short()],
+            })
+            .await;
+        assert_refused(response);
+        assert_eq!(queued(&server).await, vec![full("a"), full("b")]);
+    }
+
+    #[tokio::test]
+    async fn full_hashes_are_accepted_by_every_queue_command() {
+        let server = make_server();
+        let ok =
+            |response: Response| assert!(matches!(response, Response::Ok { .. }), "{response:?}");
+        ok(server
+            .handle_command(Command::QueueAppend {
+                hash: full("b"),
+                source: SourceName::audio(),
+            })
+            .await);
+        ok(server
+            .handle_command(Command::QueueNext {
+                hash: full("a"),
+                source: SourceName::audio(),
+            })
+            .await);
+        assert_eq!(queued(&server).await, vec![full("a"), full("b")]);
+        ok(server
+            .handle_command(Command::QueueReplace {
+                entries: vec![
+                    (full("c"), SourceName::audio()),
+                    (full("d"), SourceName::audio()),
+                ],
+            })
+            .await);
+        assert_eq!(queued(&server).await, vec![full("c"), full("d")]);
+        let response = server
+            .handle_command(Command::QueueRemove {
+                hashes: vec![full("c")],
+            })
+            .await;
+        assert!(matches!(
+            response,
+            Response::Ok {
+                data: Some(ResponseData::Count(1))
+            }
+        ));
+        assert_eq!(queued(&server).await, vec![full("d")]);
+    }
+
+    #[tokio::test]
+    async fn load_queue_drops_persisted_entries_that_are_not_canonical() {
+        let server = make_server();
+        let persisted = [
+            PersistEntry {
+                hash: full("a").to_string(),
+                source: SourceName::audio(),
+            },
+            PersistEntry {
+                hash: short().to_string(),
+                source: SourceName::audio(),
+            },
+        ];
+        std::fs::write(&server.queue_file, serde_json::to_vec(&persisted).unwrap()).unwrap();
+        let loaded = server.load_queue().await;
+        let _ = std::fs::remove_file(&server.queue_file);
+        let hashes: Vec<_> = loaded.iter().map(|e| e.hash.clone()).collect();
+        assert_eq!(hashes, vec![h("a")]);
     }
 
     fn entry(s: &str) -> QueueEntry {

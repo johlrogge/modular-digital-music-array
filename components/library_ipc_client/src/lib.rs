@@ -4,6 +4,7 @@
 //! Used by mdma-cli and mdma-console.
 
 pub use library_ipc_protocol::*;
+pub use music_primitives::{CanonicalHash, NotCanonical};
 
 use thiserror::Error;
 
@@ -698,9 +699,176 @@ pub fn content_to_hashes(content: &str) -> Vec<ContentHash> {
         .collect()
 }
 
+/// A hash that could not be resolved to a full hash.
+#[derive(Debug, Error)]
+pub enum ResolveError {
+    /// The library could not resolve the hash (unknown, ambiguous, or the
+    /// library failed).
+    #[error("cannot resolve {hash}: {source}")]
+    Lookup {
+        hash: ContentHash,
+        #[source]
+        source: ClientError,
+    },
+    /// The library answered with a hash that is not in full form (a legacy
+    /// short-hash entity in the index).
+    #[error("library returned non-full hash {returned} for {hash}")]
+    NotCanonical {
+        hash: ContentHash,
+        returned: ContentHash,
+    },
+}
+
+impl ResolveError {
+    /// The hash, as given, that failed to resolve.
+    pub fn hash(&self) -> &ContentHash {
+        match self {
+            ResolveError::Lookup { hash, .. } | ResolveError::NotCanonical { hash, .. } => hash,
+        }
+    }
+
+    /// True when the library could not be reached, as opposed to refusing the hash.
+    pub fn is_transport(&self) -> bool {
+        matches!(
+            self,
+            ResolveError::Lookup {
+                source: ClientError::Transport(_),
+                ..
+            }
+        )
+    }
+}
+
+/// Resolve every hash, prefix or full, to the canonical hash of its track.
+///
+/// The one resolver for clients that send hashes to playback, which holds only
+/// full hashes. A hash that is already canonical is returned unchanged without
+/// asking the library; only prefixes go to `get_track`, the library's own
+/// prefix resolution. All hashes are resolved before any is returned, and the
+/// first that is unknown, ambiguous or resolves to a non-full hash fails the
+/// whole batch, so nothing is half sent.
+pub fn resolve_full_hashes(
+    hashes: &[ContentHash],
+    get_track: impl Fn(&ContentHash) -> Result<TrackInfo, ClientError>,
+) -> Result<Vec<CanonicalHash>, ResolveError> {
+    hashes
+        .iter()
+        .map(|hash| {
+            if let Ok(canonical) = CanonicalHash::try_from(hash.clone()) {
+                return Ok(canonical);
+            }
+            let track = get_track(hash).map_err(|source| ResolveError::Lookup {
+                hash: hash.clone(),
+                source,
+            })?;
+            CanonicalHash::try_from(track.content_hash).map_err(|NotCanonical(returned)| {
+                ResolveError::NotCanonical {
+                    hash: hash.clone(),
+                    returned,
+                }
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn track_with(hash: &str) -> TrackInfo {
+        TrackInfo {
+            content_hash: ContentHash::new(hash),
+            title: None,
+            artist: None,
+            album: None,
+            duration: None,
+            bpm: None,
+            key: None,
+            blob_path: None,
+            cover_art_path: None,
+            track_number: None,
+            disc_number: None,
+            added: None,
+            started: None,
+            stopped: None,
+            memory_cues: vec![],
+            beat_grid: None,
+            role: None,
+            energy: None,
+        }
+    }
+
+    fn full(tag: &str) -> String {
+        format!("sha256:{}", tag.repeat(64))
+    }
+
+    #[test]
+    fn resolve_full_hashes_maps_each_prefix_through_the_library() {
+        let lookup = |h: &ContentHash| Ok(track_with(&full(h.as_str())));
+        let got = resolve_full_hashes(&[ContentHash::new("a"), ContentHash::new("b")], lookup);
+        let got: Vec<ContentHash> = got.unwrap().into_iter().map(Into::into).collect();
+        assert_eq!(
+            got,
+            vec![ContentHash::new(full("a")), ContentHash::new(full("b"))]
+        );
+    }
+
+    #[test]
+    fn resolve_full_hashes_passes_canonical_input_through_without_a_lookup() {
+        let lookup = |_: &ContentHash| -> Result<TrackInfo, ClientError> {
+            panic!("a canonical hash must not be looked up")
+        };
+        let got = resolve_full_hashes(&[ContentHash::new(full("c"))], lookup).unwrap();
+        assert_eq!(got[0], ContentHash::new(full("c")));
+    }
+
+    #[test]
+    fn resolve_full_hashes_refuses_a_library_answer_that_is_not_full() {
+        let lookup = |_: &ContentHash| Ok(track_with("9fb4105e"));
+        let err = resolve_full_hashes(&[ContentHash::new("9fb4")], lookup).unwrap_err();
+        assert!(matches!(err, ResolveError::NotCanonical { .. }));
+        assert_eq!(
+            err.to_string(),
+            "library returned non-full hash 9fb4105e for 9fb4"
+        );
+    }
+
+    #[test]
+    fn resolve_error_is_transport_only_for_transport_failures() {
+        let protocol = ResolveError::Lookup {
+            hash: ContentHash::new("a"),
+            source: ClientError::Protocol(ProtocolError::Internal {
+                message: "x".to_string(),
+            }),
+        };
+        assert!(!protocol.is_transport());
+        let transport = ResolveError::Lookup {
+            hash: ContentHash::new("a"),
+            source: ClientError::Transport(nng_transport::NngClientError::Nng(nng::Error::Closed)),
+        };
+        assert!(transport.is_transport());
+    }
+
+    #[test]
+    fn resolve_full_hashes_fails_on_the_first_unknown_hash_naming_it() {
+        let lookup = |h: &ContentHash| match h.as_str() {
+            "unknown" | "also-unknown" => Err(ClientError::Protocol(ProtocolError::Internal {
+                message: "no such track".to_string(),
+            })),
+            other => Ok(track_with(&full(other))),
+        };
+        let err = resolve_full_hashes(
+            &[
+                ContentHash::new("a"),
+                ContentHash::new("unknown"),
+                ContentHash::new("also-unknown"),
+            ],
+            lookup,
+        )
+        .unwrap_err();
+        assert_eq!(err.hash(), &ContentHash::new("unknown"));
+        assert!(err.to_string().contains("cannot resolve unknown"), "{err}");
+    }
 
     #[test]
     fn invalid_request_is_unsupported_request() {

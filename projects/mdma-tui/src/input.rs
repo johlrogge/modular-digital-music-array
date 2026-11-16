@@ -114,10 +114,21 @@ fn handle_normal(app: &mut App, key: KeyEvent) {
                 app.set_status("No tracks selected");
             } else {
                 let count = hashes.len();
-                for hash in &hashes {
-                    let _ = app.playback.queue_append(hash.clone(), SourceName::audio());
+                let outcome = app
+                    .library
+                    .resolve_for_playback(&hashes)
+                    .map_err(|e| e.to_string())
+                    .and_then(|resolved| {
+                        resolved.iter().try_for_each(|hash| {
+                            app.playback
+                                .queue_append(hash.into(), SourceName::audio())
+                                .map_err(|e| e.to_string())
+                        })
+                    });
+                match outcome {
+                    Ok(()) => app.set_status(format!("Queued {} track(s)", count)),
+                    Err(e) => app.set_status(format!("Queue failed: {e}")),
                 }
-                app.set_status(format!("Queued {} track(s)", count));
             }
         }
         KeyCode::Char('Q') => {
@@ -126,10 +137,21 @@ fn handle_normal(app: &mut App, key: KeyEvent) {
                 app.set_status("No tracks selected");
             } else {
                 let count = hashes.len();
-                for hash in hashes.iter().rev() {
-                    let _ = app.playback.queue_next(hash.clone(), SourceName::audio());
+                let outcome = app
+                    .library
+                    .resolve_for_playback(&hashes)
+                    .map_err(|e| e.to_string())
+                    .and_then(|resolved| {
+                        resolved.iter().rev().try_for_each(|hash| {
+                            app.playback
+                                .queue_next(hash.into(), SourceName::audio())
+                                .map_err(|e| e.to_string())
+                        })
+                    });
+                match outcome {
+                    Ok(()) => app.set_status(format!("Queued next {} track(s)", count)),
+                    Err(e) => app.set_status(format!("Queue failed: {e}")),
                 }
-                app.set_status(format!("Queued next {} track(s)", count));
             }
         }
         KeyCode::Char('A') => {
@@ -146,8 +168,19 @@ fn handle_normal(app: &mut App, key: KeyEvent) {
                     let target = app.active_pane().add_playing_target();
                     match target {
                         AddPlayingTarget::Queue => {
-                            match app.playback.queue_append(h, SourceName::audio()) {
-                                Ok(_) => {
+                            let outcome = app
+                                .library
+                                .resolve_for_playback(&[h])
+                                .map_err(|e| e.to_string())
+                                .and_then(|resolved| {
+                                    resolved.iter().try_for_each(|hash| {
+                                        app.playback
+                                            .queue_append(hash.into(), SourceName::audio())
+                                            .map_err(|e| e.to_string())
+                                    })
+                                });
+                            match outcome {
+                                Ok(()) => {
                                     app.active_pane_mut().refresh();
                                     app.set_status("Added playing track to queue");
                                 }
@@ -191,13 +224,22 @@ fn handle_normal(app: &mut App, key: KeyEvent) {
                 app.set_status("No track selected");
             } else {
                 let count = hashes.len();
-                let result = (|| -> Result<(), mdma_client::PlaybackClientError> {
-                    for hash in queue_next_order(hashes) {
-                        app.playback.queue_next(hash, SourceName::audio())?;
-                    }
-                    app.playback.skip()?;
-                    Ok(())
-                })();
+                let result = app
+                    .library
+                    .resolve_for_playback(&hashes)
+                    .map_err(|e| e.to_string())
+                    .and_then(|resolved| {
+                        let ordered =
+                            queue_next_order(resolved.into_iter().map(Into::into).collect());
+                        (|| -> Result<(), mdma_client::PlaybackClientError> {
+                            for hash in ordered {
+                                app.playback.queue_next(hash, SourceName::audio())?;
+                            }
+                            app.playback.skip()?;
+                            Ok(())
+                        })()
+                        .map_err(|e| e.to_string())
+                    });
                 match result {
                     Ok(()) => app.set_status(format!("Playing {} track(s)", count)),
                     Err(e) => app.set_status(format!("Play failed: {e}")),
