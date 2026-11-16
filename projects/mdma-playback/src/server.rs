@@ -13,7 +13,7 @@ use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-use stream_source_protocol::StreamPlaybackState;
+use stream_source_protocol::{OutputHealth, StreamPlaybackState, StreamTrackInfo};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
@@ -30,6 +30,7 @@ fn is_read_only(command: &Command) -> bool {
             | Command::GetSession
             | Command::ListAudioOutputs
             | Command::GetAudioOutput
+            | Command::GetOutputStatus
     )
 }
 
@@ -64,6 +65,9 @@ pub struct Server {
     queue_file: PathBuf,
     event_pub: Socket,
     acid_client: Arc<AcidClient>,
+    /// Latest output health reported by the audio source; written by the
+    /// poll task, read by `GetOutputStatus`.
+    output: Arc<Mutex<Option<OutputHealth>>>,
 }
 
 impl Server {
@@ -82,6 +86,7 @@ impl Server {
             queue_file,
             event_pub,
             acid_client,
+            output: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -146,6 +151,7 @@ impl Server {
             self.event_pub.clone(),
             self.acid_client.clone(),
             self.queue_file.clone(),
+            self.output.clone(),
         ));
 
         loop {
@@ -428,6 +434,9 @@ impl Server {
                     },
                 }
             }
+            Command::GetOutputStatus => Response::Ok {
+                data: Some(ResponseData::OutputStatus(*self.output.lock().await)),
+            },
             Command::GetAudioOutput => {
                 debug!("Getting current audio output");
                 match self.audio.lock().await.get_output() {
@@ -620,6 +629,48 @@ fn preload_action(
     })
 }
 
+/// The event to publish when the source's reported output health moves from
+/// `prev` to `now`. Nothing when unchanged, and nothing when the source
+/// reports no health (an old source): absence is not a change. So the cache
+/// is never cleared once a source has reported; the last known health stays
+/// until a new one replaces it.
+fn output_change(prev: Option<OutputHealth>, now: Option<OutputHealth>) -> Option<PlaybackEvent> {
+    let health = now?;
+    (prev != now).then_some(PlaybackEvent::OutputChanged { health })
+}
+
+/// Fold a source's health `reported` into `last`: returns the event to
+/// publish, and updates `last` exactly when there is one.
+fn apply_output_report(
+    last: &mut Option<OutputHealth>,
+    reported: Option<OutputHealth>,
+) -> Option<PlaybackEvent> {
+    let event = output_change(*last, reported);
+    if event.is_some() {
+        *last = reported;
+    }
+    event
+}
+
+/// Poll the source with `Loaded`, publish an `OutputChanged` event and refresh
+/// the `GetOutputStatus` cache when its health moved. Returns the poll result
+/// so the caller can reuse it.
+async fn refresh_output(
+    audio: &Mutex<StreamClient>,
+    event_pub: &nng::Socket,
+    cache: &Mutex<Option<OutputHealth>>,
+    last_output: &mut Option<OutputHealth>,
+) -> Result<(Option<StreamTrackInfo>, Option<OutputHealth>), ServerError> {
+    let polled = audio.lock().await.loaded_with_output();
+    if let Ok((_, reported)) = &polled {
+        if let Some(event) = apply_output_report(last_output, *reported) {
+            publish_event_on_socket(event_pub, &event);
+            *cache.lock().await = *last_output;
+        }
+    }
+    polled
+}
+
 #[derive(Debug, Clone, PartialEq)]
 enum PollAction {
     Nothing,
@@ -779,8 +830,11 @@ async fn auto_advance_task(
     event_pub: nng::Socket,
     acid_client: Arc<AcidClient>,
     queue_file: PathBuf,
+    output_cache: Arc<Mutex<Option<OutputHealth>>>,
 ) {
     let mut tick: u8 = 0;
+    // Last output health reported by the source (None until it reports one).
+    let mut last_output: Option<OutputHealth> = None;
     // Last preload value sent to the source, and the track it was sent for.
     let mut last_sent: Option<CanonicalHash> = None;
     let mut last_current: Option<CanonicalHash> = None;
@@ -822,6 +876,12 @@ async fn auto_advance_task(
                 last_current = None;
                 last_sent = None;
                 known.clear();
+                // The output keeps running while Idle, so its health stays
+                // meaningful: keep watching it (~1 s).
+                if tick.is_multiple_of(5) {
+                    let _ =
+                        refresh_output(&audio, &event_pub, &output_cache, &mut last_output).await;
+                }
                 continue;
             }
         };
@@ -832,8 +892,9 @@ async fn auto_advance_task(
             known.clear();
         }
 
+        let polled = refresh_output(&audio, &event_pub, &output_cache, &mut last_output).await;
         let (finished, heard, reported_next, position_ms, duration_ms) =
-            match audio.lock().await.loaded() {
+            match polled.map(|(info, _)| info) {
                 Ok(Some(ref info)) => (
                     matches!(info.state, StreamPlaybackState::Finished),
                     // A hash the source reports that is not canonical is not one
@@ -1319,6 +1380,73 @@ mod tests {
             desired_preload(&PlaybackState::Paused { hash: h("a") }, &q),
             None
         );
+    }
+
+    #[test]
+    fn output_change_same_health_publishes_nothing() {
+        let r = Some(OutputHealth::Running);
+        assert_eq!(output_change(r, r), None);
+    }
+
+    #[test]
+    fn output_change_publishes_on_transition() {
+        assert_eq!(
+            output_change(Some(OutputHealth::Running), Some(OutputHealth::Stalled)),
+            Some(PlaybackEvent::OutputChanged {
+                health: OutputHealth::Stalled
+            })
+        );
+    }
+
+    #[test]
+    fn output_change_first_report_publishes() {
+        assert_eq!(
+            output_change(None, Some(OutputHealth::Starting)),
+            Some(PlaybackEvent::OutputChanged {
+                health: OutputHealth::Starting
+            })
+        );
+    }
+
+    #[test]
+    fn output_change_old_source_publishes_nothing() {
+        assert_eq!(output_change(None, None), None);
+        assert_eq!(output_change(Some(OutputHealth::Running), None), None);
+    }
+
+    #[test]
+    fn apply_output_report_updates_last_only_on_a_change() {
+        let mut last = None;
+        assert_eq!(
+            apply_output_report(&mut last, Some(OutputHealth::Stalled)),
+            Some(PlaybackEvent::OutputChanged {
+                health: OutputHealth::Stalled
+            })
+        );
+        assert_eq!(last, Some(OutputHealth::Stalled));
+
+        assert_eq!(
+            apply_output_report(&mut last, Some(OutputHealth::Stalled)),
+            None
+        );
+        assert_eq!(last, Some(OutputHealth::Stalled));
+
+        // An old source reporting nothing never clears what was known.
+        assert_eq!(apply_output_report(&mut last, None), None);
+        assert_eq!(last, Some(OutputHealth::Stalled));
+
+        assert_eq!(
+            apply_output_report(&mut last, Some(OutputHealth::Running)),
+            Some(PlaybackEvent::OutputChanged {
+                health: OutputHealth::Running
+            })
+        );
+        assert_eq!(last, Some(OutputHealth::Running));
+    }
+
+    #[test]
+    fn get_output_status_is_read_only() {
+        assert!(is_read_only(&Command::GetOutputStatus));
     }
 
     #[test]

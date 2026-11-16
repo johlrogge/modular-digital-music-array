@@ -15,7 +15,7 @@
 //! currently audible). `ClearPreload` cancels a pending preload.
 
 use music_primitives::ContentHash;
-pub use playback_primitives::{AudioOutputConfig, AudioSinkInfo};
+pub use playback_primitives::{AudioOutputConfig, AudioSinkInfo, OutputHealth};
 
 /// Commands sent FROM the queue manager TO a stream source.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -55,7 +55,15 @@ pub enum StreamResponse {
     /// Command accepted.
     Ok,
     /// Response to Loaded query.
-    Loaded { info: Option<StreamTrackInfo> },
+    ///
+    /// `output` reports whether the source's audio output is pulling samples,
+    /// independent of `info.state` (ADR-028). `None` from an older source (or one with
+    /// no notion of output).
+    Loaded {
+        info: Option<StreamTrackInfo>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output: Option<OutputHealth>,
+    },
     /// Response to ListOutputs.
     Outputs { sinks: Vec<AudioSinkInfo> },
     /// Response to GetOutput / SetOutput.
@@ -285,7 +293,10 @@ mod tests {
 
     #[test]
     fn stream_response_loaded_none_serialize() {
-        let resp = StreamResponse::Loaded { info: None };
+        let resp = StreamResponse::Loaded {
+            info: None,
+            output: None,
+        };
         let json = serde_json::to_string(&resp).unwrap();
         assert_eq!(json, r#"{"status":"loaded","info":null}"#);
     }
@@ -294,7 +305,43 @@ mod tests {
     fn stream_response_loaded_none_deserialize() {
         let parsed: StreamResponse =
             serde_json::from_str(r#"{"status":"loaded","info":null}"#).unwrap();
-        assert!(matches!(parsed, StreamResponse::Loaded { info: None }));
+        assert!(matches!(
+            parsed,
+            StreamResponse::Loaded {
+                info: None,
+                output: None
+            }
+        ));
+    }
+
+    #[test]
+    fn loaded_without_output_field_deserializes_to_none() {
+        let parsed: StreamResponse =
+            serde_json::from_str(r#"{"status":"loaded","info":null}"#).unwrap();
+        let StreamResponse::Loaded { output, .. } = parsed else {
+            panic!("expected Loaded");
+        };
+        assert_eq!(output, None);
+    }
+
+    #[test]
+    fn loaded_output_roundtrips_for_every_health() {
+        for health in [
+            OutputHealth::Absent,
+            OutputHealth::Starting,
+            OutputHealth::Running,
+            OutputHealth::Stalled,
+        ] {
+            let json = serde_json::to_string(&StreamResponse::Loaded {
+                info: None,
+                output: Some(health),
+            })
+            .unwrap();
+            let StreamResponse::Loaded { output, .. } = serde_json::from_str(&json).unwrap() else {
+                panic!("expected Loaded");
+            };
+            assert_eq!(output, Some(health), "json: {json}");
+        }
     }
 
     #[test]

@@ -125,7 +125,9 @@ impl NowPlaying {
                 self.queue_length = *length;
                 true
             }
-            PlaybackEvent::SessionStarted { .. } | PlaybackEvent::SessionEnded { .. } => false,
+            PlaybackEvent::SessionStarted { .. }
+            | PlaybackEvent::SessionEnded { .. }
+            | PlaybackEvent::OutputChanged { .. } => false,
         }
     }
 
