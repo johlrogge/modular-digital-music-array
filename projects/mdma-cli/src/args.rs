@@ -3,7 +3,7 @@
 use crate::local_complete::complete_playlists;
 use crate::stdin::is_hash_token;
 use bpaf::{positional, Parser};
-use hicli::Arg;
+use hicli::{Arg, ArgHelp};
 use library_ipc_client::{ContentHash, PlaylistName, PlaylistNameError};
 use playlist_import::sanitize_playlist_name;
 use std::num::NonZeroUsize;
@@ -138,13 +138,57 @@ impl<T> OrStdin<T> {
     }
 }
 
-/// Content hash (as for HASH), or `-` to read hashes from stdin
+/// A content hash, or `-` to read hashes from stdin; the help row is `HashInput::HELP`.
 ///
 /// Follows the stdin rule: at least 8 lowercase hex characters, optional `sha256:`
 /// prefix. Stdin is read only for `-`.
-#[derive(Debug, Clone, PartialEq, Eq, Arg)]
-#[arg(positional = "HASH|-")]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct HashInput(pub OrStdin<ContentHash>);
+
+/// What the user is told when no hash is given: stdin is never read implicitly, so
+/// the way to ask for it is spelled out. It names no command: every command that
+/// takes a hash shares it.
+const HASH_INPUT_MISSING: &str =
+    "expected HASH or `-` (`-` reads hashes from stdin, e.g. piped from `mdma search`)";
+
+impl HashInput {
+    const METAVAR: &'static str = "HASH|-";
+
+    /// The help row: the only source of it.
+    pub(crate) const HELP: &'static str =
+        "Content hash (as for HASH), or `-` to read hashes from stdin";
+
+    /// The positional alone: for a command that offers a hash as one alternative of
+    /// several (`plays`), where a `fallback_with` would hide the other alternatives'
+    /// "expected" text. Use this, not `Arg::parser()`, inside `construct!([..])`.
+    /// Its parse errors are named by hand, as hicli names only what
+    /// `#[derive(Arg)]` spells.
+    pub(crate) fn alternative(help: &'static str) -> impl Parser<Self> {
+        positional::<String>(Self::METAVAR)
+            .help(help)
+            .parse(|word| {
+                word.parse::<HashInput>()
+                    .map_err(|e| format!("`{}`: {e}", Self::METAVAR))
+            })
+    }
+}
+
+// Written by hand, not derived, only to carry `HASH_INPUT_MISSING`: hicli's
+// `#[derive(Arg)]` cannot customise the "missing positional" error. `custom_usage`
+// keeps the usage line `<HASH|->` (a fallback would show it as optional).
+impl ArgHelp for HashInput {
+    fn parser_with_help(help: &'static str) -> impl Parser<Self> {
+        Self::alternative(help)
+            .fallback_with(|| Err(HASH_INPUT_MISSING))
+            .custom_usage("<HASH|->")
+    }
+}
+
+impl Arg for HashInput {
+    fn parser() -> impl Parser<Self> {
+        <Self as ArgHelp>::parser_with_help(Self::HELP)
+    }
+}
 
 impl FromStr for HashInput {
     type Err = &'static str;
@@ -345,6 +389,13 @@ mod tests {
         assert!(err.contains("not a content hash"), "{err}");
         assert!(err.contains("`HASH|-`"), "{err}");
         assert!(run_arg::<HashInput>(&[]).is_err());
+    }
+
+    #[test]
+    fn a_missing_hash_says_how_to_read_stdin() {
+        let err = run_arg::<HashInput>(&[]).unwrap_err();
+        assert!(err.contains("`-` reads hashes from stdin"), "{err}");
+        assert!(err.contains("mdma search"), "{err}");
     }
 
     #[test]

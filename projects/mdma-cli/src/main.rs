@@ -16,6 +16,7 @@ mod editor;
 /// Add or retract metadata facts on a track
 #[hicli::group]
 mod fact;
+mod fact_filter;
 /// Inbox management commands
 #[hicli::group]
 mod inbox;
@@ -167,9 +168,11 @@ mod tests {
     /// Every command that takes track hashes accepts `-` for hashes on stdin.
     #[test]
     fn hash_commands_accept_a_dash_for_stdin() {
-        let cases: [&[&str]; 8] = [
+        let cases: [&[&str]; 10] = [
             &["get", "-"],
             &["facts", "-"],
+            &["facts", "--include=BPM", "-"],
+            &["facts", "-", "--exclude=TrackStarted"],
             &["library", "track", "delete", "-"],
             &["library", "track", "restore", "-"],
             &["fact", "add", "--field", "title", "--value", "x", "-"],
@@ -182,9 +185,28 @@ mod tests {
         }
         // Still a hash, still validated.
         usage_error(&["get", "xyz"]);
-        // Nothing at all is a usage error that names both spellings.
-        let err = usage_error(&["get"]);
-        assert!(err.contains("<HASH|->"), "{err}");
+        // Nothing at all is a usage error that names both spellings and says how to
+        // read stdin, for every command that takes a hash.
+        for argv in [
+            &["get"][..],
+            &["facts"],
+            &["fact", "add", "--field", "title", "--value", "x"],
+        ] {
+            let err = usage_error(argv);
+            let hint = "`-` reads hashes from stdin";
+            assert!(err.contains(hint), "{argv:?}: {err}");
+        }
+        // The hint is shared, so it names no one command.
+        let err = usage_error(&["queue", "next"]);
+        assert!(!err.contains("mdma facts"), "{err}");
+    }
+
+    /// The hash is required, so the usage line must not show it as optional.
+    #[test]
+    fn facts_help_shows_the_hash_as_required() {
+        let text = crate::test_support::help(&["facts", "--help"]);
+        assert!(text.contains("<HASH|->"), "{text}");
+        assert!(!text.contains("[<HASH|->]"), "{text}");
     }
 
     fn given(args: &[&str]) -> bool {

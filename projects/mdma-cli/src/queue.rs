@@ -477,7 +477,8 @@ mod tests {
             assert!(parse(&["queue", sub, "-"]).is_ok(), "{sub} -");
             // Omitted: nothing to act on (stdin is not read unasked).
             let err = usage_error(&["queue", sub]);
-            assert!(err.contains("<HASH|->"), "{sub}: {err}");
+            let hint = "`-` reads hashes from stdin";
+            assert!(err.contains(hint), "{sub}: {err}");
             // A hash and `-` do not mix.
             usage_error(&["queue", sub, "-", "abcd1234"]);
             usage_error(&["queue", sub, "abcd1234", "-"]);

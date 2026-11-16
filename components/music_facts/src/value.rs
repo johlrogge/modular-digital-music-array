@@ -504,6 +504,48 @@ impl MusicValue {
             MusicValue::MemoryCue { .. } => "MemoryCue",
         }
     }
+
+    /// The kind of this value: its attribute, as a type.
+    pub fn kind(&self) -> FactKind {
+        FactKind(self.display_name())
+    }
+}
+
+/// The name of a fact's attribute (one of `MusicValue::ATTRIBUTE_NAMES`).
+///
+/// Parsed ignoring ASCII case, and always holding the canonical spelling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FactKind(&'static str);
+
+impl FactKind {
+    /// The canonical name, as `MusicValue::display_name` spells it.
+    pub fn as_str(&self) -> &'static str {
+        self.0
+    }
+}
+
+impl fmt::Display for FactKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+/// Why a name is not a fact kind.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("unknown fact kind")]
+pub struct UnknownFactKind;
+
+impl std::str::FromStr for FactKind {
+    type Err = UnknownFactKind;
+
+    fn from_str(name: &str) -> Result<Self, Self::Err> {
+        MusicValue::ATTRIBUTE_NAMES
+            .iter()
+            .find(|known| known.eq_ignore_ascii_case(name))
+            .copied()
+            .map(Self)
+            .ok_or(UnknownFactKind)
+    }
 }
 
 impl fmt::Display for MusicValue {
@@ -734,6 +776,44 @@ mod tests {
             MusicValue::ATTRIBUTE_NAMES.len(),
             "no duplicates"
         );
+    }
+
+    #[test]
+    fn fact_kind_parses_every_attribute_name_ignoring_case_to_its_canonical_name() {
+        for name in MusicValue::ATTRIBUTE_NAMES {
+            for spelling in [name.to_string(), name.to_lowercase(), name.to_uppercase()] {
+                let kind: FactKind = spelling
+                    .parse()
+                    .unwrap_or_else(|e| panic!("{spelling}: {e}"));
+                assert_eq!(kind.as_str(), *name, "{spelling}");
+            }
+        }
+    }
+
+    #[test]
+    fn fact_kind_rejects_unknown_names() {
+        for bad in ["", "Titel", "Title ", "bpm2", "-"] {
+            assert!(bad.parse::<FactKind>().is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn attribute_names_are_unique_ignoring_case() {
+        let mut lowered: Vec<String> = MusicValue::ATTRIBUTE_NAMES
+            .iter()
+            .map(|n| n.to_ascii_lowercase())
+            .collect();
+        lowered.sort_unstable();
+        lowered.dedup();
+        assert_eq!(lowered.len(), MusicValue::ATTRIBUTE_NAMES.len());
+    }
+
+    #[test]
+    fn kind_of_every_sample_is_its_display_name() {
+        for sample in attribute_samples() {
+            assert_eq!(sample.kind().as_str(), sample.display_name());
+            assert_eq!(sample.kind().to_string(), sample.display_name());
+        }
     }
 
     #[test]
