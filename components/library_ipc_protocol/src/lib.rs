@@ -6,8 +6,8 @@
 
 // Re-export types used in the protocol so clients don't need to depend on music-facts
 pub use music_facts::{
-    Bpm, ContentHash, CueKind, DurationSeconds, FactSource, Key, Mark, MarkFilter, MarkName,
-    MarkNameError, MusicValue,
+    Bpm, ContentHash, CueKind, DurationSeconds, FactKind, FactSource, Key, Mark, MarkFilter,
+    MarkName, MarkNameError, MusicValue,
 };
 pub use music_primitives::{CanonicalHash, EnergyLevel, TrackRole};
 // Re-export query types so clients can use them without depending on library-search directly
@@ -63,7 +63,7 @@ pub enum AttributeListError {
 /// is already known to name something (a typo would otherwise retract nothing).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "Vec<FactType>", into = "Vec<FactType>")]
-pub struct AttributeList(Vec<FactType>);
+pub struct AttributeList(Vec<FactKind>);
 
 impl AttributeList {
     pub fn try_new<S: AsRef<str>>(
@@ -79,10 +79,10 @@ impl AttributeList {
 
     /// Whether `value` is of one of the listed attributes.
     pub fn contains(&self, value: &MusicValue) -> bool {
-        self.0.iter().any(|a| a.as_str() == value.display_name())
+        self.0.contains(&value.kind())
     }
 
-    pub fn as_slice(&self) -> &[FactType] {
+    pub fn as_slice(&self) -> &[FactKind] {
         &self.0
     }
 }
@@ -94,19 +94,21 @@ impl TryFrom<Vec<FactType>> for AttributeList {
         if names.is_empty() {
             return Err(AttributeListError::Empty);
         }
-        if let Some(unknown) = names
+        let kinds = names
             .iter()
-            .find(|n| !MusicValue::ATTRIBUTE_NAMES.contains(&n.as_str()))
-        {
-            return Err(AttributeListError::Unknown(unknown.to_string()));
-        }
-        Ok(Self(names))
+            .map(|n| {
+                n.as_str()
+                    .parse::<FactKind>()
+                    .map_err(|_| AttributeListError::Unknown(n.to_string()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self(kinds))
     }
 }
 
 impl From<AttributeList> for Vec<FactType> {
     fn from(list: AttributeList) -> Self {
-        list.0
+        list.0.iter().map(|k| FactType::new(k.as_str())).collect()
     }
 }
 
@@ -1869,6 +1871,16 @@ mod tests {
             serde_json::to_string(&AttributeList::try_new(["Album"]).unwrap()).unwrap(),
             r#"["Album"]"#
         );
+    }
+
+    #[test]
+    fn attribute_list_keeps_the_canonical_spelling() {
+        let list = AttributeList::try_new(["title", "BPM", "bpm"]).unwrap();
+        assert_eq!(
+            serde_json::to_string(&list).unwrap(),
+            r#"["Title","BPM","BPM"]"#
+        );
+        assert!(list.contains(&MusicValue::Title(music_facts::Title::new("t"))));
     }
 
     #[test]

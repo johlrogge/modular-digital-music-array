@@ -10,4 +10,7 @@ pub use music_primitives::{
 };
 pub use primitives::*;
 pub use source::{EmptyNameError, FactSource, Origin, OriginKind, SourceIdentity, ToolName};
-pub use value::{AlbumArtPresence, CueKind, MusicFormat, MusicValue, StartReason, StopReason};
+pub use value::{
+    AlbumArtPresence, CueKind, FactKind, MusicFormat, MusicValue, StartReason, StopReason,
+    UnknownFactKind,
+};
