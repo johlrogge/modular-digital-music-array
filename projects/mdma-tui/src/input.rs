@@ -20,6 +20,45 @@ fn mark_status(mark: &Mark, result: Result<MarkWrite, LibraryClientError>) -> St
     }
 }
 
+/// Where resolved tracks go in the playback queue.
+#[derive(Clone, Copy)]
+enum QueuePosition {
+    /// At the end of the queue, in selection order.
+    Append,
+    /// Right after the playing track, keeping the selection order.
+    Next,
+}
+
+/// Resolve `hashes` for playback and queue them at `position`.
+/// Returns how many tracks were queued; nothing is queued when resolving fails.
+fn queue_resolved(
+    app: &App,
+    hashes: &[ContentHash],
+    position: QueuePosition,
+) -> Result<usize, String> {
+    let resolved: Vec<ContentHash> = app
+        .library
+        .resolve_for_playback(hashes)
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .map(Into::into)
+        .collect();
+    let count = resolved.len();
+    match position {
+        QueuePosition::Append => resolved.into_iter().try_for_each(|hash| {
+            app.playback
+                .queue_append(hash, SourceName::audio())
+                .map_err(|e| e.to_string())
+        }),
+        QueuePosition::Next => queue_next_order(resolved).into_iter().try_for_each(|hash| {
+            app.playback
+                .queue_next(hash, SourceName::audio())
+                .map_err(|e| e.to_string())
+        }),
+    }?;
+    Ok(count)
+}
+
 /// Dispatch a key event to the application based on the current input mode.
 pub fn handle_key(app: &mut App, key: KeyEvent) {
     match app.mode {
@@ -113,20 +152,8 @@ fn handle_normal(app: &mut App, key: KeyEvent) {
             if hashes.is_empty() {
                 app.set_status("No tracks selected");
             } else {
-                let count = hashes.len();
-                let outcome = app
-                    .library
-                    .resolve_for_playback(&hashes)
-                    .map_err(|e| e.to_string())
-                    .and_then(|resolved| {
-                        resolved.iter().try_for_each(|hash| {
-                            app.playback
-                                .queue_append(hash.into(), SourceName::audio())
-                                .map_err(|e| e.to_string())
-                        })
-                    });
-                match outcome {
-                    Ok(()) => app.set_status(format!("Queued {} track(s)", count)),
+                match queue_resolved(app, &hashes, QueuePosition::Append) {
+                    Ok(count) => app.set_status(format!("Queued {} track(s)", count)),
                     Err(e) => app.set_status(format!("Queue failed: {e}")),
                 }
             }
@@ -136,20 +163,8 @@ fn handle_normal(app: &mut App, key: KeyEvent) {
             if hashes.is_empty() {
                 app.set_status("No tracks selected");
             } else {
-                let count = hashes.len();
-                let outcome = app
-                    .library
-                    .resolve_for_playback(&hashes)
-                    .map_err(|e| e.to_string())
-                    .and_then(|resolved| {
-                        resolved.iter().rev().try_for_each(|hash| {
-                            app.playback
-                                .queue_next(hash.into(), SourceName::audio())
-                                .map_err(|e| e.to_string())
-                        })
-                    });
-                match outcome {
-                    Ok(()) => app.set_status(format!("Queued next {} track(s)", count)),
+                match queue_resolved(app, &hashes, QueuePosition::Next) {
+                    Ok(count) => app.set_status(format!("Queued next {} track(s)", count)),
                     Err(e) => app.set_status(format!("Queue failed: {e}")),
                 }
             }
@@ -168,19 +183,8 @@ fn handle_normal(app: &mut App, key: KeyEvent) {
                     let target = app.active_pane().add_playing_target();
                     match target {
                         AddPlayingTarget::Queue => {
-                            let outcome = app
-                                .library
-                                .resolve_for_playback(&[h])
-                                .map_err(|e| e.to_string())
-                                .and_then(|resolved| {
-                                    resolved.iter().try_for_each(|hash| {
-                                        app.playback
-                                            .queue_append(hash.into(), SourceName::audio())
-                                            .map_err(|e| e.to_string())
-                                    })
-                                });
-                            match outcome {
-                                Ok(()) => {
+                            match queue_resolved(app, &[h], QueuePosition::Append) {
+                                Ok(_) => {
                                     app.active_pane_mut().refresh();
                                     app.set_status("Added playing track to queue");
                                 }
@@ -188,11 +192,10 @@ fn handle_normal(app: &mut App, key: KeyEvent) {
                             }
                         }
                         AddPlayingTarget::Playlist(name) => {
-                            use crate::playlist_pane::playlist_content_for_write;
+                            use crate::rows::{rows_content_for_write, ListRow};
                             match app.library.get_track(&h) {
                                 Ok(track) => {
-                                    let content =
-                                        playlist_content_for_write(std::slice::from_ref(&track));
+                                    let content = rows_content_for_write(&[ListRow::Track(track)]);
                                     match app.library.playlist_append(&name, content) {
                                         Ok(()) => {
                                             app.active_pane_mut().refresh();

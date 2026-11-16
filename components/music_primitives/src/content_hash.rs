@@ -30,7 +30,8 @@ const CANONICAL_HEX_LEN: usize = 64;
 /// lowercase hex digits. Holds no prefix, so what carries one cannot be a
 /// short form. Services that record or compare hashes (playback state, play
 /// facts) hold this; resolving a prefix to it is the library's job.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "ContentHash", into = "ContentHash")]
 pub struct CanonicalHash(ContentHash);
 
 /// A [`ContentHash`] that is not in canonical form.
@@ -166,5 +167,23 @@ mod tests {
         let json = serde_json::to_string(&h).unwrap();
         let decoded: ContentHash = serde_json::from_str(&json).unwrap();
         assert_eq!(h, decoded);
+    }
+
+    #[test]
+    fn canonical_hash_roundtrips_as_a_plain_string() {
+        let canonical =
+            CanonicalHash::try_from(ContentHash::new(format!("sha256:{}", hex64()))).unwrap();
+        let json = serde_json::to_string(&canonical).unwrap();
+        assert_eq!(json, format!("\"sha256:{}\"", hex64()));
+        let decoded: CanonicalHash = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, canonical);
+    }
+
+    #[test]
+    fn canonical_hash_deserialize_refuses_a_prefix() {
+        let result = serde_json::from_str::<CanonicalHash>("\"9fb4105e\"");
+        assert!(result.is_err());
+        let result = serde_json::from_str::<CanonicalHash>("\"sha256:9fb4105e\"");
+        assert!(result.is_err());
     }
 }

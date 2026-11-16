@@ -2170,7 +2170,12 @@
             var area = document.getElementById('browse-content');
             area.innerHTML = '<div class="empty-state">Loading tracks...</div>';
             fetch('/library/playlists/' + encodeURIComponent(playlistName) + '/tracks')
-                .then(function(r) { return r.json(); })
+                .then(function(r) {
+                    return r.json().then(function(body) {
+                        if (!r.ok) { throw new Error(body.error || ('HTTP ' + r.status)); }
+                        return body;
+                    });
+                })
                 .then(function(tracks) {
                     var html = '<div style="margin-bottom:12px"><button class="btn btn-sm btn-ghost" onclick="loadBrowseContent()">&larr; Back</button> <span style="font-family:\'DM Mono\',monospace;color:var(--accent)">' + escapeHtml(playlistName) + '</span></div>';
                     html += '<div style="margin-bottom:12px"><button class="btn btn-accent btn-sm" onclick="queuePlaylist(\'' + escapeHtml(playlistName).replace(/'/g, "\\'") + '\')">Queue This Playlist</button></div>';
@@ -2197,12 +2202,12 @@
         function renderBrowseTrackTable(tracks) {
             var rows = tracks.map(function(t) {
                 var hash = escapeHtml(t.content_hash || '');
-                var title = escapeHtml(t.title || 'Unknown');
+                var title = escapeHtml(t.unavailable ? t.error : (t.title || 'Unknown'));
                 var artist = escapeHtml(t.artist || '');
                 var bpmStr = t.bpm ? parseFloat(t.bpm).toFixed(1) : '';
                 var keyStr = escapeHtml(t.key || '');
                 var dur = t.duration ? fmtDuration(t.duration) : '';
-                return '<tr>' +
+                return '<tr' + (t.unavailable ? ' style="opacity:0.5;font-style:italic"' : '') + '>' +
                     '<td>' + title + '</td>' +
                     '<td style="color:var(--text-secondary)">' + artist + '</td>' +
                     '<td class="col-mono">' + bpmStr + '</td>' +

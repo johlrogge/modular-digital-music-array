@@ -5,7 +5,7 @@ use music_primitives::TrackRole;
 
 use crate::filters::{build_track_query, FilterState};
 use crate::ipc::{ConnectionStatus, IpcChannels, IpcRequest};
-use crate::playlists::{CentralView, PlaylistState};
+use crate::playlists::{CentralView, PlaylistRow, PlaylistState};
 use crate::results::{
     fmt_bpm, fmt_energy, fmt_key, fmt_role, sort_tracks, SearchResults, SortColumn,
 };
@@ -28,6 +28,22 @@ fn track_row(ui: &mut egui::Ui, track: &TrackInfo) {
     ui.label(fmt_role(&track.role));
     ui.label(fmt_energy(&track.energy));
     ui.end_row();
+}
+
+/// Render one playlist row: a track, or an unavailable line in muted text
+/// with the remaining cells left empty. Callers must keep the grid's
+/// column count equal to `track_header_labels().len()`.
+fn playlist_row(ui: &mut egui::Ui, row: &PlaylistRow) {
+    match row {
+        PlaylistRow::Track(track) => track_row(ui, track),
+        PlaylistRow::Unavailable(reason) => {
+            ui.label(egui::RichText::new(format!("unavailable: {reason}")).weak());
+            for _ in 1..track_header_labels().len() {
+                ui.label("");
+            }
+            ui.end_row();
+        }
+    }
 }
 
 /// All `TrackRole` variants in display order, for the combo box.
@@ -96,7 +112,7 @@ pub fn ui_system(
                             && current_selected != Some(idx)
                         {
                             playlist_state.selected = Some(idx);
-                            playlist_state.tracks.clear();
+                            playlist_state.rows.clear();
                             playlist_state.loading = true;
                             *central_view = CentralView::Playlist;
 
@@ -213,11 +229,7 @@ fn show_playlist_panel(ui: &mut egui::Ui, state: &PlaylistState) {
             if state.loading {
                 ui.label(format!("Loading {name}\u{2026}"));
             } else {
-                ui.label(format!(
-                    "Playlist: {} ({} tracks)",
-                    name,
-                    state.tracks.len()
-                ));
+                ui.label(format!("Playlist: {} ({} entries)", name, state.rows.len()));
                 ui.separator();
 
                 egui::ScrollArea::vertical()
@@ -233,8 +245,8 @@ fn show_playlist_panel(ui: &mut egui::Ui, state: &PlaylistState) {
                                 }
                                 ui.end_row();
 
-                                for track in &state.tracks {
-                                    track_row(ui, track);
+                                for row in &state.rows {
+                                    playlist_row(ui, row);
                                 }
                             });
                     });

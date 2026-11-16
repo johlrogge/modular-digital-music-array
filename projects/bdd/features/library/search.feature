@@ -45,4 +45,4 @@ Feature: Library search
     Given the library also contains a legacy track with raw hash "7926386d" and title "LegacyTrack" by "OldArtist"
     And the library also contains a legacy track with raw hash "79263890" and title "OtherLegacy" by "OldArtist"
     When I resolve hash "792638"
-    Then the operation should fail with "Ambiguous"
+    Then the operation should fail with "ambiguous hash '792638' matches 2 tracks"

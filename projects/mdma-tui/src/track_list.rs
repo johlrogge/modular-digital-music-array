@@ -1,5 +1,7 @@
 use crate::selection::SelectionState;
-use crate::theme::{RowState, ACCENT2, SELECTED_FG, SELECTION_FG, TEXT_PRIMARY, TEXT_TERTIARY};
+use crate::theme::{
+    RowState, ACCENT2, MUTED, SELECTED_FG, SELECTION_FG, TEXT_PRIMARY, TEXT_TERTIARY,
+};
 use corsett::{
     shortener::{FreeText, RightEllipsis},
     ColumnSizingConfigBuilder, RemovalPolicy, Row, Score, Shorten, ShortenAny,
@@ -117,6 +119,49 @@ impl TrackRow {
     }
 }
 
+impl TrackRow {
+    /// A row for a line with no track: only the title cell, carrying `text`.
+    fn unavailable(text: String) -> Self {
+        Self {
+            artist: ColArtist(String::new()),
+            title: ColTitle(text),
+            bpm: ColBpm(String::new()),
+            key: ColKey(String::new()),
+            duration: ColDuration(String::new()),
+        }
+    }
+}
+
+/// What a list row shows: a track, or text saying why there is none.
+pub enum Listing<'a> {
+    Track(&'a TrackInfo),
+    Unavailable(String),
+}
+
+/// A row `render_track_list` can show.
+pub trait ListedRow {
+    fn listing(&self) -> Listing<'_>;
+}
+
+impl ListedRow for TrackInfo {
+    fn listing(&self) -> Listing<'_> {
+        Listing::Track(self)
+    }
+}
+
+impl Listing<'_> {
+    fn to_row(&self) -> TrackRow {
+        match self {
+            Listing::Track(track) => TrackRow::from_track(track),
+            Listing::Unavailable(text) => TrackRow::unavailable(text.clone()),
+        }
+    }
+
+    fn is_unavailable(&self) -> bool {
+        matches!(self, Listing::Unavailable(_))
+    }
+}
+
 // =============================================================================
 // Public API
 // =============================================================================
@@ -144,15 +189,19 @@ const SEP: &str = " \u{2014} "; // " — " (3 chars: space, em-dash, space)
 ///
 /// Column removal is decided upfront based on natural content widths and available budget.
 /// Corsett handles fine-grained shrinking of the remaining visible columns.
+#[cfg(test)]
 pub fn size_track_columns(tracks: &[&TrackInfo], available_width: u16) -> SizedColumns {
-    if tracks.is_empty() {
+    let rows: Vec<TrackRow> = tracks.iter().map(|t| TrackRow::from_track(t)).collect();
+    size_rows(rows, available_width)
+}
+
+fn size_rows(rows: Vec<TrackRow>, available_width: u16) -> SizedColumns {
+    if rows.is_empty() {
         return SizedColumns {
             cells: vec![],
             col_widths: [0; 5],
         };
     }
-
-    let rows: Vec<TrackRow> = tracks.iter().map(|t| TrackRow::from_track(t)).collect();
 
     // Compute natural max content width per column across all rows.
     let mut natural_widths = [0usize; 5];
@@ -263,28 +312,27 @@ fn fit_cell(s: &str, width: usize) -> String {
 /// Render a list of tracks respecting the SelectionState's visibility and selection.
 ///
 /// The block title and borders are provided by the caller.
-pub fn render_track_list(
+pub fn render_track_list<T: ListedRow>(
     f: &mut Frame,
     area: Rect,
-    tracks: &[TrackInfo],
+    tracks: &[T],
     selection: &SelectionState,
     block: Block,
 ) {
-    let visible_tracks: Vec<&TrackInfo> = selection
+    let listings: Vec<Listing> = selection
         .visible_to_data
         .iter()
-        .map(|&data_idx| &tracks[data_idx])
+        .map(|&data_idx| tracks[data_idx].listing())
         .collect();
 
-    let sized = size_track_columns(&visible_tracks, area.width);
+    let sized = size_rows(listings.iter().map(Listing::to_row).collect(), area.width);
 
-    let items: Vec<ListItem> = selection
-        .visible_to_data
+    let items: Vec<ListItem> = listings
         .iter()
         .enumerate()
         .zip(sized.cells)
         .map(
-            |((vis_idx, &_data_idx), [artist_str, title_str, bpm_str, key_str, dur_str])| {
+            |((vis_idx, listing), [artist_str, title_str, bpm_str, key_str, dur_str])| {
                 let is_cursor = selection.cursor_position() == Some(vis_idx);
                 let is_selected = selection.selected.contains(&vis_idx);
 
@@ -295,6 +343,7 @@ pub fn render_track_list(
                         (SELECTION_FG, SELECTION_FG, SELECTION_FG)
                     }
                     RowState::Selected => (SELECTED_FG, SELECTED_FG, TEXT_TERTIARY),
+                    RowState::Normal if listing.is_unavailable() => (MUTED, MUTED, MUTED),
                     RowState::Normal => (ACCENT2, TEXT_PRIMARY, TEXT_TERTIARY),
                 };
 

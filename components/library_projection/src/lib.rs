@@ -30,7 +30,7 @@
 //! ([`PlayHistory`]) read the same resolved events. [`resolve_prefix`] is the one
 //! resolution of a partial hash.
 
-use library_ipc_protocol::FactType;
+use library_ipc_protocol::{CanonicalHash, EntryError, FactType, PlaylistEntry};
 use music_facts::{ContentHash, Mark, MarkFilter, MusicValue, StartReason, StopReason};
 use stainless_facts::{aggregate_facts, Fact, Operation};
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -1505,26 +1505,49 @@ fn short_prefix_counts<'a>(full_keys: impl Iterator<Item = &'a str>) -> HashMap<
     counts
 }
 
+/// A track record a partial hash can be resolved against. Implemented by the
+/// library's [`IndexedTrackInfo`] and the BDD stub's own record, so both resolve
+/// with the same [`resolve_prefix`].
+pub trait HashedTrack {
+    fn content_hash(&self) -> &str;
+    fn title(&self) -> Option<&str>;
+    fn is_hidden(&self) -> bool;
+}
+
+impl HashedTrack for IndexedTrackInfo {
+    fn content_hash(&self) -> &str {
+        self.content_hash.as_str()
+    }
+
+    fn title(&self) -> Option<&str> {
+        self.title.as_deref()
+    }
+
+    fn is_hidden(&self) -> bool {
+        IndexedTrackInfo::is_hidden(self)
+    }
+}
+
 /// Why a partial hash does not name one track ([`resolve_prefix`]).
-pub enum Unresolved<'a> {
+pub enum Unresolved<'a, T> {
     /// No track's hash starts with it.
     NotFound,
     /// Different hashes start with it: every track that does.
-    Ambiguous(Vec<&'a IndexedTrackInfo>),
+    Ambiguous(Vec<&'a T>),
 }
 
 /// What to tell the user when `partial` matches several `tracks`: how many, and the
 /// first three.
-pub fn ambiguity_message(partial: &str, tracks: &[&IndexedTrackInfo]) -> String {
+pub fn ambiguity_message<T: HashedTrack>(partial: &str, tracks: &[&T]) -> String {
     let examples: Vec<_> = tracks
         .iter()
         .take(3)
         .map(|t| {
-            let hash_str = t.content_hash.as_str();
+            let hash_str = t.content_hash();
             // Show 8 chars after "sha256:" prefix; fall back to full string for
             // legacy short hashes that lack the prefix.
             let short = hash_str.get(7..15).unwrap_or(hash_str);
-            let name = t.title.as_deref().unwrap_or("Unknown");
+            let name = t.title().unwrap_or("Unknown");
             format!("  {} ({})", short, name)
         })
         .collect();
@@ -1539,23 +1562,16 @@ pub fn ambiguity_message(partial: &str, tracks: &[&IndexedTrackInfo]) -> String 
 /// Resolve a partial hash to the track it names (like git short refs). Hidden tracks
 /// resolve too; the one lookup behind the library service and anything reading a
 /// replica.
-pub fn resolve_prefix<'a>(
-    tracks: &'a [IndexedTrackInfo],
+pub fn resolve_prefix<'a, T: HashedTrack>(
+    tracks: &'a [T],
     partial: &str,
-) -> Result<&'a IndexedTrackInfo, Unresolved<'a>> {
+) -> Result<&'a T, Unresolved<'a, T>> {
     let normalize = |h: &str| h.strip_prefix("sha256:").unwrap_or(h).to_lowercase();
     let partial_clean = normalize(partial);
 
     let matches: Vec<_> = tracks
         .iter()
-        .filter(|t| {
-            let hash = t
-                .content_hash
-                .as_str()
-                .strip_prefix("sha256:")
-                .unwrap_or(t.content_hash.as_str());
-            hash.to_lowercase().starts_with(&partial_clean)
-        })
+        .filter(|t| normalize(t.content_hash()).starts_with(&partial_clean))
         .collect();
 
     match matches.len() {
@@ -1572,7 +1588,7 @@ pub fn resolve_prefix<'a>(
             // both normalize to the same prefix, so one starts_with the other.
             let normalized: Vec<String> = matches
                 .iter()
-                .map(|t| normalize(t.content_hash.as_str()))
+                .map(|t| normalize(t.content_hash()))
                 .collect();
             // All entries represent the same content if every pair of
             // normalized hashes has one that is a prefix of the other
@@ -1583,11 +1599,12 @@ pub fn resolve_prefix<'a>(
                     .all(|b| a.starts_with(b.as_str()) || b.starts_with(a.as_str()))
             });
             if all_same {
-                // Prefer the entry with the longest (most complete) hash,
-                // so a full "sha256:..." hash wins over a legacy 8-char hash.
+                // Prefer a visible entry over a hidden one, then the longest
+                // (most complete) hash, so a full "sha256:..." hash wins over a
+                // legacy 8-char hash.
                 let best = matches
                     .iter()
-                    .max_by_key(|t| t.content_hash.as_str().len())
+                    .max_by_key(|t| (!t.is_hidden(), t.content_hash().len()))
                     .unwrap();
                 return Ok(*best);
             }
@@ -1595,6 +1612,54 @@ pub fn resolve_prefix<'a>(
             // Genuinely different hashes share a prefix: real ambiguity.
             Err(Unresolved::Ambiguous(matches))
         }
+    }
+}
+
+/// Like [`resolve_prefix`], but a hidden (deleted/superseded) track is as absent as
+/// an unknown one: the one rule behind `get_track` and playlist entry resolution.
+/// When the index holds a hidden and a visible entry of one hash, the visible wins.
+pub fn resolve_visible<'a, T: HashedTrack>(
+    tracks: &'a [T],
+    partial: &str,
+) -> Result<&'a T, Unresolved<'a, T>> {
+    match resolve_prefix(tracks, partial) {
+        Ok(track) if track.is_hidden() => Err(Unresolved::NotFound),
+        other => other,
+    }
+}
+
+/// Resolve one playlist line's token to the entry it stands for.
+///
+/// Every token, short or full, resolves the same way, as `get_track` does
+/// ([`resolve_visible`]): `Track` means the track exists and is visible; a full
+/// hash that is absent or hidden is as unknown as a prefix.
+pub fn resolve_entry<T: HashedTrack>(tracks: &[T], token: &str) -> PlaylistEntry {
+    let unresolved = |error| PlaylistEntry::Unresolved { error };
+    let unknown = || EntryError::Unknown {
+        hash: ContentHash::new(token),
+    };
+    match resolve_visible(tracks, token) {
+        Err(Unresolved::NotFound) => unresolved(unknown()),
+        Err(Unresolved::Ambiguous(found)) => {
+            let mut candidates: Vec<ContentHash> = Vec::new();
+            for track in found {
+                let hash = ContentHash::new(track.content_hash());
+                if !candidates.contains(&hash) {
+                    candidates.push(hash);
+                }
+            }
+            unresolved(EntryError::Ambiguous {
+                hash: ContentHash::new(token),
+                candidates,
+            })
+        }
+        Ok(track) => match CanonicalHash::try_from(ContentHash::new(track.content_hash())) {
+            Ok(hash) => PlaylistEntry::Track { hash },
+            Err(not_canonical) => unresolved(EntryError::NotCanonical {
+                hash: ContentHash::new(token),
+                found: not_canonical.0,
+            }),
+        },
     }
 }
 
@@ -2231,6 +2296,168 @@ mod tests {
         assert_eq!(
             ambiguity_message("sha256:abcdef00", &found),
             "Ambiguous hash 'sha256:abcdef00' matches 2 tracks:\n  abcdef00 (Track A)\n  abcdef00 (Track B)"
+        );
+    }
+
+    // ---- resolving a playlist entry ----------------------------------------------
+
+    fn full_hash(tag: char) -> String {
+        format!("sha256:{}", tag.to_string().repeat(64))
+    }
+
+    fn hash_entry(hash: &str) -> PlaylistEntry {
+        PlaylistEntry::Track {
+            hash: CanonicalHash::try_from(ContentHash::new(hash)).unwrap(),
+        }
+    }
+
+    fn unresolved(error: EntryError) -> PlaylistEntry {
+        PlaylistEntry::Unresolved { error }
+    }
+
+    #[test]
+    fn resolve_entry_prefix_of_one_visible_track_is_its_full_hash() {
+        let a = full_hash('a');
+        let tracks = [entry(&a, "A"), entry(&full_hash('b'), "B")];
+        assert_eq!(resolve_entry(&tracks, "aaaaaaaa"), hash_entry(&a));
+        assert_eq!(resolve_entry(&tracks, "sha256:aaaa"), hash_entry(&a));
+    }
+
+    #[test]
+    fn resolve_entry_full_hash_absent_from_index_is_unknown() {
+        let tracks = [entry(&full_hash('b'), "B")];
+        let absent = full_hash('a');
+        assert_eq!(
+            resolve_entry(&tracks, &absent),
+            unresolved(EntryError::Unknown {
+                hash: ContentHash::new(&absent)
+            })
+        );
+    }
+
+    #[test]
+    fn resolve_entry_full_hash_of_hidden_track_is_unknown() {
+        let hash = full_hash('a');
+        let mut hidden = entry(&hash, "A");
+        hidden.deleted_at = Some(chrono::Utc::now());
+        assert_eq!(
+            resolve_entry(&[hidden], &hash),
+            unresolved(EntryError::Unknown {
+                hash: ContentHash::new(&hash)
+            })
+        );
+    }
+
+    #[test]
+    fn resolve_entry_treats_full_and_prefix_of_same_track_alike() {
+        let a = full_hash('a');
+        let visible = [entry(&a, "A")];
+        assert_eq!(resolve_entry(&visible, &a), hash_entry(&a));
+        assert_eq!(resolve_entry(&visible, "aaaa"), hash_entry(&a));
+        let mut hidden = entry(&a, "A");
+        hidden.deleted_at = Some(chrono::Utc::now());
+        let hidden = [hidden];
+        let full = resolve_entry(&hidden, &a);
+        let prefix = resolve_entry(&hidden, "aaaa");
+        assert!(matches!(full, PlaylistEntry::Unresolved { .. }));
+        assert!(matches!(prefix, PlaylistEntry::Unresolved { .. }));
+    }
+
+    #[test]
+    fn resolve_entry_unknown_prefix_is_unknown_naming_it() {
+        let tracks = [entry(&full_hash('b'), "B")];
+        assert_eq!(
+            resolve_entry(&tracks, "ffff"),
+            unresolved(EntryError::Unknown {
+                hash: ContentHash::new("ffff")
+            })
+        );
+    }
+
+    #[test]
+    fn resolve_entry_prefix_of_hidden_track_is_unknown() {
+        let mut hidden = entry(&full_hash('a'), "A");
+        hidden.deleted_at = Some(chrono::Utc::now());
+        assert_eq!(
+            resolve_entry(&[hidden], "aaaa"),
+            unresolved(EntryError::Unknown {
+                hash: ContentHash::new("aaaa")
+            })
+        );
+    }
+
+    #[test]
+    fn resolve_entry_prefix_of_two_tracks_is_ambiguous_listing_both() {
+        let (a, b) = (
+            format!("sha256:ab{}", "1".repeat(62)),
+            format!("sha256:ab{}", "2".repeat(62)),
+        );
+        let tracks = [entry(&a, "A"), entry(&b, "B")];
+        assert_eq!(
+            resolve_entry(&tracks, "ab"),
+            unresolved(EntryError::Ambiguous {
+                hash: ContentHash::new("ab"),
+                candidates: vec![ContentHash::new(&a), ContentHash::new(&b)],
+            })
+        );
+    }
+
+    #[test]
+    fn resolve_entry_ambiguous_candidates_are_distinct_in_index_order() {
+        let (x, y) = (
+            format!("sha256:ab{}", "1".repeat(62)),
+            format!("sha256:ab{}", "2".repeat(62)),
+        );
+        let tracks = [entry(&x, "X"), entry(&x, "X again"), entry(&y, "Y")];
+        assert_eq!(
+            resolve_entry(&tracks, "ab"),
+            unresolved(EntryError::Ambiguous {
+                hash: ContentHash::new("ab"),
+                candidates: vec![ContentHash::new(&x), ContentHash::new(&y)],
+            })
+        );
+    }
+
+    #[test]
+    fn resolve_visible_prefers_the_visible_entry_of_an_identical_hash() {
+        let hash = full_hash('a');
+        let mut hidden = entry(&hash, "hidden");
+        hidden.deleted_at = Some(chrono::Utc::now());
+        let visible = entry(&hash, "visible");
+        for tracks in [[hidden.clone(), visible.clone()], [visible, hidden]] {
+            let Ok(track) = resolve_visible(&tracks, "aaaa") else {
+                panic!("the visible entry must resolve");
+            };
+            assert_eq!(track.title.as_deref(), Some("visible"));
+        }
+    }
+
+    #[test]
+    fn resolve_visible_treats_a_hidden_track_as_not_found() {
+        let mut hidden = entry(&full_hash('a'), "hidden");
+        hidden.deleted_at = Some(chrono::Utc::now());
+        assert!(matches!(
+            resolve_visible(&[hidden], "aaaa"),
+            Err(Unresolved::NotFound)
+        ));
+    }
+
+    #[test]
+    fn resolve_entry_prefix_of_legacy_short_and_full_of_one_track_is_the_full() {
+        let full = format!("sha256:9fb4105e{}", "0".repeat(56));
+        let tracks = [entry("9fb4105e", "Unknown"), entry(&full, "A")];
+        assert_eq!(resolve_entry(&tracks, "9fb4"), hash_entry(&full));
+    }
+
+    #[test]
+    fn resolve_entry_prefix_of_only_a_legacy_short_entity_is_not_canonical() {
+        let tracks = [entry("9fb4105e", "Legacy")];
+        assert_eq!(
+            resolve_entry(&tracks, "9fb4"),
+            unresolved(EntryError::NotCanonical {
+                hash: ContentHash::new("9fb4"),
+                found: ContentHash::new("9fb4105e"),
+            })
         );
     }
 
