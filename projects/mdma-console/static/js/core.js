@@ -12,7 +12,9 @@
 //   position   on every PositionUpdate from the server (about once a second while playing).
 //              detail and store.player.position are { hash, position_ms, duration_ms };
 //              position is reset to null whenever player.now changes.
-//   filters    when store.f or store.sort is changed by the narrowing UI (emitted by narrow.js).
+//   filters    when store.f[key] was changed by the narrowing UI (emitted by narrow.js).
+//              detail is always the view key whose filters changed.
+//   sort       when store.sort was changed (emitted by narrow.js). No detail: the sort is global.
 //
 // ============================================================ API conventions
 // api() resolves the parsed JSON body of any 2xx response, including 207 partial success
@@ -29,7 +31,7 @@ export const store = {
   playlists: [], // [{ name, hashes }]
   player: { state: "idle", now: null, queue: [], offline: false, position: null }, // state: idle|playing|paused|loading
   nb: {}, // per-view narrowing text, keyed by view key
-  f: { bmin: "", bmax: "", key: "", compat: false, added: "any" }, // filters, sticky for the session
+  f: {}, // per-view filters keyed by view key (like nb); absent means none. Read with narrow.js filtersOf(key). Sticky for the session
   sort: { by: "added", dir: "desc" },
 };
 

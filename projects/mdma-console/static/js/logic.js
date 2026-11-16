@@ -127,6 +127,41 @@ export function groupArtists(tracks) {
     .sort((a, b) => collate(a.name, b.name));
 }
 
+/**
+ * The playlists to show for one narrowing state. Set algebra on the server's answers; no text is
+ * matched here. `playlists` is [{ name, hashes }]. `narrowed`: text or a filter is on.
+ * `matched`: Set of hashes of the tracks matching text and filters together. `names`: Set of
+ * playlist names the server matched by name, or null without text. `filterOnly`: Set of hashes
+ * passing the filters alone, or null when text or filters are missing (no filters to also pass).
+ * A playlist shows when:
+ *   1. nothing is narrowed (all of them);
+ *   2. it holds a track in `matched`;
+ *   3. its name matched and no filters are on (`filterOnly` null): the name alone is enough;
+ *   4. its name matched, filters are on, and it holds a track in `filterOnly`.
+ * Otherwise it is hidden.
+ */
+export function visiblePlaylists(playlists, { narrowed, matched, names, filterOnly }) {
+  if (!narrowed) return playlists;
+  return playlists.filter(
+    (p) =>
+      p.hashes.some((x) => matched.has(x)) ||
+      (names && names.has(p.name) && (!filterOnly || p.hashes.some((x) => filterOnly.has(x)))),
+  );
+}
+
+/**
+ * Number of active filter groups in `f` ({ bmin, bmax, key, compat, added }, all fields present):
+ * tempo, key and added each count once.
+ */
+export function filterGroups(f) {
+  return (f.bmin || f.bmax ? 1 : 0) + (f.key ? 1 : 0) + (f.added !== "any" ? 1 : 0);
+}
+
+/** True when the search `text` has anything but blanks or any filter group of `f` is on. */
+export function isNarrowedBy(text, f) {
+  return !!String(text || "").trim() || filterGroups(f) > 0;
+}
+
 /** Queue edits by index. All return new arrays; the input is never mutated. */
 export function removeAt(queue, i) {
   return queue.filter((_, j) => j !== i);

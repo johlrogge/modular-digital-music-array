@@ -388,6 +388,10 @@ pub enum LibraryRequest {
     /// List all playlist names.
     PlaylistList,
 
+    /// Search playlists by name with the library's text rules (the same matcher as the track
+    /// search). Answered with `LibraryResponse::PlaylistNames`, sorted by name.
+    PlaylistSearch { query: StringQuery },
+
     /// Get playlist content verbatim.
     PlaylistGet { name: PlaylistName },
 
