@@ -1,8 +1,8 @@
 //! Playback backend abstraction — works in both gateway and direct mode.
 
 use media_client::{
-    AudioOutputConfig, AudioSinkInfo, ClientError, Command, ContentHash, Deck, MediaClient,
-    Response, ResponseData, SourceName,
+    into_transport, AudioOutputConfig, AudioSinkInfo, ClientError, Command, ContentHash, Deck,
+    MediaClient, PositionMs, Response, ResponseData, SourceName, TransportStatus,
 };
 
 /// Abstraction for playback commands, works in both gateway and direct mode.
@@ -75,6 +75,33 @@ impl PlaybackBackend {
         match self {
             PlaybackBackend::Direct(c) => c.resume(deck),
             PlaybackBackend::Gateway(gw) => gw_command(gw, Command::Resume { deck }),
+        }
+    }
+
+    /// Move the audible track to `position` (kept within the track); playing
+    /// stays playing, paused stays paused. Refused with "nothing loaded" when
+    /// idle. Answers where the track is now.
+    pub fn seek(&self, deck: Deck, position: PositionMs) -> Result<TransportStatus, ClientError> {
+        match self {
+            PlaybackBackend::Direct(c) => c.seek(deck, position),
+            PlaybackBackend::Gateway(gw) => gw_extract(
+                gw,
+                Command::Seek {
+                    deck,
+                    position_ms: position,
+                },
+                into_transport,
+            ),
+        }
+    }
+
+    /// Transport state, audible track, position and duration of `deck`.
+    pub fn get_transport(&self, deck: Deck) -> Result<TransportStatus, ClientError> {
+        match self {
+            PlaybackBackend::Direct(c) => c.get_transport(deck),
+            PlaybackBackend::Gateway(gw) => {
+                gw_extract(gw, Command::GetTransport { deck }, into_transport)
+            }
         }
     }
 

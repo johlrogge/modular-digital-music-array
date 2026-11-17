@@ -72,6 +72,7 @@ mod replica;
 /// ```
 #[hicli::group]
 mod search;
+mod seek;
 /// Music source management
 ///
 /// Per-source commands: mdma source <SOURCE-NAME> <COMMAND>

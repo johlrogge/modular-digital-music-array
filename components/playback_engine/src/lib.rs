@@ -7,6 +7,7 @@ mod track;
 
 use std::{
     collections::HashMap,
+    num::NonZeroU32,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -26,7 +27,7 @@ pub use error::PlaybackError;
 use mixer::{Mixer, MixerSnapshot, MixerStatus, Slot};
 use output_watch::OutputWatch;
 use playback_primitives::Db;
-pub use playback_primitives::{OutputHealth, Volume};
+pub use playback_primitives::{OutputHealth, PositionMs, Volume};
 use playhead::{Playhead, Segment};
 use ringbuf::{HeapConsumer, HeapRb};
 use tracing::info;
@@ -46,12 +47,57 @@ const MIXER_BUFFER_SAMPLES: usize = 262_144;
 /// Engine-assigned track identifier (non-zero; 0 means "none" in the mixer).
 pub type TrackId = u64;
 
+/// How a source's samples are laid out: the one place milliseconds and
+/// interleaved sample indexes (at the source rate) convert into each other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SourceFormat {
+    /// Channel count of the source (interleaving of its samples).
+    channels: NonZeroU32,
+    /// Native sample rate (frames per second) of the source.
+    rate: NonZeroU32,
+}
+
+impl SourceFormat {
+    fn new(channels: NonZeroU32, rate: NonZeroU32) -> Self {
+        Self { channels, rate }
+    }
+
+    /// The layout of a source from what it reports. A source with no channels
+    /// has no samples to index. One with no rate is given `fallback_rate`, as
+    /// [`select_target_rate`] does for the rate it is decoded to; with neither
+    /// there is no layout.
+    fn of_source(
+        channels: u32,
+        source_rate: u32,
+        fallback_rate: u32,
+    ) -> Result<Self, PlaybackError> {
+        let channels = NonZeroU32::new(channels).ok_or(PlaybackError::NoFormat("channels"))?;
+        let rate = NonZeroU32::new(select_target_rate(source_rate, fallback_rate))
+            .ok_or(PlaybackError::NoFormat("sample rate"))?;
+        Ok(Self::new(channels, rate))
+    }
+
+    /// Interleaved sample index at `position` (saturating for absurd times).
+    fn sample_index(self, position: PositionMs) -> usize {
+        let frames = u128::from(position.as_millis()) * u128::from(self.rate.get()) / 1000;
+        usize::try_from(frames * u128::from(self.channels.get())).unwrap_or(usize::MAX)
+    }
+
+    /// Position of the interleaved sample `index`.
+    fn position(self, index: usize) -> PositionMs {
+        let frames = index as u64 / u64::from(self.channels.get());
+        PositionMs::new(frames * 1000 / u64::from(self.rate.get()))
+    }
+}
+
 /// A track owned by the engine plus what is needed to account its position.
 struct TrackEntry {
     track: Track,
     path: PathBuf,
     /// Output sample rate (frames per second) the track is decoded to.
     rate: u32,
+    /// Layout of the source's samples, for seeking by time.
+    format: SourceFormat,
 }
 
 /// Where a preloaded track's audio currently is.
@@ -89,9 +135,7 @@ impl Preload {
 struct OpenedTrack {
     track: Track,
     consumer: HeapConsumer<f32>,
-    /// Channel count of the source (interleaving of its samples).
-    channels: u32,
-    source_rate: u32,
+    format: SourceFormat,
     /// Rate the track is decoded to (the output rate it needs).
     rate: u32,
 }
@@ -101,7 +145,11 @@ struct OpenedTrack {
 fn open_track(path: &Path, fallback_rate: u32) -> Result<OpenedTrack, PlaybackError> {
     let source = AudioSource::new(path)?;
     let source_rate = source.sample_rate();
-    let channels = u32::from(source.audio_channels()).max(1);
+    let format = SourceFormat::of_source(
+        u32::from(source.audio_channels()),
+        source_rate,
+        fallback_rate,
+    )?;
     let rate = select_target_rate(source_rate, fallback_rate);
     let (producer, consumer) = HeapRb::<f32>::new(TRACK_BUFFER_SAMPLES).split();
     // The decoder resamples source_rate -> rate if they differ.
@@ -109,8 +157,7 @@ fn open_track(path: &Path, fallback_rate: u32) -> Result<OpenedTrack, PlaybackEr
     Ok(OpenedTrack {
         track,
         consumer,
-        channels,
-        source_rate,
+        format,
         rate,
     })
 }
@@ -184,6 +231,9 @@ pub struct PlaybackEngine {
     mix_thread_running: Arc<AtomicBool>,
     config_path: PathBuf,
     audio_config: AudioOutputConfig,
+    /// No audio output is ever opened: tracks are decoded and mixed, nothing
+    /// is played. Only set by [`PlaybackEngine::new_headless`].
+    headless: bool,
 }
 
 enum MixerCommand {
@@ -319,7 +369,18 @@ impl PlaybackEngine {
             mix_thread_running,
             config_path,
             audio_config,
+            headless: false,
         })
+    }
+
+    /// An engine that never opens an audio output, so the real decoder, mixer
+    /// and seek path run on a machine without a sound server (CI). Nothing is
+    /// heard and positions do not advance, as no output consumes samples.
+    #[cfg(feature = "test-support")]
+    pub fn new_headless(config_path: PathBuf) -> Result<Self, PlaybackError> {
+        let mut engine = Self::new(config_path)?;
+        engine.headless = true;
+        Ok(engine)
     }
 
     /// Signal the mix thread to stop and wait for it to join.
@@ -406,6 +467,9 @@ impl PlaybackEngine {
     /// consumer in `mixer_consumer` and the output absent, so the next call
     /// tries again.
     fn ensure_output(&mut self, target_rate: u32) -> Result<(), PlaybackError> {
+        if self.headless {
+            return Ok(());
+        }
         let verdict = self.output_verdict();
         if !needs_new_output(self.current_sample_rate, target_rate, verdict) {
             return Ok(());
@@ -614,8 +678,7 @@ impl PlaybackEngine {
         let OpenedTrack {
             mut track,
             consumer,
-            channels,
-            source_rate,
+            format,
             rate,
         } = open_track(path, self.audio_config.sample_rate)?;
 
@@ -624,7 +687,7 @@ impl PlaybackEngine {
         let mut base_ms = 0;
         if let Some(position) = seek_to {
             track.seek(position)?;
-            base_ms = position as u64 / u64::from(channels) * 1000 / u64::from(source_rate.max(1));
+            base_ms = format.position(position).as_millis();
         }
         tracing::info!("Track is ready for playback");
 
@@ -639,6 +702,7 @@ impl PlaybackEngine {
                 track,
                 path: path.to_path_buf(),
                 rate,
+                format,
             },
         );
         self.start_playhead(id, start_sample, base_ms, rate);
@@ -758,8 +822,8 @@ impl PlaybackEngine {
         let OpenedTrack {
             mut track,
             consumer,
+            format,
             rate,
-            ..
         } = open_track(path, self.audio_config.sample_rate)?;
         // Fill the ring now; the decoder blocks when it is full. Independent
         // of the pause flag.
@@ -772,6 +836,7 @@ impl PlaybackEngine {
                 track,
                 path: path.to_path_buf(),
                 rate,
+                format,
             },
         );
 
@@ -995,6 +1060,33 @@ impl PlaybackEngine {
         tracing::info!("Seeking to position {}", position);
         self.start_fresh(&path, Some(position))
     }
+
+    /// [`seek`](Self::seek) by time: converts `position` to an interleaved
+    /// sample index here, where the audible track's channel count and source
+    /// rate are known. Same contract: the track is left stopped and the
+    /// preload is dropped. A position past the end of the track is kept to the
+    /// track's duration (the one rule for every client); returns the position
+    /// seeked to.
+    pub fn seek_ms(&mut self, position: PositionMs) -> Result<PositionMs, PlaybackError> {
+        self.reconcile();
+        let (format, duration_ms) = self
+            .audible_track_id()
+            .and_then(|id| self.tracks.get(&id))
+            .map(|e| (e.format, e.track.duration_ms()))
+            .ok_or(PlaybackError::NoTrackLoaded)?;
+        let position = within_track(position, duration_ms);
+        self.seek(format.sample_index(position))?;
+        Ok(position)
+    }
+}
+
+/// `position`, kept to a track of `duration_ms`. A duration of 0 is "unknown"
+/// (see `Track::duration_ms`): nothing to keep it to.
+fn within_track(position: PositionMs, duration_ms: u64) -> PositionMs {
+    match duration_ms {
+        0 => position,
+        duration => position.min(PositionMs::new(duration)),
+    }
 }
 
 /// What to do with audio still in the mixer ring when its consumer comes home
@@ -1070,6 +1162,105 @@ mod tests {
         assert!(!finished_decision(true, true, false, Some(true)));
     }
 
+    #[test]
+    fn a_seek_past_the_end_is_kept_to_the_track() {
+        let d = 240_000;
+        assert_eq!(
+            within_track(PositionMs::new(5_940_000), d),
+            PositionMs::new(d)
+        );
+        assert_eq!(within_track(PositionMs::new(d), d), PositionMs::new(d));
+        assert_eq!(
+            within_track(PositionMs::new(90_000), d),
+            PositionMs::new(90_000)
+        );
+    }
+
+    #[test]
+    fn an_unknown_duration_keeps_the_seek_as_asked() {
+        assert_eq!(
+            within_track(PositionMs::new(5_940_000), 0),
+            PositionMs::new(5_940_000)
+        );
+    }
+
+    #[test]
+    fn absurd_times_saturate_instead_of_wrapping() {
+        let f = fmt(2, 48_000);
+        assert_eq!(f.sample_index(PositionMs::new(u64::MAX)), usize::MAX);
+    }
+
+    /// The layout of a source with `channels` and `rate`, as the engine reads it.
+    fn fmt(channels: u32, rate: u32) -> SourceFormat {
+        SourceFormat::of_source(channels, rate, 0).unwrap()
+    }
+
+    #[test]
+    fn a_source_with_no_channels_has_no_layout() {
+        let err = SourceFormat::of_source(0, 48_000, 48_000).unwrap_err();
+        assert!(matches!(err, PlaybackError::NoFormat("channels")), "{err}");
+    }
+
+    #[test]
+    fn a_source_with_no_rate_takes_the_fallback_rate_and_with_neither_has_no_layout() {
+        assert_eq!(
+            SourceFormat::of_source(2, 0, 44_100).unwrap(),
+            fmt(2, 44_100)
+        );
+        let err = SourceFormat::of_source(2, 0, 0).unwrap_err();
+        assert!(
+            matches!(err, PlaybackError::NoFormat("sample rate")),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn ms_to_sample_index_at_44100_stereo() {
+        let f = fmt(2, 44_100);
+        // 1 s = 44_100 frames = 88_200 interleaved samples.
+        assert_eq!(f.sample_index(PositionMs::new(1_000)), 88_200);
+        assert_eq!(f.sample_index(PositionMs::new(90_000)), 7_938_000);
+        assert_eq!(f.sample_index(PositionMs::START), 0);
+        // 1 ms = 44.1 frames, truncated to 44.
+        assert_eq!(f.sample_index(PositionMs::new(1)), 88);
+    }
+
+    #[test]
+    fn ms_to_sample_index_at_48000_stereo() {
+        let f = fmt(2, 48_000);
+        assert_eq!(f.sample_index(PositionMs::new(1_000)), 96_000);
+        assert_eq!(f.sample_index(PositionMs::new(1)), 96);
+    }
+
+    #[test]
+    fn ms_to_sample_index_respects_channel_count() {
+        let mono = fmt(1, 48_000);
+        assert_eq!(mono.sample_index(PositionMs::new(1_000)), 48_000);
+    }
+
+    #[test]
+    fn sample_index_round_trips_to_position() {
+        for rate in [44_100, 48_000] {
+            let f = fmt(2, rate);
+            for ms in [0, 1_000, 90_000, 359_999] {
+                let back = f.position(f.sample_index(PositionMs::new(ms)));
+                assert!(
+                    back.as_millis() <= ms && ms - back.as_millis() <= 1,
+                    "{ms} ms at {rate} Hz came back as {back}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn seek_ms_with_no_track_returns_error() {
+        let (mut engine, _tmp) = engine_with_tempdir();
+        assert!(matches!(
+            engine.seek_ms(PositionMs::new(1_000)),
+            Err(PlaybackError::NoTrackLoaded)
+        ));
+    }
+
     fn engine_with_tempdir() -> (PlaybackEngine, tempfile::TempDir) {
         let tmp = tempfile::tempdir().expect("tempdir");
         let config_path = tmp.path().join("audio_config.json");
@@ -1087,6 +1278,7 @@ mod tests {
                     track: Track::new_test().expect("test track"),
                     path: PathBuf::from(format!("/test/{id}")),
                     rate: 48_000,
+                    format: fmt(2, 48_000),
                 },
             );
             id

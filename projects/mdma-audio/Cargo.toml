@@ -26,5 +26,7 @@ clap = { version = "4.5", features = ["derive", "env"] }
 color-eyre = "0.6"
 
 [dev-dependencies]
+# An engine with no audio output, so the tests run without a sound server.
+playback-engine = { path = "../../components/playback_engine", features = ["test-support"] }
 pretty_assertions = "1"
 tempfile = "3"

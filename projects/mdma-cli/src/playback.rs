@@ -1,5 +1,6 @@
 use crate::ctx::Ctx;
 use crate::output::{display_error, library_error};
+use crate::seek::SeekArg;
 use color_eyre::eyre::eyre;
 use color_eyre::Result;
 use hicli::Arg;
@@ -43,6 +44,31 @@ pub(crate) fn resume(ctx: &Ctx) -> Result<()> {
     playback.resume(Deck::A).map_err(display_error)?;
 
     println!("Resumed");
+    Ok(())
+}
+
+/// Seek the track that is playing on deck A
+///
+/// TIME is seconds, or M:SS or H:MM:SS, and goes exactly there. +Nb and -Nb
+/// move N beats from the nearest beat and need the track to have a beat grid.
+/// A time past the end goes to the end. Playing stays playing and paused stays
+/// paused. A value that starts with - needs `--` before it.
+///
+/// # Examples
+///
+/// ```sh
+/// mdma playback seek 1:30
+/// mdma playback seek +8b
+/// mdma playback seek -- -8b
+/// ```
+#[hicli::command]
+pub(crate) fn seek(target: SeekArg, ctx: &Ctx) -> Result<()> {
+    let playback = ctx.node().playback()?;
+    let SeekArg(target) = target;
+    println!(
+        "{}",
+        crate::seek::run(&playback, || ctx.node().library(), target)?
+    );
     Ok(())
 }
 

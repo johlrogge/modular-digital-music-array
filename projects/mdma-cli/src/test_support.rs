@@ -130,6 +130,21 @@ pub(crate) struct FakeServices {
     sent: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
 }
 
+/// What the fake services know, beyond the tracks of the library.
+#[derive(Default)]
+pub(crate) struct Setup<'a> {
+    /// The full hashes the fake library holds.
+    pub(crate) tracks: &'a [&'a str],
+    /// What the fake playback lists as its queue.
+    pub(crate) queue: &'a [&'a str],
+    /// What the fake playback answers `GetTransport` with (nothing, if `None`).
+    pub(crate) transport: Option<mdma_client::TransportStatus>,
+    /// What it answers `Seek` with: where the track is afterwards.
+    pub(crate) seeked: Option<mdma_client::TransportStatus>,
+    /// The beat grid every track of the fake library has.
+    pub(crate) grid: Option<library_ipc_client::BeatGridInfo>,
+}
+
 impl FakeServices {
     /// `tracks`: the full hashes the fake library holds.
     pub(crate) fn new(tracks: &[&str]) -> Self {
@@ -139,6 +154,21 @@ impl FakeServices {
     /// `tracks`: the full hashes the fake library holds; `queue`: what the
     /// fake playback lists as its queue.
     pub(crate) fn with_queue(tracks: &[&str], queue: &[&str]) -> Self {
+        Self::start(Setup {
+            tracks,
+            queue,
+            ..Setup::default()
+        })
+    }
+
+    pub(crate) fn start(setup: Setup) -> Self {
+        let Setup {
+            tracks,
+            queue,
+            transport,
+            seeked,
+            grid,
+        } = setup;
         let dir = tempfile::tempdir().expect("temp dir");
         let library_addr = format!("ipc://{}/library.sock", dir.path().display());
         let playback_addr = format!("ipc://{}/playback.sock", dir.path().display());
@@ -170,7 +200,10 @@ impl FakeServices {
                 .filter(|t| t.trim_start_matches("sha256:").starts_with(wanted))
                 .collect();
             let response = match found.as_slice() {
-                [one] => library_ipc_client::LibraryResponse::Track(Box::new(track(one))),
+                [one] => library_ipc_client::LibraryResponse::Track(Box::new(TrackInfo {
+                    beat_grid: grid.clone(),
+                    ..track(one)
+                })),
                 [] => library_ipc_client::LibraryResponse::Error(
                     library_ipc_client::ProtocolError::TrackNotFound {
                         hash: hash.to_string(),
@@ -200,6 +233,12 @@ impl FakeServices {
                         }
                         mdma_client::Command::QueueList => {
                             Some(mdma_client::ResponseData::Queue(queue.clone()))
+                        }
+                        mdma_client::Command::GetTransport { .. } => {
+                            transport.clone().map(mdma_client::ResponseData::Transport)
+                        }
+                        mdma_client::Command::Seek { .. } => {
+                            seeked.clone().map(mdma_client::ResponseData::Transport)
                         }
                         _ => None,
                     };
