@@ -12,7 +12,7 @@ use crate::ipc::{
 use library_projection::{
     apply_fact, distinct_retractions, fact_values, marked, project, resolve_prefix,
     resolve_visible, retain_live, search, track_info, unresolved_error, visible, AlbumCovers,
-    IndexedTrackInfo,
+    IndexedTrackInfo, LineageLog,
 };
 use music_facts::{FactSource, MusicValue};
 use stainless_facts::{Fact, Operation};
@@ -63,6 +63,11 @@ impl ReleaseVersion {
 /// or how a list is ordered (ADR-030 §1).
 pub struct LibraryService {
     tracks: Mutex<Vec<IndexedTrackInfo>>,
+    /// The plays and covers of the lineage, recorded as every fact is projected and
+    /// applied to the tracks before every catalog read, as the real service does.
+    ///
+    /// Lock order: `tracks` -> `lineage`.
+    lineage: Mutex<LineageLog>,
     fact_index: Mutex<HashMap<FactType, HashSet<String>>>,
     /// Playlist name -> content (everything but append). This mutex is the
     /// stub's `playlists_lock`: held by every playlist reader and writer.
@@ -179,11 +184,12 @@ impl LibraryService {
 
         // The real service's startup fold, then its plays.
         let mut projection = project(facts);
-        projection.plays.apply_to(&mut projection.tracks);
+        projection.lineage.apply_to(&mut projection.tracks);
 
         Ok(Self {
             tracks_count: projection.tracks.len(),
             tracks: Mutex::new(projection.tracks),
+            lineage: Mutex::new(projection.lineage),
             fact_index: Mutex::new(projection.fact_index),
             playlists: Mutex::new(HashMap::new()),
             written: Mutex::new(Vec::new()),
@@ -561,9 +567,12 @@ impl LibraryService {
     }
 
     /// Run a read over the track index and its album covers, which the projection's
-    /// read side needs (rebuilt per read: the stub is small).
+    /// read side needs (rebuilt per read: the stub is small). The lineage is applied
+    /// first, as the node does before every such read (ADR-030 §1.3), so a `Replaces`
+    /// or a cover written after startup takes effect.
     fn with_catalog<R>(&self, read: impl FnOnce(&[IndexedTrackInfo], &AlbumCovers) -> R) -> R {
-        let tracks = self.tracks.lock().unwrap();
+        let mut tracks = self.tracks.lock().unwrap();
+        self.lineage.lock().unwrap().apply_to(&mut tracks);
         read(&tracks, &AlbumCovers::build(&tracks))
     }
 
@@ -578,6 +587,7 @@ impl LibraryService {
     ) {
         let fact = Fact::new(entity.clone(), value, chrono::Utc::now(), source, operation);
         let mut tracks = self.tracks.lock().unwrap();
+        self.lineage.lock().unwrap().record(&fact);
         let mut positions: HashMap<String, usize> = tracks
             .iter()
             .enumerate()

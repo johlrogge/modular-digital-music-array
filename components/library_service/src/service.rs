@@ -17,7 +17,7 @@ use library_projection::{
     apply_fact, distinct_retractions, entity_facts, fact_values, hash_key, is_play_event,
     is_provenance_tracked, project, remove_cancelled, resolve_prefix, resolve_visible, retain_live,
     retract_matches, search, track_info, try_parse_fact_line, unresolved_error, visible,
-    AlbumCovers, IndexedTrackInfo, MusicFact, PlayLog, Unresolved,
+    AlbumCovers, IndexedTrackInfo, LineageLog, MusicFact, Unresolved,
 };
 #[cfg(test)]
 use library_projection::{apply_fact_to_track, blob_path_for, IndexedCue};
@@ -27,7 +27,7 @@ use music_facts::MusicValue;
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use thiserror::Error;
@@ -80,17 +80,21 @@ pub struct LibraryService {
     /// (the fact subscriber or a writer that just wrote to ACID).
     ///
     /// Lock order: `retire_gate` -> `cursor` -> `tracks` -> `fact_index` ->
-    /// `content_hashes`; `event_cursor` -> `tracks` -> `play_events`
-    /// (`refresh_event_timestamps`).
+    /// `content_hashes`; `event_cursor` -> `tracks` -> `lineage`
+    /// (`refresh_lineage`). The archiving of a retired file asks whether a cover is
+    /// still shown (`cover_art_in_use`) while it holds `retire_gate`, so
+    /// `retire_gate` -> `event_cursor` -> `tracks` -> `lineage` is an edge too: no
+    /// path takes `retire_gate` inside `event_cursor` or `tracks`.
     ///
     /// Covers: `tracks` -> `album_cover_cache` (nothing taken while holding it;
-    /// `drop_non_live` takes it inside `content_hashes`).
+    /// `drop_non_live` takes it inside `content_hashes`, `refresh_lineage` takes it
+    /// inside `tracks` after it has let go of `lineage`).
     ///
     /// `identity_backfill` is independent: take it alone and never
     /// together with another lock in this list.
     /// No projection lock may be held while calling `catch_up`.
     cursor: Mutex<Option<String>>,
-    /// Cursor for incremental reads in refresh_event_timestamps.
+    /// Cursor for incremental reads in refresh_lineage.
     ///
     /// Separate from `cursor` (used by spawn_fact_subscriber) so the two readers
     /// don't fight over the same position.  Starts at None (full scan on first
@@ -100,12 +104,19 @@ pub struct LibraryService {
     /// The assumption is that such retractions never occur in production.  If they
     /// become meaningful, a full scan from None would be required.
     event_cursor: Mutex<Option<String>>,
-    /// Latest start and stop recorded under every entity key (normalised hash) seen
-    /// by `refresh_event_timestamps`, retired entities included: a track's play
-    /// history is its own plus that of every hash it replaces (ADR-013).
+    /// The play events and the cover art events recorded under every entity key
+    /// (normalised hash) seen by `refresh_lineage`, retired entities included: a
+    /// track's play history is its own plus that of every hash it replaces, and a
+    /// track without a cover of its own inherits one along the same lineage (ADR-013).
     ///
     /// Lock order: taken after `tracks`, alone or inside it; nothing is taken while holding it.
-    play_events: Mutex<PlayLog>,
+    lineage: Mutex<LineageLog>,
+    /// Whether the last `refresh_lineage` read to the end of the stream. False until the
+    /// first one: the lineage is then not known to be current. It says nothing about
+    /// facts written since: a caller that needs the lineage to include a write
+    /// (`cover_art_in_use`) must have refreshed after it. Stored with `tracks` held and
+    /// loaded with `tracks` held, so it is read together with the tracks it describes.
+    lineage_current: AtomicBool,
     /// Address of the ACID request socket (used by background subscriber thread).
     acid_socket: String,
     /// Address of the ACID events pub/sub socket.
@@ -422,7 +433,8 @@ impl LibraryService {
             content_hashes: Mutex::new(loaded.content_hashes),
             cursor: Mutex::new(final_cursor),
             event_cursor: Mutex::new(None),
-            play_events: Mutex::new(PlayLog::default()),
+            lineage: Mutex::new(LineageLog::default()),
+            lineage_current: AtomicBool::new(false),
             acid_socket: acid_socket.to_string(),
             acid_events_socket: acid_events_socket.to_string(),
             self_ref: self_ref.clone(),
@@ -1173,7 +1185,7 @@ impl LibraryService {
             LibraryRequest::PlaylistEdit { name, version, ops } => {
                 // The outcome carries TrackInfo, so plays are refreshed like for
                 // every such read, before the playlists lock (ADR-030 §1.3).
-                self.refresh_event_timestamps();
+                self.refresh_lineage();
                 self.with_playlist(&name, |path, content| {
                     let planned = {
                         let tracks = self.tracks.lock().unwrap();
@@ -1786,7 +1798,7 @@ impl LibraryService {
 
         // Neither of these takes the gate (it is not reentrant), and neither needs it.
         let playlists_rewritten = self.rewrite_playlists_replace_hash(loser, winner);
-        self.refresh_event_timestamps();
+        self.refresh_lineage();
 
         Ok(MergeOutcome {
             playlists_rewritten,
@@ -2104,7 +2116,7 @@ impl LibraryService {
     /// Plays are refreshed first, for every such read (ADR-030 §1.3), so the answer
     /// matches a local fold of the same log.
     fn with_catalog<R>(&self, read: impl FnOnce(&[IndexedTrackInfo], &AlbumCovers) -> R) -> R {
-        self.refresh_event_timestamps();
+        self.refresh_lineage();
         let tracks = self.tracks.lock().unwrap();
         let covers = self.album_cover_cache.lock().unwrap();
         read(&tracks, &covers)
@@ -2208,8 +2220,10 @@ impl LibraryService {
         }
     }
 
-    /// Read new TrackStarted/TrackStopped facts from the ACID stream (since the last
-    /// call) and update `last_started` / `last_stopped` in the in-memory index.
+    /// Read the new plays and cover art facts and `Replaces` assertions from the ACID
+    /// stream (since the last call) into `lineage`, and apply the lineage to the
+    /// in-memory index: `last_started` / `last_stopped`, the cover a track inherits,
+    /// and the album covers.
     ///
     /// Uses `event_cursor` (a separate cursor from the subscriber's `cursor`) so that
     /// the background fact subscriber and this refresh path don't interfere with each
@@ -2227,10 +2241,17 @@ impl LibraryService {
     /// transitively replaces, with their original timestamps (ADR-013), so a merged
     /// or replaced track keeps its predecessors' history. Events keyed by the short
     /// hashes older playback wrote (#86) resolve to the full hash. Every event seen
-    /// is remembered in `play_events`, whether or not its entity is still live, and
+    /// is remembered in `lineage`, whether or not its entity is still live, and
     /// the lineage is re-applied on every refresh so a `Replaces` asserted after the
-    /// events were read takes effect too.
-    fn refresh_event_timestamps(&self) {
+    /// events were read takes effect too. The same goes for the cover a track
+    /// without one of its own inherits, and the album covers are rebuilt from it.
+    ///
+    /// When a page cannot be read, the pages read before it are still applied and the
+    /// cursor stays after the last of them, so the next refresh goes on from there.
+    /// `lineage_current` records whether the last refresh read to the end of the
+    /// stream, so that what must not act on a stale lineage (the archiving of a cover)
+    /// can tell; it must also have refreshed after the writes it depends on.
+    fn refresh_lineage(&self) {
         const PAGE_SIZE: usize = 10_000;
 
         // Held for the whole refresh, like `cursor` in `catch_up_with`: concurrent
@@ -2238,8 +2259,9 @@ impl LibraryService {
         let mut event_cursor = self.event_cursor.lock().unwrap();
         let mut current_cursor = event_cursor.clone();
 
-        // The play events since the last refresh, per normalised entity key.
-        let mut delta = PlayLog::default();
+        // The lineage events since the last refresh, per normalised entity key.
+        let mut delta = LineageLog::default();
+        let mut caught_up = true;
 
         loop {
             let chunk = match self
@@ -2250,9 +2272,10 @@ impl LibraryService {
                 Err(e) => {
                     tracing::warn!(
                         error = %e,
-                        "refresh_event_timestamps: ACID read failed, skipping refresh"
+                        "refresh_lineage: ACID read failed, applying the pages read so far"
                     );
-                    return;
+                    caught_up = false;
+                    break;
                 }
             };
 
@@ -2269,15 +2292,22 @@ impl LibraryService {
             }
         }
 
-        // Advance the stored cursor so the next call only reads new facts.
+        // Advance the stored cursor (to the last page read) so the next call only
+        // reads new facts.
         *event_cursor = current_cursor;
 
         let mut tracks = self.tracks.lock().unwrap();
-        let mut events = self.play_events.lock().unwrap();
-        events.merge(delta);
+        let mut lineage = self.lineage.lock().unwrap();
+        lineage.merge(delta);
 
-        // Apply each track's lineage (itself and what it replaces) to the index.
-        events.apply_to(&mut tracks);
+        // Apply each track's lineage (itself and what it replaces) to the index: plays
+        // and the cover a track without one inherits.
+        lineage.apply_to(&mut tracks);
+        drop(lineage);
+        // The album covers follow it, so they never name a cover another lineage
+        // reading would not. `lineage` is let go first: nothing is taken inside it.
+        *self.album_cover_cache.lock().unwrap() = AlbumCovers::build(&tracks);
+        self.lineage_current.store(caught_up, Ordering::Relaxed);
     }
 
     /// Search tracks by structured query (uses library-search for evaluation; hidden tracks excluded)
@@ -3071,7 +3101,7 @@ mod tests {
         assert_eq!(before.len(), 1, "track should appear before play event");
 
         // Simulate playback service writing a TrackStarted fact via ACID after startup.
-        // refresh_event_timestamps() now reads from the ACID stream incrementally, so
+        // refresh_lineage() now reads from the ACID stream incrementally, so
         // this write will be picked up on the next search_tracks call.
         let source = music_facts::FactSource::new("test-playback", "1.0.0", "Unknown");
         let external_client = AcidClient::connect(&facts_addr).unwrap();
@@ -3917,7 +3947,7 @@ mod tests {
         (service, metadata_dir, facts_addr)
     }
 
-    /// Verify that refresh_event_timestamps advances the event_cursor so that a
+    /// Verify that refresh_lineage advances the event_cursor so that a
     /// second call does not double-process already-seen facts.
     ///
     /// Step 1: Write TrackStarted for hash_a, call search (triggers refresh).
@@ -3926,7 +3956,7 @@ mod tests {
     ///         hash_b should now appear with last_started set.
     ///         hash_a's last_started must remain unchanged (cursor didn't go back).
     #[test]
-    fn refresh_event_timestamps_incremental_cursor() {
+    fn refresh_lineage_incremental_cursor() {
         use library_search::{query::DateQuery, TrackQuery};
 
         let hash_a = ContentHash::new("sha256:cursor_test_a");
@@ -4169,6 +4199,78 @@ mod tests {
             MusicValue::TrackStarted(StartReason::OnRequest),
             12,
         );
+
+        // Covers along `Replaces` (ADR-013, amendment 2026-11-17): two finished merges,
+        // in stream order. `eq_lost` had a cover, so `eq_heir` shows it though the merge
+        // retracted it; `eq_user_lost`'s cover was retracted before the merge, so
+        // `eq_user_heir` shows none.
+        let in_album = |hash: &str, title: &str, album: &str, day| {
+            [
+                (MusicValue::Title(Title::new(title)), day),
+                (MusicValue::Album(Album::new(album)), day),
+            ]
+            .map(|(value, day)| (ContentHash::new(hash), value, at(day), Operation::Assert))
+        };
+        let cover = |hash: &str, path: &str, day, op| {
+            (
+                ContentHash::new(hash),
+                MusicValue::CoverArtPath(path.to_string()),
+                at(day),
+                op,
+            )
+        };
+        let replaces = |winner: &str, loser: &str, day| {
+            (
+                ContentHash::new(winner),
+                MusicValue::Replaces(ContentHash::new(loser)),
+                at(day),
+                Operation::Assert,
+            )
+        };
+        let retract_title = |hash: &str, title: &str, album: &str, day| {
+            [
+                MusicValue::Title(Title::new(title)),
+                MusicValue::Album(Album::new(album)),
+            ]
+            .map(|value| (ContentHash::new(hash), value, at(day), Operation::Retract))
+        };
+        facts.extend(in_album("sha256:eq_lost", "Lost", "Gamma", 13));
+        facts.push(cover(
+            "sha256:eq_lost",
+            "cover-art/lost.jpg",
+            13,
+            Operation::Assert,
+        ));
+        facts.extend(in_album("sha256:eq_heir", "Heir", "Gamma", 14));
+        facts.push(replaces("sha256:eq_heir", "sha256:eq_lost", 14));
+        facts.extend(retract_title("sha256:eq_lost", "Lost", "Gamma", 15));
+        facts.push(cover(
+            "sha256:eq_lost",
+            "cover-art/lost.jpg",
+            15,
+            Operation::Retract,
+        ));
+        facts.extend(in_album("sha256:eq_user_lost", "User lost", "Delta", 16));
+        facts.push(cover(
+            "sha256:eq_user_lost",
+            "cover-art/user.jpg",
+            16,
+            Operation::Assert,
+        ));
+        facts.push(cover(
+            "sha256:eq_user_lost",
+            "cover-art/user.jpg",
+            17,
+            Operation::Retract,
+        ));
+        facts.extend(in_album("sha256:eq_user_heir", "User heir", "Delta", 18));
+        facts.push(replaces("sha256:eq_user_heir", "sha256:eq_user_lost", 19));
+        facts.extend(retract_title(
+            "sha256:eq_user_lost",
+            "User lost",
+            "Delta",
+            20,
+        ));
         write_facts_file_with_operations(&facts)
     }
 
@@ -4195,7 +4297,7 @@ mod tests {
             }
         }
         let mut projection = library_projection::project_lines(lines.iter().map(String::as_str));
-        projection.plays.apply_to(&mut projection.tracks);
+        projection.lineage.apply_to(&mut projection.tracks);
         let covers = AlbumCovers::build(&projection.tracks);
         LocalView {
             lines: lines.len(),
@@ -4303,7 +4405,17 @@ mod tests {
                 .find(|t| t.content_hash.as_str() == hash)
                 .unwrap_or_else(|| panic!("{hash} is visible"))
         };
-        assert_eq!(visible.len(), 6, "the deleted track is hidden");
+        assert_eq!(visible.len(), 8, "the deleted track is hidden");
+        assert_eq!(
+            by_hash("sha256:eq_heir").cover_art_path.as_deref(),
+            Some("cover-art/lost.jpg"),
+            "the heir shows the cover of the track it replaced, though the merge retracted it"
+        );
+        assert_eq!(
+            by_hash("sha256:eq_user_heir").cover_art_path,
+            None,
+            "a cover retracted before the merge is not inherited"
+        );
         assert!(by_hash("sha256:eq_a1").started.is_some(), "a play");
         assert!(
             by_hash("sha256:eq_old").started.is_some(),
@@ -8013,7 +8125,7 @@ mod tests {
     //
     // The FactAggregator::assert path uses Utc::now() as a placeholder
     // timestamp. After the fix, it must NOT populate last_started/last_stopped
-    // during bulk load — those are None until refresh_event_timestamps runs.
+    // during bulk load — those are None until refresh_lineage runs.
     // =========================================================================
 
     // =========================================================================
@@ -9382,7 +9494,7 @@ mod tests {
 
     /// After a bulk bootstrap containing TrackStarted/TrackStopped facts,
     /// last_started and last_stopped must be None (not a bootstrap wall-clock
-    /// value). refresh_event_timestamps is the sole source of truth.
+    /// value). refresh_lineage is the sole source of truth.
     #[test]
     fn bulk_bootstrap_does_not_set_timestamps_from_placeholder() {
         let hash = ContentHash::new("sha256:bulk_ts_placeholder");
@@ -9432,7 +9544,7 @@ mod tests {
             .expect("track must be indexed after bulk bootstrap");
 
         // The bulk path must NOT populate last_started/last_stopped with Utc::now().
-        // refresh_event_timestamps (triggered by a date-filtered search) is the sole
+        // refresh_lineage (triggered by a date-filtered search) is the sole
         // source of truth for these fields after bootstrap.
         assert_eq!(
             track.last_started, None,

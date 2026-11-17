@@ -18,6 +18,8 @@ use std::collections::{HashMap, HashSet};
 ///
 /// A track without cover art of its own shows the cover of its album. The cover of
 /// the track with the smallest content hash wins, whatever the order of the tracks.
+/// A track's cover is its effective one (`IndexedTrackInfo::effective_cover_art_path`):
+/// its own, else the one it inherits along its `Replaces` lineage.
 #[derive(Clone, Debug, Default)]
 pub struct AlbumCovers(HashMap<String, String>);
 
@@ -49,10 +51,9 @@ impl AlbumCovers {
 fn album_cover<'a>(of_album: impl IntoIterator<Item = &'a IndexedTrackInfo>) -> Option<String> {
     of_album
         .into_iter()
-        .filter(|t| t.cover_art_path.is_some())
-        .min_by(|a, b| a.content_hash.as_str().cmp(b.content_hash.as_str()))
-        .and_then(|t| t.cover_art_path.as_ref())
-        .map(|p| p.to_string_lossy().into_owned())
+        .filter_map(|t| Some((t.content_hash.as_str(), t.effective_cover_art_path()?)))
+        .min_by_key(|(hash, _)| *hash)
+        .map(|(_, cover)| cover.to_string_lossy().into_owned())
 }
 
 /// Convert an indexed track to the protocol `TrackInfo`.
@@ -67,8 +68,7 @@ pub fn track_info(t: &IndexedTrackInfo, covers: &AlbumCovers) -> TrackInfo {
         key: t.key,
         blob_path: Some(t.blob_path.to_string_lossy().to_string()),
         cover_art_path: t
-            .cover_art_path
-            .as_ref()
+            .effective_cover_art_path()
             .map(|p| p.to_string_lossy().to_string())
             .or_else(|| {
                 t.album

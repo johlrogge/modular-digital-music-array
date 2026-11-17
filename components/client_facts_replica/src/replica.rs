@@ -1163,7 +1163,7 @@ mod tests {
         assert_eq!(fold.projection.unparseable_lines, 0);
         let tracks = &fold.projection.tracks;
         assert_eq!(tracks.len(), 1);
-        assert_eq!(fold.projection.plays.histories(tracks)[0].count(), 1);
+        assert_eq!(fold.projection.lineage.histories(tracks)[0].count(), 1);
     }
 
     #[test]

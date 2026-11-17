@@ -790,7 +790,7 @@ fn plays_follow_the_replaces_chain_through_retired_intermediates() {
     );
     retire(&service, &a).unwrap();
 
-    service.refresh_event_timestamps();
+    service.refresh_lineage();
 
     assert_eq!(played(&service, &c).0, Some(started.to_rfc3339()));
 }
@@ -813,7 +813,7 @@ fn play_events_under_short_hashes_resolve_to_the_full_hash() {
         );
     }
 
-    service.refresh_event_timestamps();
+    service.refresh_lineage();
 
     assert!(played(&service, &track).0.is_some());
 }
@@ -1059,7 +1059,7 @@ fn after_a_restart_the_loser_is_gone_and_the_winner_still_shows_its_plays() {
     };
 
     let restarted = super::tests::restart_service(&addrs);
-    restarted.refresh_event_timestamps();
+    restarted.refresh_lineage();
 
     assert!(gone(&restarted, &old));
     let listed: Vec<String> = restarted
@@ -1109,7 +1109,7 @@ fn a_reingested_loser_resolves_with_its_own_plays_and_a_second_merge_adds_no_sec
     // The same bytes arrive again: the loser's identity is back.
     seed(&service, "old", base(1, Some("p1"), 1));
     assert!(!gone(&service, &old));
-    service.refresh_event_timestamps();
+    service.refresh_lineage();
     assert!(played(&service, &old).0.is_some(), "its own plays");
     assert_eq!(live_plays(&service, &old), 3);
 
@@ -1167,7 +1167,7 @@ fn archived(service: &LibraryService, abs: &Path) -> std::path::PathBuf {
 }
 
 #[test]
-fn cover_art_is_removed_unless_another_live_track_uses_it() {
+fn cover_art_is_kept_while_a_live_track_holds_it_as_its_own_or_inherited_cover() {
     let (service, _d, _acid) = make_empty_service();
     let art = |name: &str| {
         let rel = format!("cover-art/{name}.jpg");
@@ -1187,7 +1187,17 @@ fn cover_art_is_removed_unless_another_live_track_uses_it() {
         ]
         .concat(),
     );
-    seed(&service, "lone-new", base(1, Some("p1"), 2));
+    // The winner has a cover of its own, and the loser's is its fallback.
+    let (winner_rel, winner_abs) = art("winner");
+    seed(
+        &service,
+        "lone-new",
+        [
+            base(1, Some("p1"), 2),
+            vec![src(MusicValue::CoverArtPath(winner_rel))],
+        ]
+        .concat(),
+    );
     seed(
         &service,
         "shared-old",
@@ -1210,14 +1220,11 @@ fn cover_art_is_removed_unless_another_live_track_uses_it() {
 
     apply(&service);
 
-    assert!(!own_abs.exists(), "unshared cover art leaves cover-art/");
-    assert_eq!(
-        std::fs::read(archived(&service, &own_abs)).unwrap(),
-        b"jpg",
-        "unshared cover art is archived"
-    );
-    assert!(shared_abs.exists(), "shared cover art is kept");
-    assert!(!archived(&service, &shared_abs).exists());
+    // Every one of them is some live track's own or inherited cover.
+    for abs in [&own_abs, &shared_abs, &winner_abs] {
+        assert!(abs.exists(), "{abs:?} is kept");
+        assert!(!archived(&service, abs).exists());
+    }
 }
 
 fn archive_listing(service: &LibraryService) -> ArchiveListing {
@@ -1522,7 +1529,7 @@ fn cover_file(service: &LibraryService, name: &str) -> String {
 }
 
 #[test]
-fn cover_art_that_only_the_merged_loser_held_is_archived_and_the_album_stops_showing_it() {
+fn cover_art_that_only_the_merged_loser_held_is_kept_for_the_winner_and_the_album() {
     let (service, _d, _acid) = make_empty_service();
     let rel = cover_file(&service, "album");
     seed(
@@ -1547,13 +1554,49 @@ fn cover_art_that_only_the_merged_loser_held_is_archived_and_the_album_stops_sho
 
     apply(&service);
 
-    // The loser was the only holder: no live track shows it any more, so it is
-    // archived and the rebuilt album covers no longer name it.
-    assert!(archived(&service, &service.music_dir.join(&rel)).exists());
-    assert_eq!(service.album_cover_cache.lock().unwrap().get("A"), None);
+    // The loser was the only holder, but the winner has none of its own and follows
+    // the `Replaces` to it: the winner still shows it, so it is not archived and the
+    // album keeps it (ADR-013, amendment 2026-11-17).
+    assert!(service.music_dir.join(&rel).exists(), "still shown");
+    assert!(!archived(&service, &service.music_dir.join(&rel)).exists());
+    assert_eq!(
+        service.album_cover_cache.lock().unwrap().get("A"),
+        Some(rel.as_str())
+    );
     assert_eq!(
         service.get_track(&hash("new")).unwrap().cover_art_path,
-        None
+        Some(rel)
+    );
+}
+
+#[test]
+fn the_winners_own_cover_wins_and_the_losers_file_stays_as_its_fallback() {
+    let (service, _d, _acid) = make_empty_service();
+    let (old_rel, new_rel) = (cover_file(&service, "old"), cover_file(&service, "new"));
+    let with_cover = |day, rel: &String| {
+        [
+            base(1, Some("p1"), day),
+            vec![src(album("A")), src(MusicValue::CoverArtPath(rel.clone()))],
+        ]
+        .concat()
+    };
+    seed(&service, "old", with_cover(1, &old_rel));
+    seed(&service, "new", with_cover(2, &new_rel));
+
+    apply(&service);
+
+    // The winner shows its own, and the loser's file is the cover it falls back to
+    // should its own be retracted: any live track's own or inherited cover is in use.
+    assert!(service.music_dir.join(&old_rel).exists());
+    assert!(!archived(&service, &service.music_dir.join(&old_rel)).exists());
+    assert!(service.music_dir.join(&new_rel).exists());
+    assert_eq!(
+        service.get_track(&hash("new")).unwrap().cover_art_path,
+        Some(new_rel.clone())
+    );
+    assert_eq!(
+        service.album_cover_cache.lock().unwrap().get("A"),
+        Some(new_rel.as_str())
     );
 }
 
@@ -1591,7 +1634,7 @@ fn cover_art_that_another_track_of_the_album_holds_is_kept() {
 }
 
 #[test]
-fn an_album_cache_entry_is_repointed_when_its_cover_is_archived() {
+fn an_album_cache_entry_is_repointed_to_the_winners_own_cover() {
     let (service, _d, _acid) = make_empty_service();
     let (old_rel, new_rel) = (cover_file(&service, "old"), cover_file(&service, "new"));
     // The old copy's hash is the smaller one, so its cover is the album's.
@@ -1627,13 +1670,13 @@ fn an_album_cache_entry_is_repointed_when_its_cover_is_archived() {
     apply(&service);
 
     assert!(
-        archived(&service, &service.music_dir.join(&old_rel)).exists(),
-        "unused cover art is archived"
+        !archived(&service, &service.music_dir.join(&old_rel)).exists(),
+        "the loser's file is the winner's fallback"
     );
     assert_eq!(
         service.album_cover_cache.lock().unwrap().get("A"),
         Some(new_rel.as_str()),
-        "the cache no longer names an archived file"
+        "the winner's own cover wins the album"
     );
     assert_eq!(
         service.get_track(&hash("new")).unwrap().cover_art_path,
@@ -1726,6 +1769,66 @@ fn only_plain_paths_below_the_stores_may_be_archived() {
     assert!(victim.exists(), "a traversing path moves nothing");
     assert_eq!(report, DedupApplyReport::default());
     assert!(!service.music_dir.join("archive").exists());
+}
+
+/// Ask the archiving to retire the cover file `rel`, as a merge does for a loser's.
+fn archive_cover(service: &LibraryService, rel: &str) {
+    let mut report = DedupApplyReport::default();
+    let gate = service.retire_gate.lock().unwrap();
+    service.archive_retired_files(
+        &gate,
+        &RetiredFiles {
+            blob: None,
+            cover_art: Some(rel.into()),
+        },
+        &mut report,
+    );
+    assert!(report.errors.is_empty(), "{report:?}");
+}
+
+#[test]
+fn a_cover_file_nobody_holds_is_archived_and_an_inherited_one_is_not() {
+    let (service, _d, _acid) = make_empty_service();
+    let (inherited, unheld) = (
+        cover_file(&service, "inherited"),
+        cover_file(&service, "unheld"),
+    );
+    seed(
+        &service,
+        "old",
+        [
+            base(1, Some("p1"), 1),
+            vec![src(MusicValue::CoverArtPath(inherited.clone()))],
+        ]
+        .concat(),
+    );
+    seed(&service, "new", base(1, Some("p1"), 2));
+    apply(&service);
+    service.refresh_lineage();
+
+    archive_cover(&service, &inherited);
+    archive_cover(&service, &unheld);
+
+    assert!(service.music_dir.join(&inherited).exists(), "the heir's");
+    assert!(!archived(&service, &service.music_dir.join(&inherited)).exists());
+    assert!(!service.music_dir.join(&unheld).exists());
+    assert!(archived(&service, &service.music_dir.join(&unheld)).exists());
+}
+
+#[test]
+fn nothing_is_archived_while_the_lineage_is_not_known_to_be_current() {
+    let (service, _d, _acid) = make_empty_service();
+    let unheld = cover_file(&service, "unheld");
+    service.refresh_lineage();
+    // A refresh that could not read the whole stream.
+    service
+        .lineage_current
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+
+    archive_cover(&service, &unheld);
+
+    assert!(service.music_dir.join(&unheld).exists());
+    assert!(!archived(&service, &service.music_dir.join(&unheld)).exists());
 }
 
 #[test]
@@ -2247,7 +2350,7 @@ fn a_short_hash_shared_by_two_tracks_belongs_to_neither() {
         vec![src(MusicValue::TrackStarted(StartReason::OnRequest))],
     );
 
-    service.refresh_event_timestamps();
+    service.refresh_lineage();
 
     assert_eq!(played(&service, &a).0, None);
     assert_eq!(played(&service, &b).0, None);
@@ -2849,7 +2952,7 @@ fn no_library_path_writes_facts_for_a_merged_loser_not_even_after_a_restart() {
     assert_eq!(loser_log(&restarted, &loser), log, "startup backfill");
     run_backfill(&restarted, true);
     assert_eq!(loser_log(&restarted, &loser), log, "identity backfill");
-    restarted.refresh_event_timestamps();
+    restarted.refresh_lineage();
     assert!(gone(&restarted, &loser));
     assert_winner_shows_short_key_plays(&restarted, &loser, &winner);
 }
@@ -2974,7 +3077,7 @@ fn apply_finishes_an_unfinished_merge_like_a_merge() {
     assert!(dedup_report(&service, false).unfinished.is_empty());
 
     let restarted = super::tests::restart_service(&addrs);
-    restarted.refresh_event_timestamps();
+    restarted.refresh_lineage();
     assert!(gone(&restarted, &loser));
     assert_winner_shows_short_key_plays(&restarted, &loser, &winner);
 }
