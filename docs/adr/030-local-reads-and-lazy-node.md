@@ -55,23 +55,24 @@ File and line references below are as of 5d2cf8f.
    - `Replica(ReplicaView)`: the folded replica, with plays applied and `AlbumCovers`;
    - `Node(&Node)`: lazy (§4).
    - As built, `Facts<N>` is `Replica(Box<ReplicaView>)` or `Node(N)` with `N: Deref<Target = Node>`, so the CLI holds `&Node` and the TUI holds `Rc<Node>`.
-2. `Facts` answers the reads that facts can answer: `search`, `tracks(limit)`, `track(hash)`, `marked(filter)`, `fact_values(type)`, `facts_of(hash)` and `plays`.
+2. `Facts` answers the reads that facts can answer: `search`, `tracks(limit)`, `track(hash)`, `marked(filter)`, `fact_values(type)`, `facts_of(hash)`, `play_histories` and `recent_plays`.
    - Each method is one `match` with two arms.
    - The replica arm calls the §1 functions.
    - The node arm sends the existing `LibraryRequest`, which the service answers with the same §1 functions.
-   - `plays` has no `LibraryRequest` yet. `Facts::Node`'s `plays` arm answers with the error "`mdma plays` reads only the replica: the node has no plays request yet; drop --facts=node". When `LibraryRequest::Plays` exists, the arm sends it like the others.
+   - `play_histories` and `recent_plays` have no `LibraryRequest` yet. `Facts::Node`'s arms for them answer with the error "`mdma plays` reads only the replica: the node has no plays request yet; drop --facts=node". When a plays request exists, the arms send it like the others.
 3. **Choosing the source (Decided).** `--facts=replica|node` is a global option of every client. **The default is `replica` from the start**, because offline-first is the point. §6 measures whether a cache is needed; it does not decide the default.
-   - `MDMA_FACTS` is an optional convenience with the same values. Nothing requires it. The flag wins over the variable. An invalid value is a usage error.
+   - `MDMA_FACTS` is an optional convenience with the same values. Nothing requires it. The flag wins over the variable. An invalid value is a usage error. An empty `--facts` or `MDMA_FACTS` counts as unset, in every client: `FactsChoice::parse_given(&str) -> Result<Option<FactsChoice>, UnknownFactsChoice>` is the one parser, and the CLI and the TUI both use it. (hicli cannot express "empty is unset" for a typed value; johlrogge/hicli#40.)
+   - `--facts` governs only the category (a) reads of §5. A read whose answer becomes a node write, or that serves a node-only pane, reads from the node whatever `--facts` says: a stale replica would give a partial answer and the write would act on it. It is still the `Facts` API, as `Facts::Node(node)`, so there is one code path.
    - **There is never a silent fallback.**
-     - **No replica** is an error that says how to get one, with the existing texts: "no replica of <id> yet; a background sync creates it, or run `mdma replica sync`". With no node known at all: "no node to find a replica for; use --node NAME or run `mdma node select`". The command exits 1 and never asks the node. `after_command` starts the background sync as usual.
+     - **No replica** is an error that says how to get one, with the existing texts: "no replica of <id> yet; a background sync creates it, or run `mdma replica sync`". With no node known at all: "no node to find a replica for; use --node NAME or run `mdma node select`". The command exits 1 and never asks the node. The client requests a background sync (the CLI's `after_command`, the TUI at start and on `:refresh`), so the next read finds a replica.
      - **An unreadable replica** is the same error with its cause.
      - **An unreachable node** under `--facts=node` is an error that names the replica as the alternative, with its age.
 4. This is an enum, not a trait. The build-time interface is still `client-facts` (ADR-022 §3); it decides which sources a build has. The runtime flag picks one of them. `LibraryBackend::{Direct, Gateway}` already works this way. A later `client_facts_remote` would offer only `Node` and answer `--facts=replica` with "this build has no replica".
-5. Writes and node-only reads (playlists, queue, playback, sources, inbox, admin, export) do not go through `Facts`. They use `Node` directly, as today.
+5. Writes and node-only operations (playlists, queue, playback, sources, inbox, admin, export) use `Node` directly, as today. The reads that feed a write, and the rows of a node-only pane (the TUI's queue and playlists), go through `Facts::Node` and never use the `--facts` choice: the node's own answer is what the write acts on.
 
 ### 3. Local reads say where they come from
 
-- Every answer from the replica writes one note to stderr: "replica of <id>, synced <age>".
+- Every answer from the replica writes one note to stderr: "replica of <id>, synced <age>". A refusal counts as an answer ("track not found" from a stale replica is exactly when the age matters), so the note is printed whenever the replica opened and was asked. When it did not open, there is no note: the error says why.
 - It adds "behind: the last sync attempt failed" when `last_attempt > synced_at` or `failures > 0`, and "N lines this mdma cannot read; upgrade mdma" when there are unreadable lines.
 - Stdout carries only the answer, so pipes stay clean.
 - There is one note function. `plays` uses it too.
@@ -81,12 +82,12 @@ File and line references below are as of 5d2cf8f.
 
 1. Nothing connects until something needs the node. `mdma_client::Node` resolves on first use (as today). It caches each connection (library, playback, gateway) after the first success and retries after a failure.
    - A remote node's library, playback and admin connections are one gateway socket. The socket is shared by clones and serialises requests (`nng_transport::SharedSocket`, send to receive under one lock), because a Req0 socket has one request in flight.
-   - "Events" is an address (`Node::event_gateway`), not a cached connection: the subscriber owns its SUB socket. The address still passes the reachability check.
+   - "Events" is an address (`Node::event_gateway`, or `Node::event_address` once resolved), not a cached connection: the subscriber owns its SUB socket and dials without waiting (`dial_async`), so it connects and reconnects by itself. The address does not pass the reachability check.
 2. **Reachability.** The first use of a remote node is bounded: the probe connects without waiting and sends `Identify`. Sending is limited by `IDENTIFY_TIMEOUT` and so is receiving, so the probe takes at most 2 × `IDENTIFY_TIMEOUT` (2 s), plus name resolution for a host name. The outcome is cached for the process: on failure, further attempts fail at once for 10 s, so a TUI never freezes on each keystroke. There is one mechanism for every caller, not one per command.
    - A node that answered "who are you" while the resolver verified it (a cached node, the usual case) counts as reached, and the answer (`Answer`: the `NodeIdentity`, or why there is none) is kept. The probe runs only when nobody has asked yet (`--node`, `MDMA_NODE`). `replica sync` reads `Node::identity()` instead of asking again. It still opens its own gateway client with its 10 s `LINK_TIMEOUT` for the large ACID reads; the probe bound applies only to "does it answer".
    - Silence reads "<host> (<ip>) did not answer in time". The dial is asynchronous, so a refused or unreachable node also shows up as silence; a dial that fails outright keeps its wording.
    - Known risk: the probe gates `replica sync` on an explicit target (`--node`, `MDMA_NODE`), where the resolver verified nothing. A node that answers "who are you" slower than the probe bound fails where the sync's own 10 s `LINK_TIMEOUT` identify used to succeed. Raise the probe bound or give the `Node` one if it shows up.
-   - For P5: one gateway socket serialises library, playback and admin requests, so a slow request blocks the others. Per-service sockets are a cheap change in `Node` (drop the shared `gateway_client` slot) if it shows up.
+   - **Known limitation (standing).** A remote node's library, playback and admin requests share one gateway socket, which serialises them: a slow request blocks the others. A service that hangs behind the gateway does so too: its request times out after the request timeout (5 s), the transport records the node as unreachable (§4.4), and every service of the node is then dropped for 10 s, though only one was hung. Per-service sockets are a cheap change in `Node` (drop the shared `gateway_client` slot), and the only cure, if it shows up.
 3. **Errors name what needed the node.** `Node` carries a `needed_by` label, set once where the client starts, and there is no default: every client names itself.
    - Every error about resolving or reaching the node (`Resolve`, `Connect` for local IPC and after a successful probe, and the probe failure) reads "<needed_by> needs the node: <text>". One function (`Node::labelled`, public, idempotent) applies the label; a client that connects on its own (`replica sync`) uses it too. `NeedsGateway`, `NoRemoteNode`, `InvalidEnv` and the sources directory error are not about reaching the node and stay as they were.
    - The CLI sets it from the parsed command path (`main.rs`): "mdma queue append needs the node: <the connect text>";
@@ -95,20 +96,25 @@ File and line references below are as of 5d2cf8f.
 4. Resolution failures behave like connect failures: they do not stop a client from starting, and they are kept the same way. A failed resolution (nothing found, cancelled prompt) is kept for 10 s with its text; asking again within the window fails at once, without browsing or prompting again.
    - Only the first resolution of a process may ask the user to pick or print a note. A retry after the window runs silent and non-interactive.
    - A cancelled prompt (`ResolveError::Cancelled`) stands for the whole process: the user chose no node, and it is never retried.
-   - Not yet: a transport timeout on an already cached connection does not mark the node unreachable. P5 (the TUI) should call that out when it wires the unreachable state.
-5. **The TUI** resolves before raw mode (ADR-022 §2), so the pick prompt still works.
+   - **Sticky reach (Decided).** A node that stops answering on a connection already cached is unreachable too, and the transport says so, not the callers.
+     - `nng_transport::SharedSocket` carries a reach cell that all its clones share. A request that fails with an unreachable error records the error text in it. The one classification is `NngClientError::is_unreachable()`: `TimedOut`, `ConnectionRefused`, `ConnectionReset` and `Closed` (also as the cause of a failed dial) mean unreachable; `Serialization`, a service's own error and the other nng errors do not. `library_ipc_client::ClientError::is_unreachable()` is built on it (a protocol refusal is never unreachable), and the playback and gateway clients have it through `NngClientError`.
+     - `Node::library()`, `playback()` and `admin()` ask the cell of each cached connection (`take_unreachable`) before handing one out. If one went dead, the node drops it and the connections that share its socket: all of a remote node's (they are one socket), but on local IPC only that service, so a hung library leaves playback usable (the window is kept per group of connections). A remote node is put back to "must answer the reachability check", and for `RETRY_AFTER` (10 s, counted from the ask that first heard of the failure) every ask fails with the transport's text, labelled like every node error, without dialling. After the window the node dials again and a remote node is probed again.
+     - A request that was already in flight when the cell was set is not retried; only the next ask is affected. The cell is told once (taking it clears it).
+     - Clients that call methods on a backend they hold (the TUI's panes) need nothing of their own to notice: the next call to `Node` finds out. A loop that keeps calling the held backend does not look in between, so such loops stop at the first error (the TUI's queueing does), rather than waiting out the timeout once per item.
+5. **The TUI** resolves before raw mode (ADR-022 §2), so the pick prompt still works. `Link::new` resolves the node and probes it once there (a remote node: at most 2 s, §4.2), then opens `Facts`. That is the only wait before raw mode.
    - A failed resolution or connect becomes the "node unreachable" state, shown in the queue, now-playing and playlist panes. The browser and search keep working from `Facts`.
+   - The node panes read their row metadata from the node (§5): `Link::node_facts()` is always `Facts::Node`, whatever `--facts` says, so a playlist is never written back from rows that came from a replica.
+   - **Events.** The TUI subscribes once, on the first tick after the node is resolved (`Node::event_address`, which never resolves and never probes), whether or not the node answers: the SUB socket dials without waiting and reconnects by itself, so nothing resubscribes. A message that cannot be read (`AppEvent::Malformed`) is news for the status line only. A subscription ends only when the socket fails (`SubscriberError`) or nobody listens any more; the thread then exits, the channel closes, and the TUI does not subscribe again. While the node is reached and no subscription is live (not resolved yet, no event address, or ended), the status line says "no live updates".
+   - **Background sync.** At start the TUI asks for a background sync with `Urgency::WhenStale`, and `:refresh` asks with `Urgency::Now` (it also folds the replica again and refreshes every pane, even when the fold fails). It finds `mdma` next to its own executable, then on `PATH` (an executable file, in an absolute directory); if a sync is due and it finds none, the status line says so. It keeps the child that `spawn_background_sync` returns and reaps it with `try_wait` on tick; the CLI drops it, as it exits soon. It never syncs inline.
+   - The status line shows the lines of `source_note`, then what is wrong with the node.
    - **Decided:** cancelling the pick prompt starts the TUI offline with no node. The node panes show "no node selected; run `mdma node select`". `Facts` opens the replica chosen offline by ADR-021 §6's order (the remembered node). With no replica, the browser shows the §2.3 missing-replica text.
 6. **Background sync** stays detached (ADR-021 §6, ADR-022 §5). A local read never waits for it, never takes `sync.lock` and never fails because of it.
 
 ### 5. What reads locally
 
 - **(a) local:** search, fact-values-for, list, get, view, sort, facts, marked and plays in the CLI; browser, search and genre groups in the TUI.
-- **(c) partial:**
-  - `rekordbox import` matching is local, its writes need the node;
-  - TUI queue and now-playing rows take their metadata from `Facts`, while queue and playback need the node;
-  - TUI playlist rows likewise.
-- **(b) node only:** writes, playlists (files), queue, playback, events, sources, inbox, admin, status, ping, export, upload and library maintenance.
+- **(b) node only:** writes, playlists (files), queue, playback, events, sources, inbox, admin, status, ping, export, upload and library maintenance. This includes `rekordbox import` (the matching and its writes), and the rows of the TUI's queue, now-playing and playlist panes. The rule: a read whose answer becomes a node write, or that serves a node-only pane, reads from the node. `rekordbox import` matches with `Facts::Node`, because a stale replica gives fewer matches and the import would replace a good playlist with a partial one; the panes are shown from the same node that gave their hashes.
+- **(c) partial:** none.
 - **Covers and blob paths** are node-relative strings. Locally they are the same text, but the files are not there. No CLI or TUI view renders them; exports stay (b).
 
 ### 6. Measuring decides whether a cache is needed
@@ -150,7 +156,8 @@ The comparison covers every `TrackInfo` field and the order, serialised as JSON.
 - `library_projection` (interface `library-projection`) gains dependencies on `library-search` and `acid-protocol`. It already depends on `library-ipc-protocol` and `music-facts`. `library_search` does not depend on `library_projection`, so there is no cycle.
 - `client_facts_replica` (interface `client-facts`, new) depends on `mdma-client`, `fact-replica`, `library-projection`, `acid-protocol` and `gateway-client`.
 - `mdma_client` does not depend on `client-facts`, so bevy-app and bdd stay light and there is no cycle. It may depend on `library_projection`, which is pure, for the one hash-resolution rule; `library_projection` never depends on `mdma_client`.
-- `mdma-cli` and `mdma-tui` depend on `client-facts` and `mdma-client`. `mdma-cli` drops its direct `fact-replica` and `library-projection` dependencies (ADR-022 §4).
+- `mdma-cli` and `mdma-tui` depend on `client-facts` and `mdma-client`. `mdma-cli` drops its direct `fact-replica` and `library-projection` dependencies (ADR-022 §4). For that, `Facts` answers plays in values rather than handing out the fold: `play_histories(&[ContentHash])` (the hash resolved inside `Facts`, each answered or refused on its own, the plays of replaced tracks included) and `recent_plays(n)`, with `Play`, `PlayHistory` and `Stop` re-exported. A future node arm (`LibraryRequest::Plays`) can carry the same values.
+- `client-facts` also owns starting the detached background sync (`spawn_background_sync(mdma, node)`, with `detach`), so the TUI can request one; the throttle is `request_sync`.
 - `library_service` and `library_service_stub` depend on `library-projection` for the §1 functions and `sort_catalog`.
 
 ### 9. Offline writes are a future increment
@@ -178,13 +185,13 @@ The comparison covers every `TrackInfo` field and the order, serialised as JSON.
 
 ## Consequences
 
-- Wire: none. `LibraryRequest` is unchanged. Search order changes for every client (console, TUI, CLI), deliberately.
+- Wire: `LibraryRequest` is unchanged. `TrackInfo` gains `genre`, `label` and `styles`, additive with serde defaults, so old nodes and clients still decode (ADR-022 0a); `library_projection::track_info` fills them. Search order changes for every client (console, TUI, CLI), deliberately.
 - The library and console redeploy for the order; old clients keep working.
 - With the replica as default, every local read folds the replica. Before §6's checkpoint that is about 7 MB per CLI command, and a pipeline folds once per command. §6 decides whether a checkpoint is built.
 - First use with no replica fails with how to get one (§2.3). The background sync started by that command makes the next one work.
 - `library_service_stub` loses its own fold (§1.4).
 - `NodeError` texts change (they gain "`mdma X` needs the node:"). That is a deliberate amendment of ADR-022 §1's byte-identical texts.
-- The TUI holds one fold in memory and applies new lines on its refresh (`catch_up`). It searches per keystroke in memory.
+- The TUI holds one fold in memory. Its refresh is a full refold, via `:refresh`; incremental catch-up waits for §6's measurement (and the checkpoint, if it is built). It searches per keystroke in memory.
 
 ## Open questions
 
@@ -201,7 +208,7 @@ New: whether ADR-031 is needed is decided by §6's measurement.
 
 ## Phasing
 
-P0a (read side into `library_projection`), P1 (`client_facts_replica` move) and P3 (lazy node) run in parallel. P0b (service consistency, equivalence test and the stub fold-in) follows P0a; P2 (`Facts`) follows P0a and P1; P4 (CLI) and P5 (TUI) follow P2 and P3; P6 (measure, record, and trigger ADR-031 if needed) is last.
+P0a (read side into `library_projection`), P1 (`client_facts_replica` move) and P3 (lazy node) run in parallel. P0b (service consistency, equivalence test and the stub fold-in) follows P0a; P2 (`Facts`) follows P0a and P1; P4 (CLI) follows P2 and P3; P5 (TUI) follows P2 and P3 and depends on the reach cell (§4.4), which is part of the transport and `Node`; P6 (measure, record, and trigger ADR-031 if needed) is last.
 
 ## Related
 
