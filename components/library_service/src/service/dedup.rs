@@ -817,17 +817,25 @@ impl LibraryService {
         }
     }
 
-    /// Whether a live track shows the cover art `rel`: as its own. An album's cover
-    /// is always the own cover of one of its tracks, and `album_cover_cache` is
-    /// rebuilt from the live tracks every time the projection catches up, so it
-    /// never names a cover that no live track holds: the loser's retract has already
-    /// been projected, and the album shows another cover or none.
+    /// Whether a live track holds the cover art `rel`: as its own cover or as the one
+    /// it inherits along `Replaces` (ADR-013, amendment 2026-11-17), so the file of the
+    /// nearest ancestor is not archived while it is a fallback of the track that
+    /// replaced it. An album's cover is always the effective cover of one of its
+    /// tracks, and `album_cover_cache` is rebuilt from the live tracks every time the
+    /// projection catches up or the lineage is refreshed, so it never names a cover
+    /// that no live track shows.
+    ///
+    /// A pure read. It needs the lineage refreshed after the facts that retired the
+    /// file (`merge_into` does, `cleanup_merge_orphans` does first), and when the last
+    /// refresh could not read the whole stream the lineage is not known to be
+    /// current, so every cover counts as in use and nothing is archived.
     fn cover_art_in_use(&self, rel: &Path) -> bool {
-        self.tracks
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|t| t.cover_art_path.as_deref() == Some(rel))
+        let tracks = self.tracks.lock().unwrap();
+        !self.lineage_current.load(Ordering::Relaxed)
+            || tracks.iter().any(|t| {
+                t.cover_art_path.as_deref() == Some(rel)
+                    || t.inherited_cover_art_path.as_deref() == Some(rel)
+            })
     }
 
     /// Archive cover art that no live track references any more.
@@ -1100,6 +1108,8 @@ impl LibraryService {
     /// ever touches hashes named by a live `Replaces` from `mdma-dedup`: other
     /// `NoLiveFacts` orphans (ADR-004 replace leftovers) are not its business.
     pub(super) fn cleanup_merge_orphans(&self, report: &mut DedupApplyReport) {
+        // The covers an orphan's files may still be shown as are read from the lineage.
+        self.refresh_lineage();
         for key in self.merge_orphan_candidates() {
             // Liveness is re-checked under the retire gate right before the files
             // move, so a track that came back since the candidate list was made

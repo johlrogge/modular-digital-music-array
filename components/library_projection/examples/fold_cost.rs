@@ -60,7 +60,7 @@ fn main() {
         let mut projection = project_lines(text.lines());
         record(1, &mut lap);
 
-        projection.plays.apply_to(&mut projection.tracks);
+        projection.lineage.apply_to(&mut projection.tracks);
         record(2, &mut lap);
 
         let covers = AlbumCovers::build(&projection.tracks);

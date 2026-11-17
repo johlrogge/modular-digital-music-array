@@ -564,8 +564,8 @@ mod tests {
 
         // The plays of every track, and the latest of them, as `mdma plays` reads them.
         let started = std::time::Instant::now();
-        let histories = projection.plays.histories(&projection.tracks);
-        let recent = projection.plays.recent(&projection.tracks, 20);
+        let histories = projection.lineage.histories(&projection.tracks);
+        let recent = projection.lineage.recent(&projection.tracks, 20);
         let plays = started.elapsed();
         assert_eq!(histories.iter().filter(|h| h.count() == 1).count(), 4_000);
         assert_eq!(recent.len(), 20);

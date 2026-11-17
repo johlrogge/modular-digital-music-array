@@ -94,7 +94,7 @@ Amends ADR-021 §4 (who depends on `library_projection`) and §6 (refresh and no
 - **Risk, folding cost:** opening the replica folds about 7 MB of log. Doing that per CLI command may be too slow. Measure before adding a cached projection.
 - **Risk, lock contention:** a long-running TUI and CLI shells share `sync.lock`. A TUI that syncs often can make CLI syncs exit as busy. That is correct, but it can delay a refresh the CLI asked for.
 - **Risk, remote plays:** a future remote implementation needs a `LibraryRequest::Plays`, or `FactsView::plays` answers `Unsupported`. That is open until the remote implementation is built.
-- Play history in the CLI (#99) already shipped in 0.38.0, built directly on `library_projection`'s `PlayLog` via the CLI's replica. When phase 3 lands it moves onto `FactsView::plays`. That is a move, not new work, and clients still never count facts themselves.
+- Play history in the CLI (#99) already shipped in 0.38.0, built directly on `library_projection`'s `LineageLog` (then `PlayLog`) via the CLI's replica. When phase 3 lands it moves onto `FactsView::plays`. That is a move, not new work, and clients still never count facts themselves.
 
 ## Phasing
 
@@ -103,7 +103,7 @@ Amends ADR-021 §4 (who depends on `library_projection`) and §6 (refresh and no
 - **0c.** `mdma-cli`, `mdma-tui` and bdd use `mdma-client = { workspace = true }`.
 - **1.** `Node`, resolution and `ClientConfig` into `mdma_client`, and `bases/client` deleted. **1b:** the TUI on `Node`.
 - **2.** `client_facts_replica` as a pure move out of `mdma-cli`.
-- **3.** `FactsView`. Play history (#99, shipped in 0.38.0 on `library_projection`'s `PlayLog`) moves onto `FactsView::plays`; this is a move, not new work.
+- **3.** `FactsView`. Play history (#99, shipped in 0.38.0 on `library_projection`'s `PlayLog`, now `LineageLog`) moves onto `FactsView::plays`; this is a move, not new work.
 - **4.** The TUI on `FactsView`, with live updates (events plus the 30 s timer).
 - **Deferred.** `client_facts_remote`, `embedded.profile`, CI for that profile.
 

@@ -118,7 +118,9 @@ pub struct ReplicaView {
 impl ReplicaView {
     /// The view of `fold`: its plays applied to its tracks, and the covers built.
     pub fn new(mut fold: ReplicaFold) -> Self {
-        fold.projection.plays.apply_to(&mut fold.projection.tracks);
+        fold.projection
+            .lineage
+            .apply_to(&mut fold.projection.tracks);
         let covers = AlbumCovers::build(&fold.projection.tracks);
         Self { fold, covers }
     }
@@ -281,7 +283,7 @@ impl<N: Deref<Target = Node>> Facts<N> {
         match self {
             Facts::Replica(view) => {
                 let projection = &view.fold.projection;
-                let resolved = projection.plays.resolved(&projection.tracks);
+                let resolved = projection.lineage.resolved(&projection.tracks);
                 Ok(hashes
                     .iter()
                     .map(|hash| {
@@ -314,7 +316,7 @@ impl<N: Deref<Target = Node>> Facts<N> {
             Facts::Replica(view) => {
                 let projection = &view.fold.projection;
                 Ok(projection
-                    .plays
+                    .lineage
                     .recent(&projection.tracks, n)
                     .into_iter()
                     .map(|(i, play)| {
