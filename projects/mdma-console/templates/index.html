@@ -2186,11 +2186,11 @@
         }
 
         function queuePlaylist(name) {
-            fetch('/library/playlists/' + encodeURIComponent(name) + '/queue-replace', { method: 'POST' })
+            fetch('/library/playlists/' + encodeURIComponent(name) + '/queue', { method: 'POST' })
                 .then(function(r) { return r.json(); })
                 .then(function(data) {
                     if (data.success) {
-                        showStatus('Queued playlist: ' + name, false);
+                        showStatus('Queued ' + data.queued + ' from ' + name + ' (' + data.skipped.length + ' unavailable)', false);
                         refreshQueue();
                     } else {
                         showStatus('Queue failed: ' + (data.error || 'unknown'), true);

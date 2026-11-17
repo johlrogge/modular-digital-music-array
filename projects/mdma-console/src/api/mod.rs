@@ -242,10 +242,12 @@ pub fn library_failure_status(error: &ClientError) -> StatusCode {
         ClientError::Protocol(ProtocolError::PlaylistNotFound { .. }) => StatusCode::NOT_FOUND,
         ClientError::Protocol(
             ProtocolError::AmbiguousHash { .. }
+            | ProtocolError::HashNotCanonical { .. }
             | ProtocolError::TrackNotFound { .. }
             | ProtocolError::InboxFileNotFound { .. }
             | ProtocolError::PlaylistAlreadyExists { .. }
-            | ProtocolError::InvalidPlaylistName { .. },
+            | ProtocolError::InvalidPlaylistName { .. }
+            | ProtocolError::InvalidEdit { .. },
         ) => StatusCode::UNPROCESSABLE_ENTITY,
         ClientError::Protocol(
             ProtocolError::IngestionFailed { .. }

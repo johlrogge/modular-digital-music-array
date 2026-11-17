@@ -5641,6 +5641,7 @@ dependencies = [
  "music-primitives",
  "nng",
  "nng-transport",
+ "serde",
  "serde_json",
  "thiserror 1.0.69",
 ]
@@ -5656,6 +5657,7 @@ dependencies = [
  "rstest",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 1.0.69",
 ]
 
@@ -5704,7 +5706,9 @@ dependencies = [
  "music-primitives",
  "nng",
  "notify",
+ "playlist-edit",
  "pretty_assertions",
+ "private-file",
  "rstest",
  "serde",
  "serde_json",
@@ -5725,6 +5729,7 @@ dependencies = [
  "music-facts",
  "music-primitives",
  "nng",
+ "playlist-edit",
  "serde",
  "serde_json",
  "stainless-facts",
@@ -7571,6 +7576,17 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 1.0.69",
+]
+
+[[package]]
+name = "playlist-edit"
+version = "0.38.3"
+dependencies = [
+ "library-ipc-protocol",
+ "library-projection",
+ "pretty_assertions",
+ "thiserror 1.0.69",
+ "track-formatter",
 ]
 
 [[package]]

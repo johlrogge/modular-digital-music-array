@@ -713,15 +713,22 @@ pub fn content_to_hashes(content: &str) -> Vec<ContentHash> {
     playlist_hashes(content).map(ContentHash::new).collect()
 }
 
-/// The hashes of a playlist's entries, for sending to playback, which holds
-/// only full hashes. Fails on the first unresolved entry, returning its
-/// position and why, so nothing is half sent.
-pub fn entries_for_playback(
-    entries: &[PlaylistEntry],
-) -> Result<Vec<CanonicalHash>, UnplayableEntry> {
-    match unresolved_entries(entries).next() {
-        Some(unplayable) => Err(unplayable),
-        None => Ok(track_hashes(entries)),
+/// A playlist split for playback: what can be sent, and what is left out.
+#[derive(Debug, PartialEq)]
+pub struct PlayableEntries {
+    /// The full hash of each available entry, in order, duplicates kept.
+    pub hashes: Vec<CanonicalHash>,
+    /// The entries that cannot be played, for the caller to report.
+    pub skipped: Vec<UnplayableEntry>,
+}
+
+/// The entries of a playlist for sending to playback, which holds only full
+/// hashes. Unresolved entries are skipped and reported (ADR-027 §10), not
+/// failed on.
+pub fn entries_for_playback(entries: &[PlaylistEntry]) -> PlayableEntries {
+    PlayableEntries {
+        hashes: track_hashes(entries),
+        skipped: unresolved_entries(entries).collect(),
     }
 }
 
@@ -736,7 +743,7 @@ pub fn track_hashes(entries: &[PlaylistEntry]) -> Vec<CanonicalHash> {
         .collect()
 }
 
-/// The entries of a playlist that are not available, with their 1-based positions.
+/// The entries of a playlist that are not available, with their 0-based positions.
 pub fn unresolved_entries(entries: &[PlaylistEntry]) -> impl Iterator<Item = UnplayableEntry> + '_ {
     entries
         .iter()
@@ -744,7 +751,7 @@ pub fn unresolved_entries(entries: &[PlaylistEntry]) -> impl Iterator<Item = Unp
         .filter_map(|(index, entry)| match entry {
             PlaylistEntry::Track { .. } => None,
             PlaylistEntry::Unresolved { error } => Some(UnplayableEntry {
-                position: index + 1,
+                position: index,
                 error: error.clone(),
             }),
         })
@@ -787,11 +794,12 @@ pub fn entry_tracks<'a, E>(
 }
 
 /// A playlist entry that cannot be sent to playback.
-#[derive(Debug, Error, PartialEq)]
-#[error("entry {position}: {error}")]
+#[derive(Debug, Error, PartialEq, serde::Serialize)]
+#[error("entry {}: {error}", .position + 1)]
 pub struct UnplayableEntry {
-    /// 1-based position among the playlist's track entries; comments and blank
-    /// lines are not counted.
+    /// 0-based position among the playlist's entries, like every position on
+    /// the wire; comments and blank lines are not counted. The message counts
+    /// from 1, for people.
     pub position: usize,
     pub error: EntryError,
 }
@@ -1021,11 +1029,9 @@ mod tests {
     #[test]
     fn entries_for_playback_returns_tracks_in_order_with_duplicates() {
         let entries = [track_entry("b"), track_entry("a"), track_entry("b")];
-        let got: Vec<ContentHash> = entries_for_playback(&entries)
-            .unwrap()
-            .into_iter()
-            .map(Into::into)
-            .collect();
+        let playable = entries_for_playback(&entries);
+        assert!(playable.skipped.is_empty());
+        let got: Vec<ContentHash> = playable.hashes.into_iter().map(Into::into).collect();
         assert_eq!(
             got,
             vec![
@@ -1037,22 +1043,40 @@ mod tests {
     }
 
     #[test]
-    fn entries_for_playback_fails_on_first_unresolved_with_its_position() {
+    fn entries_for_playback_skips_unresolved_and_reports_their_positions() {
         let entries = [
             track_entry("a"),
             unknown_entry("first"),
             track_entry("b"),
             unknown_entry("second"),
         ];
-        let unplayable = entries_for_playback(&entries).unwrap_err();
-        assert_eq!(unplayable.position, 2, "1-based");
+        let playable = entries_for_playback(&entries);
         assert_eq!(
-            unplayable.error,
+            playable.hashes,
+            vec![
+                CanonicalHash::try_from(ContentHash::new(full("a"))).unwrap(),
+                CanonicalHash::try_from(ContentHash::new(full("b"))).unwrap(),
+            ]
+        );
+        let positions: Vec<usize> = playable.skipped.iter().map(|u| u.position).collect();
+        assert_eq!(positions, vec![1, 3], "0-based, among the entries");
+        assert_eq!(
+            playable.skipped[0].error,
             EntryError::Unknown {
                 hash: ContentHash::new("first")
             }
         );
-        assert_eq!(unplayable.to_string(), "entry 2: unknown track first");
+        assert_eq!(
+            playable.skipped[0].to_string(),
+            "entry 2: unknown track first"
+        );
+    }
+
+    #[test]
+    fn entries_for_playback_with_nothing_playable_has_no_hashes() {
+        let playable = entries_for_playback(&[unknown_entry("gone")]);
+        assert!(playable.hashes.is_empty());
+        assert_eq!(playable.skipped.len(), 1);
     }
 
     #[test]
@@ -1102,14 +1126,24 @@ mod tests {
     }
 
     #[test]
-    fn unresolved_entries_number_positions_from_one() {
+    fn unresolved_entries_number_positions_from_zero_and_say_them_from_one() {
         let entries = [
             unknown_entry("first"),
             track_entry("a"),
             unknown_entry("second"),
         ];
-        let positions: Vec<usize> = unresolved_entries(&entries).map(|u| u.position).collect();
-        assert_eq!(positions, vec![1, 3]);
+        let unplayable: Vec<UnplayableEntry> = unresolved_entries(&entries).collect();
+        let positions: Vec<usize> = unplayable.iter().map(|u| u.position).collect();
+        assert_eq!(positions, vec![0, 2]);
+        assert_eq!(unplayable[0].to_string(), "entry 1: unknown track first");
+    }
+
+    #[test]
+    fn unplayable_entry_serializes_with_its_typed_error() {
+        let json =
+            serde_json::to_value(unresolved_entries(&[unknown_entry("gone")]).next()).unwrap();
+        assert_eq!(json["position"], 0);
+        assert_eq!(json["error"]["Unknown"]["hash"], "gone");
     }
 
     #[test]

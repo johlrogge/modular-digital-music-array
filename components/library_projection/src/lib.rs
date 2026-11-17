@@ -1634,12 +1634,22 @@ pub fn resolve_visible<'a, T: HashedTrack>(
 /// ([`resolve_visible`]): `Track` means the track exists and is visible; a full
 /// hash that is absent or hidden is as unknown as a prefix.
 pub fn resolve_entry<T: HashedTrack>(tracks: &[T], token: &str) -> PlaylistEntry {
-    let unresolved = |error| PlaylistEntry::Unresolved { error };
-    let unknown = || EntryError::Unknown {
-        hash: ContentHash::new(token),
-    };
+    match resolve_entry_track(tracks, token) {
+        Ok((hash, _)) => PlaylistEntry::Track { hash },
+        Err(error) => PlaylistEntry::Unresolved { error },
+    }
+}
+
+/// [`resolve_entry`] with the track it found: the token's full hash and the
+/// track, or why the token names no single track with a full hash.
+pub fn resolve_entry_track<'a, T: HashedTrack>(
+    tracks: &'a [T],
+    token: &str,
+) -> Result<(CanonicalHash, &'a T), EntryError> {
     match resolve_visible(tracks, token) {
-        Err(Unresolved::NotFound) => unresolved(unknown()),
+        Err(Unresolved::NotFound) => Err(EntryError::Unknown {
+            hash: ContentHash::new(token),
+        }),
         Err(Unresolved::Ambiguous(found)) => {
             let mut candidates: Vec<ContentHash> = Vec::new();
             for track in found {
@@ -1648,18 +1658,17 @@ pub fn resolve_entry<T: HashedTrack>(tracks: &[T], token: &str) -> PlaylistEntry
                     candidates.push(hash);
                 }
             }
-            unresolved(EntryError::Ambiguous {
+            Err(EntryError::Ambiguous {
                 hash: ContentHash::new(token),
                 candidates,
             })
         }
-        Ok(track) => match CanonicalHash::try_from(ContentHash::new(track.content_hash())) {
-            Ok(hash) => PlaylistEntry::Track { hash },
-            Err(not_canonical) => unresolved(EntryError::NotCanonical {
+        Ok(track) => CanonicalHash::try_from(ContentHash::new(track.content_hash()))
+            .map(|hash| (hash, track))
+            .map_err(|not_canonical| EntryError::NotCanonical {
                 hash: ContentHash::new(token),
                 found: not_canonical.0,
             }),
-        },
     }
 }
 
