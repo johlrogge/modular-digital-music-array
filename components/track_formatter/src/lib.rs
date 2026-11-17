@@ -122,15 +122,17 @@ pub fn short_hash(hash: &ContentHash) -> &str {
 /// Format: `{12-char-hash}  {Artist} - {Title}  [{duration}]`
 ///
 /// If duration is absent the trailing `  [{duration}]` segment is omitted.
-/// Artist and Title fall back to `"Unknown"` when absent.
+/// Artist and Title fall back to `"Unknown"` when absent. Line breaks in them
+/// become spaces, so the result is always one line.
 ///
 /// Internally constructs a [`NonShrinkableHash`] to carry the playlist-safe intent:
 /// this hash must never be truncated. The guarantee is structural — this function
 /// formats directly via `format!()` and never calls `corsett::resize_columns`, so
 /// the full 12-char prefix always appears in the output.
 pub fn format_track_line(track: &TrackInfo) -> String {
-    let title = track.title.as_deref().unwrap_or("Unknown");
-    let artist = track.artist.as_deref().unwrap_or("Unknown");
+    let one_line = |text: &str| text.replace(['\n', '\r'], " ");
+    let title = one_line(track.title.as_deref().unwrap_or("Unknown"));
+    let artist = one_line(track.artist.as_deref().unwrap_or("Unknown"));
     let hash: NonShrinkableHash = (&track.content_hash).into();
     match track.duration {
         Some(d) => format!("{}  {} - {}  [{}]", hash.as_ref(), artist, title, d),
@@ -441,6 +443,20 @@ mod tests {
         );
         let line = format_track_line(&track);
         assert_eq!(line, "8d4e7b2cabc1  Artist Name - Track Title");
+    }
+
+    #[test]
+    fn format_track_line_turns_line_breaks_into_spaces() {
+        let track = make_track(
+            "sha256:8d4e7b2cabc12345",
+            Some("Art\r\nist"),
+            Some("Two\nlines"),
+            None,
+        );
+        assert_eq!(
+            format_track_line(&track),
+            "8d4e7b2cabc1  Art  ist - Two lines"
+        );
     }
 
     #[test]

@@ -5,15 +5,15 @@
 //! ACID, ingestion, or file-system side effects.
 
 use crate::ipc::{
-    bookmark_scope_mark, parse_request, playlist_hashes, BeatGridInfo, Bpm, ContentHash, CueInfo,
-    DurationSeconds, FactType, IpcServer, LibraryRequest, LibraryResponse, Mark, MarkFilter,
-    MarkWrite, OrphanInfo, OrphanReason, PlaylistName, ProtocolError, ServiceStatus, TrackInfo,
-    TrackQuery, Unmark,
+    bookmark_scope_mark, parse_request, BeatGridInfo, Bpm, ContentHash, CueInfo, DurationSeconds,
+    FactType, IpcServer, LibraryRequest, LibraryResponse, Mark, MarkFilter, MarkWrite, OrphanInfo,
+    OrphanReason, PlaylistName, ProtocolError, ServiceStatus, TrackInfo, TrackQuery, Unmark,
 };
-use library_projection::{resolve_entry, resolve_prefix, resolve_visible, HashedTrack, Unresolved};
+use library_projection::{resolve_prefix, resolve_visible, HashedTrack, Unresolved};
 use library_search::{matches_query, TrackFields};
 use music_facts::{FactSource, MusicValue};
 use music_primitives::{EnergyLevel, Key, TrackRole};
+use std::collections::hash_map::{Entry, OccupiedEntry};
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
@@ -165,8 +165,10 @@ impl IndexedTrack {
 pub struct LibraryService {
     tracks: Mutex<Vec<IndexedTrack>>,
     fact_index: Mutex<HashMap<FactType, HashSet<String>>>,
-    /// Playlist name -> content (list/get/new/replace; append, remove and
-    /// rename are not supported).
+    /// Playlist name -> content (everything but append). This mutex is the
+    /// stub's `playlists_lock`: held by every playlist reader and writer.
+    ///
+    /// Lock order: `playlists` -> `tracks`, as in the real service.
     playlists: Mutex<HashMap<String, String>>,
     /// Every `WriteFact` received, with the source it stated, in order.
     written: Mutex<Vec<(ContentHash, MusicValue, Option<FactSource>)>>,
@@ -419,29 +421,85 @@ impl LibraryService {
                 LibraryResponse::PlaylistNames(names)
             }
 
-            LibraryRequest::PlaylistGet { name } => {
-                match self.playlists.lock().unwrap().get(name.as_str()) {
-                    Some(content) => LibraryResponse::PlaylistContent(content.clone()),
-                    None => LibraryResponse::Error(ProtocolError::PlaylistNotFound {
-                        name: name.to_string(),
-                    }),
-                }
-            }
+            LibraryRequest::PlaylistGet { name } => self.with_playlist(&name, |entry, _| {
+                LibraryResponse::PlaylistContent(entry.get().clone())
+            }),
 
             LibraryRequest::PlaylistEntries { name } => {
-                match self.playlists.lock().unwrap().get(name.as_str()) {
-                    Some(content) => {
-                        let tracks = self.tracks.lock().unwrap();
-                        LibraryResponse::PlaylistEntries(
-                            playlist_hashes(content)
-                                .map(|token| resolve_entry(&tracks, token))
-                                .collect(),
-                        )
+                self.with_playlist(&name, |entry, tracks| {
+                    LibraryResponse::PlaylistEntries(playlist_edit::entries(entry.get(), tracks))
+                })
+            }
+
+            LibraryRequest::PlaylistSnapshot { name } => {
+                self.with_playlist(&name, |entry, tracks| {
+                    LibraryResponse::PlaylistSnapshot(playlist_edit::snapshot(entry.get(), tracks))
+                })
+            }
+
+            LibraryRequest::PlaylistEdit { name, version, ops } => {
+                self.with_playlist(&name, |entry, tracks| {
+                    match playlist_edit::plan_edit(
+                        entry.get(),
+                        &version,
+                        &ops,
+                        tracks,
+                        IndexedTrack::to_track_info,
+                    ) {
+                        Ok(planned) => commit(entry, planned),
+                        Err(e) => LibraryResponse::Error(e),
                     }
-                    None => LibraryResponse::Error(ProtocolError::PlaylistNotFound {
-                        name: name.to_string(),
-                    }),
+                })
+            }
+
+            LibraryRequest::PlaylistRevert {
+                name,
+                version,
+                content: to,
+            } => self.with_playlist(&name, |entry, tracks| {
+                let planned = playlist_edit::plan_revert(entry.get(), &version, &to, tracks);
+                commit(entry, planned)
+            }),
+
+            LibraryRequest::PlaylistDelete { name, version } => {
+                self.with_playlist(&name, |entry, tracks| {
+                    match playlist_edit::plan_delete(entry.get(), &version, tracks) {
+                        Ok(()) => {
+                            entry.remove();
+                            LibraryResponse::PlaylistDeleted
+                        }
+                        Err(current) => LibraryResponse::PlaylistDeleteConflict { current },
+                    }
+                })
+            }
+
+            LibraryRequest::PlaylistRemove { name } => self.with_playlist(&name, |entry, _| {
+                entry.remove();
+                LibraryResponse::Pong
+            }),
+
+            LibraryRequest::PlaylistAppend { name, content } => {
+                self.with_playlist(&name, |mut entry, _| {
+                    let new_content = playlist_edit::appended(entry.get(), &content);
+                    *entry.get_mut() = new_content.clone();
+                    LibraryResponse::PlaylistContent(new_content)
+                })
+            }
+
+            LibraryRequest::PlaylistRename { from, to } => {
+                let mut playlists = self.playlists.lock().unwrap();
+                if !playlists.contains_key(from.as_str()) {
+                    return not_found(&from);
                 }
+                if playlists.contains_key(to.as_str()) {
+                    return LibraryResponse::Error(ProtocolError::PlaylistAlreadyExists {
+                        name: to.to_string(),
+                    });
+                }
+                if let Some(content) = playlists.remove(from.as_str()) {
+                    playlists.insert(to.as_str().to_string(), content);
+                }
+                LibraryResponse::Pong
             }
 
             LibraryRequest::PlaylistNew { name, content } => {
@@ -462,14 +520,6 @@ impl LibraryService {
                     .unwrap()
                     .insert(name.as_str().to_string(), content.clone());
                 LibraryResponse::PlaylistContent(content)
-            }
-
-            LibraryRequest::PlaylistAppend { .. }
-            | LibraryRequest::PlaylistRemove { .. }
-            | LibraryRequest::PlaylistRename { .. } => {
-                LibraryResponse::Error(ProtocolError::Internal {
-                    message: "playlist operations not supported in stub".to_string(),
-                })
             }
 
             // Stub no-ops for inbox/ingestion operations
@@ -844,6 +894,42 @@ pub fn run_ipc_server(svc: Arc<LibraryService>, address: &str) -> Result<(), Ser
 /// The stub has no ACID stream to follow; present so callers of the real
 /// `library_service::service::spawn_fact_subscriber` compile unchanged.
 pub fn spawn_fact_subscriber(_service: Arc<LibraryService>) {}
+
+fn not_found(name: &PlaylistName) -> LibraryResponse {
+    LibraryResponse::Error(ProtocolError::PlaylistNotFound {
+        name: name.to_string(),
+    })
+}
+
+/// Store what `planned` says to write, and answer its outcome.
+fn commit(
+    entry: OccupiedEntry<'_, String, String>,
+    planned: playlist_edit::Planned,
+) -> LibraryResponse {
+    let (write, outcome) = planned.into_parts();
+    if let Some(bytes) = write {
+        *entry.into_mut() = bytes;
+    }
+    LibraryResponse::PlaylistEdited(outcome)
+}
+
+impl LibraryService {
+    /// Run `f` on the entry of playlist `name` (read, change or remove it) and on
+    /// the tracks, under the playlists lock and then the tracks lock (the lock
+    /// order). A missing playlist is `PlaylistNotFound`.
+    fn with_playlist(
+        &self,
+        name: &PlaylistName,
+        f: impl FnOnce(OccupiedEntry<'_, String, String>, &[IndexedTrack]) -> LibraryResponse,
+    ) -> LibraryResponse {
+        let mut playlists = self.playlists.lock().unwrap();
+        let Entry::Occupied(entry) = playlists.entry(name.as_str().to_string()) else {
+            return not_found(name);
+        };
+        let tracks = self.tracks.lock().unwrap();
+        f(entry, &tracks)
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -1673,6 +1759,15 @@ mod tests {
             "{resp:?}"
         );
     }
+
+    // The ADR-027 contract, stated once in `playlist_edit::contract`.
+
+    fn contract_setup(content: &str) -> playlist_edit::contract::Handler {
+        let svc = service_with_playlist(content);
+        Box::new(move |request| svc.handle_request(request))
+    }
+
+    playlist_edit::playlist_contract_tests!(contract_setup);
 
     #[test]
     fn playlist_replace_creates_a_missing_playlist_like_the_real_service() {
