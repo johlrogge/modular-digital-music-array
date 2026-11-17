@@ -21,7 +21,7 @@ use color_eyre::eyre::eyre;
 use color_eyre::Result;
 use fact_replica::{LineCount, Replica, SyncReport, UnixSecs};
 use library_projection::{project_lines, IndexedTrackInfo, Projection};
-use music_facts::{Mark, StoredMark};
+use music_facts::Mark;
 use serde::{Deserialize, Serialize};
 
 use crate::replica::{Probe, Probed, PROBE_TTL_SECS};
@@ -89,18 +89,20 @@ impl CompletionSnapshot {
     pub fn build(projection: &Projection, probe: &Probe, lines: LineCount) -> Self {
         let tracks = &projection.tracks;
         let styles = tracks.iter().flat_map(|t| &t.styles).map(String::as_str);
-        let mut marks: BTreeSet<String> = BTreeSet::from([Mark::Default.to_string()]);
-        let mut origins: BTreeSet<&str> = BTreeSet::new();
-        for (value, source) in tracks.iter().flat_map(|t| &t.provenance) {
-            // A legacy free-text scope is not a mark name `mark` would accept.
-            if let Some(StoredMark::Mark(mark)) = value.stored_mark() {
-                marks.insert(mark.to_string());
-            }
-            origins.insert(source.origin.kind.as_str());
-        }
+        // Legacy free-text scopes are not marks, and `marks()` leaves them out.
+        let marks: BTreeSet<Mark> = tracks
+            .iter()
+            .flat_map(IndexedTrackInfo::marks)
+            .chain([Mark::Default])
+            .collect();
+        let origins: BTreeSet<&str> = tracks
+            .iter()
+            .flat_map(|t| &t.provenance)
+            .map(|(_, source)| source.origin.kind.as_str())
+            .collect();
         Self {
             lines,
-            marks: marks.into_iter().collect(),
+            marks: marks.iter().map(Mark::to_string).collect(),
             artists: field(tracks, |t| t.artist.as_deref()),
             titles: field(tracks, |t| t.title.as_deref()),
             albums: field(tracks, |t| t.album.as_deref()),
@@ -298,7 +300,7 @@ mod tests {
         let snapshot = CompletionSnapshot::build(&projection, &probed, LineCount::new(13));
 
         assert_eq!(snapshot.lines, LineCount::new(13));
-        assert_eq!(snapshot.marks, strings(&["banger", "liked"]));
+        assert_eq!(snapshot.marks, strings(&["liked", "banger"]));
         assert_eq!(snapshot.artists, strings(&["New Order", "deadmau5"]));
         assert_eq!(snapshot.titles, strings(&["Blue Monday", "Strobe"]));
         assert_eq!(snapshot.albums, strings(&["Power"]), "distinct");

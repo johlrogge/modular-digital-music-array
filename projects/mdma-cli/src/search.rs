@@ -1,8 +1,8 @@
 use crate::args::{value_and_dash, StdinDash};
 use crate::ctx::Ctx;
 use crate::local_complete::{
-    complete_albums, complete_artists, complete_genres, complete_labels, complete_query,
-    complete_sources, complete_styles, complete_titles, merge_unlisted,
+    complete_albums, complete_artists, complete_genres, complete_labels, complete_marks,
+    complete_query, complete_sources, complete_styles, complete_titles, merge_unlisted,
 };
 use crate::output::print_tracks;
 use crate::stdin::hashes_if_dash;
@@ -13,7 +13,7 @@ use hicli::{Arg, Candidate, Choice};
 use library_ipc_client::{ContentHash, TrackInfo};
 use library_search::{DateQuery, DurationQuery, KeyQuery, NumericQuery, StringQuery, TrackQuery};
 use mdma_client::Node;
-use music_facts::{EnergyLevel, TrackRole};
+use music_facts::{EnergyLevel, Mark, TrackRole};
 use std::str::FromStr;
 
 // Every filter is its own argument type and takes its help from its doc comment.
@@ -36,6 +36,7 @@ pub(crate) struct SearchArgs {
     played: Option<PlayedFilter>,
     role: Option<RoleArg>,
     energy: Option<EnergyArg>,
+    mark: Option<MarkedArg>,
     not: Invert,
     input: SearchInput,
 }
@@ -240,6 +241,11 @@ impl FromStr for EnergyArg {
     }
 }
 
+/// Filter by mark (`liked` is the default mark; any other name is a named mark, e.g. banger)
+#[derive(Debug, Clone, Arg)]
+#[arg(long = "mark", metavar = "MARK", complete = complete_marks)]
+pub(crate) struct MarkedArg(pub Mark);
+
 /// Filter by BPM (formats: 128  128+-4  124..132  128+2  128-2)
 #[derive(Debug, Clone, Arg)]
 #[arg(long = "bpm", metavar = "BPM")]
@@ -300,6 +306,7 @@ fn build_track_query(args: SearchArgs) -> TrackQuery {
         played,
         role,
         energy,
+        mark,
         not,
         input: SearchInput {
             query: any_text, ..
@@ -329,6 +336,7 @@ fn build_track_query(args: SearchArgs) -> TrackQuery {
         added: added.map(|AddedFilter(q)| q),
         role: role.map(TrackRole::from),
         energy: energy.map(|EnergyArg(q)| q),
+        mark: mark.map(|MarkedArg(m)| m),
         not: not.0,
     }
 }
@@ -715,6 +723,19 @@ mod tests {
         assert!(args.role.is_some(), "{args:?}");
         let err = parse_search(&["--role", "dancer"]).unwrap_err();
         assert!(err.contains("`--role`: expected `opener`"), "{err}");
+    }
+
+    #[test]
+    fn search_mark_parses_a_named_mark_and_liked_is_the_default_mark() {
+        let mark = |value: &str| build_track_query(parse_search(&["--mark", value]).unwrap()).mark;
+        assert_eq!(mark("Banger"), Some("banger".parse().unwrap()));
+        assert_eq!(mark("liked"), Some(Mark::Default));
+        assert_eq!(build_track_query(SearchArgs::default()).mark, None);
+    }
+
+    #[test]
+    fn search_mark_rejects_an_invalid_name() {
+        assert!(parse_search(&["--mark", " "]).is_err());
     }
 
     #[test]

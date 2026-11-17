@@ -23,7 +23,7 @@ const MAX_MARK_NAME_CHARS: usize = 64;
 ///   "big banger" are different names.
 /// - The length limit is counted in `char`s after lowercasing, which can
 ///   lengthen a name (e.g. "İ" lowercases to two chars).
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct MarkName(String);
 
@@ -109,7 +109,10 @@ impl fmt::Display for MarkName {
 }
 
 /// A mark: the default one ("liked") or a named one.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+///
+/// Marks order with the default mark first, then named marks by name. The order
+/// is the derived one, so the variant order matters: `Default` must stay first.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum Mark {
     Default,
     Named(MarkName),

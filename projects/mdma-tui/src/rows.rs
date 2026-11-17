@@ -133,6 +133,7 @@ pub(crate) fn make_track_info(
         genre: None,
         label: None,
         styles: vec![],
+        marks: vec![],
     }
 }
 
