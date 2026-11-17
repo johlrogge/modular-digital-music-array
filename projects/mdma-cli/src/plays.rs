@@ -11,8 +11,8 @@ use std::str::FromStr;
 
 use bpaf::{construct, Parser};
 use chrono::{DateTime, Local, TimeZone, Utc};
+use client_facts::{fold_current, replica_notes, UnixSecs};
 use color_eyre::Result;
-use fact_replica::UnixSecs;
 use hicli::Arg;
 use library_ipc_client::ContentHash;
 use library_projection::{
@@ -24,7 +24,6 @@ use music_facts::{StartReason, StopReason};
 use crate::args::{parse_count, HashInput};
 use crate::ctx::Ctx;
 use crate::output::{each_track, TrackFailure};
-use crate::replica::{ago, fold_current, ReplicaFold};
 use crate::stdin::hashes_of_input;
 
 /// List the N latest plays of any track, instead of one track's history
@@ -100,20 +99,6 @@ pub(crate) fn plays(of: PlaysOf, ctx: &Ctx) -> Result<hicli::Success> {
             Ok(hicli::Success::OK)
         }
     }
-}
-
-/// What to say on stderr about the replica the answer comes from: which node, how old,
-/// and any lines it could not read.
-fn replica_notes(fold: &ReplicaFold, now: UnixSecs) -> Vec<String> {
-    let synced = ago(now, fold.synced_at);
-    let mut notes = vec![format!("replica of {}, synced {synced}", fold.id)];
-    let unreadable = fold.projection.unparseable_lines;
-    if unreadable > 0 {
-        let unread =
-            format!("{unreadable} lines this mdma cannot read; plays may be missing; upgrade mdma");
-        notes.push(unread);
-    }
-    notes
 }
 
 /// The history of the track `hash` names, laid out; or why it cannot be shown.
@@ -263,7 +248,6 @@ mod tests {
     use super::*;
     use crate::test_support::{asserted, help, parses, usage_error};
     use chrono::FixedOffset;
-    use fact_replica::NodeId;
     use library_projection::project_lines;
     use pretty_assertions::assert_eq;
 
@@ -494,51 +478,5 @@ mod tests {
 
         assert_eq!(shown.lines().count(), 2, "{shown}");
         assert!(shown.starts_with("2026-01-09 13:00"), "{shown}");
-    }
-
-    // --- the replica note ----------------------------------------------------
-
-    fn fold_of(lines: &[String]) -> ReplicaFold {
-        ReplicaFold {
-            id: NodeId::new("mdma-stage").unwrap(),
-            synced_at: Some(UnixSecs::new(1_000)),
-            projection: project(lines),
-        }
-    }
-
-    #[test]
-    fn the_replica_is_named_and_its_age_given_on_stderr() {
-        let fold = fold_of(&log());
-
-        let notes = replica_notes(&fold, UnixSecs::new(1_000 + 7_200));
-
-        assert_eq!(notes, ["replica of mdma-stage, synced 2 h ago"]);
-    }
-
-    #[test]
-    fn lines_this_mdma_cannot_read_are_reported_too() {
-        let mut lines = log();
-        lines.push(r#"["from-a-newer-node"]"#.to_string());
-        lines.push("garbage".to_string());
-
-        let notes = replica_notes(&fold_of(&lines), UnixSecs::new(1_005));
-
-        assert_eq!(
-            notes,
-            [
-                "replica of mdma-stage, synced 5 s ago",
-                "2 lines this mdma cannot read; plays may be missing; upgrade mdma"
-            ]
-        );
-    }
-
-    #[test]
-    fn a_replica_that_never_synced_says_never() {
-        let mut fold = fold_of(&[]);
-        fold.synced_at = None;
-
-        let notes = replica_notes(&fold, UnixSecs::new(5));
-
-        assert_eq!(notes, ["replica of mdma-stage, synced never"]);
     }
 }

@@ -1,12 +1,12 @@
 //! The completion snapshot: `completion.json` in the replica directory (ADR-021 §4).
 //!
 //! Completion must answer in a few milliseconds and never touch the network, so it
-//! does not fold the replica's raw lines. After each sync the CLI folds them once
+//! does not fold the replica's raw lines. After each sync the client folds them once
 //! with `library_projection` and writes the distinct names completion offers: mark
 //! names, artists, titles, albums, labels, genres, styles and origins, plus the
 //! playlist and source names probed at the same sync.
 //!
-//! Lives here, not in `fact_replica`: the snapshot needs the CLI's [`Probe`] and the
+//! Lives here, not in `fact_replica`: the snapshot needs the [`Probe`] and the
 //! fold, and `fact_replica` stays a plain store without a dependency on
 //! `library_projection`.
 //!
@@ -34,7 +34,7 @@ const SNAPSHOT_FILE: &str = "completion.json";
 /// does not parse at all counts as missing and is rebuilt by the next sync.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
-pub(crate) struct CompletionSnapshot {
+pub struct CompletionSnapshot {
     /// Lines of the replica this was built from; a different count means it is behind.
     pub lines: LineCount,
     /// Mark names; `liked`, the default mark, is always among them.
@@ -86,7 +86,7 @@ fn field(tracks: &[IndexedTrackInfo], get: fn(&IndexedTrackInfo) -> Option<&str>
 
 impl CompletionSnapshot {
     /// Fold of `projection` and the probed names, built from `lines` replica lines.
-    pub(crate) fn build(projection: &Projection, probe: &Probe, lines: LineCount) -> Self {
+    pub fn build(projection: &Projection, probe: &Probe, lines: LineCount) -> Self {
         let tracks = &projection.tracks;
         let styles = tracks.iter().flat_map(|t| &t.styles).map(String::as_str);
         let mut marks: BTreeSet<String> = BTreeSet::from([Mark::Default.to_string()]);
@@ -118,13 +118,13 @@ impl CompletionSnapshot {
     }
 
     /// The stored snapshot as written. `None` when there is none or it is unreadable.
-    pub(crate) fn load(replica: &Replica) -> Option<Self> {
+    pub fn load(replica: &Replica) -> Option<Self> {
         let bytes = std::fs::read(Self::path(replica)).ok()?;
         serde_json::from_slice(&bytes).ok()
     }
 
     /// Only the probed names still within their TTL.
-    pub(crate) fn live(self, now: UnixSecs) -> Self {
+    pub fn live(self, now: UnixSecs) -> Self {
         Self {
             probe: self.probe.live(now),
             ..self
@@ -158,7 +158,7 @@ impl CompletionSnapshot {
     /// does not touch the replica: the names come from the lines that parse, and the
     /// count of the others is kept in the snapshot for `replica status` to report.
     /// Discarding the replica instead would refetch the whole log at every sync.
-    pub(crate) fn refresh(replica: &Replica, report: &SyncReport, probe: &Probe) -> Result<bool> {
+    pub fn refresh(replica: &Replica, report: &SyncReport, probe: &Probe) -> Result<bool> {
         if Self::load(replica).is_some_and(|existing| existing.is_current(report, probe)) {
             return Ok(false);
         }

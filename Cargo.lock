@@ -2849,6 +2849,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "client-facts"
+version = "0.38.3"
+dependencies = [
+ "acid-protocol",
+ "color-eyre",
+ "fact-replica",
+ "gateway-client",
+ "library-projection",
+ "mdma-client",
+ "music-facts",
+ "node-discovery",
+ "pretty_assertions",
+ "private-file",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "clipboard-win"
 version = "5.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5714,9 +5733,7 @@ dependencies = [
  "chrono",
  "library-ipc-protocol",
  "library-projection",
- "library-search",
  "music-facts",
- "music-primitives",
  "nng",
  "playlist-edit",
  "serde",
@@ -6089,11 +6106,11 @@ dependencies = [
 name = "mdma-cli"
 version = "0.38.3"
 dependencies = [
- "acid-protocol",
  "audio-transcoder",
  "bpaf",
  "chrono",
  "cli-base",
+ "client-facts",
  "color-eyre",
  "colored",
  "dirs",
@@ -6113,11 +6130,9 @@ dependencies = [
  "node-discovery",
  "playlist-import",
  "pretty_assertions",
- "private-file",
  "rekordbox-roundtrip",
  "rekordbox-xml",
  "reqwest",
- "serde",
  "serde_json",
  "source-protocol",
  "storage_primitives",

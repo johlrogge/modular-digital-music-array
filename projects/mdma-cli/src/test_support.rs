@@ -53,45 +53,11 @@ pub(crate) fn run_arg<T: hicli::Arg>(args: &[&str]) -> Result<T, String> {
         .map_err(|failure| flat(&failure.unwrap_stderr()))
 }
 
-/// Held by every test that sets an environment variable (`MDMA_NODE`, `EDITOR`,
-/// `COLUMNS`): the environment is process-wide and tests run in parallel.
-pub(crate) fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-/// Environment variables set for the length of a test and put back when it ends,
-/// even if it panics. Hold [`env_lock`] first (declare it first, so it drops last).
-#[derive(Default)]
-pub(crate) struct EnvVars(Vec<(&'static str, Option<std::ffi::OsString>)>);
-
-impl EnvVars {
-    pub(crate) fn set(&mut self, name: &'static str, value: impl AsRef<std::ffi::OsStr>) {
-        self.0.push((name, std::env::var_os(name)));
-        std::env::set_var(name, value);
-    }
-}
-
-impl Drop for EnvVars {
-    fn drop(&mut self) {
-        for (name, original) in self.0.drain(..).rev() {
-            match original {
-                Some(value) => std::env::set_var(name, value),
-                None => std::env::remove_var(name),
-            }
-        }
-    }
-}
-
-/// Global options as given by none of the flags or variables.
-pub(crate) fn globals() -> Globals {
-    Globals {
-        node: NodeFlag(None),
-        socket: LibrarySocket(None),
-        playback_socket: PlaybackSocket(None),
-        sources_dir: SourcesDir(None),
-    }
-}
+// The environment is process-wide, so one lock serves every test that sets a variable
+// (`MDMA_NODE`, `EDITOR`, `COLUMNS`): the one `client-facts` takes, whose tests set
+// `XDG_CACHE_HOME`. Any new test that starts a process, or takes a sync flock, must
+// hold `env_lock` (#107: a forked child inherits the flock until its exec).
+pub(crate) use client_facts::test_support::{asserted, env_lock, EnvVars};
 
 /// A context for the local services (IPC), with no node to resolve. Its sockets
 /// and sources directory do not exist, so no test can reach a real local service.
@@ -143,13 +109,6 @@ pub(crate) fn strip_ansi(s: &str) -> String {
         }
     }
     out
-}
-
-/// One line of a fact log, as a replica stores it: an assertion of the JSON `value`
-/// (`{"t": .., "v": ..}`) about `entity` at `time` (RFC 3339).
-pub(crate) fn asserted(entity: &str, value: &str, time: &str) -> String {
-    let source = r#"{"tool":"t","version":"1","origin":{"type":"User"}}"#;
-    format!(r#"["{entity}",{value},"{time}",{source},"Assert"]"#)
 }
 
 /// Fake library and playback services over IPC, for commands that talk to both.

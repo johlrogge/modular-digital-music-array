@@ -1,0 +1,34 @@
+[package]
+name = "client-facts"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[package.metadata.polylith]
+interface = "client-facts"
+
+[dependencies]
+acid-protocol = { workspace = true }
+fact-replica = { workspace = true }
+gateway-client = { workspace = true }
+library-projection = { workspace = true }
+mdma-client = { workspace = true }
+music-facts = { workspace = true }
+node-discovery = { workspace = true }
+private-file = { workspace = true }
+color-eyre = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[features]
+# Environment and fact-line helpers for tests, here and in the clients (mdma-cli).
+# Helpers only: no production behaviour depends on it.
+test-support = []
+
+[dev-dependencies]
+fact-replica = { workspace = true, features = ["test-support"] }
+mdma-client = { workspace = true, features = ["test-support"] }
+pretty_assertions = { workspace = true }
+tempfile = { workspace = true }
