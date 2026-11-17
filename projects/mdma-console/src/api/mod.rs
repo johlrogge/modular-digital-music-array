@@ -39,6 +39,9 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/api/player", get(player::player))
         .route("/api/pause", post(player::pause))
         .route("/api/resume", post(player::resume))
+        .route("/api/preview", post(player::preview))
+        .route("/api/preview/back", post(player::preview_back))
+        .route("/api/seek", post(player::seek))
         .route("/api/queue", post(player::queue))
         .route("/api/queue/edit", post(player::queue_edit))
         .route("/api/start", post(player::start))
@@ -96,6 +99,7 @@ impl From<gateway_client::ClientError> for PlaybackFailure {
     fn from(e: gateway_client::ClientError) -> Self {
         match e {
             gateway_client::ClientError::Service(message) => PlaybackFailure::Unexpected(message),
+            gateway_client::ClientError::Refused(message) => PlaybackFailure::Refused(message),
             other => PlaybackFailure::Unreachable(other),
         }
     }

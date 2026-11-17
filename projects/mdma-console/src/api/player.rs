@@ -1,14 +1,16 @@
 //! Player wire types for the new web UI.
 //!
 //! `ApiPlayer` is the shape of `GET /api/player` and the `{queue}` every `/api/queue/*`
-//! mutation returns. `static/js/core.js` reads exactly these keys.
+//! mutation returns. `static/js/core.js` reads exactly these keys. It is built from the playback
+//! service's `GetTransport`, so what is playing, paused or previewed is the node's word, never a
+//! guess from events.
 //!
-//! Every playback command sent here is queue-level, which the protocol routes to deck A and
-//! which carries no `deck` field yet (ADR-017 phase 1); nothing here targets another deck.
+//! Every playback command sent here targets deck A (the console has one) or is queue-level,
+//! which the protocol routes to deck A and which carries no `deck` field yet (ADR-017 phase 1).
 
 use super::library::playlist_name;
 use super::{
-    error_reply, gw, json_or_failure, library, library_failed, parse_hashes, playback_failed,
+    error_reply, gw, library, library_failed, parse_hashes, playback_failed,
     playback_failure_status, queue_entries, resolve_for_playback, resolve_for_queue_replace,
     respond, send, PlaybackFailure, Reply,
 };
@@ -21,69 +23,60 @@ use axum::{
     http::StatusCode,
     response::{Json, Response},
 };
-use event_protocol::PlaybackEvent;
 use gateway_client::{Command, GatewayClient, LibraryRequest};
 use library_ipc_client::{
     entries_for_playback, interpret_playlist_entries, CanonicalHash, PlayableEntries, PlaylistName,
 };
-use media_protocol::{ContentHash, Deck, OutputHealth, ResponseData};
+use mdma_client::{
+    seek_to, skip_beats, LibraryBackend, NodeError, Placement, PlaybackBackend, SeekError,
+};
+use media_protocol::{
+    ContentHash, Deck, OutputHealth, PositionMs, PreviewStatus, ResponseData, Transport,
+    TransportStatus,
+};
 use serde::{Deserialize, Serialize};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-/// Transport state. `idle` means nothing is loaded; paused and loading both count as busy.
+/// Transport state. `idle` means nothing is loaded; paused counts as busy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PlayerState {
     Idle,
     Playing,
     Paused,
-    /// Reserved for a transport status command (G6); not produced yet.
-    #[allow(dead_code)]
-    Loading,
 }
 
-/// What the console knows about pause, from the event stream. `NowPlaying` answers `Some` for
-/// playing and paused alike, so this is the only way to tell them apart until the playback
-/// service reports it. A cold console sees a paused track as playing until the next event.
-#[derive(Debug, Default)]
-pub struct TransportCache {
-    paused: Mutex<Option<String>>,
-}
-
-impl TransportCache {
-    /// Fold one playback event in: pause marks the track paused, anything else about a track
-    /// (resumed, started, stopped, ended) clears it.
-    pub fn apply(&self, event: &PlaybackEvent) {
-        let mut paused = self.paused.lock().unwrap_or_else(|p| p.into_inner());
-        match event {
-            PlaybackEvent::TrackPaused { hash } => *paused = Some(hash.as_str().to_owned()),
-            PlaybackEvent::TrackResumed { .. }
-            | PlaybackEvent::TrackStarted { .. }
-            | PlaybackEvent::TrackStopped { .. }
-            | PlaybackEvent::TrackEnded { .. } => *paused = None,
-            _ => {}
+impl From<Transport> for PlayerState {
+    fn from(transport: Transport) -> Self {
+        match transport {
+            Transport::Playing => PlayerState::Playing,
+            Transport::Paused => PlayerState::Paused,
         }
     }
+}
 
-    /// Remember that `hash` is paused (the console just paused it itself).
-    pub fn mark_paused(&self, hash: &ContentHash) {
-        let mut paused = self.paused.lock().unwrap_or_else(|p| p.into_inner());
-        *paused = Some(hash.as_str().to_owned());
-    }
+/// What a running preview goes back to. All three are null when the preview started over nothing
+/// (going back stops playback); otherwise the held track, where in it, and whether it played.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ApiPreview {
+    pub back_to: Option<String>,
+    pub back_at_ms: Option<u64>,
+    pub back_transport: Option<PlayerState>,
+}
 
-    /// Forget any pause (the console just resumed).
-    pub fn clear(&self) {
-        let mut paused = self.paused.lock().unwrap_or_else(|p| p.into_inner());
-        *paused = None;
-    }
-
-    /// Transport state given what `NowPlaying` reported.
-    pub fn state_for(&self, now: Option<&ContentHash>) -> PlayerState {
-        let paused = self.paused.lock().unwrap_or_else(|p| p.into_inner());
-        match now {
-            None => PlayerState::Idle,
-            Some(hash) if paused.as_deref() == Some(hash.as_str()) => PlayerState::Paused,
-            Some(_) => PlayerState::Playing,
+impl From<PreviewStatus> for ApiPreview {
+    fn from(preview: PreviewStatus) -> Self {
+        match preview.back_to {
+            Some(held) => Self {
+                back_to: Some(held.hash.as_str().to_owned()),
+                back_at_ms: Some(held.at.as_millis()),
+                back_transport: Some(held.transport.into()),
+            },
+            None => Self {
+                back_to: None,
+                back_at_ms: None,
+                back_transport: None,
+            },
         }
     }
 }
@@ -91,18 +84,24 @@ impl TransportCache {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ApiPlayer {
     pub state: PlayerState,
-    /// Hash of the loaded track, or null when idle.
+    /// Hash of the audible track (the preview, while one runs), or null when idle.
     pub now: Option<String>,
     /// Hashes in Up next, next track first.
     pub queue: Vec<String>,
     /// Audio output health (`absent|starting|running|stalled`), or null when the node cannot
     /// say (an old node). Reported next to the transport state, never folded into it (ADR-028).
     pub output: Option<OutputHealth>,
+    /// Where the audible track is, or null when idle or the source cannot say.
+    pub position_ms: Option<u64>,
+    /// How long the audible track is, or null when idle or the source cannot say.
+    pub duration_ms: Option<u64>,
+    /// Null unless the audible track is a preview.
+    pub preview: Option<ApiPreview>,
 }
 
 /// What one read of the player found.
 struct Snapshot {
-    now: Option<ContentHash>,
+    transport: TransportStatus,
     queue: Vec<ContentHash>,
     output: Option<OutputHealth>,
 }
@@ -123,6 +122,17 @@ fn now_of(client: &GatewayClient) -> Result<Option<ContentHash>, PlaybackFailure
         Some(ResponseData::NowPlaying(now)) => Ok(now),
         other => Err(PlaybackFailure::Unexpected(format!(
             "Unexpected NowPlaying response: {other:?}"
+        ))),
+    }
+}
+
+/// The transport of deck A. An answer that is not a `Transport` (an old node) is an error, never
+/// "idle".
+fn transport_of(client: &GatewayClient) -> Result<TransportStatus, PlaybackFailure> {
+    match send(client, &Command::GetTransport { deck: Deck::A })? {
+        Some(ResponseData::Transport(transport)) => Ok(transport),
+        other => Err(PlaybackFailure::Unexpected(format!(
+            "Unexpected GetTransport response: {other:?}"
         ))),
     }
 }
@@ -203,60 +213,238 @@ fn start_failed_reply(client: &GatewayClient, queued: usize, failure: PlaybackFa
 }
 
 /// The player as `GET /api/player` reports it.
-fn api_player(transport: &TransportCache, snapshot: Snapshot) -> ApiPlayer {
-    ApiPlayer {
-        state: transport.state_for(snapshot.now.as_ref()),
-        now: snapshot.now.map(|h| h.as_str().to_owned()),
-        queue: strings(&snapshot.queue),
-        output: snapshot.output,
+fn api_player(snapshot: Snapshot) -> ApiPlayer {
+    let queue = strings(&snapshot.queue);
+    let output = snapshot.output;
+    match snapshot.transport {
+        TransportStatus::Idle => ApiPlayer {
+            state: PlayerState::Idle,
+            now: None,
+            queue,
+            output,
+            position_ms: None,
+            duration_ms: None,
+            preview: None,
+        },
+        TransportStatus::Loaded {
+            transport,
+            now,
+            position_ms,
+            duration_ms,
+            preview,
+        } => ApiPlayer {
+            state: transport.into(),
+            now: Some(now.as_str().to_owned()),
+            queue,
+            output,
+            position_ms: position_ms.map(|p| p.as_millis()),
+            duration_ms: duration_ms.map(|p| p.as_millis()),
+            preview: preview.map(ApiPreview::from),
+        },
     }
 }
 
 fn snapshot(client: &GatewayClient) -> Result<Snapshot, PlaybackFailure> {
     Ok(Snapshot {
-        now: now_of(client)?,
+        transport: transport_of(client)?,
         queue: queue_of(client)?,
         output: output_of(client),
     })
 }
 
-/// `GET /api/player`: `{state, now, queue, output}`.
+/// The reply of `GET /api/player`: `{state, now, queue, output, position_ms, duration_ms,
+/// preview}`, the one answer every transport route ends with.
+fn player_reply(client: &GatewayClient) -> Reply {
+    match snapshot(client) {
+        Ok(snap) => (
+            StatusCode::OK,
+            serde_json::to_value(api_player(snap)).unwrap_or_default(),
+        ),
+        Err(failure) => playback_failed(&failure),
+    }
+}
+
+/// Send `command`, then answer like `GET /api/player`. A command that fails answers with
+/// `failed`.
+fn then_player(
+    client: &GatewayClient,
+    command: &Command,
+    failed: fn(&PlaybackFailure) -> Reply,
+) -> Reply {
+    match send(client, command) {
+        Ok(_) => player_reply(client),
+        Err(failure) => failed(&failure),
+    }
+}
+
+/// `command` to deck A, answered like `GET /api/player`; a failure by the transport policy
+/// ([`transport_failed`]).
+async fn deck_a(state: &Arc<AppState>, command: Command) -> Response {
+    respond(
+        gw(state, move |client| {
+            then_player(client, &command, transport_failed)
+        })
+        .await,
+    )
+}
+
+/// `GET /api/player`.
 pub async fn player(State(state): State<Arc<AppState>>) -> Response {
-    let read = gw(&state, snapshot).await;
-    json_or_failure(read.map(|r| r.map(|snap| api_player(&state.transport, snap))))
+    respond(gw(&state, player_reply).await)
 }
 
-/// `POST /api/pause`: pause deck A, then answer like `GET /api/player`. The console remembers
-/// the pause (a cold console cannot tell paused from playing otherwise).
+/// `POST /api/pause`: pause deck A (the preview, while one runs), then answer like
+/// `GET /api/player`.
 pub async fn pause(State(state): State<Arc<AppState>>) -> Response {
-    let read = gw(&state, |client| {
-        send(client, &Command::Pause { deck: Deck::A })?;
-        snapshot(client)
-    })
-    .await;
-    json_or_failure(read.map(|r| {
-        r.map(|snap| {
-            if let Some(hash) = &snap.now {
-                state.transport.mark_paused(hash);
-            }
-            api_player(&state.transport, snap)
-        })
-    }))
+    deck_a(&state, Command::Pause { deck: Deck::A }).await
 }
 
-/// `POST /api/resume`: resume deck A, then answer like `GET /api/player`.
+/// `POST /api/resume`: resume deck A (the preview, while one runs), then answer like
+/// `GET /api/player`.
 pub async fn resume(State(state): State<Arc<AppState>>) -> Response {
-    let read = gw(&state, |client| {
-        send(client, &Command::Resume { deck: Deck::A })?;
-        snapshot(client)
-    })
-    .await;
-    json_or_failure(read.map(|r| {
-        r.map(|snap| {
-            state.transport.clear();
-            api_player(&state.transport, snap)
+    deck_a(&state, Command::Resume { deck: Deck::A }).await
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PreviewRequest {
+    hash: Option<String>,
+}
+
+/// The one policy of every transport route (pause, resume, preview, back, seek): a refusal by
+/// playback is a 409 with its own words (it said no to this state of the player); a gateway that
+/// does not know the command or an answer of the wrong kind is a 502, an unreachable node a 503
+/// ([`playback_failure_status`]).
+fn transport_failed(failure: &PlaybackFailure) -> Reply {
+    match failure {
+        PlaybackFailure::Refused(message) => error_reply(StatusCode::CONFLICT, message.clone()),
+        other => playback_failed(other),
+    }
+}
+
+/// `POST /api/preview {hash}`: play the track at once on deck A, holding what is audible to go
+/// back to (ADR-031), and answer like `GET /api/player`. The hash is resolved like every hash
+/// bound for playback.
+/// Replies: 400 without a hash, 422 for a hash the library does not know (nothing is sent), 409
+/// with playback's words when it refuses (for example when the source does not say where the
+/// playing track is), 502/503 per [`playback_failure_status`].
+pub async fn preview(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<PreviewRequest>,
+) -> Response {
+    let hashes = match parse_hashes(req.hash.into_iter().collect()) {
+        Ok(h) => h,
+        Err(response) => return response,
+    };
+    let resolver = Arc::clone(&state);
+    respond(
+        gw(&state, move |client| {
+            match resolve_for_playback(&resolver, &hashes) {
+                Ok(mut resolved) => {
+                    let command = Command::Preview {
+                        deck: Deck::A,
+                        hash: resolved.remove(0).into(),
+                    };
+                    then_player(client, &command, transport_failed)
+                }
+                Err(reply) => reply,
+            }
         })
-    }))
+        .await,
+    )
+}
+
+/// `POST /api/preview/back`: end the preview and go back to what it held (a no-op when none
+/// runs), then answer like `GET /api/player`.
+pub async fn preview_back(State(state): State<Arc<AppState>>) -> Response {
+    deck_a(&state, Command::EndPreview { deck: Deck::A }).await
+}
+
+/// How a requested time is placed (see [`Placement`]); the rule is the node's, the browser only
+/// says which.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SeekPlacement {
+    Snap,
+    Free,
+}
+
+impl From<SeekPlacement> for Placement {
+    fn from(placement: SeekPlacement) -> Self {
+        match placement {
+            SeekPlacement::Snap => Placement::Snap,
+            SeekPlacement::Free => Placement::Free,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SeekTo {
+    to_ms: u64,
+    placement: SeekPlacement,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SeekBy {
+    by_beats: i32,
+}
+
+/// Where to seek: to a time (placed as asked), or by beats (negative goes back).
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum SeekRequest {
+    To(SeekTo),
+    By(SeekBy),
+}
+
+/// The reply for a seek that could not be made.
+fn seek_failed(error: SeekError) -> Reply {
+    match error {
+        SeekError::NothingLoaded | SeekError::NoPosition => {
+            error_reply(StatusCode::CONFLICT, error.to_string())
+        }
+        SeekError::NoBeatGrid => error_reply(StatusCode::UNPROCESSABLE_ENTITY, error.to_string()),
+        SeekError::Playback(e) => transport_failed(&e.into()),
+        SeekError::Library(e) => library_failed(&e),
+        SeekError::Node(e) => error_reply(StatusCode::SERVICE_UNAVAILABLE, e.to_string()),
+    }
+}
+
+/// `POST /api/seek {to_ms, placement: "snap"|"free"}` or `{by_beats}`: move the audible track of
+/// deck A (the preview, while one runs) and answer like `GET /api/player`. Snapping and beat
+/// steps are mdma_client's rules (`seek_to`, `skip_beats`); playing stays playing and paused
+/// stays paused.
+/// Replies: 409 when nothing is loaded (or playback refuses), 422 for a beat step on a track with
+/// no beat grid or a body that is neither form, 502/503 per the library's and playback's policy.
+pub async fn seek(State(state): State<Arc<AppState>>, Json(req): Json<SeekRequest>) -> Response {
+    let gateway = state.gateway.clone();
+    respond(
+        gw(&state, move |client| {
+            let playback = PlaybackBackend::Gateway(client.clone());
+            let library = || {
+                LibraryBackend::connect_gateway(&gateway)
+                    .map_err(|e| NodeError::Connect(e.to_string()))
+            };
+            let moved = match req {
+                SeekRequest::To(SeekTo { to_ms, placement }) => seek_to(
+                    &playback,
+                    library,
+                    Deck::A,
+                    PositionMs::new(to_ms),
+                    placement.into(),
+                ),
+                SeekRequest::By(SeekBy { by_beats }) => {
+                    skip_beats(&playback, library, Deck::A, by_beats)
+                }
+            };
+            match moved {
+                Ok(_) => player_reply(client),
+                Err(error) => seek_failed(error),
+            }
+        })
+        .await,
+    )
 }
 
 fn busy_reply() -> Reply {
@@ -584,21 +772,59 @@ pub async fn queue_edit(
 mod tests {
     use super::*;
 
+    fn keys_of(json: &serde_json::Value) -> Vec<String> {
+        let mut keys: Vec<_> = json.as_object().unwrap().keys().cloned().collect();
+        keys.sort();
+        keys
+    }
+
     #[test]
-    fn player_json_has_exactly_state_now_queue_output() {
+    fn player_json_has_exactly_the_documented_keys() {
         let p = ApiPlayer {
             state: PlayerState::Paused,
             now: Some("sha256:a".into()),
             queue: vec!["sha256:b".into()],
             output: Some(OutputHealth::Running),
+            position_ms: Some(1500),
+            duration_ms: Some(200_000),
+            preview: Some(ApiPreview {
+                back_to: Some("sha256:c".into()),
+                back_at_ms: Some(151_000),
+                back_transport: Some(PlayerState::Playing),
+            }),
         };
         let json = serde_json::to_value(&p).unwrap();
-        let mut keys: Vec<_> = json.as_object().unwrap().keys().cloned().collect();
-        keys.sort();
-        assert_eq!(keys, ["now", "output", "queue", "state"]);
+        assert_eq!(
+            keys_of(&json),
+            [
+                "duration_ms",
+                "now",
+                "output",
+                "position_ms",
+                "preview",
+                "queue",
+                "state"
+            ]
+        );
         assert_eq!(json["state"], "paused");
         assert_eq!(json["queue"][0], "sha256:b");
         assert_eq!(json["output"], "running");
+        assert_eq!(json["position_ms"], 1500);
+        assert_eq!(
+            keys_of(&json["preview"]),
+            ["back_at_ms", "back_to", "back_transport"]
+        );
+        assert_eq!(json["preview"]["back_transport"], "playing");
+    }
+
+    #[test]
+    fn a_preview_over_nothing_goes_back_to_nothing() {
+        let status = PreviewStatus { back_to: None };
+        let json = serde_json::to_value(ApiPreview::from(status)).unwrap();
+        assert_eq!(
+            json,
+            json!({"back_to": null, "back_at_ms": null, "back_transport": null})
+        );
     }
 
     #[test]
@@ -608,14 +834,17 @@ mod tests {
             now: None,
             queue: vec![],
             output: None,
+            position_ms: None,
+            duration_ms: None,
+            preview: None,
         };
         let json = serde_json::to_value(&p).unwrap();
         assert!(json["now"].is_null());
+        assert!(json["preview"].is_null());
         for (s, want) in [
             (PlayerState::Idle, "idle"),
             (PlayerState::Playing, "playing"),
             (PlayerState::Paused, "paused"),
-            (PlayerState::Loading, "loading"),
         ] {
             assert_eq!(serde_json::to_value(s).unwrap(), want);
         }
@@ -623,52 +852,6 @@ mod tests {
 
     fn hash(s: &str) -> ContentHash {
         ContentHash::new(s)
-    }
-
-    #[test]
-    fn transport_cache_tracks_pause_by_hash() {
-        let cache = TransportCache::default();
-        let a = hash("sha256:a");
-        assert_eq!(cache.state_for(None), PlayerState::Idle);
-        assert_eq!(cache.state_for(Some(&a)), PlayerState::Playing);
-
-        cache.apply(&PlaybackEvent::TrackPaused { hash: a.clone() });
-        assert_eq!(cache.state_for(Some(&a)), PlayerState::Paused);
-        // A pause remembered for another track says nothing about this one.
-        assert_eq!(
-            cache.state_for(Some(&hash("sha256:b"))),
-            PlayerState::Playing
-        );
-        assert_eq!(cache.state_for(None), PlayerState::Idle);
-
-        cache.apply(&PlaybackEvent::TrackResumed { hash: a.clone() });
-        assert_eq!(cache.state_for(Some(&a)), PlayerState::Playing);
-    }
-
-    #[test]
-    fn transport_cache_clears_on_start_stop_and_end() {
-        for event in [
-            PlaybackEvent::TrackStarted {
-                hash: hash("sha256:a"),
-            },
-            PlaybackEvent::TrackStopped {
-                hash: hash("sha256:a"),
-            },
-            PlaybackEvent::TrackEnded {
-                hash: hash("sha256:a"),
-            },
-        ] {
-            let cache = TransportCache::default();
-            cache.apply(&PlaybackEvent::TrackPaused {
-                hash: hash("sha256:a"),
-            });
-            cache.apply(&event);
-            assert_eq!(
-                cache.state_for(Some(&hash("sha256:a"))),
-                PlayerState::Playing,
-                "{event:?}"
-            );
-        }
     }
 
     // ---- handlers, against a fake gateway ----
@@ -679,6 +862,7 @@ mod tests {
     };
     use gateway_client::{GatewayRequest, GatewayResponse, LibraryRequest, LibraryResponse};
     use library_ipc_client::{CanonicalHash, EntryError, PlaylistEntry};
+    use media_protocol::{Held, PositionMs, Transport};
     use serde_json::json;
 
     fn track_entry(full: &str) -> PlaylistEntry {
@@ -726,6 +910,18 @@ mod tests {
         }
     }
 
+    /// `now` audible at 1 s of a 200 s track, `transport` playing or paused, and `preview` if it
+    /// is a preview.
+    fn loaded(now: &str, transport: Transport, preview: Option<PreviewStatus>) -> TransportStatus {
+        TransportStatus::Loaded {
+            transport,
+            now: hash(now),
+            position_ms: Some(PositionMs::new(1_000)),
+            duration_ms: Some(PositionMs::new(200_000)),
+            preview,
+        }
+    }
+
     /// A playback service with `now` loaded and `queue` queued; everything else succeeds, except
     /// commands for which `fails` returns true. Its library knows `SHORT_A` (it is `A`) and
     /// nothing else; the output answers unknown.
@@ -749,6 +945,13 @@ mod tests {
             GatewayRequest::Playback {
                 request: Command::NowPlaying,
             } => playback_ok(Some(ResponseData::NowPlaying(now.map(hash)))),
+            GatewayRequest::Playback {
+                request: Command::GetTransport { .. },
+            } => playback_ok(Some(ResponseData::Transport(
+                now.map_or(TransportStatus::Idle, |now| {
+                    loaded(now, Transport::Playing, None)
+                }),
+            ))),
             GatewayRequest::Playback {
                 request: Command::QueueList,
             } => playback_ok(Some(ResponseData::Queue(
@@ -902,17 +1105,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pause_on_a_cold_console_is_remembered_as_paused() {
+    async fn pause_sends_pause_and_answers_with_what_the_transport_says() {
         let gw = playback_script(Some(X), &[A], never);
-        let app = test_app_with(gw.addr());
-        let res = send_post_json(app.clone(), "/api/pause", &json!({})).await;
+        let res = send_post_json(test_app_with(gw.addr()), "/api/pause", &json!({})).await;
         assert_eq!(res.status(), StatusCode::OK);
+        // The fake transport says playing whatever was sent: the console reports the node's
+        // answer and keeps no memory of its own.
         assert_eq!(
             body_json(res).await,
-            json!({"state": "paused", "now": X, "queue": [A], "output": null})
+            json!({
+                "state": "playing", "now": X, "queue": [A], "output": null,
+                "position_ms": 1000, "duration_ms": 200_000, "preview": null
+            })
         );
-        let res = send_get(app, "/api/player", None).await;
-        assert_eq!(body_json(res).await["state"], "paused");
         assert!(gw
             .commands()
             .iter()
@@ -920,15 +1125,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resume_clears_the_pause() {
+    async fn resume_sends_resume() {
         let gw = playback_script(Some(X), &[], never);
-        let app = test_app_with(gw.addr());
-        send_post_json(app.clone(), "/api/pause", &json!({})).await;
-        let res = send_post_json(app.clone(), "/api/resume", &json!({})).await;
+        let res = send_post_json(test_app_with(gw.addr()), "/api/resume", &json!({})).await;
         assert_eq!(res.status(), StatusCode::OK);
-        assert_eq!(body_json(res).await["state"], "playing");
-        let res = send_get(app, "/api/player", None).await;
-        assert_eq!(body_json(res).await["state"], "playing");
         assert!(gw
             .commands()
             .iter()
@@ -936,14 +1136,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_refused_pause_is_502_and_leaves_the_cache_alone() {
+    async fn a_refused_pause_is_409_with_playbacks_words() {
         let gw = playback_script(Some(X), &[], |c| matches!(c, Command::Pause { .. }));
-        let app = test_app_with(gw.addr());
-        let res = send_post_json(app.clone(), "/api/pause", &json!({})).await;
-        assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
+        let res = send_post_json(test_app_with(gw.addr()), "/api/pause", &json!({})).await;
+        assert_eq!(res.status(), StatusCode::CONFLICT);
         assert_eq!(body_json(res).await, json!({"error": "boom"}));
-        let res = send_get(app, "/api/player", None).await;
-        assert_eq!(body_json(res).await["state"], "playing");
     }
 
     #[tokio::test]
@@ -1350,15 +1547,435 @@ mod tests {
         assert_eq!(res.status(), StatusCode::OK);
         assert_eq!(
             body_json(res).await,
-            json!({"state": "playing", "now": X, "queue": [A], "output": null})
+            json!({
+                "state": "playing", "now": X, "queue": [A], "output": null,
+                "position_ms": 1000, "duration_ms": 200_000, "preview": null
+            })
         );
 
         let idle = playback_script(None, &[], never);
         let res = send_get(test_app_with(idle.addr()), "/api/player", None).await;
         assert_eq!(
             body_json(res).await,
-            json!({"state": "idle", "now": null, "queue": [], "output": null})
+            json!({
+                "state": "idle", "now": null, "queue": [], "output": null,
+                "position_ms": null, "duration_ms": null, "preview": null
+            })
         );
+    }
+
+    /// A playback service whose transport is `transport`, and nothing queued.
+    fn transport_script(transport: TransportStatus) -> FakeGateway {
+        FakeGateway::start(move |req| match req {
+            GatewayRequest::Playback {
+                request: Command::GetTransport { .. },
+            } => playback_ok(Some(ResponseData::Transport(transport.clone()))),
+            GatewayRequest::Playback {
+                request: Command::QueueList,
+            } => playback_ok(Some(ResponseData::Queue(vec![]))),
+            _ => playback_ok(None),
+        })
+    }
+
+    #[tokio::test]
+    async fn a_paused_track_is_reported_paused_by_the_transport_not_guessed() {
+        let gw = transport_script(loaded(A, Transport::Paused, None));
+        let res = send_get(test_app_with(gw.addr()), "/api/player", None).await;
+        assert_eq!(body_json(res).await["state"], "paused");
+    }
+
+    #[tokio::test]
+    async fn a_preview_is_reported_with_what_it_goes_back_to() {
+        let held = Held {
+            hash: hash(B),
+            at: PositionMs::new(151_000),
+            transport: Transport::Paused,
+        };
+        let gw = transport_script(loaded(
+            A,
+            Transport::Playing,
+            Some(PreviewStatus {
+                back_to: Some(held),
+            }),
+        ));
+        let res = send_get(test_app_with(gw.addr()), "/api/player", None).await;
+        let body = body_json(res).await;
+        assert_eq!(body["now"], A);
+        assert_eq!(
+            body["preview"],
+            json!({"back_to": B, "back_at_ms": 151_000, "back_transport": "paused"})
+        );
+    }
+
+    #[tokio::test]
+    async fn a_preview_over_nothing_has_no_back_to() {
+        let gw = transport_script(loaded(
+            A,
+            Transport::Playing,
+            Some(PreviewStatus { back_to: None }),
+        ));
+        let res = send_get(test_app_with(gw.addr()), "/api/player", None).await;
+        assert_eq!(
+            body_json(res).await["preview"],
+            json!({"back_to": null, "back_at_ms": null, "back_transport": null})
+        );
+    }
+
+    #[tokio::test]
+    async fn a_position_the_source_cannot_say_is_null() {
+        let gw = transport_script(TransportStatus::Loaded {
+            transport: Transport::Playing,
+            now: hash(A),
+            position_ms: None,
+            duration_ms: None,
+            preview: None,
+        });
+        let res = send_get(test_app_with(gw.addr()), "/api/player", None).await;
+        let body = body_json(res).await;
+        assert!(body["position_ms"].is_null());
+        assert!(body["duration_ms"].is_null());
+    }
+
+    #[tokio::test]
+    async fn a_node_that_does_not_know_get_transport_is_502() {
+        let gw = playback_script(Some(X), &[], |c| matches!(c, Command::GetTransport { .. }));
+        let res = send_get(test_app_with(gw.addr()), "/api/player", None).await;
+        assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    // ---- preview ----
+
+    /// `POST /api/preview` with `body`.
+    async fn preview_call(gw: &FakeGateway, body: serde_json::Value) -> axum::response::Response {
+        send_post_json(test_app_with(gw.addr()), "/api/preview", &body).await
+    }
+
+    #[tokio::test]
+    async fn previewing_resolves_the_hash_sends_preview_on_deck_a_and_answers_like_the_player() {
+        let gw = playback_script(Some(A), &[B], never);
+        let res = preview_call(&gw, json!({"hash": SHORT_A})).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = body_json(res).await;
+        assert_eq!(body["now"], A);
+        assert_eq!(body["queue"], json!([B]));
+        let previews: Vec<_> = gw
+            .commands()
+            .into_iter()
+            .filter(|c| matches!(c, Command::Preview { .. }))
+            .collect();
+        assert!(
+            matches!(&previews[..], [Command::Preview { deck: Deck::A, hash }] if hash.as_str() == A),
+            "{previews:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn previewing_without_a_hash_is_400_and_sends_nothing() {
+        let gw = playback_script(Some(X), &[], never);
+        for body in [json!({}), json!({"hash": null})] {
+            let res = preview_call(&gw, body).await;
+            assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        }
+        assert!(gw.requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn previewing_an_unknown_hash_is_422_and_sends_nothing_to_playback() {
+        let gw = playback_script(Some(A), &[], never);
+        let res = preview_call(&gw, json!({"hash": X})).await;
+        assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(body_json(res).await["error"].as_str().unwrap().contains(X));
+        assert!(gw.commands().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_preview_playback_refuses_is_409_with_its_words() {
+        let gw = FakeGateway::start(|req| match req {
+            GatewayRequest::Playback {
+                request: Command::Preview { .. },
+            } => playback_err("Cannot preview: the source does not say where the playing track is"),
+            GatewayRequest::Library {
+                request: LibraryRequest::GetTrack { hash },
+            } => track_ok(hash.as_str()),
+            _ => playback_ok(None),
+        });
+        let res = preview_call(&gw, json!({"hash": A})).await;
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            body_json(res).await,
+            json!({"error": "Cannot preview: the source does not say where the playing track is"})
+        );
+    }
+
+    #[tokio::test]
+    async fn a_gateway_that_does_not_know_preview_is_502() {
+        let gw = FakeGateway::start(|req| match req {
+            GatewayRequest::Playback {
+                request: Command::Preview { .. },
+            } => GatewayResponse::Error {
+                message: "unknown command".into(),
+            },
+            GatewayRequest::Library {
+                request: LibraryRequest::GetTrack { hash },
+            } => track_ok(hash.as_str()),
+            _ => playback_ok(None),
+        });
+        let res = preview_call(&gw, json!({"hash": A})).await;
+        assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn a_preview_answer_that_cannot_be_read_is_503() {
+        let gw = FakeGateway::start_unreadable_when(
+            |req| {
+                matches!(
+                    req,
+                    GatewayRequest::Playback {
+                        request: Command::Preview { .. }
+                    }
+                )
+            },
+            |req| match req {
+                GatewayRequest::Library {
+                    request: LibraryRequest::GetTrack { hash },
+                } => track_ok(hash.as_str()),
+                _ => playback_ok(None),
+            },
+        );
+        let res = preview_call(&gw, json!({"hash": A})).await;
+        assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn previewing_with_no_gateway_is_503() {
+        let res = send_post_json(
+            crate::test_support::test_app(),
+            "/api/preview",
+            &json!({"hash": A}),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    // ---- back ----
+
+    #[tokio::test]
+    async fn back_sends_end_preview_on_deck_a_and_answers_like_the_player() {
+        let gw = playback_script(Some(B), &[A], never);
+        let res = send_post_json(test_app_with(gw.addr()), "/api/preview/back", &json!({})).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(body_json(res).await["now"], B);
+        assert!(gw
+            .commands()
+            .iter()
+            .any(|c| matches!(c, Command::EndPreview { deck: Deck::A })));
+    }
+
+    #[tokio::test]
+    async fn a_refused_back_is_409_and_a_dead_one_503() {
+        let gw = playback_script(Some(B), &[], |c| matches!(c, Command::EndPreview { .. }));
+        let res = send_post_json(test_app_with(gw.addr()), "/api/preview/back", &json!({})).await;
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+        assert_eq!(body_json(res).await, json!({"error": "boom"}));
+
+        let res = send_post_json(
+            crate::test_support::test_app(),
+            "/api/preview/back",
+            &json!({}),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    // ---- seek ----
+
+    use library_ipc_client::{BeatGridInfo, Bpm};
+
+    /// 120 BPM: a beat every 500 ms from 100 ms.
+    fn grid() -> BeatGridInfo {
+        BeatGridInfo {
+            first_beat_ms: 100,
+            bpm: Bpm::from_u32(120).unwrap(),
+            beats_per_bar: 4,
+        }
+    }
+
+    /// A node on which `A` plays at 1 s of 200 s (or nothing does), whose library holds `A` with
+    /// `grid`. `Seek` answers the transport at the position it was sent.
+    fn seek_script(playing: bool, grid: Option<BeatGridInfo>) -> FakeGateway {
+        FakeGateway::start(move |req| match req {
+            GatewayRequest::Playback {
+                request: Command::GetTransport { .. },
+            } => playback_ok(Some(ResponseData::Transport(if playing {
+                loaded(A, Transport::Playing, None)
+            } else {
+                TransportStatus::Idle
+            }))),
+            GatewayRequest::Playback {
+                request: Command::Seek { position_ms, .. },
+            } if playing => playback_ok(Some(ResponseData::Transport(TransportStatus::Loaded {
+                transport: Transport::Playing,
+                now: hash(A),
+                position_ms: Some(*position_ms),
+                duration_ms: Some(PositionMs::new(200_000)),
+                preview: None,
+            }))),
+            GatewayRequest::Playback {
+                request: Command::Seek { .. },
+            } => playback_err("nothing loaded"),
+            GatewayRequest::Playback {
+                request: Command::QueueList,
+            } => playback_ok(Some(ResponseData::Queue(vec![]))),
+            GatewayRequest::Library {
+                request: LibraryRequest::GetTrack { hash },
+            } => {
+                let mut track = crate::test_support::bare_track(hash.as_str());
+                track.beat_grid = grid.clone();
+                library_ok(LibraryResponse::Track(Box::new(track)))
+            }
+            _ => playback_ok(None),
+        })
+    }
+
+    async fn seek_call(gw: &FakeGateway, body: serde_json::Value) -> axum::response::Response {
+        send_post_json(test_app_with(gw.addr()), "/api/seek", &body).await
+    }
+
+    /// The positions of the `Seek` commands the node received.
+    fn seeks(gw: &FakeGateway) -> Vec<u64> {
+        gw.commands()
+            .into_iter()
+            .filter_map(|c| match c {
+                Command::Seek { position_ms, .. } => Some(position_ms.as_millis()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_free_seek_goes_where_asked_without_asking_the_library() {
+        let gw = seek_script(true, Some(grid()));
+        let res = seek_call(&gw, json!({"to_ms": 1230, "placement": "free"})).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(seeks(&gw), [1230]);
+        assert!(gw
+            .requests()
+            .iter()
+            .all(|r| !matches!(r, GatewayRequest::Library { .. })));
+        assert_eq!(body_json(res).await["now"], A);
+    }
+
+    #[tokio::test]
+    async fn a_snapped_seek_goes_to_the_nearest_beat() {
+        let gw = seek_script(true, Some(grid()));
+        let res = seek_call(&gw, json!({"to_ms": 1230, "placement": "snap"})).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(seeks(&gw), [1100]);
+    }
+
+    #[tokio::test]
+    async fn a_snapped_seek_on_a_track_without_a_grid_goes_where_asked() {
+        let gw = seek_script(true, None);
+        let res = seek_call(&gw, json!({"to_ms": 1230, "placement": "snap"})).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(seeks(&gw), [1230]);
+    }
+
+    #[tokio::test]
+    async fn a_beat_step_snaps_steps_and_seeks() {
+        // At 1000 ms the nearest beat is 1100; one beat on is 1600.
+        let gw = seek_script(true, Some(grid()));
+        let res = seek_call(&gw, json!({"by_beats": 1})).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(seeks(&gw), [1600]);
+        let res = seek_call(&gw, json!({"by_beats": -1})).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(seeks(&gw), [1600, 600]);
+    }
+
+    #[tokio::test]
+    async fn a_beat_step_without_a_grid_is_422_and_seeks_nothing() {
+        let gw = seek_script(true, None);
+        let res = seek_call(&gw, json!({"by_beats": 4})).await;
+        assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(body_json(res).await["error"]
+            .as_str()
+            .unwrap()
+            .contains("beat grid"));
+        assert!(seeks(&gw).is_empty());
+    }
+
+    #[tokio::test]
+    async fn seeking_while_idle_is_409_whatever_the_request() {
+        let gw = seek_script(false, Some(grid()));
+        for body in [
+            json!({"to_ms": 5000, "placement": "free"}),
+            json!({"to_ms": 5000, "placement": "snap"}),
+            json!({"by_beats": 4}),
+        ] {
+            let res = seek_call(&gw, body.clone()).await;
+            assert_eq!(res.status(), StatusCode::CONFLICT, "{body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_seek_that_names_neither_a_time_nor_beats_is_422_and_sends_nothing() {
+        let gw = seek_script(true, Some(grid()));
+        for body in [
+            json!({}),
+            json!({"to_ms": 5000}),
+            json!({"to_ms": 5000, "placement": "sideways"}),
+            json!({"to_ms": 5000, "placement": "free", "by_beats": 1}),
+        ] {
+            let res = seek_call(&gw, body.clone()).await;
+            assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        }
+        assert!(gw.requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_gateway_that_does_not_know_seek_is_502_not_409() {
+        let gw = FakeGateway::start(|req| match req {
+            GatewayRequest::Playback {
+                request: Command::Seek { .. },
+            } => GatewayResponse::Error {
+                message: "unknown command".into(),
+            },
+            _ => playback_ok(None),
+        });
+        let res = seek_call(&gw, json!({"to_ms": 5000, "placement": "free"})).await;
+        assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn seeking_with_no_gateway_is_503() {
+        let res = send_post_json(
+            crate::test_support::test_app(),
+            "/api/seek",
+            &json!({"to_ms": 5000, "placement": "free"}),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn a_seek_through_a_library_that_is_down_is_502() {
+        let gw = FakeGateway::start(|req| match req {
+            GatewayRequest::Playback {
+                request: Command::GetTransport { .. },
+            } => playback_ok(Some(ResponseData::Transport(loaded(
+                A,
+                Transport::Playing,
+                None,
+            )))),
+            GatewayRequest::Library { .. } => GatewayResponse::Error {
+                message: "library unavailable".into(),
+            },
+            _ => playback_ok(None),
+        });
+        let res = seek_call(&gw, json!({"by_beats": 1})).await;
+        assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
+        assert!(seeks(&gw).is_empty());
     }
 
     #[tokio::test]

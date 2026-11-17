@@ -6,10 +6,11 @@
 // on(evt, fn) / emit(evt, detail). Exactly when each one fires:
 //   tracks     after a successful loadCatalogue(): store.tracks / store.order were replaced.
 //   playlists  after a successful loadPlaylists(): store.playlists was replaced.
-//   player     when store.player.state, .now, .offline or .output changed. Never for queue or position only.
+//   player     when store.player.state, .now, .offline, .output or .preview changed. Never for queue or position only.
 //   queue      when the CONTENT of store.player.queue changed (refreshPlayer or applyQueue).
 //              One refresh can fire both player and queue; each fires at most once per refresh.
-//   position   on every PositionUpdate from the server (about once a second while playing).
+//   position   on every PositionUpdate from the server (about once a second while playing), and on
+//              every player answer that says where the track is (a refresh, a seek, a preview).
 //              detail and store.player.position are { hash, position_ms, duration_ms };
 //              position is reset to null whenever player.now changes.
 //   marks      when a track's marks (store.tracks.get(hash).marks) changed after a mark action, or the
@@ -24,7 +25,7 @@
 // Non-2xx rejects with ApiError (status 0 means the network failed, 409 means busy or stale).
 // Every /api/queue/* mutation returns the resulting { queue: [hash] }; pass it to applyQueue().
 
-import { LIKED, markLabel } from "./logic.js";
+import { LIKED, markLabel, trackTitle } from "./logic.js";
 
 /* ============================================================ store + events */
 
@@ -33,7 +34,7 @@ export const store = {
   tracks: new Map(), // hash -> Track (see logic.js for the shape)
   order: [], // hashes, catalogue order
   playlists: [], // [{ name, hashes: [full hash, file order, duplicates kept], unavailable: count of lines without a track }]
-  player: { state: "idle", now: null, queue: [], offline: false, position: null, output: null }, // state: idle|playing|paused|loading; output: absent|starting|running|stalled|null (unknown)
+  player: { state: "idle", now: null, queue: [], offline: false, position: null, output: null, preview: null }, // state: idle|playing|paused; output: absent|starting|running|stalled|null (unknown); preview: null, or while `now` is a preview { back_to: hash|null, back_at_ms, back_transport } (all null when it goes back to nothing)
   nb: {}, // per-view narrowing text, keyed by view key
   f: {}, // per-view filters keyed by view key (like nb); absent means none. Read with narrow.js filtersOf(key). Sticky for the session
   ni: {}, // per-view instance (album or artist name) the narrowing state in nb/f belongs to; see narrow.js claimNarrowing
@@ -315,16 +316,24 @@ export function applyQueue(queue) {
   emit("queue");
 }
 
-/** Apply a GET /api/player body: { state, now, queue, output }. Fires player and/or queue, see the header. */
+const samePreview = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+
+/** Apply a GET /api/player body: { state, now, queue, output, position_ms, duration_ms, preview }. Fires player, position and/or queue, see the header. */
 export function applyPlayer(body) {
   const p = store.player;
   const out = body.output ?? null;
-  const changed = p.state !== body.state || p.now !== body.now || p.output !== out;
+  const preview = body.preview ?? null;
+  const changed = p.state !== body.state || p.now !== body.now || p.output !== out || !samePreview(p.preview, preview);
   if (p.now !== body.now) p.position = null;
   p.state = body.state;
   p.now = body.now;
   p.output = out;
+  p.preview = preview;
   if (changed) emit("player");
+  if (body.position_ms != null) {
+    p.position = { hash: body.now, position_ms: body.position_ms, duration_ms: body.duration_ms };
+    emit("position", p.position);
+  }
   applyQueue(body.queue || []);
 }
 
@@ -352,7 +361,7 @@ export async function loadPlaylists() {
   }
 }
 
-/** Fetch { state, now, queue, output } into store.player. Fires "player" and/or "queue". */
+/** Fetch { state, now, queue, output, position_ms, duration_ms, preview } into store.player. Fires "player", "position" and/or "queue". */
 export async function refreshPlayer() {
   try {
     applyPlayer(await api("/api/player"));
@@ -382,7 +391,7 @@ export function handleServerEvent(ev) {
       store.player.output = health;
       emit("player");
     }
-  } else if (type === "QueueChanged" || type === "Connected" || type === "Lagged" || (type || "").startsWith("Track")) {
+  } else if (type === "QueueChanged" || type === "Connected" || type === "Lagged" || (type || "").startsWith("Track") || (type || "").startsWith("Preview")) {
     refreshPlayer();
   } else if ((type || "").startsWith("Facts")) {
     loadCatalogueSoon(); // ACID events
@@ -714,6 +723,33 @@ async function setMark(action, hash, subject, mark) {
   return true;
 }
 
+/* ------------------------------------------------------------ transport */
+
+// Pause, preview and seek act on the audible track (the preview, while one runs). Each POSTs to the
+// node, which holds every rule (where a seek lands, what a preview goes back to, what it refuses),
+// and applies the player the node answers with. A refusal (409) is toasted in the node's own words.
+// Each resolves true when the node did it, false after toasting why not. One request at a time:
+// one made while another is out is dropped (false, no toast), as a held key would send many.
+
+let transportBusy = false;
+
+async function playerAction(path, body, what) {
+  if (transportBusy) return false;
+  transportBusy = true;
+  try {
+    applyPlayer(await api(path, { method: "POST", body }));
+    return true;
+  } catch (e) {
+    toast(e instanceof ApiError && e.status === 409 ? e.message : "Couldn't " + what + (e.message ? ": " + e.message : ""));
+    return false;
+  } finally {
+    transportBusy = false;
+  }
+}
+
+/** What the player says it plays, for a toast. */
+const nowTitle = () => trackTitle(store.tracks.get(store.player.now));
+
 // `set` below is what to act on (ofHashes, ofPlaylist). `subject` is a noun phrase naming it
 // ("Song title", "12 tracks"); the action adds the verb. Defaults to "N tracks".
 export const actions = {
@@ -742,10 +778,28 @@ export const actions = {
   mark: (hash, subject, mark = LIKED) => setMark("mark", hash, subject, mark),
   /** Take `mark` off the track. Toast says "Unliked “X”", with Undo when it changed. */
   unmark: (hash, subject, mark = LIKED) => setMark("unmark", hash, subject, mark),
+  /** Pause what plays (the preview, while one runs). The caller says pause or resume from the state it showed. */
+  pause: () => playerAction("/api/pause", {}, "pause"),
+  /** Resume what is paused (the preview, while one runs). */
+  resume: () => playerAction("/api/resume", {}, "resume"),
+  /** Play the track `hash` (named `subject`) at once over what plays, holding that to go back to; previewing again replaces the preview and keeps the hold. Toast says "Previewing “X”" with a Back action. Not a play, not a queue change. */
+  async preview(hash, subject) {
+    const ok = await playerAction("/api/preview", { hash }, "preview");
+    if (ok) toast("Previewing “" + subject + "”", actions.back, "Back");
+    return ok;
+  },
+  /** End the preview and go back to what it held (stop, when it held nothing). Toast says where it went. */
+  async back() {
+    const ok = await playerAction("/api/preview/back", {}, "go back");
+    if (ok) toast(store.player.now ? "Back to “" + nowTitle() + "”" : "Preview stopped");
+    return ok;
+  },
+  /** Move the audible track: { to_ms, placement: "snap"|"free" } or { by_beats }. The node snaps to the beat or places freely as asked. */
+  seek: (body) => playerAction("/api/seek", body, "seek"),
 };
 
 /** Read build facts the server put on #app. */
 export function appInfo() {
   const d = $("#app").dataset;
-  return { node: d.node, version: d.version, assetTag: d.assetTag, seekEnabled: d.seekEnabled === "true" };
+  return { node: d.node, version: d.version, assetTag: d.assetTag };
 }

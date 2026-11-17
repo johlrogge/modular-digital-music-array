@@ -14,9 +14,14 @@
 //
 // One request at a time: while one is out (and the list is being redrawn from its answer) every
 // other edit, Undo or Redo is dropped, never queued. A queued Remove would be sent with a fresh
-// version but the position of a list that has since changed. Clicks never interrupt playback;
-// nothing here touches the player.
-import { $, $$, h, icon, route, store, api, enc, plural, toast, catalogue, loadPlaylists } from "./core.js";
+// version but the position of a list that has since changed.
+//
+// Preview: a click never interrupts playback irreversibly. The one interruption is preview, which
+// always offers Back to what was playing, and this is the one page that offers it. A click on a row
+// (either pane) previews its track; a click on the previewing row pauses or resumes it; Back, B or
+// the toast's Back action ends it. What a preview holds and goes back to is the node's (ADR-031),
+// and so is which track is the preview: every row of it shows as previewing.
+import { $, $$, h, icon, route, store, api, enc, plural, toast, catalogue, loadPlaylists, actions } from "./core.js";
 import { trackTitle } from "./logic.js";
 import { narrowedTracks, emptyNote, dragList } from "./lists.js";
 import { NO_MUSIC, NONE, backLink } from "./collections.js";
@@ -67,6 +72,18 @@ function viewWorkbench(root, params) {
   let libPane = null;
   let plPane = null;
   const drag = dragList(); // the playlist rows' drag scope
+
+  // A row is previewing when the node says its track is the preview: every row of that track, in
+  // both panes, whoever started the preview and however the page got here.
+  const isPreviewing = (t) => !!store.player.preview && store.player.now === t.hash;
+  const preview = (t) => actions.preview(t.hash, trackTitle(t));
+  // The row's menu item says what the click would do (lists.js does it from the same state).
+  const previewItem = (t) => {
+    const playing = store.player.state === "playing";
+    if (!isPreviewing(t)) return ["play", "Preview (P)", () => preview(t)];
+    return playing ? ["pause", "Pause preview (P)", actions.pause] : ["play", "Resume preview (P)", actions.resume];
+  };
+  const previewRow = { preview, previewing: isPreviewing };
 
   const undoBtn = historyButton("Undo", "left", undo, () => undoIt(), () => busy);
   const redoBtn = historyButton("Redo", "right", redo, () => redoIt(), () => busy);
@@ -225,11 +242,12 @@ function viewWorkbench(root, params) {
       tracks: catalogue,
       order: "global",
       row: {
+        ...previewRow,
         lead: "art",
         sub: "artist",
         quick: { label: "Add", run: addTrack }, // swipe right
         end: (t) => [tool("plus", "Add " + quoted(t), () => addTrack(t))],
-        extra: (t) => [["plus", "Add to playlist", () => addTrack(t), "primary"]],
+        extra: (t) => [previewItem(t), ["plus", "Add to playlist", () => addTrack(t), "primary"]],
       },
       empty: { missing: () => NO_MUSIC, none: NONE },
     });
@@ -241,12 +259,14 @@ function viewWorkbench(root, params) {
       order: "natural",
       row: {
         ...PLAYLIST_ROW,
-        // The grip says the row can be dragged: it is there while the pane is not narrowed.
+        ...previewRow,
+        // The grip says the row can be dragged: it is there while the pane is not narrowed. A click
+        // on it is not a click on the row.
         end: (t) => [
-          ...(plPane.narrowed() ? [] : [h("span", { class: "handle", "aria-hidden": "true" }, [icon("drag", "sm")])]),
+          ...(plPane.narrowed() ? [] : [h("span", { class: "handle", "aria-hidden": "true", onclick: (e) => e.stopPropagation() }, [icon("drag", "sm")])]),
           tool("trash", "Remove " + quoted(t) + " (Del)", () => remove(t)),
         ],
-        extra: (t) => [...reorderItems(t), ["trash", "Remove from playlist (Del)", () => remove(t)]],
+        extra: (t) => [previewItem(t), ...reorderItems(t), ["trash", "Remove from playlist (Del)", () => remove(t)]],
         decorate: editable,
       },
       empty: { missing: () => (store.order.length ? ["Empty playlist", "Add songs from the library."] : NO_MUSIC), none: NONE },
@@ -284,6 +304,7 @@ function viewWorkbench(root, params) {
 
   root.appendChild(backLink("#/playlist/" + enc(name), "Playlist"));
   root.appendChild(h("div", { class: "wb-head" }, [h("span", { class: "kicker", text: "Editing playlist" }), h("h1", { text: name })]));
+  root.appendChild(h("div", { class: "kicker wb-tip", text: "Click a track to preview · click again to pause · Back returns to what was playing" }));
   const body = h("div", {}, [emptyNote(...notes(name).loading())]);
   root.appendChild(body);
   load(name).then((state) => {

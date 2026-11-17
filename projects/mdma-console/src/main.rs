@@ -109,8 +109,6 @@ struct AppState {
     bandcamp_cookies_path: std::path::PathBuf,
     /// Path to the Bandcamp configuration file
     bandcamp_conf_path: std::path::PathBuf,
-    /// Pause state learned from the event stream (shared with the event bridge)
-    transport: Arc<api::player::TransportCache>,
 }
 
 impl AppState {
@@ -133,7 +131,6 @@ impl AppState {
             music_root,
             bandcamp_cookies_path,
             bandcamp_conf_path,
-            transport: Arc::default(),
         }
     }
 
@@ -1621,11 +1618,7 @@ struct AdminRebootingTemplate {
 // Event Bridge
 // =============================================================================
 
-fn spawn_event_bridge(
-    event_socket: String,
-    event_tx: broadcast::Sender<String>,
-    transport: Arc<api::player::TransportCache>,
-) {
+fn spawn_event_bridge(event_socket: String, event_tx: broadcast::Sender<String>) {
     use event_protocol::{
         acid_event_from_topic_message, from_topic_message, TOPIC_ACID, TOPIC_PLAYBACK,
     };
@@ -1670,7 +1663,6 @@ fn spawn_event_bridge(
                         let bytes = msg.as_slice();
                         // Try playback events first, then ACID events
                         if let Ok((_topic, event)) = from_topic_message(bytes) {
-                            transport.apply(&event);
                             if let Ok(json) = serde_json::to_string(&event) {
                                 let _ = event_tx.send(json);
                             }
@@ -1720,7 +1712,7 @@ async fn main() -> Result<()> {
         args.bandcamp_cookies,
         args.bandcamp_conf,
     ));
-    spawn_event_bridge(args.event_socket, event_tx, Arc::clone(&state.transport));
+    spawn_event_bridge(args.event_socket, event_tx);
 
     // Initial package list load
     if let Ok(pkgs) = packages::list_installed().await {

@@ -5,7 +5,7 @@
 //   { hash, title, artist, album, track_number, disc, bpm, key, duration_secs, added, has_cover, marks }
 //   hash "sha256:..."; bpm number|null; key string|null; added ISO 8601 string|null; has_cover bool;
 //   marks [string]: the marks it carries live, "liked" for the default one.
-// Player shape: GET /api/player is { state: "idle"|"playing"|"paused"|"loading", now: hash|null, queue: [hash],
+// Player shape: GET /api/player is { state: "idle"|"playing"|"paused", now: hash|null, queue: [hash],
 //   output: "absent"|"starting"|"running"|"stalled"|null } (null: the node cannot say).
 //
 // Anything that decides what is heard (idle guard, filter semantics, queue CAS) is enforced in
@@ -39,7 +39,7 @@ export function trackTitle(t) {
   return (t && t.title) || "Unknown track";
 }
 
-/** True when nothing is loaded. The server's `state` is the only source of truth: paused and loading are busy. */
+/** True when nothing is loaded. The server's `state` is the only source of truth: paused is busy. */
 export function isIdle(player) {
   return !player || player.state === "idle";
 }

@@ -13,7 +13,7 @@
 
 {% include "icons.svg" %}
 
-<div class="app" id="app" data-node="{{ node }}" data-version="{{ version }}" data-asset-tag="{{ asset_tag }}" data-seek-enabled="{{ seek_enabled }}">
+<div class="app" id="app" data-node="{{ node }}" data-version="{{ version }}" data-asset-tag="{{ asset_tag }}">
 
   <!-- Desktop rail -->
   <nav class="rail" aria-label="Main">
@@ -34,18 +34,18 @@
   <div class="npbar" id="npbar" role="region" aria-label="Now playing" hidden>
     <div class="now" data-open-player>
       <div class="art" id="bar-art"></div>
-      <div class="info"><div class="t" id="bar-title"></div><div class="m" id="bar-artist"></div></div>
+      <div class="info"><div class="k" id="bar-kick" hidden>Previewing</div><div class="t" id="bar-title"></div><div class="m" id="bar-artist"></div></div>
     </div>
     <div class="mob ctl">
       <button class="icon-btn" data-like-now aria-label="Like" hidden><svg class="i"><use href="#i-heart"/></svg></button>
       <button class="icon-btn pp" data-pp aria-label="Pause"><svg class="i fill"><use href="#i-pause"/></svg><span class="spin"></span></button>
-      <button class="icon-btn" data-next aria-label="Next song"><svg class="i fill"><use href="#i-next"/></svg></button>
+      <button class="icon-btn" data-next aria-label="Next song"><svg class="i fill"><use href="#i-next"/></svg></button><button class="icon-btn" data-back aria-label="Back" aria-keyshortcuts="B" hidden><svg class="i"><use href="#i-undo"/></svg></button>
     </div>
     <div class="desk center ctl">
       <div class="transport">
         <button class="icon-btn" disabled aria-label="Previous (coming later)"><svg class="i fill sm"><use href="#i-prev"/></svg></button>
         <button class="pp-big pp" data-pp aria-label="Pause"><svg class="i fill sm"><use href="#i-pause"/></svg><span class="spin"></span></button>
-        <button class="icon-btn" data-next aria-label="Next song"><svg class="i fill sm"><use href="#i-next"/></svg></button>
+        <button class="icon-btn" data-next aria-label="Next song"><svg class="i fill sm"><use href="#i-next"/></svg></button><button class="icon-btn" data-back aria-label="Back" aria-keyshortcuts="B" hidden><svg class="i"><use href="#i-undo"/></svg></button>
       </div>
       <div class="seek num"><span data-el>0:00</span><input class="slider" type="range" min="0" max="1000" value="0" data-seek aria-label="Seek" disabled><span data-rem>-0:00</span></div>
     </div>
@@ -72,7 +72,7 @@
   <div class="inner">
     <div class="head">
       <button class="icon-btn" data-close-player aria-label="Close player"><svg class="i"><use href="#i-down"/></svg></button>
-      <div class="lbl">Playing from<b id="p-from"></b></div>
+      <div class="lbl"><span id="p-kick">Playing from</span><b id="p-from"></b></div>
       <button class="icon-btn" data-menu-current aria-label="More"><svg class="i"><use href="#i-more"/></svg></button>
     </div>
     <div class="banner" role="status"><svg class="i sm"><use href="#i-wifi-off"/></svg>Lost connection to your player. Reconnecting…</div>
@@ -86,11 +86,12 @@
           </div>
           <div class="chips pmarks" id="p-marks" role="group" aria-label="Marks"></div>
           <div class="seek num" style="margin-top:var(--s-4)"><span data-el>0:00</span><input class="slider" type="range" min="0" max="1000" value="0" data-seek aria-label="Seek" disabled><span data-rem>-0:00</span></div>
+          <div class="kicker p-seek-hint">Snaps to the beat when there is one · hold Alt to place freely</div>
         </div>
         <div class="transport ctl">
           <button class="icon-btn" disabled aria-label="Previous (coming later)"><svg class="i fill"><use href="#i-prev"/></svg></button>
           <button class="pp-huge pp" data-pp aria-label="Pause"><svg class="i fill"><use href="#i-pause"/></svg><span class="spin"></span></button>
-          <button class="icon-btn" data-next aria-label="Next song"><svg class="i fill"><use href="#i-next"/></svg></button>
+          <button class="icon-btn" data-next aria-label="Next song"><svg class="i fill"><use href="#i-next"/></svg></button><button class="icon-btn" data-back aria-label="Back" aria-keyshortcuts="B" hidden><svg class="i"><use href="#i-undo"/></svg></button>
         </div>
         <div class="sec">
           <a class="icon-btn" href="#/settings/speakers" data-close-player aria-label="Speakers"><svg class="i"><use href="#i-speaker"/></svg></a>

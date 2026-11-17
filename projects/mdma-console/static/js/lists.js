@@ -1,6 +1,7 @@
 // Building blocks for lists of music: action menu, track rows, paged list, bulk bar and cards.
 // Every click that can change what is heard goes through core's `actions`; nothing here calls a
-// playback route. A plain tap on a row or card opens a menu or a page and NEVER plays.
+// playback route. A plain tap on a row or card opens a menu or a page and NEVER plays; the one
+// exception is a preview row (opts.preview, the playlist workbench), which can always go Back.
 // Play now is offered only when logic.isIdle(store.player) (paused counts as playing).
 import { $$, h, icon, store, actions, setOf, enc, fmt, fmtTotal, plural, openMenu, on, onView, marksOf, macroForKey } from "./core.js";
 import { art } from "./art.js";
@@ -188,6 +189,12 @@ function unavailableRow(t, opts, index) {
  * More opts: end(t, i) -> nodes shown first in the row's button area (an unavailable line gets
  * them too), and decorate(li, row, t, i), called with every finished row: its <li> and its .trow element (a
  * workbench adds drag and keys here).
+ * opts.preview(t, i) makes the row a preview row (the workbench's, the one place a click may
+ * interrupt playback, and only because it can always go Back): a click, P, or Shift+Up / Shift+Down
+ * (which moves to the row above / below) calls it instead of opening the menu (the menu stays on
+ * the more button and Enter; Space is the page's play/pause). opts.previewing(t, i) says whether
+ * the row is the one being previewed: it gets an accent bar and a play/pause button, and a click
+ * on it pauses or resumes, from the state it was drawn with, instead of calling preview.
  */
 export function trackRow(t, opts = {}, index = 0) {
   const li = t.kind === "unresolved" ? unavailableRow(t, opts, index) : resolvedRow(t, opts, index);
@@ -206,15 +213,23 @@ function resolvedRow(t, opts, index) {
   const ql = h("button", { class: "qa", title: "Queue last (L)", tabindex: "-1" }, [icon("plus", "sm"), "Queue last"]);
   const heart = h("button", { class: "icon-btn more-btn heart-btn", tabindex: "-1" });
   const mks = h("span", { class: "mks" });
+  // What a click, P or Shift+Up/Down does on a preview row, from the state this row is drawn
+  // with: pause or resume the preview it is, else preview it. Null on a row that is no preview row.
+  const start = opts.preview ? () => opts.preview(t, index) : null;
+  const previewing = !!(start && opts.previewing && opts.previewing(t, index));
+  const playing = store.player.state === "playing";
+  const activate = start && (previewing ? (playing ? actions.pause : actions.resume) : start);
+  const verb = (playing ? "Pause" : "Resume") + " preview";
+  const pv = previewing ? h("button", { class: "icon-btn more-btn pv-btn on", "aria-label": verb, title: verb + " (P)", tabindex: "-1" }, [icon(playing ? "pause" : "play", "fill sm")]) : null;
   const row = h(
     "div",
     {
-      class: "trow" + (numbered ? " numbered" : "") + (current ? " current" : ""),
+      class: "trow" + (numbered ? " numbered" : "") + (current ? " current" : "") + (previewing ? " previewing" : ""),
       "data-mid": t.hash,
       tabindex: "0",
       role: "button",
-      "aria-haspopup": "menu",
-      "aria-label": title + (t.artist ? " by " + t.artist : "") + ". Opens actions.",
+      "aria-haspopup": start ? null : "menu",
+      "aria-label": title + (t.artist ? " by " + t.artist : "") + (start ? (previewing ? ". Previewing. Click to " + (playing ? "pause" : "resume") + "." : ". Click to preview.") : ". Opens actions."),
     },
     [
       numbered
@@ -229,9 +244,16 @@ function resolvedRow(t, opts, index) {
       h("span", { class: "c num", text: t.key || "" }),
       h("span", { class: "c num", text: dateOf(t.added) }),
       h("span", { class: "c num", text: t.duration_secs ? fmt(t.duration_secs) : "" }),
-      h("div", { class: "end" }, [...(opts.end ? opts.end(t, index) : []), qn, ql, heart, more]),
+      h("div", { class: "end" }, [pv, ...(opts.end ? opts.end(t, index) : []), qn, ql, heart, more]),
     ],
   );
+  row._preview = activate;
+  if (pv) {
+    pv.addEventListener("click", (e) => {
+      e.stopPropagation();
+      activate();
+    });
+  }
   // The heart and the chips show what the catalogue says; a "marks" event repaints them in place.
   // `painted` is what is on screen: the heart and the keys mark or unmark from it, so they do what
   // the user saw, not what the store holds by the time of the click.
@@ -264,7 +286,7 @@ function resolvedRow(t, opts, index) {
     queueLast();
   });
 
-  // A plain tap or click opens the menu. It never plays.
+  // A plain tap or click opens the menu, or previews in a preview row. It never plays otherwise.
   let swiped = false;
   const open = (e) => {
     if (e) e.stopPropagation();
@@ -277,13 +299,31 @@ function resolvedRow(t, opts, index) {
       swiped = false;
       return;
     }
-    open(e);
+    if (activate) activate();
+    else open(e);
   });
   row.addEventListener("keydown", (e) => {
     if (e.target !== row || e.ctrlKey || e.metaKey || e.altKey) return;
-    if (e.key === "Enter" || e.key === " ") {
+    // Space on a preview row is the page's (it plays or pauses, see player.js), not the menu's.
+    if (e.key === "Enter" || (e.key === " " && !activate)) {
       e.preventDefault();
       open(e);
+    } else if (activate && (e.key === "p" || e.key === "P") && !e.shiftKey) {
+      e.preventDefault();
+      if (!e.repeat) activate();
+    } else if (activate && e.shiftKey && (e.key === "ArrowUp" || e.key === "ArrowDown")) {
+      e.preventDefault();
+      if (e.repeat) return;
+      // The next row that is a track: an unavailable line has none to preview.
+      const side = e.key === "ArrowUp" ? "previousElementSibling" : "nextElementSibling";
+      for (let item = li[side]; item; item = item[side]) {
+        const r = item.querySelector(".trow[data-mid]");
+        if (r) {
+          r.focus();
+          r._preview();
+          break;
+        }
+      }
     } else if (e.key === "n" || e.key === "N") {
       queueNext();
     } else if (e.key === "l" || e.key === "L") {
@@ -438,6 +478,16 @@ export function emptyNote(title, text, link) {
 
 /* ============================================================ narrowed track pane */
 
+/** The rows of `hash` drawn in `region`, in order (a list may hold a track twice). */
+const rowsOfHash = (region, hash) => $$(".trow", region).filter((r) => r.dataset.mid === hash);
+
+/** Which row of `region` has the focus: { hash, nth } (the nth row of that track), or null. */
+function rowFocus(region) {
+  const row = document.activeElement && document.activeElement.closest(".trow[data-mid]");
+  if (!row || !region.contains(row)) return null;
+  return { hash: row.dataset.mid, nth: rowsOfHash(region, row.dataset.mid).indexOf(row) };
+}
+
 /**
  * A narrowing bar and a track list, with no page chrome: what an album, artist or playlist page
  * and the workbench are made of. Subscribes to "tracks" and "player" itself; call dispose() from
@@ -502,6 +552,9 @@ export function narrowedTracks(o) {
 
       const initial = keep && list ? list.count() : 0;
       const scrollY = window.scrollY;
+      // A row that has the focus gets it back once the rows are drawn anew (a preview changes the
+      // player, which redraws, and the keyboard goes on from the row it was on), if it is still there.
+      const focused = rowFocus(region);
       if (list) list.destroy();
       list = null;
       region.innerHTML = "";
@@ -516,6 +569,7 @@ export function narrowedTracks(o) {
         list = pagedList(region, rows, { ...row, initial });
       }
       if (keep) window.scrollTo(0, scrollY);
+      if (focused) rowsOfHash(region, focused.hash)[focused.nth]?.focus({ preventScroll: true });
       report({ all: everything, rows, narrowed: isNarrowed, failed });
     }
 

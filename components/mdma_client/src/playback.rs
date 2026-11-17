@@ -257,7 +257,7 @@ impl PlaybackBackend {
 fn gw_command(gw: &gateway_client::GatewayClient, cmd: Command) -> Result<(), ClientError> {
     match gw.playback_command(&cmd)? {
         Response::Ok { .. } => Ok(()),
-        Response::Err { message } => Err(ClientError::Service(message)),
+        Response::Err { message } => Err(ClientError::Refused(message)),
     }
 }
 
@@ -267,7 +267,7 @@ fn gw_extract<T>(
     extract: fn(ResponseData) -> Option<T>,
 ) -> Result<T, ClientError> {
     match gw.playback_command(&cmd)? {
-        Response::Err { message } => Err(ClientError::Service(message)),
+        Response::Err { message } => Err(ClientError::Refused(message)),
         Response::Ok { data: Some(data) } => extract(data)
             .ok_or_else(|| ClientError::Service("Unexpected response data type".to_string())),
         Response::Ok { data: None } => {

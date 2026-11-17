@@ -1,12 +1,12 @@
-// Now-playing bar, full player overlay and transport (pause/resume/skip, start when idle).
+// Now-playing bar, full player overlay and transport (pause/resume/skip, start when idle, Back from a preview, seek).
 //
-// Everything shown comes from store.player (state, now, queue, output, offline, position) joined with
+// Everything shown comes from store.player (state, now, queue, output, offline, position, preview) joined with
 // store.tracks by hash. Nothing here starts or stops audio except an explicit click on a transport
 // button: play/pause toggles pause/resume, and Play while idle goes through actions.start() (never
-// the raw /player/play-queue).
+// the raw /player/play-queue). While previewing, Back (button or B) takes Next's place.
 import { isIdle, outputDown, trackTitle, LIKED, markLabel } from "./logic.js";
 import { artBg, setArt, setCover } from "./art.js";
-import { $, $$, ApiError, actions, api, appInfo, applyPlayer, enc, fmt, h, icon, macroForKey, marksOf, on, openMenu, refreshPlayer, store, toast } from "./core.js";
+import { $, $$, ApiError, actions, api, enc, fmt, h, icon, macroForKey, marksOf, on, openMenu, refreshPlayer, store, toast } from "./core.js";
 
 const DESKTOP = 1024; // px, matches the CSS breakpoint
 
@@ -18,6 +18,9 @@ let base = { hash: null, ms: 0, at: 0, playing: false };
 // The most the clock runs ahead of the last server position. Bounds the drift on old nodes (no
 // output health) and in the ~1.2 s before a stalled output is noticed.
 const EXTRAPOLATE_CAP_MS = 1500;
+
+// Two equal positions this far apart (ms) mean the audio is not flowing (ticks come about every 1000).
+const STALL_MS = 900;
 
 const nowMs = () => performance.now();
 
@@ -79,9 +82,21 @@ function setPlayIcon(btn, shown) {
   if (use) use.setAttribute("href", shown === "pause" ? "#i-pause" : "#i-play");
 }
 
+/**
+ * What Back goes back to while previewing: `sub` is "Back to <held title> · m:ss" (the bar and
+ * the player), `back` the Back button's label; both say that Back stops playback when the
+ * preview started over nothing.
+ */
+function previewLabel(pv) {
+  if (!pv.back_to) return { sub: "Back stops playback", back: "Back, stops playback" };
+  const held = trackTitle(store.tracks.get(pv.back_to));
+  return { sub: "Back to " + held + " · " + fmt(pv.back_at_ms / 1000), back: "Back to " + held };
+}
+
 function render() {
   const p = store.player;
   const idle = isIdle(p);
+  const pv = p.preview && previewLabel(p.preview);
   $("#app").classList.toggle("paused", p.state !== "playing");
   const b = bar();
   if (idle && !p.queue.length) {
@@ -104,8 +119,9 @@ function render() {
     sub = barTrack ? [trackTitle(barTrack), barTrack.artist].filter(Boolean).join(" · ") : "";
   } else {
     title = track ? trackTitle(track) : "Now playing";
-    sub = p.offline ? "Reconnecting…" : outputDown(p) ? "No audio output" : track ? track.artist || "" : "";
+    sub = p.offline ? "Reconnecting…" : outputDown(p) ? "No audio output" : pv ? pv.sub : track ? track.artist || "" : "";
   }
+  $("#bar-kick").hidden = !pv;
   $("#bar-title").textContent = title || "";
   $("#bar-artist").textContent = sub || "";
   paintArt($("#bar-art"), barTrack);
@@ -115,7 +131,8 @@ function render() {
     const a = $("#p-artist");
     a.textContent = track ? track.artist || "" : "";
     a.setAttribute("href", track && track.artist ? "#/artist/" + enc(track.artist) : "#/library");
-    $("#p-from").textContent = "Up next";
+    $("#p-kick").textContent = pv ? "Previewing" : "Playing from";
+    $("#p-from").textContent = pv ? pv.sub : "Up next";
     paintArt($("#p-art"), track);
     $("#p-tint").style.backgroundImage = track ? artBg(track.album || track.title || "?") : "";
   }
@@ -123,17 +140,24 @@ function render() {
   renderMarks(idle ? null : track);
 
   const playing = p.state === "playing";
-  const loading = p.state === "loading";
   $$("[data-pp]").forEach((btn) => {
-    btn.classList.toggle("loading", loading);
-    btn.disabled = p.offline || loading;
-    btn.setAttribute("aria-label", playing || loading ? "Pause" : "Play");
-    setPlayIcon(btn, playing || loading ? "pause" : "play");
+    btn.disabled = p.offline;
+    btn.setAttribute("aria-label", playing ? "Pause" : "Play");
+    setPlayIcon(btn, playing ? "pause" : "play");
   });
+  // Skip is refused while previewing: Back takes Next's place.
   $$("[data-next]").forEach((btn) => {
+    btn.hidden = !!pv;
     btn.disabled = p.offline || idle;
   });
-  const seekOn = appInfo().seekEnabled && !p.offline && !idle;
+  $$("[data-back]").forEach((btn) => {
+    btn.hidden = !pv;
+    btn.disabled = p.offline;
+    if (!pv) return;
+    btn.title = pv.back + " (B)";
+    btn.setAttribute("aria-label", pv.back);
+  });
+  const seekOn = !p.offline && !idle;
   $$("[data-seek]").forEach((r) => {
     r.disabled = !seekOn;
   });
@@ -196,7 +220,7 @@ let busy = false;
 
 /**
  * Run one transport request at a time. `fn` may resolve true when it already applied the new
- * player state itself (pause/resume answer with it); otherwise the player is refetched after.
+ * player state itself (the actions answer with it); otherwise the player is refetched after.
  */
 async function transport(fn) {
   if (busy || store.player.offline) return;
@@ -206,26 +230,19 @@ async function transport(fn) {
     applied = (await fn()) === true;
   } catch (e) {
     const served = e instanceof ApiError && e.body && e.body.error;
-    toast(e instanceof ApiError && e.status === 409 ? "The player is busy" : served || "Couldn't reach the player");
+    toast(served && served !== "busy" ? served : e instanceof ApiError && e.status === 409 ? "The player is busy" : "Couldn't reach the player");
   } finally {
     busy = false;
     if (!applied) refreshPlayer();
   }
 }
 
-/** POST a pause/resume; the reply is the new { state, now, queue, output }. */
-async function setPaused(path) {
-  applyPlayer(await api(path, { method: "POST" }));
-  return true;
-}
-
 function togglePlay() {
   const p = store.player;
   if (p.offline) return Promise.resolve();
   if (isIdle(p)) return p.queue.length ? transport(() => actions.start()) : Promise.resolve();
-  if (p.state === "playing") return transport(() => setPaused("/api/pause"));
-  if (p.state === "paused") return transport(() => setPaused("/api/resume"));
-  return Promise.resolve(); // loading: wait
+  if (p.state === "playing") return transport(() => actions.pause());
+  return transport(() => actions.resume()); // paused
 }
 
 function skip() {
@@ -263,8 +280,11 @@ on("queue", render);
 on("marks", render);
 on("position", (pos) => {
   if (pos.hash !== store.player.now) return; // a late tick of the previous track
-  advancing = !(lastPos && lastPos.hash === pos.hash && pos.position_ms === lastPos.position_ms);
-  lastPos = pos;
+  // Equal positions only mean a stall when a tick's worth of time passed between them: a refresh
+  // answers between ticks and may repeat the position it just saw.
+  const at = nowMs();
+  advancing = !(lastPos && lastPos.hash === pos.hash && pos.position_ms === lastPos.position_ms && at - lastPos.at >= STALL_MS);
+  lastPos = { ...pos, at };
   rebase(pos.hash, pos.position_ms, clockRuns(store.player) && advancing);
   renderProgress();
 });
@@ -292,6 +312,9 @@ document.addEventListener("click", (e) => {
   } else if (t.hasAttribute("data-next")) {
     e.stopPropagation();
     skip();
+  } else if (t.hasAttribute("data-back")) {
+    e.stopPropagation();
+    transport(() => actions.back());
   } else if (t.hasAttribute("data-open-queue")) {
     e.stopPropagation();
     closePlayer();
@@ -331,20 +354,27 @@ document.addEventListener("keydown", (e) => {
     closePlayer(); // core's capture handler already took care of any menu or confirm
     return;
   }
+  const a = document.activeElement;
   if (e.key === " " && !e.ctrlKey && !e.metaKey && !e.altKey) {
     // Space toggles playback only from the page itself or the player overlay, never from inside
-    // a menu, sheet, dialog, narrowing bar or any control.
-    const a = document.activeElement;
-    if (a && a !== document.body && a !== playerEl()) return;
+    // a menu, sheet, dialog, narrowing bar or any control. A preview row (lists.js) may have the
+    // focus too, as it is what was clicked: Space on it plays or pauses like anywhere else.
+    if (a && a !== document.body && a !== playerEl() && !a._preview) return;
     e.preventDefault();
     togglePlay();
     return;
   }
+  if (e.ctrlKey || e.metaKey || e.altKey) return;
+  const typing = a && (/^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName) || a.closest("#menu,#fsheet,#confirm"));
+  // B goes back while previewing, from anywhere but a text field, menu, sheet or dialog.
+  if ((e.key === "b" || e.key === "B") && !e.shiftKey && store.player.preview && !typing) {
+    e.preventDefault();
+    if (!e.repeat) transport(() => actions.back());
+    return;
+  }
   // M likes and Shift+1..9 sets a macro mark on the track the bar shows, but only when no row has
   // the focus (a row handles its own) and not from inside a text field, menu, sheet or dialog.
-  const a = document.activeElement;
-  if (!shown || e.ctrlKey || e.metaKey || e.altKey) return;
-  if (a && (/^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName) || a.closest(".trow,#menu,#fsheet,#confirm"))) return;
+  if (!shown || typing || (a && a.closest(".trow"))) return;
   if ((e.key === "m" || e.key === "M") && !e.shiftKey) {
     e.preventDefault();
     if (!e.repeat) flipShown();
@@ -357,8 +387,12 @@ document.addEventListener("keydown", (e) => {
   }
 });
 
-// Seek: only live when the server says so (data-seek-enabled). Dragging previews locally.
+// Seek: dragging previews locally. On
+// release the node places the seek: on the nearest beat, or exactly where asked while Alt is held
+// (the browser only says which; the rule is the node's).
 $$("[data-seek]").forEach((r) => {
+  let free = false;
+  for (const ev of ["pointerdown", "pointerup", "keydown"]) r.addEventListener(ev, (e) => (free = e.altKey));
   r.addEventListener("input", () => {
     const dur = durationMs();
     if (!dur || !store.player.now) return;
@@ -367,10 +401,9 @@ $$("[data-seek]").forEach((r) => {
   });
   r.addEventListener("change", () => {
     const dur = durationMs();
-    if (!appInfo().seekEnabled || !dur) return;
+    if (!dur) return;
     resetAdvancing(); // the next position legitimately jumps
-    // TODO(R1): the seek route is not defined yet; this is the assumed shape.
-    transport(() => api("/player/seek", { method: "POST", body: { position_ms: Math.round((Number(r.value) / 1000) * dur) } }));
+    transport(() => actions.seek({ to_ms: Math.round((Number(r.value) / 1000) * dur), placement: free ? "free" : "snap" }));
   });
 });
 

@@ -101,9 +101,6 @@ const ASSETS: &[Asset] = &[
 
 const IMMUTABLE: &str = "public, max-age=31536000, immutable";
 
-/// The seek bar stays disabled until the playback engine can seek.
-const SEEK_ENABLED: bool = false;
-
 const FNV_OFFSET: u32 = 0x811c_9dc5;
 
 /// Fold `bytes` into a 32-bit FNV-1a state.
@@ -156,7 +153,6 @@ struct AppTemplate {
     version: String,
     node: String,
     asset_tag: String,
-    seek_enabled: bool,
 }
 
 /// Best-effort name of this node for display, read once.
@@ -174,7 +170,6 @@ fn render_shell(node: String) -> Response {
         version: env!("CARGO_PKG_VERSION").to_string(),
         node,
         asset_tag: ASSET_TAG.clone(),
-        seek_enabled: SEEK_ENABLED,
     };
     match template.render() {
         Ok(html) => ([(header::CACHE_CONTROL, "no-cache")], Html(html)).into_response(),
@@ -205,7 +200,7 @@ mod tests {
 
     /// Budgets are for what goes over the wire: gzipped bytes.
     const CSS_BUDGET_GZ: usize = 15 * 1024;
-    const JS_BUDGET_GZ: usize = 52 * 1024; // a tripwire against unintended growth of what goes over the wire for every view; when a feature needs the room, raise it on purpose to the measured size rounded up to a whole KiB
+    const JS_BUDGET_GZ: usize = 55 * 1024; // a tripwire against unintended growth of what goes over the wire for every view; when a feature needs the room, raise it on purpose to the measured size rounded up to a whole KiB
     /// The only external-looking URL allowed: the SVG namespace, which is an identifier, not a request.
     const SVG_NS: &str = "http://www.w3.org/2000/svg";
 
@@ -228,7 +223,6 @@ mod tests {
             version: "0.0.0".into(),
             node: "test-node".into(),
             asset_tag: ASSET_TAG.clone(),
-            seek_enabled: false,
         }
         .render()
         .unwrap()
@@ -534,7 +528,6 @@ mod tests {
         assert!(header_of(&res, header::CONTENT_TYPE).starts_with("text/html"));
         let body = body_string(res).await;
         assert!(body.contains(&format!("/static/{}/js/app.js", *ASSET_TAG)));
-        assert!(body.contains("data-seek-enabled=\"false\""));
     }
 
     #[tokio::test]

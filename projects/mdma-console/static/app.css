@@ -508,3 +508,11 @@ details.more summary{cursor:pointer;min-height:44px;display:flex;align-items:cen
 .mk-chips .chip{text-decoration:none}
 .chip[aria-current="page"]{background:var(--text);color:var(--bg);box-shadow:none}
 .mk-chips .num{font-size:var(--fs-xs);opacity:.7}
+
+/* ================= PREVIEW (workbench rows, the bar and the player) ================= */
+.npbar .k{font:600 10px/1.2 var(--font-mono);letter-spacing:.1em;text-transform:uppercase;color:var(--accent-strong)}
+.trow.previewing{box-shadow:inset 2px 0 0 var(--accent-strong)}
+.pv-btn.on{color:var(--accent-strong)}
+.wb .trow[data-mid]{cursor:pointer}
+.wb-tip{margin:calc(var(--s-1) * -1) 0 var(--s-3);color:var(--text-2)}
+.p-seek-hint{margin-top:6px;text-align:center}
