@@ -142,8 +142,20 @@ struct OpenedTrack {
 
 /// Open `path` and start its (stopped) decoder, decoding at the source's
 /// native rate (`fallback_rate` only if the source reports none).
-fn open_track(path: &Path, fallback_rate: u32) -> Result<OpenedTrack, PlaybackError> {
+///
+/// With `start` (interleaved sample index at the source rate) the source is
+/// moved there before the decoder thread exists. A track is never seeked once
+/// it is running: that was asynchronous, and reset the state a `play()` had
+/// just set, leaving the track silently stopped.
+fn open_track(
+    path: &Path,
+    fallback_rate: u32,
+    start: Option<usize>,
+) -> Result<OpenedTrack, PlaybackError> {
     let source = AudioSource::new(path)?;
+    if let Some(position) = start {
+        source.seek(position)?;
+    }
     let source_rate = source.sample_rate();
     let format = SourceFormat::of_source(
         u32::from(source.audio_channels()),
@@ -376,11 +388,32 @@ impl PlaybackEngine {
     /// An engine that never opens an audio output, so the real decoder, mixer
     /// and seek path run on a machine without a sound server (CI). Nothing is
     /// heard and positions do not advance, as no output consumes samples.
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn new_headless(config_path: PathBuf) -> Result<Self, PlaybackError> {
         let mut engine = Self::new(config_path)?;
         engine.headless = true;
         Ok(engine)
+    }
+
+    /// Stand in for the output callback of a headless engine: unless paused,
+    /// pop up to `max_samples` from the mixer ring and count them as consumed
+    /// (which is what moves the playhead). Returns how many were consumed.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn pull_for_test(&mut self, max_samples: usize) -> usize {
+        if self.shared.paused.load(Ordering::Acquire) {
+            return 0;
+        }
+        let Some(consumer) = self.mixer_consumer.as_mut() else {
+            return 0;
+        };
+        let mut pulled = 0;
+        while pulled < max_samples && consumer.pop().is_some() {
+            pulled += 1;
+        }
+        self.shared
+            .consumed_total
+            .fetch_add(pulled as u64, Ordering::Release);
+        pulled
     }
 
     /// Signal the mix thread to stop and wait for it to join.
@@ -676,19 +709,15 @@ impl PlaybackEngine {
         self.drop_everything()?;
 
         let OpenedTrack {
-            mut track,
+            track,
             consumer,
             format,
             rate,
-        } = open_track(path, self.audio_config.sample_rate)?;
+        } = open_track(path, self.audio_config.sample_rate, seek_to)?;
 
         self.ensure_output(rate)?;
 
-        let mut base_ms = 0;
-        if let Some(position) = seek_to {
-            track.seek(position)?;
-            base_ms = format.position(position).as_millis();
-        }
+        let base_ms = seek_to.map_or(0, |position| format.position(position).as_millis());
         tracing::info!("Track is ready for playback");
 
         let id = self.alloc_track_id();
@@ -824,7 +853,7 @@ impl PlaybackEngine {
             consumer,
             format,
             rate,
-        } = open_track(path, self.audio_config.sample_rate)?;
+        } = open_track(path, self.audio_config.sample_rate, None)?;
         // Fill the ring now; the decoder blocks when it is full. Independent
         // of the pause flag.
         track.play();
@@ -1259,6 +1288,96 @@ mod tests {
             engine.seek_ms(PositionMs::new(1_000)),
             Err(PlaybackError::NoTrackLoaded)
         ));
+    }
+
+    /// Run a future that never waits on anything (`load_track` has no real
+    /// await points) to completion.
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        let mut future = Box::pin(future);
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        loop {
+            if let std::task::Poll::Ready(value) = future.as_mut().poll(&mut cx) {
+                return value;
+            }
+        }
+    }
+
+    fn fixture(name: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../audio_decoder/benches/test_data")
+            .join(name)
+    }
+
+    /// A headless engine playing the 30 s fixture, as the output callback
+    /// would consume it (see `pull_for_test`).
+    fn headless_engine_playing_medium() -> (PlaybackEngine, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut engine =
+            PlaybackEngine::new_headless(tmp.path().join("audio_config.json")).expect("engine");
+        block_on(engine.load_track(&fixture("medium.flac"))).expect("load the fixture");
+        engine.play().expect("play");
+        (engine, tmp)
+    }
+
+    /// Consume samples until `done` holds of the engine's status; fail after 5 s.
+    fn pull_until(engine: &mut PlaybackEngine, what: &str, done: impl Fn(&EngineStatus) -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            engine.pull_for_test(2_048);
+            let status = engine.status();
+            if done(&status) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for {what}; status: {status:?}"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn a_track_plays_on_after_a_seek_while_playing() {
+        let (mut engine, _tmp) = headless_engine_playing_medium();
+        pull_until(&mut engine, "the start to play", |s| {
+            s.position_ms.is_some_and(|p| p >= 500)
+        });
+
+        engine.seek_ms(PositionMs::new(10_000)).expect("seek");
+        engine.play().expect("play after the seek");
+
+        pull_until(&mut engine, "the position to pass the seek target", |s| {
+            s.position_ms.is_some_and(|p| p >= 11_000)
+        });
+    }
+
+    /// Restoring a held track: load it (stopped), seek while not playing, then play.
+    #[test]
+    fn a_track_loaded_then_seeked_while_stopped_plays_from_the_target() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut engine =
+            PlaybackEngine::new_headless(tmp.path().join("audio_config.json")).expect("engine");
+        block_on(engine.load_track(&fixture("medium.flac"))).expect("load the fixture");
+
+        engine.seek_ms(PositionMs::new(10_000)).expect("seek");
+        engine.play().expect("play");
+
+        pull_until(&mut engine, "the position to pass the seek target", |s| {
+            s.position_ms.is_some_and(|p| p >= 11_000)
+        });
+    }
+
+    #[test]
+    fn a_track_finishes_after_a_seek_near_its_end() {
+        let (mut engine, _tmp) = headless_engine_playing_medium();
+        let duration = engine.status().duration_ms.expect("a duration");
+
+        engine
+            .seek_ms(PositionMs::new(duration - 300))
+            .expect("seek");
+        engine.play().expect("play after the seek");
+
+        pull_until(&mut engine, "the track to finish", |s| s.finished);
     }
 
     fn engine_with_tempdir() -> (PlaybackEngine, tempfile::TempDir) {
