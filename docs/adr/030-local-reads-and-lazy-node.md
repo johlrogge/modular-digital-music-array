@@ -123,8 +123,9 @@ File and line references below are as of 5d2cf8f.
 - The plays refresh (§1.3) adds an ACID `read_stream` round trip to every `TrackInfo` read on the node. Measure it, because the console polls.
 - **Tools.**
   - `library_projection`'s example `fold_cost` times read, `project_lines`, `plays.apply_to`, `AlbumCovers::build`, search and sort over a given `facts.jsonl`, and prints p50 and p95 over 20 runs.
-  - `hyperfine` times `mdma search --facts=replica` and `mdma search --facts=replica | mdma view --title -`.
+  - `just replica-search-timing` times `mdma search --facts=replica` and `mdma search --facts=replica | mdma view --title -` with a shell loop (`hyperfine` is not in the devenv), on a copy of the replica whose `synced_at` and `last_attempt` are set to now, so no background sync lands in the timings and the real cache is untouched. `just replica-fold-cost <facts.jsonl>` runs the example on the production profile.
   - Run both on the laptop and on a Pi 5 (on the node the CLI reads the `localhost` replica).
+  - Agents cannot run these recipes: the just MCP allowlist blocks them (metadev#69). A human runs them.
 - **Thresholds.**
   - Laptop: search p95 at most 150 ms; the two-command pipeline at most 300 ms.
   - Pi 5: search p95 at most 300 ms.
@@ -140,6 +141,31 @@ File and line references below are as of 5d2cf8f.
     - Its precondition is a reference-counted `fact_index` in `library_projection`, so incremental retracts stop scanning every track.
     - Positions, an entity index and resumable folds are also wanted natively in stainless_facts: johlrogge/stainless_facts#16 (positions), #17 (entity index) and #18 (resumable folds and checkpoints). The MDMA checkpoint is shaped so that it can move onto them.
   - **Still over after the checkpoint:** next try a binary codec for the checkpoint, then split provenance into a second file loaded only by reads that need it (marked, `facts`), each step measured.
+- **Measured (P6, laptop).**
+  - Machine johlmut, AMD Ryzen 7 PRO 6850H. Release `mdma` 0.38.3. Replica `mdma-stage2`: 24000 lines, 6904676 bytes. Artist filter "Carbon Based Lifeforms". 20 runs each. The Pi 5 is not measured yet.
+  - `fold_cost`, in process:
+
+    | stage | p50 ms | p95 ms |
+    |---|---|---|
+    | read file | 1.4 | 2.3 |
+    | `project_lines` | 60.1 | 70.5 |
+    | plays apply | 1.1 | 2.1 |
+    | `AlbumCovers::build` | 0.2 | 0.5 |
+    | search, default query | 1.3 | 2.3 |
+    | search, artist filter | 0.2 | 0.4 |
+    | `sort_catalog` | 0.5 | 1.2 |
+    | total | 66.1 | 79.4 |
+
+  - End to end, release binary, process start included:
+
+    | command | p50 ms | p95 ms |
+    |---|---|---|
+    | `mdma --facts=replica search --artist` | 87.7 | 90.9 |
+    | `search \| view --title -` | 98.2 | 102.0 |
+
+  - **Verdict: within every laptop threshold.** Search p95 91 ms against 150; the pipeline 102 ms against 300; the cold fold (TUI start proxy, `fold_cost` total) 79 ms against 500. No checkpoint, and ADR-031 is not triggered. Re-measure when the replica passes 48000 lines, or when a release changes the fold.
+  - `project_lines` is about 90% of the cost; a checkpoint, if ever needed, would target it.
+  - The Pi 5 threshold and the node-side plays refresh round trip are still unmeasured.
 - `facts <hash>` reads raw lines with a byte prefilter on the full hash, confirmed by ACID's `is_entity_match`. An entity index waits for stainless_facts (johlrogge/stainless_facts#17) or a measurement that shows the need.
 - The replica fold must not stop silently at an unreadable line. MDMA counts such lines itself (ADR-021 §1); stainless_facts' `FactIterator` ends there without an error (johlrogge/stainless_facts#19), so MDMA does not use it for this.
 
