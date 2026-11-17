@@ -14,6 +14,7 @@ interface = "library-search"
 [dependencies]
 date-expression = { workspace = true }
 music-primitives = { workspace = true }
+music-facts = { workspace = true }
 chrono = "0.4"
 serde = { version = "1", features = ["derive"] }
 thiserror = "1.0"

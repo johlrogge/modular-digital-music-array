@@ -365,6 +365,7 @@ mod tests {
             genre: None,
             label: None,
             styles: vec![],
+            marks: vec![],
         }
     }
 

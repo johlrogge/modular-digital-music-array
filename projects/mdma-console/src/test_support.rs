@@ -129,6 +129,7 @@ pub fn bare_track(hash: &str) -> library_ipc_client::TrackInfo {
         genre: None,
         label: None,
         styles: vec![],
+        marks: vec![],
     }
 }
 

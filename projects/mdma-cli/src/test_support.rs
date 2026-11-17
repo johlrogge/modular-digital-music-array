@@ -257,6 +257,7 @@ pub(crate) fn track(hash: &str) -> TrackInfo {
         genre: None,
         label: None,
         styles: vec![],
+        marks: vec![],
         duration: None,
         bpm: None,
         key: None,

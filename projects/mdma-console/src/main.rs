@@ -3020,6 +3020,7 @@ mod tests {
             genre: None,
             label: None,
             styles: vec![],
+            marks: vec![],
         };
         let json = TrackInfoJson::from_track_info(&track);
         assert_eq!(json.content_hash, "sha256:abc123");
@@ -3057,6 +3058,7 @@ mod tests {
             genre: None,
             label: None,
             styles: vec![],
+            marks: vec![],
         };
         let json = TrackInfoJson::from_track_info(&track);
         assert_eq!(json.content_hash, "sha256:deadbeef");
@@ -3094,6 +3096,7 @@ mod tests {
             genre: None,
             label: None,
             styles: vec![],
+            marks: vec![],
         };
         let json = TrackInfoJson::from_track_info(&track);
         assert_eq!(json.disc_number, Some(2));

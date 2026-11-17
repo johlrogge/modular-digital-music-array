@@ -5703,6 +5703,7 @@ version = "0.10.1"
 dependencies = [
  "chrono",
  "date-expression",
+ "music-facts",
  "music-primitives",
  "regex",
  "rstest",

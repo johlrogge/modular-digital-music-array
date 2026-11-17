@@ -200,6 +200,20 @@ Points marked **decided** were decided by Joakim. Everything else is **proposed*
 
 Macro buttons can ship any time after phase 1 for online use. They work offline after phase 3.
 
+## Amendment 2026-11-17
+
+Clients (the console first) need each track's marks without a lookup per track, and need to narrow a search by mark.
+
+- **`TrackInfo.marks: Vec<Mark>`** (`#[serde(default)]`). `library_projection::read::track_info` fills it from the track's live marks (`IndexedTrackInfo::marks`), so the service and a client replica give the same answer (ADR-030).
+  - The order is deterministic: the default mark first, then named marks sorted by name. Each mark appears once.
+  - Legacy free-text scopes are not marks and are left out. `ListMarked` with `MarkFilter::Any` still lists those tracks.
+- **`TrackQuery.mark: Option<Mark>`** (`#[serde(default)]`). A query with a mark matches the tracks that hold that mark live. It combines with the other filters by AND, and `not` inverts the whole query. `mdma search --mark NAME` sets it; `liked` is the default mark.
+- **Old nodes.** An old library sends no `marks`, which reads as unmarked, and an old library ignores the unknown `mark` field and answers unfiltered. The real exposure is small:
+  - Replica reads evaluate `mark` locally, so they are right whatever the node runs. Only `--facts=node` reaches the node.
+  - The console ships together with the library (ADR-004).
+  - It is the same accepted property as `role` and `energy` when they were added.
+  - `TrackQuery` now has `deny_unknown_fields`, so a filter added later fails loudly on a node that predates it instead of being ignored. That closes the class for later filters; `mark` itself predates the guard.
+
 ## Related
 
 - ADR-001, ADR-004, ADR-009, ADR-011, ADR-013, ADR-014, ADR-015

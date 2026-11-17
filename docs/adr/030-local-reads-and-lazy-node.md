@@ -143,7 +143,7 @@ File and line references below are as of 5d2cf8f.
     - It is produced by the same fold. It is derived and deletable, so it is not a second mapping and not a projection on the wire (ADR-021).
     - Its precondition is a reference-counted `fact_index` in `library_projection`, so incremental retracts stop scanning every track.
     - Positions, an entity index and resumable folds are also wanted natively in stainless_facts: johlrogge/stainless_facts#16 (positions), #17 (entity index) and #18 (resumable folds and checkpoints). The MDMA checkpoint is shaped so that it can move onto them.
-  - **Still over after the checkpoint:** next try a binary codec for the checkpoint, then split provenance into a second file loaded only by reads that need it (marked, `facts`), each step measured.
+  - **Still over after the checkpoint:** next try a binary codec for the checkpoint, then split provenance into a second file loaded only by reads that need it, each step measured. Since ADR-016's 2026-11-17 amendment, provenance is read by every `TrackInfo` read (it carries the marks) and every search (`--mark`), so the split no longer helps those reads: only `facts` would still avoid it.
 - **Measured (P6, laptop).**
   - Machine johlmut, AMD Ryzen 7 PRO 6850H. Release `mdma` 0.38.3. Replica `mdma-stage2`: 24000 lines, 6904676 bytes. Artist filter "Carbon Based Lifeforms". 20 runs each. The Pi 5 is not measured yet.
   - `fold_cost`, in process:

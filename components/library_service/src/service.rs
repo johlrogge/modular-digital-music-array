@@ -4125,6 +4125,11 @@ mod tests {
             1,
         );
         put("sha256:eq_a1", Mark::Default.fact_value(at(5)), 5);
+        put(
+            "sha256:eq_a1",
+            "banger".parse::<Mark>().unwrap().fact_value(at(6)),
+            6,
+        );
         // A blob path, so the startup backfills have something to write facts for.
         put(
             "sha256:eq_a1",
@@ -4384,7 +4389,11 @@ mod tests {
             started: Some(DateQuery::NA),
             ..Default::default()
         };
-        for query in [everything, never_played] {
+        let banger = TrackQuery {
+            mark: Some("banger".parse().unwrap()),
+            ..Default::default()
+        };
+        for query in [everything, never_played, banger.clone()] {
             assert_eq!(
                 json(&ask(LibraryRequest::Search {
                     query: query.clone()
@@ -4483,6 +4492,13 @@ mod tests {
         let mut styles = tagged.styles.clone();
         styles.sort();
         assert_eq!(styles, ["Deep", "Dub"], "styles on the wire");
+        assert_eq!(
+            tagged.marks,
+            [Mark::Default, "banger".parse().unwrap()],
+            "marks on the wire"
+        );
+        let banger_hits = ask(LibraryRequest::Search { query: banger });
+        assert_eq!(banger_hits.len(), 1, "only the marked track matches");
     }
 
     #[test]
