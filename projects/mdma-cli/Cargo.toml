@@ -12,7 +12,6 @@ path = "src/main.rs"
 
 [dependencies]
 client-facts = { workspace = true }
-library-projection = { workspace = true }
 hicli = "0.7.0"
 bpaf = { version = "0.9", features = ["derive"] }
 color-eyre = "0.6"

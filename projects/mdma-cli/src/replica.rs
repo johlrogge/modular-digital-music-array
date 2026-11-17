@@ -20,7 +20,7 @@ pub(crate) struct Quiet(pub bool);
 /// this one exit at once.
 #[hicli::command(hide)]
 pub(crate) fn sync(quiet: Quiet, ctx: &Ctx) -> Result<()> {
-    let (id, report) = client_facts::sync(ctx, quiet.0)?;
+    let (id, report) = client_facts::sync(ctx.node(), quiet.0)?;
     let Some(report) = report else {
         if !quiet.0 {
             println!("Another sync of {id} is running.");
@@ -44,7 +44,7 @@ pub(crate) fn sync(quiet: Quiet, ctx: &Ctx) -> Result<()> {
 /// unset or names it).
 #[hicli::command]
 pub(crate) fn status(ctx: &Ctx) -> Result<()> {
-    println!("{}", client_facts::status(ctx)?);
+    println!("{}", client_facts::status(ctx.node())?);
     Ok(())
 }
 
@@ -55,7 +55,7 @@ pub(crate) fn status(ctx: &Ctx) -> Result<()> {
 /// says there is nothing to reset.
 #[hicli::command]
 pub(crate) fn reset(ctx: &Ctx) -> Result<()> {
-    println!("{}", client_facts::reset(ctx)?);
+    println!("{}", client_facts::reset(ctx.node())?);
     Ok(())
 }
 

@@ -1,6 +1,6 @@
 //! Test helpers shared by several modules' tests.
 
-use crate::ctx::{Ctx, Globals, LibrarySocket, NodeFlag, PlaybackSocket, SourcesDir};
+use crate::ctx::{Ctx, FactsFlag, Globals, LibrarySocket, NodeFlag, PlaybackSocket, SourcesDir};
 use bpaf::{ParseFailure, Parser as _};
 use library_ipc_client::{ContentHash, TrackInfo};
 
@@ -57,20 +57,22 @@ pub(crate) fn run_arg<T: hicli::Arg>(args: &[&str]) -> Result<T, String> {
 // (`MDMA_NODE`, `EDITOR`, `COLUMNS`): the one `client-facts` takes, whose tests set
 // `XDG_CACHE_HOME`. Any new test that starts a process, or takes a sync flock, must
 // hold `env_lock` (#107: a forked child inherits the flock until its exec).
-pub(crate) use client_facts::test_support::{asserted, env_lock, EnvVars};
+pub(crate) use client_facts::test_support::{env_lock, EnvVars};
 
 /// A context for the local services (IPC), with no node to resolve. Its sockets
 /// and sources directory do not exist, so no test can reach a real local service.
+/// It reads facts from the node (which is not there), never from the replica of
+/// whoever runs the tests.
 pub(crate) fn local_ctx() -> Ctx {
     let nowhere = "/nonexistent/mdma-test";
     Ctx::with_target(
         Globals {
+            facts: FactsFlag::given(Some(client_facts::FactsChoice::Node)),
             node: NodeFlag(None),
             socket: LibrarySocket(Some(format!("ipc://{nowhere}/library.sock"))),
             playback_socket: PlaybackSocket(Some(format!("ipc://{nowhere}/playback.sock"))),
             sources_dir: SourcesDir(Some(std::path::PathBuf::from(format!("{nowhere}/sources")))),
-        }
-        .into(),
+        },
         node_discovery::Target::LocalIpc,
     )
 }
@@ -252,6 +254,9 @@ pub(crate) fn track(hash: &str) -> TrackInfo {
         title: None,
         artist: None,
         album: None,
+        genre: None,
+        label: None,
+        styles: vec![],
         duration: None,
         bpm: None,
         key: None,

@@ -100,8 +100,8 @@ fn queue_replace_resolved(
 /// ```
 #[hicli::command]
 pub(crate) fn next(hash: HashInput, ctx: &Ctx) -> Result<()> {
-    let library = ctx.library()?;
-    let playback = ctx.playback()?;
+    let library = ctx.node().library()?;
+    let playback = ctx.node().playback()?;
     let hashes = hashes_of_input(hash)?;
     let count = queue_next_resolved(&library, &playback, &hashes)?;
     println!("Queued {} track(s) next", count);
@@ -120,8 +120,8 @@ pub(crate) fn next(hash: HashInput, ctx: &Ctx) -> Result<()> {
 /// ```
 #[hicli::command]
 pub(crate) fn append(hash: HashInput, ctx: &Ctx) -> Result<()> {
-    let library = ctx.library()?;
-    let playback = ctx.playback()?;
+    let library = ctx.node().library()?;
+    let playback = ctx.node().playback()?;
     let hashes = hashes_of_input(hash)?;
     let count = queue_append_resolved(&library, &playback, &hashes)?;
     println!("Appended {} track(s) to queue", count);
@@ -131,8 +131,8 @@ pub(crate) fn append(hash: HashInput, ctx: &Ctx) -> Result<()> {
 /// Show the current queue
 #[hicli::command]
 pub(crate) fn list(ctx: &Ctx) -> Result<()> {
-    let library = ctx.library()?;
-    let playback = ctx.playback()?;
+    let library = ctx.node().library()?;
+    let playback = ctx.node().playback()?;
     let hashes = playback.queue_list().map_err(display_error)?;
 
     if hashes.is_empty() {
@@ -203,7 +203,7 @@ pub(crate) fn list(ctx: &Ctx) -> Result<()> {
 /// Clear the queue
 #[hicli::command]
 pub(crate) fn clear(ctx: &Ctx) -> Result<()> {
-    let playback = ctx.playback()?;
+    let playback = ctx.node().playback()?;
     playback.queue_clear().map_err(display_error)?;
     println!("Queue cleared");
     Ok(())
@@ -221,7 +221,7 @@ pub(crate) fn clear(ctx: &Ctx) -> Result<()> {
 /// ```
 #[hicli::command]
 pub(crate) fn remove(hash: HashInput, ctx: &Ctx) -> Result<()> {
-    let playback = ctx.playback()?;
+    let playback = ctx.node().playback()?;
     let content_hashes = hashes_of_input(hash)?;
 
     let removed = queue_remove_resolved(&playback, &content_hashes)?;
@@ -244,8 +244,8 @@ pub(crate) fn remove(hash: HashInput, ctx: &Ctx) -> Result<()> {
 /// ```
 #[hicli::command]
 pub(crate) fn replace(_stdin: StdinDash, ctx: &Ctx) -> Result<()> {
-    let library = ctx.library()?;
-    let playback = ctx.playback()?;
+    let library = ctx.node().library()?;
+    let playback = ctx.node().playback()?;
     let hashes = require_stdin_hashes()?;
     let queue = playback.queue_list().map_err(display_error)?;
     let count = queue_replace_resolved(&library, &playback, &queue, &hashes)?;
@@ -258,8 +258,8 @@ pub(crate) fn replace(_stdin: StdinDash, ctx: &Ctx) -> Result<()> {
 /// Opens the current queue as a playlist file; save to apply changes.
 #[hicli::command]
 pub(crate) fn edit(ctx: &Ctx) -> Result<()> {
-    let library = ctx.library()?;
-    let playback = ctx.playback()?;
+    let library = ctx.node().library()?;
+    let playback = ctx.node().playback()?;
     let count = edit_queue(&library, &playback, |content| {
         crate::editor::edit_text("mdma-queue-", content)
     })?;

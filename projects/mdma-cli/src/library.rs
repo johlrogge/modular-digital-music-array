@@ -12,7 +12,7 @@ use hicli::Arg;
 #[hicli::command]
 pub(crate) fn reindex_covers(ctx: &Ctx) -> Result<()> {
     use library_ipc_client::{IngestResult, LibraryRequest, LibraryResponse};
-    let library = ctx.library()?;
+    let library = ctx.node().library()?;
     let result = interpret_library(
         library.request(&LibraryRequest::ReindexCovers),
         |r| match r {

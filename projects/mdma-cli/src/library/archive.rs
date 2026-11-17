@@ -67,7 +67,7 @@ fn format_archive_emptied(r: &ArchiveEmptyReport) -> String {
 /// List the files that duplicate merges moved to the archive
 #[hicli::command(default)]
 pub(crate) fn list(ctx: &Ctx) -> Result<()> {
-    let library = ctx.library()?;
+    let library = ctx.node().library()?;
     let listing = library.archive_list().map_err(display_error)?;
     println!("{}", format_archive_listing(&listing));
     Ok(())
@@ -79,7 +79,7 @@ pub(crate) fn list(ctx: &Ctx) -> Result<()> {
 #[hicli::command]
 pub(crate) fn empty(yes: Yes, ctx: &Ctx) -> hicli::Outcome<Success> {
     let Yes(yes) = yes;
-    let library = ctx.library()?;
+    let library = ctx.node().library()?;
     // `--yes` without a listing deletes everything; after a prompt, only what was shown.
     let mut up_to = None;
     if !yes {

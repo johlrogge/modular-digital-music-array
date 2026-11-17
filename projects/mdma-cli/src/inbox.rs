@@ -23,7 +23,7 @@ impl FromStr for InboxFileArg {
 /// List files in inbox
 #[hicli::command]
 pub(crate) fn list(ctx: &Ctx) -> Result<()> {
-    let library = ctx.library()?;
+    let library = ctx.node().library()?;
     let files = library.inbox_queue().map_err(library_error)?;
     if files.is_empty() {
         println!("Inbox is empty");
@@ -42,7 +42,7 @@ pub(crate) fn list(ctx: &Ctx) -> Result<()> {
 /// Delete a file from inbox without ingesting
 #[hicli::command]
 pub(crate) fn delete(file: InboxFileArg, ctx: &Ctx) -> Result<()> {
-    let library = ctx.library()?;
+    let library = ctx.node().library()?;
     let InboxFileArg(path) = file;
 
     use mdma_client::IngestResult;
@@ -61,7 +61,7 @@ fn ingest_failed(message: &str) -> color_eyre::Report {
 /// Ingest a specific file from inbox
 #[hicli::command]
 pub(crate) fn ingest(file: InboxFileArg, ctx: &Ctx) -> Result<()> {
-    let library = ctx.library()?;
+    let library = ctx.node().library()?;
     let InboxFileArg(path) = file;
 
     println!("Ingesting: {}", path.as_str());
@@ -83,7 +83,7 @@ pub(crate) fn ingest(file: InboxFileArg, ctx: &Ctx) -> Result<()> {
 /// Ingest all files in inbox
 #[hicli::command]
 pub(crate) fn ingest_all(ctx: &Ctx) -> Result<Success> {
-    let library = ctx.library()?;
+    let library = ctx.node().library()?;
     println!("Ingesting all files in inbox...");
 
     let results = library.ingest_all().map_err(library_error)?;

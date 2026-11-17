@@ -6,14 +6,10 @@
 //! [`request_sync`]); this module is the spawn and the rule for which commands ask.
 
 use std::io;
-use std::process::Command;
-
 use std::path::PathBuf;
 
 use client_facts::{replica_from_environment, request_sync, UnixSecs, Urgency};
 use node_discovery::NodeSpec;
-
-use crate::detach::detach;
 
 /// The directory the replicas live in. Under test it is `None` unless the test set
 /// `XDG_CACHE_HOME`, so no test can read or write the real cache of whoever runs it.
@@ -24,38 +20,17 @@ pub(crate) fn replicas_dir() -> Option<PathBuf> {
     client_facts::replicas_dir()
 }
 
-/// The arguments of the background sync: `replica sync --quiet`, for the node the
-/// command named with `--node` if it did (the child would otherwise resolve a node of
-/// its own, which may be another one).
-fn sync_args(node: Option<&NodeSpec>) -> Vec<String> {
-    let mut args = Vec::new();
-    if let Some(node) = node {
-        args.push("--node".to_string());
-        args.push(node.to_string());
-    }
-    args.extend(["replica", "sync", "--quiet"].map(String::from));
-    args
-}
-
-/// Start `mdma replica sync --quiet` detached, and do not wait for it.
-///
-/// The `Child` is dropped at once, which neither waits for nor kills it. The child is
-/// not reaped by this process: when the caller (a completion or a command, both
-/// short-lived) exits, init adopts and reaps it, and until then a child that finishes
-/// first is a zombie for a few milliseconds. A double fork would avoid even that, at
-/// the price of a second process per refresh; for a process that exits right after
-/// spawning it is not worth it.
+/// Start `mdma replica sync --quiet` detached (see
+/// [`client_facts::spawn_background_sync`]), and do not wait for it.
 pub(crate) fn spawn_background_sync(node: Option<&NodeSpec>) -> io::Result<()> {
     // The test binary is not `mdma`: spawning `current_exe()` there would run the
     // test harness with `replica sync --quiet` as its arguments. Tests inject their own
-    // spawner into `request_sync`, and `tests/detach.rs` checks `detach` on a stand-in.
+    // spawner into `request_sync`.
     if cfg!(test) {
         return Ok(());
     }
-    let exe = std::env::current_exe()?;
-    let child = detach(Command::new(exe).args(sync_args(node))).spawn()?;
-    drop(child);
-    Ok(())
+    // Dropped: the CLI exits soon, and init adopts and reaps the child.
+    client_facts::spawn_background_sync(&std::env::current_exe()?, node).map(|_child| ())
 }
 
 /// What to do after the command at `path` has run; `None` for the commands that
@@ -250,15 +225,5 @@ mod tests {
         let after = parsed(&["mark", "banger", "--node", "h.local"]).unwrap();
         assert_eq!(after.node.unwrap().to_string(), "h.local");
         assert_eq!(parsed(&["mark", "banger"]).unwrap().node, None);
-    }
-
-    #[test]
-    fn the_child_is_told_the_node_the_command_named() {
-        let spec: NodeSpec = "h.local:5555".parse().unwrap();
-        assert_eq!(
-            sync_args(Some(&spec)),
-            ["--node", "h.local:5555", "replica", "sync", "--quiet"]
-        );
-        assert_eq!(sync_args(None), ["replica", "sync", "--quiet"]);
     }
 }
