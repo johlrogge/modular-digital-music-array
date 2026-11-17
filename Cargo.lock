@@ -5749,6 +5749,7 @@ dependencies = [
  "chrono",
  "library-ipc-protocol",
  "library-projection",
+ "library-search",
  "music-facts",
  "nng",
  "playlist-edit",
