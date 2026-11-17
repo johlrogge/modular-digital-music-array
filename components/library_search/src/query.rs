@@ -1,10 +1,15 @@
 use chrono::NaiveDate;
+use music_facts::Mark;
 use music_primitives::{Key, TrackRole};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
 /// Search query for tracks. Implicit AND across all non-None fields.
+///
+/// An unknown field is an error, so a filter added later fails loudly on a node that
+/// predates it, instead of being ignored and answering unfiltered.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct TrackQuery {
     /// Searches all text fields (title, artist, album, label, genre) — OR across fields.
     pub any_text: Option<StringQuery>,
@@ -33,6 +38,10 @@ pub struct TrackQuery {
     /// e.g. `7`, `5..8`, `7+-2`
     #[serde(default)]
     pub energy: Option<NumericQuery>,
+    /// Only tracks carrying this mark live (ADR-016). Absent on the wire from clients
+    /// that predate it; a library that predates it ignores it and answers unfiltered.
+    #[serde(default)]
+    pub mark: Option<Mark>,
     /// When true, invert the match — return tracks that do NOT match the other filters.
     #[serde(default)]
     pub not: bool,
@@ -58,6 +67,7 @@ impl TrackQuery {
             && self.added.is_none()
             && self.role.is_none()
             && self.energy.is_none()
+            && self.mark.is_none()
     }
 }
 

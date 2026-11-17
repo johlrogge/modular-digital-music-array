@@ -44,7 +44,7 @@ pub use read::{
 };
 
 use library_ipc_protocol::{CanonicalHash, EntryError, FactType, PlaylistEntry, ProtocolError};
-use music_facts::{ContentHash, Mark, MarkFilter, MusicValue, StartReason, StopReason};
+use music_facts::{ContentHash, Mark, MarkFilter, MusicValue, StartReason, StopReason, StoredMark};
 use stainless_facts::{aggregate_facts, Fact, Operation};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -266,6 +266,22 @@ impl IndexedTrackInfo {
         mark: &'a Mark,
     ) -> impl Iterator<Item = &'a (MusicValue, music_facts::FactSource)> {
         self.provenance.iter().filter(move |(v, _)| mark.matches(v))
+    }
+
+    /// The marks this track holds live, each once: the default mark first, then the
+    /// named ones by name. Legacy free-text scopes are not marks and are left out.
+    pub fn marks(&self) -> Vec<Mark> {
+        let mut marks: Vec<Mark> = self
+            .provenance
+            .iter()
+            .filter_map(|(v, _)| match v.stored_mark()? {
+                StoredMark::Mark(mark) => Some(mark),
+                StoredMark::Legacy(_) => None,
+            })
+            .collect();
+        marks.sort_unstable();
+        marks.dedup();
+        marks
     }
 
     /// The keys ([`hash_key`]) of the tracks a live `Replaces` fact of this track

@@ -1013,6 +1013,11 @@ pub struct TrackInfo {
     /// the wire from nodes that predate it (ADR-022 0a).
     #[serde(default)]
     pub styles: Vec<String>,
+    /// The marks the track holds live: the default mark first, then named ones by name.
+    /// Legacy free-text scopes are left out. Absent on the wire from nodes that
+    /// predate it (ADR-016 amendment 2026-11-17), which reads as unmarked.
+    #[serde(default)]
+    pub marks: Vec<Mark>,
 }
 
 /// Service status information.
@@ -2578,6 +2583,7 @@ mod tests {
             genre: None,
             label: None,
             styles: vec![],
+            marks: vec![Mark::Default, "banger".parse().unwrap()],
         };
 
         let json = serde_json::to_string(&track).unwrap();
@@ -2586,6 +2592,17 @@ mod tests {
         assert_eq!(parsed.content_hash.as_str(), track.content_hash.as_str());
         assert_eq!(parsed.memory_cues, track.memory_cues);
         assert_eq!(parsed.beat_grid, track.beat_grid);
+        assert_eq!(parsed.marks, track.marks);
+    }
+
+    /// A node that predates `marks` sends none: the track decodes as unmarked.
+    #[test]
+    fn track_info_marks_are_optional_on_the_wire() {
+        let old = r#"{"content_hash":"sha256:abc123","title":null,"artist":null,"album":null,
+            "duration":null,"bpm":null,"key":null,"blob_path":null,"cover_art_path":null,
+            "track_number":null,"disc_number":null,"added":null}"#;
+        let decoded: TrackInfo = serde_json::from_str(old).unwrap();
+        assert_eq!(decoded.marks, Vec::<Mark>::new());
     }
 
     /// A node that predates `genre` sends no such field: the track still decodes,
@@ -2647,6 +2664,7 @@ mod tests {
             genre: None,
             label: None,
             styles: vec![],
+            marks: vec![],
         };
 
         let json = serde_json::to_string(&track).unwrap();

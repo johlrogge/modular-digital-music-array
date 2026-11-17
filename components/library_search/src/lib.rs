@@ -19,7 +19,7 @@
 //!     title: None, album: None, label: None, genre: None,
 //!     styles: &[], key: None, duration: None, year: None, source: None,
 //!     last_started: None, last_stopped: None, added: None,
-//!     role: None, energy: None,
+//!     role: None, energy: None, marks: vec![],
 //! };
 //!
 //! assert!(matches_query(&query, &fields));

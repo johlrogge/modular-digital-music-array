@@ -2,6 +2,7 @@ use crate::query::{
     DatePrecision, DateQuery, DurationQuery, DurationUnit, NumericQuery, StringQuery, TrackQuery,
 };
 use chrono::{DateTime, Datelike, NaiveDate, Utc};
+use music_facts::Mark;
 use music_primitives::{Key, TrackRole};
 use regex::Regex;
 
@@ -28,6 +29,8 @@ pub struct TrackFields<'a> {
     pub role: Option<TrackRole>,
     /// Energy level 1–10.
     pub energy: Option<u8>,
+    /// The marks the track carries live. Owned, because the fold derives them.
+    pub marks: Vec<Mark>,
 }
 
 /// Evaluate a `TrackQuery` against a set of track fields, respecting `query.not`.
@@ -145,6 +148,12 @@ fn matches_query_inner(query: &TrackQuery, track: &TrackFields) -> bool {
 
     if let Some(nq) = &query.energy {
         if !track.energy.is_some_and(|e| matches_numeric(nq, e as f32)) {
+            return false;
+        }
+    }
+
+    if let Some(mark) = &query.mark {
+        if !track.marks.contains(mark) {
             return false;
         }
     }
@@ -317,7 +326,63 @@ mod tests {
             added: None,
             role: None,
             energy: None,
+            marks: Vec::new(),
         }
+    }
+
+    fn named(name: &str) -> Mark {
+        name.parse().unwrap()
+    }
+
+    #[test]
+    fn a_mark_query_requires_that_mark_to_be_live() {
+        let query = |mark: Mark| TrackQuery {
+            mark: Some(mark),
+            ..Default::default()
+        };
+        let mut fields = empty_fields();
+        assert!(!matches_query(&query(Mark::Default), &fields));
+        fields.marks = vec![Mark::Default, named("banger")];
+        assert!(matches_query(&query(Mark::Default), &fields));
+        assert!(matches_query(&query(named("banger")), &fields));
+        assert!(!matches_query(&query(named("opener")), &fields));
+    }
+
+    #[test]
+    fn a_mark_query_inverts_with_not() {
+        let query = TrackQuery {
+            mark: Some(named("banger")),
+            not: true,
+            ..Default::default()
+        };
+        let mut fields = empty_fields();
+        assert!(matches_query(&query, &fields));
+        fields.marks = vec![named("banger")];
+        assert!(!matches_query(&query, &fields));
+    }
+
+    #[test]
+    fn a_query_without_mark_decodes_from_old_json() {
+        let query: TrackQuery = serde_json::from_str(r#"{"not":false}"#).unwrap();
+        assert_eq!(query.mark, None);
+        assert!(query.is_empty());
+    }
+
+    #[test]
+    fn a_query_with_an_unknown_field_is_rejected() {
+        assert!(serde_json::from_str::<TrackQuery>(r#"{"not":false,"future":1}"#).is_err());
+    }
+
+    #[test]
+    fn a_mark_query_round_trips_and_is_not_empty() {
+        let query = TrackQuery {
+            mark: Some(named("banger")),
+            ..Default::default()
+        };
+        assert!(!query.is_empty());
+        let json = serde_json::to_string(&query).unwrap();
+        let back: TrackQuery = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.mark, Some(named("banger")));
     }
 
     #[test]

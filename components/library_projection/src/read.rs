@@ -104,6 +104,7 @@ pub fn track_info(t: &IndexedTrackInfo, covers: &AlbumCovers) -> TrackInfo {
         genre: t.genre.clone(),
         label: t.label.clone(),
         styles: t.styles.clone(),
+        marks: t.marks(),
     }
 }
 
@@ -127,6 +128,7 @@ pub fn search_fields(t: &IndexedTrackInfo) -> TrackFields<'_> {
         added: t.added_at,
         role: t.role,
         energy: t.energy.map(u8::from),
+        marks: t.marks(),
     }
 }
 
@@ -252,7 +254,7 @@ mod tests {
     use super::*;
     use crate::{project_lines, MusicFact};
     use library_ipc_protocol::KeyQuery;
-    use music_facts::{Artist, FactSource, Title};
+    use music_facts::{Artist, FactSource, Mark, Title};
     use pretty_assertions::assert_eq;
     use stainless_facts::{Fact, Operation};
 
@@ -295,6 +297,99 @@ mod tests {
 
         assert_eq!(info(&with).genre.as_deref(), Some("Techno"));
         assert_eq!(info(&indexed("h2")).genre, None);
+    }
+
+    // ---- marks ------------------------------------------------------------------
+
+    fn apply_mark(t: &mut IndexedTrackInfo, scope: Option<&str>, op: Operation) {
+        let at = chrono::Utc::now();
+        let value = MusicValue::Bookmarked {
+            scope: scope.map(str::to_owned),
+            timestamp: at,
+        };
+        let source = FactSource::new("test", "1.0.0", "Unknown");
+        crate::apply_fact_to_track(t, &value, at, op, &source);
+    }
+
+    fn named(name: &str) -> Mark {
+        name.parse().unwrap()
+    }
+
+    #[test]
+    fn track_info_lists_live_marks_default_first_then_named_sorted() {
+        let mut t = indexed("h1");
+        for scope in [Some("opener"), None, Some("banger"), Some("banger")] {
+            apply_mark(&mut t, scope, Operation::Assert);
+        }
+        assert_eq!(
+            info(&t).marks,
+            vec![Mark::Default, named("banger"), named("opener")]
+        );
+        assert_eq!(info(&indexed("h2")).marks, Vec::<Mark>::new());
+    }
+
+    #[test]
+    fn track_info_leaves_out_retracted_and_legacy_marks() {
+        let mut t = indexed("h1");
+        apply_mark(&mut t, Some("banger"), Operation::Assert);
+        apply_mark(&mut t, Some("opener"), Operation::Assert);
+        apply_mark(&mut t, Some("Some Free Text!\u{200B}"), Operation::Assert);
+        let retract = |t: &mut IndexedTrackInfo| {
+            let value = t
+                .provenance
+                .iter()
+                .find(|(v, _)| named("banger").matches(v))
+                .map(|(v, _)| v.clone())
+                .unwrap();
+            let source = FactSource::new("test", "1.0.0", "Unknown");
+            crate::apply_fact_to_track(t, &value, chrono::Utc::now(), Operation::Retract, &source);
+        };
+        retract(&mut t);
+        assert_eq!(info(&t).marks, vec![named("opener")]);
+    }
+
+    #[test]
+    fn scopes_that_fold_to_one_mark_are_listed_once() {
+        let mut t = indexed("h1");
+        for scope in [Some("Banger"), Some("banger"), Some("liked"), None] {
+            apply_mark(&mut t, scope, Operation::Assert);
+        }
+        assert_eq!(info(&t).marks, vec![Mark::Default, named("banger")]);
+    }
+
+    #[test]
+    fn marks_and_has_mark_agree() {
+        let mut t = indexed("h1");
+        for scope in [Some("banger"), Some("Free Text!\u{200B}"), None] {
+            apply_mark(&mut t, scope, Operation::Assert);
+        }
+        for mark in [Mark::Default, named("banger"), named("opener")] {
+            assert_eq!(
+                t.marks().contains(&mark),
+                t.has_mark(&MarkFilter::Only(mark.clone())),
+                "{mark}"
+            );
+        }
+    }
+
+    #[test]
+    fn search_matches_a_live_mark_and_only_that_mark() {
+        let mut marked_track = indexed("sha256:a");
+        apply_mark(&mut marked_track, Some("banger"), Operation::Assert);
+        let tracks = vec![marked_track, indexed("sha256:b")];
+        let covers = AlbumCovers::build(&tracks);
+        let by = |mark: Mark| {
+            let query = TrackQuery {
+                mark: Some(mark),
+                ..TrackQuery::default()
+            };
+            hashes(&search(&tracks, &covers, &query))
+                .into_iter()
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(by(named("banger")), vec!["sha256:a"]);
+        assert!(by(Mark::Default).is_empty());
     }
 
     // ---- order ------------------------------------------------------------------
@@ -451,7 +546,6 @@ mod tests {
 
     #[test]
     fn marked_returns_only_marked_visible_tracks_in_order() {
-        use music_facts::Mark;
         let source = FactSource::new("test", "1.0.0", "Unknown");
         let mark = Mark::Default;
         let mut tracks = Vec::new();
