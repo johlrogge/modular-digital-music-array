@@ -2,7 +2,8 @@
 //! the library with the version the browser last read. The console decides nothing about a
 //! playlist: it forwards the ops and the version, and answers with what the library answered.
 //!
-//! - 200: applied (`{snapshot, skipped, previous}`) or deleted (`{deleted: true}`);
+//! - 200: applied (`{snapshot, skipped, previous}`; `previous` only when the edit wrote, so Undo
+//!   exists exactly then) or deleted (`{deleted: true}`);
 //! - 409: the version was stale, nothing was written (`{current}`, the playlist as it is now);
 //! - every other failure is classified by `library_failure_status`, the one policy of ADR-026 A7.
 //!   There is no fallback to PlaylistReplace: an old node answers 502.
@@ -41,14 +42,17 @@ fn edited(response: LibraryResponse) -> Option<Reply> {
             snapshot,
             skipped,
             previous,
-        }) => Some((
-            StatusCode::OK,
-            serde_json::json!({
+        }) => {
+            let mut body = serde_json::json!({
                 "snapshot": ApiSnapshot::from(&snapshot),
                 "skipped": skipped,
-                "previous": previous,
-            }),
-        )),
+            });
+            // Present exactly when the edit wrote, like `previous` on the queue routes.
+            if let Some(previous) = previous {
+                body["previous"] = serde_json::json!(previous);
+            }
+            Some((StatusCode::OK, body))
+        }
         LibraryResponse::PlaylistEdited(EditOutcome::Conflict { current }) => {
             Some(conflict(&current))
         }
@@ -269,7 +273,15 @@ mod tests {
                 hash: ContentHash::new(full('b')),
                 existing_at: 3,
             }],
-            previous: StoredPlaylist::new("old\n"),
+            previous: Some(StoredPlaylist::new("old\n")),
+        })
+    }
+
+    fn applied_unchanged() -> LibraryResponse {
+        LibraryResponse::PlaylistEdited(EditOutcome::Applied {
+            snapshot: snapshot("new"),
+            skipped: Vec::new(),
+            previous: None,
         })
     }
 
@@ -293,6 +305,22 @@ mod tests {
                     "skipped": [{"hash": full('b'), "existing_at": 3}],
                     "previous": "old\n",
                 }),
+                "{}",
+                call.1
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_edit_that_wrote_nothing_has_no_previous() {
+        let gw = write_gateway(applied_unchanged());
+        let all = calls();
+        for call in &all[..2] {
+            let res = send_call(test_app_with(gw.addr()), call).await;
+            assert_eq!(res.status(), StatusCode::OK, "{}", call.1);
+            assert_eq!(
+                body_json(res).await,
+                json!({"snapshot": snapshot_json("new"), "skipped": []}),
                 "{}",
                 call.1
             );

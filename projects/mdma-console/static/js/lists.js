@@ -63,6 +63,51 @@ export function swipe(el, { dir = "right", threshold, max = 160, onMove, onEnd, 
   el.addEventListener("touchcancel", () => end(false));
 }
 
+/* ============================================================ drag reorder */
+
+/**
+ * The drag scope of one list: items of the same scope can be dropped on each other, and nothing
+ * else can. `clear()` forgets a drag that never ended (its element was drawn away); call it when
+ * the list is redrawn. `item(el, at, onMove)` makes `el`, the item at `at`, draggable and a drop
+ * target. Dropping item `from` on it calls onMove(from, at), always: `from === at` too, which the
+ * server takes as no change. `el` is .dragging while dragged, and .over while another item is over
+ * it (with .below when that item comes from above, so the line shows where it will land).
+ */
+export function dragList() {
+  let dragFrom = null;
+  const clear = () => (dragFrom = null);
+  function item(el, at, onMove) {
+    el.draggable = true;
+    el.addEventListener("dragstart", (e) => {
+      dragFrom = at;
+      el.classList.add("dragging");
+      if (e.dataTransfer) {
+        e.dataTransfer.setData("text/plain", String(at)); // Firefox starts no drag without data
+        e.dataTransfer.effectAllowed = "move";
+      }
+    });
+    el.addEventListener("dragend", () => {
+      clear();
+      el.classList.remove("dragging");
+    });
+    el.addEventListener("dragover", (e) => {
+      if (dragFrom === null) return;
+      e.preventDefault();
+      el.classList.add("over");
+      el.classList.toggle("below", dragFrom < at);
+    });
+    el.addEventListener("dragleave", () => el.classList.remove("over"));
+    el.addEventListener("drop", (e) => {
+      e.preventDefault();
+      el.classList.remove("over");
+      const from = dragFrom;
+      clear();
+      if (from !== null) onMove(from, at);
+    });
+  }
+  return { item, clear };
+}
+
 /* ============================================================ track menu */
 
 /**
@@ -103,22 +148,23 @@ const dateOf = (added) => (added ? String(added).slice(0, 10) : "");
 const bpmOf = (t) => (t.bpm == null ? "" : String(Math.round(t.bpm)));
 
 /**
- * A playlist line the library could not resolve ({ kind: "unresolved", pos, token, reason }), in
- * its place: dimmed, the reason under the usual fallback title, and no actions. The cells match a
- * track row's so the desktop columns line up.
+ * A playlist line the library could not resolve ({ kind: "unresolved", at, token, reason }), in
+ * its place: dimmed, the reason under the usual fallback title, and no actions but opts.end's.
+ * With those it can take the focus, so the keyboard reaches them. The cells match a track row's
+ * so the desktop columns line up.
  */
-function unavailableRow(t, opts) {
+function unavailableRow(t, opts, index) {
   const numbered = opts.lead === "number";
   const title = trackTitle(t);
   return h("li", { style: "position:relative" }, [
     h(
       "div",
-      { class: "trow unavailable" + (numbered ? " numbered" : ""), "aria-label": title + ", unavailable. " + t.reason },
+      { class: "trow unavailable" + (numbered ? " numbered" : ""), tabindex: opts.end ? "0" : null, "aria-label": title + ", unavailable. " + t.reason },
       [
         h("span", { class: "no", text: numbered ? String(opts.number(t)) : "" }),
         h("div", { style: "min-width:0" }, [h("div", { class: "t", text: title }), h("div", { class: "m", text: t.reason })]),
         ...Array.from({ length: 5 }, () => h("span", { class: "c" })),
-        h("div", { class: "end" }),
+        h("div", { class: "end" }, opts.end ? opts.end(t, index) : []),
       ],
     ),
   ]);
@@ -130,10 +176,18 @@ function unavailableRow(t, opts) {
  * (default) or "album" under the title; extra(t, i): menu items
  * spliced in after Queue last, where `i` is the row's index (a list may hold a track twice).
  * Tap/click opens the action menu; N / L queue next / last from the keyboard; on phones swipe
- * right past ~96px queues last.
+ * right past ~96px runs opts.quick ({ label, run(t, i) }), by default Queue last.
+ * More opts: end(t, i) -> nodes shown first in the row's button area (an unavailable line gets
+ * them too), and decorate(li, row, t, i), called with every finished row: its <li> and its .trow element (a
+ * workbench adds drag and keys here).
  */
 export function trackRow(t, opts = {}, index = 0) {
-  if (t.kind === "unresolved") return unavailableRow(t, opts);
+  const li = t.kind === "unresolved" ? unavailableRow(t, opts, index) : resolvedRow(t, opts, index);
+  if (opts.decorate) opts.decorate(li, li.querySelector(".trow"), t, index);
+  return li;
+}
+
+function resolvedRow(t, opts, index) {
   const numbered = opts.lead === "number";
   const now = store.player.now;
   const current = now === t.hash && !isIdle(store.player);
@@ -164,7 +218,7 @@ export function trackRow(t, opts = {}, index = 0) {
       h("span", { class: "c num", text: t.key || "" }),
       h("span", { class: "c num", text: dateOf(t.added) }),
       h("span", { class: "c num", text: t.duration_secs ? fmt(t.duration_secs) : "" }),
-      h("div", { class: "end" }, [qn, ql, more]),
+      h("div", { class: "end" }, [...(opts.end ? opts.end(t, index) : []), qn, ql, more]),
     ],
   );
   const queueNext = () => actions.queueNext(setOf([t]), title);
@@ -205,9 +259,10 @@ export function trackRow(t, opts = {}, index = 0) {
     }
   });
 
-  // Phones: swipe right past the threshold queues last. A short swipe snaps back and a mostly
-  // vertical gesture is a scroll, which cancels the swipe.
-  const li = h("li", { style: "position:relative" }, [h("div", { class: "swipe", "aria-hidden": "true" }, [icon("plus", "sm"), "Queue last"]), row]);
+  // Phones: swipe right past the threshold runs the quick action. A short swipe snaps back and a
+  // mostly vertical gesture is a scroll, which cancels the swipe.
+  const quick = opts.quick || { label: "Queue last", run: queueLast };
+  const li = h("li", { style: "position:relative" }, [h("div", { class: "swipe", "aria-hidden": "true" }, [icon("plus", "sm"), quick.label]), row]);
   const hint = li.firstChild;
   swipe(row, {
     dir: "right",
@@ -223,7 +278,7 @@ export function trackRow(t, opts = {}, index = 0) {
         setTimeout(() => (swiped = false), 400);
       }
     },
-    onCommit: queueLast,
+    onCommit: () => quick.run(t, index),
   });
   return li;
 }
@@ -345,19 +400,23 @@ export function emptyNote(title, text, link) {
 
 /**
  * A narrowing bar and a track list, with no page chrome: what an album, artist or playlist page
- * (and later the workbench) is made of. Subscribes to "tracks" and "player" itself; call
- * dispose() from the view's cleanup.
+ * and the workbench are made of. Subscribes to "tracks" and "player" itself; call dispose() from
+ * the view's cleanup.
  * o.key: view key. o.instance: the name shown (resets the key's narrowing when it changes).
  * o.placeholder. o.tracks(): the tracks in natural order, evaluated on each draw; empty when
  * unknown or the catalogue is not loaded. o.order: "natural" keeps o.tracks() order (no Sort
  * button); "global" follows the global sort.
- * o.row: { lead: "number"|"art", sub: "artist"|"album", extra(t, i) } as for trackRow.
+ * o.row: { lead: "number"|"art", sub: "artist"|"album", extra(t, i), quick, end(t, i),
+ * decorate(li, row, t, i) } as for trackRow.
  * o.above(rows): node between the bar and the column header, or null.
  * o.empty: { missing() -> [title, text, link?] when o.tracks() is empty, none: [title, text] when
  * the text leaves nothing }. Filters and failed searches use the standard notes.
  * o.onChange({ all, rows, narrowed, failed }): after every draw; rows are the displayed tracks in
  * displayed order, which is what buttons next to the pane must act on.
- * Returns { el, rows(), refresh(opts), dispose() }.
+ * Returns { el, rows(), narrowed(), refresh(opts), dispose() }: refresh(opts) redraws from
+ * o.tracks() again (opts as for narrowedView's refresh) for a page whose tracks changed under it,
+ * and resolves once the rows are drawn. narrowed() says whether the rows being drawn (or last
+ * drawn) are a narrowed set: row callbacks may read it.
  */
 export function narrowedTracks(o) {
   const row = o.row || {};
@@ -365,8 +424,8 @@ export function narrowedTracks(o) {
   const el = h("div");
   let view = null;
   let list = null;
-  let known = null;
   let shown = [];
+  let isNarrowed = false;
 
   function stop() {
     if (view) view.dispose();
@@ -384,8 +443,8 @@ export function narrowedTracks(o) {
     stop();
     el.innerHTML = "";
     const all = o.tracks();
-    known = all.length > 0;
-    if (!known) {
+    if (!all.length) {
+      isNarrowed = false;
       el.appendChild(emptyNote(...o.empty.missing()));
       report({ all, rows: [], narrowed: false, failed: false });
       return;
@@ -395,6 +454,7 @@ export function narrowedTracks(o) {
     function draw(state, { keep, narrowed, nFilters }) {
       const everything = o.tracks();
       const failed = state.kind === "failed";
+      isNarrowed = narrowed && !failed;
       const set = state.kind === "matched" ? state.data : null;
       // The server's set covers text, tempo, key and added; here it is only intersected.
       const ts = failed ? [] : everything.filter((t) => !set || set.has(t.hash));
@@ -416,31 +476,33 @@ export function narrowedTracks(o) {
         list = pagedList(region, rows, { ...row, initial });
       }
       if (keep) window.scrollTo(0, scrollY);
-      report({ all: everything, rows, narrowed: narrowed && !failed, failed });
+      report({ all: everything, rows, narrowed: isNarrowed, failed });
     }
 
     view = narrowedView({ key: o.key, instance: o.instance, placeholder: o.placeholder, sort: global, fetch: matchSet, render: draw });
     el.appendChild(view.el);
     el.appendChild(region);
-    view.refresh({ bar: true });
+    return view.refresh({ bar: true });
   }
+
+  // Rows appearing, or all of them vanishing, changes what the pane is (rows or a note): rebuild
+  // it then. Otherwise the same state: redraw with `opts`. Resolves when drawn.
+  const redraw = (opts) => (view && o.tracks().length > 0 ? view.refresh(opts) : mount());
 
   mount();
 
   // The catalogue may arrive after the pane opens, or lose the tracks. Same state: keep rows and
   // scroll, and leave the bar alone while typing. Idle changes redraw the buttons beside it.
   const offs = [
-    onView("tracks", () => {
-      if (!known || o.tracks().length === 0) mount(); // still missing (the note may change), or gone
-      else if (view) view.refresh({ bar: !view.el.contains(document.activeElement), keep: true });
-    }),
+    onView("tracks", () => redraw({ bar: !(view && view.el.contains(document.activeElement)), keep: true })),
     onView("player", () => view && view.refresh({ keep: true })),
   ];
 
   return {
     el,
     rows: () => shown,
-    refresh: (opts) => view && view.refresh(opts),
+    narrowed: () => isNarrowed,
+    refresh: redraw,
     dispose() {
       for (const off of offs) off();
       stop();

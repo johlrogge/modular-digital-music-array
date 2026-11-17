@@ -74,18 +74,20 @@ fn applied<T: HashedTrack>(
     skipped: Vec<Skipped>,
     tracks: &[T],
 ) -> Planned {
+    let written = new != current;
     let outcome = EditOutcome::Applied {
         snapshot: snapshot(&new, tracks),
         skipped,
-        previous: StoredPlaylist::new(current),
+        // Present exactly when the file is written: only then is there something to undo.
+        previous: written.then(|| StoredPlaylist::new(current)),
     };
-    if new == current {
-        Planned::Answer(outcome)
-    } else {
+    if written {
         Planned::Write {
             bytes: new,
             outcome,
         }
+    } else {
+        Planned::Answer(outcome)
     }
 }
 

@@ -4,29 +4,36 @@
 // whole playlist through the server (core.js ofPlaylist), which leaves out the lines that cannot
 // play and says which; narrowed to a subset, they act on exactly the rows shown, which all have
 // a track. A line the library resolved but the console's catalogue lacks is a placeholder track
-// (logic.js placeholderTrack). The server has the edit routes (ADR-027 §9: edit, revert, delete),
-// but this page does not use them yet: it is read-only.
-import { route, store, api, enc, ofPlaylist, setOf } from "./core.js";
+// (logic.js placeholderTrack). The page is read-only; its Edit link opens the workbench
+// (workbench.js), which uses the server's edit routes (ADR-027 §9).
+import { h, icon, route, store, api, enc, ofPlaylist, setOf } from "./core.js";
 import { playlistRows, coverOf } from "./logic.js";
 import { songCounts } from "./lists.js";
 import { collectionPage, missing, LIBRARY_LINK, NO_MUSIC, NONE } from "./collections.js";
 
-/** The page's state: "loading" until the fetch answers, then "ready", "notfound" or "failed". */
-const settled = (status, entries = []) => ({ status, entries });
+/** The page's state: "loading" until the fetch answers, then "ready", "notfound" or "failed", with the snapshot's `version` and `entries` when ready. */
+const settled = (status, snapshot = {}) => ({ status, version: snapshot.version, entries: snapshot.entries || [] });
 const FAILURE_STATUS = { 404: "notfound" };
 
-async function load(name) {
+/** Read the playlist: a `settled` state. The workbench edits against its `version`. */
+export async function load(name) {
   try {
-    return settled("ready", (await api("/api/playlists/" + enc(name))).entries);
+    return settled("ready", await api("/api/playlists/" + enc(name)));
   } catch (e) {
     return settled(FAILURE_STATUS[e.status] || "failed");
   }
 }
 
+/** The rows of a playlist's `entries`, in file order. Rows need the catalogue to show their tracks: without it there are none. */
+export const rowsOf = (entries) => (store.order.length ? playlistRows(entries, (hash) => store.tracks.get(hash)) : []);
+
+/** The row shape of a playlist pane (lists.js trackRow): line numbers from 1, the artist under the title. */
+export const PLAYLIST_ROW = { lead: "number", number: (t) => t.at + 1, sub: "artist" };
+
 // The note for a page without rows, by state. With the catalogue not loaded there are no rows to
 // show for any state but the failures.
 const EMPTY = ["Empty playlist", "This playlist has no songs. ", LIBRARY_LINK];
-const notes = (name) => ({
+export const notes = (name) => ({
   loading: () => ["Loading playlist", "One moment."],
   ready: () => (store.order.length ? EMPTY : NO_MUSIC),
   notfound: missing("Playlist", name),
@@ -37,6 +44,7 @@ const notes = (name) => ({
 function drawPlaylist(root, name, state) {
   return collectionPage(root, {
     back: { href: "#/library/playlists", text: "Library" },
+    tools: state.status === "ready" ? [h("a", { class: "btn", href: "#/playlist/" + enc(name) + "/edit" }, [icon("wrench", "sm"), "Edit"])] : [],
     header: {
       label: "Playlist",
       name,
@@ -53,10 +61,9 @@ function drawPlaylist(root, name, state) {
       key: "playlist",
       instance: name,
       placeholder: "Filter this playlist",
-      // Rows need the catalogue to show their tracks; without it the pane says so.
-      tracks: () => (store.order.length ? playlistRows(state.entries, (hash) => store.tracks.get(hash)) : []),
+      tracks: () => rowsOf(state.entries),
       order: "natural",
-      row: { lead: "number", number: (t) => t.pos, sub: "artist" },
+      row: PLAYLIST_ROW,
       empty: { missing: notes(name)[state.status], none: NONE },
     },
   });

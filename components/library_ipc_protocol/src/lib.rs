@@ -369,12 +369,14 @@ pub struct Skipped {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EditOutcome {
     /// The edit was applied (or changed nothing, with the version unchanged).
-    /// `previous` is the file as it was before, for a `PlaylistRevert` that
-    /// undoes the edit (and whose own `previous` redoes it).
+    /// `previous` is present exactly when the file was written: the file as it
+    /// was before, for a `PlaylistRevert` that undoes the edit (and whose own
+    /// `previous` redoes it). `None` means nothing changed, so there is nothing
+    /// to undo.
     Applied {
         snapshot: PlaylistSnapshot,
         skipped: Vec<Skipped>,
-        previous: StoredPlaylist,
+        previous: Option<StoredPlaylist>,
     },
     /// The version did not match; nothing was written.
     Conflict { current: PlaylistSnapshot },
@@ -1442,12 +1444,17 @@ mod tests {
                 hash: ContentHash::new("sha256:aaa"),
                 existing_at: 4,
             }],
-            previous: StoredPlaylist::new("aaa\n# c\n"),
+            previous: Some(StoredPlaylist::new("aaa\n# c\n")),
+        };
+        let unchanged = EditOutcome::Applied {
+            snapshot: snapshot(),
+            skipped: Vec::new(),
+            previous: None,
         };
         let conflict = EditOutcome::Conflict {
             current: snapshot(),
         };
-        for outcome in [applied, conflict] {
+        for outcome in [applied, unchanged, conflict] {
             match roundtrip(&LibraryResponse::PlaylistEdited(outcome.clone())) {
                 LibraryResponse::PlaylistEdited(back) => assert_eq!(back, outcome),
                 other => panic!("expected PlaylistEdited, got {other:?}"),

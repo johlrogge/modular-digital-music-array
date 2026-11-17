@@ -36,6 +36,9 @@ export const store = {
   sort: { by: "added", dir: "desc" },
 };
 
+/** Every track of the catalogue, in catalogue order. */
+export const catalogue = () => store.order.map((hash) => store.tracks.get(hash)).filter(Boolean);
+
 const listeners = new Map();
 
 /** Subscribe to an event (see the list above). Returns an unsubscribe function. */
@@ -110,19 +113,20 @@ export const enc = (s) => encodeURIComponent(s);
 
 let toastTimer;
 
-/** Show a message; with `undo` a button runs it and dismisses the toast. */
-export function toast(msg, undo) {
+/** Show a message; with `act` a button runs it and dismisses the toast. The button says `label` ("Undo" unless told otherwise). */
+export function toast(msg, act, label = "Undo") {
   const t = $("#toast");
   $("#toast-msg").textContent = msg;
   const b = $("#toast-act");
-  b.hidden = !undo;
+  b.textContent = label;
+  b.hidden = !act;
   b.onclick = () => {
     t.classList.remove("on");
-    if (undo) undo();
+    if (act) act();
   };
   t.classList.add("on");
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => t.classList.remove("on"), undo ? 6000 : 2600);
+  toastTimer = setTimeout(() => t.classList.remove("on"), act ? 6000 : 2600);
 }
 
 /** Modal confirm. Runs `fn` only on the OK button. */
@@ -628,8 +632,10 @@ async function editQueue(expect, next, message) {
   const body = await queueCall("/api/queue/edit", { expect, queue: next }, message === "undo" ? "Up next changed since; can't undo" : undefined);
   if (!body) return false;
   applyQueue(body.queue);
+  // The server sends `previous` only when it changed the queue: nothing to undo means nothing changed.
   if (message === "undo") toast("Undone");
-  else if (message) toastUndo(message, expect, body.queue);
+  else if (message && body.previous) toastUndo(message, body.previous, body.queue);
+  else if (message) toast("Nothing changed");
   return true;
 }
 

@@ -191,15 +191,16 @@ export function coverOf(tracks) {
  * The rows of a playlist page, one per line of GET /api/playlists/{name} in file order (duplicates
  * kept), each tagged by `kind`. `entries` is [{ status: "Track", hash } | { status: "Unresolved",
  * token, reason }]; `trackOf(hash)` is the catalogue lookup. A resolved line is
- * { kind: "track", pos, ...track } (a placeholder when the catalogue lacks the hash); an
- * unresolved one is { kind: "unresolved", pos, token, reason }. `pos` is the 1-based line number.
+ * { kind: "track", at, ...track } (a placeholder when the catalogue lacks the hash); an
+ * unresolved one is { kind: "unresolved", at, token, reason }. `at` is the 0-based position of
+ * the line among the playlist's entries: the number the server's ops use (people count from 1).
  */
 export function playlistRows(entries, trackOf) {
   const ROW = {
-    Track: (e, pos) => ({ kind: "track", pos, ...(trackOf(e.hash) || placeholderTrack(e.hash)) }),
-    Unresolved: (e, pos) => ({ kind: "unresolved", pos, token: e.token, reason: e.reason }),
+    Track: (e, at) => ({ kind: "track", at, ...(trackOf(e.hash) || placeholderTrack(e.hash)) }),
+    Unresolved: (e, at) => ({ kind: "unresolved", at, token: e.token, reason: e.reason }),
   };
-  return entries.map((e, i) => ROW[e.status](e, i + 1));
+  return entries.map((e, i) => ROW[e.status](e, i));
 }
 
 /**

@@ -4,12 +4,11 @@
 // configurations of it, and so is the playlist page (playlist.js). Clicks never interrupt playback:
 // the buttons come from lists.js queueButtons, where Play now exists only while idle. NO_MUSIC and
 // missing() are the notes shared by every page that needs the catalogue (playlist.js too).
-import { h, icon, route, store, enc, plural, fmtTotal, setOf } from "./core.js";
+import { h, icon, route, store, catalogue, enc, plural, fmtTotal, setOf } from "./core.js";
 import { art } from "./art.js";
 import { albumOrder, groupAlbums, isIdle, coverOf } from "./logic.js";
 import { queueButtons, narrowedTracks, albumCard } from "./lists.js";
 
-const catalogue = () => store.order.map((hash) => store.tracks.get(hash)).filter(Boolean);
 export const LIBRARY_LINK = { href: "#/library", text: "Back to Library" };
 
 /**
@@ -37,13 +36,17 @@ export function collectionHeader(cfg, all, rows, narrowed) {
   ]);
 }
 
+/** The link back to the page this one belongs to. */
+export const backLink = (href, text) => h("a", { class: "back", href }, [icon("left", "sm"), text]);
+
 /**
  * A collection page drawn into `root`: back link, header, pane. Returns the router's cleanup.
- * o.back: { href, text }. o.header: collectionHeader's cfg. o.pane: narrowedTracks' options
- * (the page adds onChange, which redraws the header from the pane's displayed rows).
+ * o.back: { href, text }. o.tools: nodes shown at the right end of the back link's row, if any.
+ * o.header: collectionHeader's cfg. o.pane: narrowedTracks' options (the page adds onChange,
+ * which redraws the header from the pane's displayed rows).
  */
 export function collectionPage(root, o) {
-  root.appendChild(h("a", { class: "back", href: o.back.href }, [icon("left", "sm"), o.back.text]));
+  root.appendChild(h("div", { class: "coll-bar" }, [backLink(o.back.href, o.back.text), ...(o.tools || [])]));
   const head = h("div");
   root.appendChild(head);
   const pane = narrowedTracks({

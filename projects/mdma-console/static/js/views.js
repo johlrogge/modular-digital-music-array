@@ -1,7 +1,7 @@
 // Home and Library views. Library has the tabs Tracks / Albums / Artists / Playlists; only Tracks
 // is fully built here, the other tabs show a plain card grid that the browsing phase replaces.
 // lists.js and narrow.js supply the rows, cards and the narrowing bar.
-import { h, icon, route, routeFallback, appInfo, store, onView, enc, plural } from "./core.js";
+import { h, icon, route, routeFallback, appInfo, store, catalogue, onView, enc, plural } from "./core.js";
 import { art } from "./art.js";
 import { groupAlbums, groupArtists, sortTracks, collate, visiblePlaylists, coverOf } from "./logic.js";
 import { pagedList, thead, bulkBar, emptyNote, albumCard, artistCard, playlistCard, playlistTracks, recentAlbums } from "./lists.js";
@@ -15,8 +15,6 @@ function greeting(hour) {
   if (hour < 18) return "Good afternoon";
   return "Good evening";
 }
-
-const catalogue = () => store.order.map((hash) => store.tracks.get(hash)).filter(Boolean);
 
 function topbar(title, sub) {
   return h("div", { class: "topbar" }, [

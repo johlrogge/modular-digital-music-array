@@ -457,7 +457,8 @@ export const FILTERS_EMPTY_NOTE = ["Nothing matches these filters", "Try a wider
  *
  * Returns { el, refresh({ bar, keep }), focus(), dispose() }. `el` holds the bar: put it in the
  * view. refresh({ bar: true }) rebuilds the bar too (badge, chips, text); { keep: true } tells
- * render this is the same query with new data, so keep rows and scroll. The controller also
+ * render this is the same query with new data, so keep rows and scroll. refresh returns a promise
+ * that resolves once the newest refresh has drawn. The controller also
  * refreshes by itself when its key's filters change ("filters") and, with o.sort, on "sort".
  */
 export function narrowedView(o) {
@@ -469,7 +470,20 @@ export function narrowedView(o) {
   let barEl = null;
   let toastedFor = null; // the query state whose failure was already toasted
 
-  async function refresh({ bar = false, keep = false } = {}) {
+  let last = Promise.resolve(); // the newest run
+
+  /**
+   * Resolves when the newest refresh has drawn (or the view is gone): a refresh that a newer one
+   * supersedes waits for that one, so what follows it sees the final rows.
+   */
+  function refresh(opts) {
+    const mine = run(opts);
+    last = mine;
+    const settle = (p) => p.then(() => (last === p ? undefined : settle(last)));
+    return settle(mine);
+  }
+
+  async function run({ bar = false, keep = false } = {}) {
     if (!alive) return;
     const fresh = next();
     if (bar || !barEl) {

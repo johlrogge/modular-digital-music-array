@@ -540,7 +540,9 @@ pub struct EditRequest {
 }
 
 /// `POST /api/queue/edit {expect, queue}`: replace Up next with `queue` if it still equals
-/// `expect`; otherwise 409 `{error, queue: current}` and nothing is touched.
+/// `expect`; otherwise 409 `{error, queue: current}` and nothing is touched. A change answers 200
+/// `{queue, previous}` (the queue it replaced, for Undo); an edit that leaves the queue as it is,
+/// once the hashes are resolved, sends nothing and answers `{queue}` with no `previous`.
 pub async fn queue_edit(
     State(state): State<Arc<AppState>>,
     Json(req): Json<EditRequest>,
@@ -560,17 +562,24 @@ pub async fn queue_edit(
                 );
             }
             let requested: Vec<ContentHash> = req.queue.into_iter().map(ContentHash::new).collect();
-            let entries = match resolve_for_queue_replace(&resolver, &queue, &requested) {
-                Ok(full) => queue_entries(full),
+            let full = match resolve_for_queue_replace(&resolver, &queue, &requested) {
+                Ok(full) => full,
                 Err(reply) => return reply,
             };
+            // Compared after resolution, so a short hash naming the same track is no change. An
+            // edit that changes nothing writes nothing and has no `previous`: nothing to undo.
+            let resolved: Vec<ContentHash> = full.iter().cloned().map(Into::into).collect();
+            if resolved == queue {
+                return (StatusCode::OK, serde_json::json!({ "queue": current }));
+            }
+            let entries = queue_entries(full);
             if let Err(failure) = send(client, &Command::QueueReplace { entries }) {
                 return playback_failed(&failure);
             }
             match queue_of(client) {
                 Ok(queue) => (
                     StatusCode::OK,
-                    serde_json::json!({ "queue": strings(&queue) }),
+                    serde_json::json!({ "queue": strings(&queue), "previous": current }),
                 ),
                 Err(failure) => playback_failed(&failure),
             }
@@ -1210,8 +1219,29 @@ mod tests {
         .await;
         assert_eq!(res.status(), StatusCode::OK);
         assert_eq!(described(&gw), ["list", &format!("replace {B}"), "list"]);
-        // The fake playback lists the same scripted queue after the replace.
-        assert_eq!(body_json(res).await, json!({"queue": [A, B]}));
+        // The fake playback lists the same scripted queue after the replace; `previous` is the
+        // queue the edit replaced.
+        assert_eq!(
+            body_json(res).await,
+            json!({"queue": [A, B], "previous": [A, B]})
+        );
+    }
+
+    #[tokio::test]
+    async fn an_identity_queue_edit_sends_no_replace_and_has_no_previous() {
+        // The second case names the same track by a short hash: equal after resolution.
+        for requested in [json!([A, B]), json!([SHORT_A, B])] {
+            let gw = playback_script(Some(X), &[A, B], never);
+            let res = send_post_json(
+                test_app_with(gw.addr()),
+                "/api/queue/edit",
+                &json!({"expect": [A, B], "queue": requested.clone()}),
+            )
+            .await;
+            assert_eq!(res.status(), StatusCode::OK);
+            assert_eq!(body_json(res).await, json!({"queue": [A, B]}));
+            assert_eq!(described(&gw), ["list"], "{requested}");
+        }
     }
 
     #[tokio::test]

@@ -125,7 +125,16 @@ fn revert(handler: &Handler, version: &PlaylistVersion, to: &StoredPlaylist) -> 
 struct Done {
     snapshot: PlaylistSnapshot,
     skipped: Vec<Skipped>,
-    previous: StoredPlaylist,
+    previous: Option<StoredPlaylist>,
+}
+
+impl Done {
+    /// The file as it was before an edit that wrote: what Undo sends back.
+    fn undo_point(&self) -> &StoredPlaylist {
+        self.previous
+            .as_ref()
+            .expect("an edit that wrote has a previous")
+    }
 }
 
 fn applied(response: LibraryResponse) -> Done {
@@ -229,7 +238,7 @@ pub fn applied_edit_reports_the_version_of_the_new_bytes(setup: Setup) {
         ]
     );
     assert!(done.skipped.is_empty());
-    assert_eq!(done.previous.as_str(), content());
+    assert_eq!(done.undo_point().as_str(), content());
 }
 
 pub fn lines_an_edit_did_not_touch_stay_byte_identical(setup: Setup) {
@@ -293,11 +302,31 @@ pub fn an_edit_that_skips_everything_changes_nothing(setup: Setup) {
         }]
     );
     assert_eq!(done.snapshot, before);
-    assert_eq!(done.previous.as_str(), content());
+    assert_eq!(
+        done.previous, None,
+        "nothing was written, so nothing to undo"
+    );
     assert_eq!(bytes(&handler), content());
 
     let done = applied(edit(&handler, &before.version, vec![]));
     assert_eq!(done.snapshot, before);
+    assert_eq!(
+        done.previous, None,
+        "nothing was written, so nothing to undo"
+    );
+    assert_eq!(bytes(&handler), content());
+
+    // A move onto the entry's own place is an identity edit too.
+    let done = applied(edit(
+        &handler,
+        &before.version,
+        vec![EditOp::Move { from: 1, to: 1 }],
+    ));
+    assert_eq!(done.snapshot, before);
+    assert_eq!(
+        done.previous, None,
+        "nothing was written, so nothing to undo"
+    );
     assert_eq!(bytes(&handler), content());
 }
 
@@ -331,13 +360,21 @@ pub fn revert_restores_the_exact_bytes_and_its_own_previous_redoes_the_edit(setu
     ));
     let edited_bytes = bytes(&handler);
 
-    let undone = applied(revert(&handler, &edited.snapshot.version, &edited.previous));
+    let undone = applied(revert(
+        &handler,
+        &edited.snapshot.version,
+        edited.undo_point(),
+    ));
     assert_eq!(bytes(&handler), content());
     assert_eq!(undone.snapshot.version, v0);
     assert!(undone.skipped.is_empty());
-    assert_eq!(undone.previous.as_str(), edited_bytes);
+    assert_eq!(undone.undo_point().as_str(), edited_bytes);
 
-    let redone = applied(revert(&handler, &undone.snapshot.version, &undone.previous));
+    let redone = applied(revert(
+        &handler,
+        &undone.snapshot.version,
+        undone.undo_point(),
+    ));
     assert_eq!(bytes(&handler), edited_bytes);
     assert_eq!(redone.snapshot.version, edited.snapshot.version);
 }
@@ -492,7 +529,7 @@ pub fn a_crlf_playlist_keeps_its_bytes_through_read_and_edit(setup: Setup) {
             track_b1()
         )
     );
-    assert_eq!(done.previous.as_str(), crlf_content());
+    assert_eq!(done.undo_point().as_str(), crlf_content());
 }
 
 pub fn append_joins_on_a_line_break(setup: Setup) {

@@ -8,6 +8,7 @@ import "./narrow.js";
 import "./views.js";
 import "./collections.js";
 import "./playlist.js";
+import "./workbench.js";
 import "./settings.js";
 
 startRouter();

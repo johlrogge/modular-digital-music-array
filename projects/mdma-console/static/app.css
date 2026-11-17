@@ -146,6 +146,9 @@ main{padding:0 var(--gutter) calc(var(--tabbar-h) + var(--bar-h) + 40px + env(sa
 .btn{display:inline-flex;align-items:center;justify-content:center;gap:var(--s-2);min-height:44px;padding:0 18px;border-radius:var(--r-sm);font-weight:600;font-size:var(--fs-sm);background:var(--surface-2);color:var(--text);box-shadow:inset 0 0 0 1px var(--line);transition:background .16s,transform .16s}
 .btn:hover{background:var(--line)}
 .btn:active{transform:scale(.98)}
+.btn[disabled]{opacity:.35;cursor:default}
+.over{box-shadow:inset 0 2px 0 var(--accent-strong)}
+.over.below{box-shadow:inset 0 -2px 0 var(--accent-strong)}
 .btn.primary{background:var(--accent);color:var(--accent-ink);box-shadow:none}
 .btn.primary:hover{filter:brightness(1.06)}
 .btn.ghost{background:none;color:var(--text-2);box-shadow:none}
@@ -265,9 +268,8 @@ input[type=range].slider:disabled{cursor:default;opacity:.5}
 .qrow{display:grid;grid-template-columns:auto auto 1fr auto;gap:var(--s-3);align-items:center;padding:6px var(--s-1) 6px 0;border-radius:var(--r-sm);background:var(--surface);transition:background .16s,transform .2s var(--ease),opacity .2s}
 .side .qrow{background:transparent}
 .qrow:hover{background:var(--surface-2)}
-.qrow.dragging{opacity:.5}
-.qrow.over{box-shadow:inset 0 2px 0 var(--accent-strong)}
-.qrow .handle{width:32px;height:44px;display:grid;place-items:center;color:var(--text-3);cursor:grab;touch-action:none}
+.dragging{opacity:.5}
+.handle{width:32px;height:44px;display:grid;place-items:center;color:var(--text-3);cursor:grab;touch-action:none}
 .qrow .art{width:44px;border-radius:var(--r-xs);font-size:var(--fs-sm);padding:5px}
 .qrow .t{font-weight:500;font-size:var(--fs-sm);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .qrow .m{font-size:var(--fs-xs);color:var(--text-2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -418,14 +420,14 @@ details.more summary{cursor:pointer;min-height:44px;display:flex;align-items:cen
 .coll{display:grid;grid-template-columns:minmax(120px,200px) 1fr;gap:var(--s-5);align-items:end;margin:var(--s-2) 0 var(--s-3)}
 .coll .art{width:100%;font-size:3.5rem}
 .coll .art.round{font-size:3rem}
-.coll h1{margin:4px 0 2px;font-size:var(--fs-3xl);line-height:1.05;letter-spacing:-.03em;font-weight:800}
+.coll h1,.wb-head h1{margin:4px 0 2px;font-size:var(--fs-3xl);line-height:1.05;letter-spacing:-.03em;font-weight:800}
 .coll .sub{color:var(--text-2);font-size:var(--fs-sm)}
 .coll .sub a{color:var(--text);text-decoration:none;font-weight:600}
 .coll .btn-row{margin-top:var(--s-4)}
 @media (max-width:599px){
   .coll{grid-template-columns:1fr;gap:var(--s-4)}
   .coll .art{width:min(64vw,240px)}
-  .coll h1{font-size:var(--fs-2xl)}
+  .coll h1,.wb-head h1{font-size:var(--fs-2xl)}
 }
 .idle-note{font-family:var(--font-mono);font-size:var(--fs-xs);letter-spacing:.06em;text-transform:uppercase;color:var(--text-3);margin-top:var(--s-2)}
 
@@ -471,4 +473,23 @@ details.more summary{cursor:pointer;min-height:44px;display:flex;align-items:cen
 /* == lists == */
 /* == narrow == */
 /* == collections == */
+.coll-bar{display:flex;align-items:center;justify-content:space-between;gap:var(--s-2)}
 /* == settings == */
+/* == workbench == */
+.wb-head{margin:var(--s-2) 0 var(--s-3)}
+.wb-bar{display:flex;flex-wrap:wrap;align-items:center;gap:var(--s-2);margin-bottom:var(--s-2)}
+.wb-bar .seg{margin-right:auto}
+.wb-pane h2{margin:var(--s-3) 0 0;font-size:var(--fs-lg)}
+.wb-pane h2 .kicker{margin-left:var(--s-2)}
+/* The panes are narrow: every row is the compact three-column row, whatever the screen. */
+.wb .trow,.wb .trow.numbered{grid-template-columns:auto minmax(0,1fr) auto}
+.wb .trow .c,.wb .trow .qa,.wb .thead{display:none}
+.wb .trow .m .tech{display:inline}
+.wb .trow[draggable="true"]{cursor:grab}
+@media (min-width:1024px){
+  .wb{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:var(--s-5);align-items:start}
+  .wb-bar .seg{display:none}
+}
+@media (max-width:1023px){
+  .wb[data-show="lib"] [data-pane="pl"],.wb[data-show="pl"] [data-pane="lib"]{display:none}
+}
