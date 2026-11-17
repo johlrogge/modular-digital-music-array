@@ -80,8 +80,10 @@ fn build_identity(node_id: Option<&str>, node_name: Option<&str>) -> NodeIdentit
     }
 }
 
-/// How long a request to a backend may wait to be sent.
-const BACKEND_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a request to a backend may wait to be sent: that is, to find a
+/// connection. Shorter than the clients' 5s request timeout, so the gateway can
+/// replace a dead socket and retry once before a client gives up.
+const BACKEND_SEND_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// How long a reply to a client may wait to be sent, so a client that never
 /// accepts its reply cannot hold a worker.
@@ -110,19 +112,20 @@ const SOURCE_RECV_TIMEOUT: Duration = Duration::from_secs(60);
 /// leaves ample headroom while bounding threads and contexts on the Pi.
 const MAX_CONCURRENT_REQUESTS: usize = 16;
 
-/// A backend: a Req0 socket plus how long a reply from it may take.
+/// A backend: a Req0 socket dialled to a service.
 ///
 /// Every request uses its own Req0 context on the socket, so concurrent requests to
 /// the same backend do not serialise and each reply reaches the request that asked.
 #[derive(Clone)]
 struct Backend {
     socket: nng::Socket,
-    recv_timeout: Duration,
+    /// Lets a test kill the dialer, the state a restarting listener can leave behind.
+    #[cfg(test)]
+    dialer: nng::Dialer,
 }
 
-/// Connect a Req0 socket to a backend with reconnect options. `recv_timeout` is how
-/// long a reply may take.
-fn connect_backend(address: &str, recv_timeout: Duration) -> Result<Backend, nng::Error> {
+/// Connect a Req0 socket to a backend with reconnect options.
+fn connect_backend(address: &str) -> Result<Backend, nng::Error> {
     let socket = nng::Socket::new(nng::Protocol::Req0)?;
 
     // Set reconnect options on the socket before dialing
@@ -133,13 +136,125 @@ fn connect_backend(address: &str, recv_timeout: Duration) -> Result<Backend, nng
     // source operations are not idempotent, so never resend.
     socket.set_opt::<nng::options::protocol::reqrep::ResendTime>(None)?;
 
-    // Nonblocking dial — will reconnect automatically
-    socket.dial_async(address)?;
+    // Nonblocking dial. NNG's dialer is not trusted to reconnect for good (it stops
+    // for good after a connect that ends in `Closed`), so `BackendSlot` replaces the
+    // whole socket on a connection failure.
+    let _dialer = nng::Dialer::new(&socket, address, true)?;
 
     Ok(Backend {
         socket,
-        recv_timeout,
+        #[cfg(test)]
+        dialer: _dialer,
     })
+}
+
+/// The connection to one service, made on first use (`get`; `main` warms the core
+/// slots at startup) and replaced after a connection failure, with the timeouts
+/// that apply to it.
+///
+/// The lock is held only to clone or swap the socket handle, never during I/O, so
+/// requests to one backend still run alongside each other.
+struct BackendSlot {
+    address: String,
+    send_timeout: Duration,
+    recv_timeout: Duration,
+    current: Mutex<Option<Backend>>,
+}
+
+impl BackendSlot {
+    fn new(address: String, send_timeout: Duration, recv_timeout: Duration) -> Self {
+        Self {
+            address,
+            send_timeout,
+            recv_timeout,
+            current: Mutex::new(None),
+        }
+    }
+
+    /// A slot for a core service, with the standard timeouts.
+    fn service(address: &str) -> Self {
+        Self::new(
+            address.to_string(),
+            BACKEND_SEND_TIMEOUT,
+            SERVICE_RECV_TIMEOUT,
+        )
+    }
+
+    /// A slot for a source, which may take long to answer.
+    fn source(address: String) -> Self {
+        Self::new(address, BACKEND_SEND_TIMEOUT, SOURCE_RECV_TIMEOUT)
+    }
+
+    /// The current connection, made now if there is none.
+    fn get(&self) -> Result<Backend, nng::Error> {
+        let mut current = self.current.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(backend) = current.as_ref() {
+            return Ok(backend.clone());
+        }
+        let backend = connect_backend(&self.address)?;
+        *current = Some(backend.clone());
+        Ok(backend)
+    }
+
+    /// Drop `backend`, unless another worker has already replaced it with a newer
+    /// connection.
+    fn forget(&self, backend: &Backend) {
+        let mut current = self.current.lock().unwrap_or_else(|e| e.into_inner());
+        if current
+            .as_ref()
+            .is_some_and(|held| held.socket == backend.socket)
+        {
+            *current = None;
+        }
+    }
+
+    /// One attempt: forward on the current connection, forgetting it if the
+    /// connection looks broken.
+    fn attempt(
+        &self,
+        request_bytes: &[u8],
+        recv_timeout: Duration,
+    ) -> Result<Vec<u8>, ForwardError> {
+        let backend = self.get().map_err(ForwardError::Send)?;
+        let result = forward_raw(&backend, request_bytes, self.send_timeout, recv_timeout);
+        if result
+            .as_ref()
+            .is_err_and(ForwardError::is_connection_failure)
+        {
+            self.forget(&backend);
+        }
+        result
+    }
+
+    /// Forward a serialized request and return the raw response bytes, waiting at
+    /// most `recv_timeout` for the reply.
+    ///
+    /// A `Send` failure is safe to resend once on a fresh socket: in nng 1.4 req0 a
+    /// send completes only when the message is assigned to a pipe
+    /// (`req0_run_send_queue`), and a send that fails was withdrawn from the queue
+    /// (`req0_ctx_cancel_send`), so the service never saw it. A `Recv` failure is
+    /// never retried: the service may have acted on the request.
+    fn exchange_within(
+        &self,
+        request_bytes: &[u8],
+        recv_timeout: Duration,
+    ) -> Result<Vec<u8>, ForwardError> {
+        match self.attempt(request_bytes, recv_timeout) {
+            Err(ForwardError::Send(_)) => self.attempt(request_bytes, recv_timeout),
+            result => result,
+        }
+    }
+
+    /// [`exchange_within`](Self::exchange_within) the slot's own reply timeout.
+    fn exchange(&self, request_bytes: &[u8]) -> Result<Vec<u8>, ForwardError> {
+        self.exchange_within(request_bytes, self.recv_timeout)
+    }
+
+    /// Kill the dialer of the current connection (the dead-dialer state).
+    #[cfg(test)]
+    fn close_dialer(&self) {
+        self.get().unwrap().dialer.close();
+    }
 }
 
 /// An NNG context with its own `Aio`, driven synchronously by one thread.
@@ -197,7 +312,8 @@ impl ForwardError {
     fn is_connection_failure(&self) -> bool {
         matches!(
             self,
-            ForwardError::Send(_) | ForwardError::Recv(nng::Error::Closed)
+            ForwardError::Send(_)
+                | ForwardError::Recv(nng::Error::Closed | nng::Error::ConnectionReset)
         )
     }
 }
@@ -212,39 +328,32 @@ impl std::fmt::Display for ForwardError {
 }
 
 /// Forward a serialized request to a backend and return the raw response bytes,
-/// waiting at most `recv_timeout` for the reply.
+/// waiting at most `send_timeout` to send and `recv_timeout` for the reply.
 /// Uses a fresh Req0 context, so other requests to the same backend run alongside.
 fn forward_raw(
     backend: &Backend,
     request_bytes: &[u8],
+    send_timeout: Duration,
     recv_timeout: Duration,
 ) -> Result<Vec<u8>, ForwardError> {
     let io = BlockingContext::new(&backend.socket).map_err(ForwardError::Send)?;
-    io.send(
-        nng::Message::from(request_bytes),
-        Some(BACKEND_SEND_TIMEOUT),
-    )
-    .map_err(ForwardError::Send)?;
+    io.send(nng::Message::from(request_bytes), Some(send_timeout))
+        .map_err(ForwardError::Send)?;
 
     let response_msg = io.recv(Some(recv_timeout)).map_err(ForwardError::Recv)?;
 
     Ok(response_msg.as_slice().to_vec())
 }
 
-/// A failed typed forward: the error envelope for the client, and whether the
-/// connection should be dropped from the source cache.
-struct ForwardFailure {
-    response: GatewayResponse,
-    drop_connection: bool,
-}
-
-/// Serialize a request, forward it to a backend (waiting `backend.recv_timeout`),
-/// and deserialize the typed response.
-fn forward_typed<Req, Resp>(
-    backend: &Backend,
+/// Serialize a request, forward it through `slot` (waiting its reply timeout),
+/// and wrap the typed response with `wrap`. A failure becomes the error envelope
+/// for the client. The one forwarding path for every backend.
+fn forward_via<Req, Resp>(
+    slot: &BackendSlot,
     request: &Req,
     service_name: &str,
-) -> Result<Resp, Box<ForwardFailure>>
+    wrap: impl FnOnce(Resp) -> GatewayResponse,
+) -> GatewayResponse
 where
     Req: Serialize,
     Resp: DeserializeOwned,
@@ -252,34 +361,32 @@ where
     let request_bytes = serde_json::to_vec(request)
         .expect("request serialization must not fail for well-formed protocol types");
 
-    let resp_bytes = forward_raw(backend, &request_bytes, backend.recv_timeout).map_err(|e| {
-        Box::new(ForwardFailure {
-            drop_connection: e.is_connection_failure(),
-            response: GatewayResponse::Error {
+    let resp_bytes = match slot.exchange(&request_bytes) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            return GatewayResponse::Error {
                 message: format!("{} service unreachable: {}", service_name, e),
-            },
-        })
-    })?;
+            }
+        }
+    };
 
-    serde_json::from_slice(&resp_bytes).map_err(|e| {
-        Box::new(ForwardFailure {
-            drop_connection: false,
-            response: GatewayResponse::Error {
-                message: format!("{} response parse error: {}", service_name, e),
-            },
-        })
-    })
+    match serde_json::from_slice(&resp_bytes) {
+        Ok(response) => wrap(response),
+        Err(e) => GatewayResponse::Error {
+            message: format!("{} response parse error: {}", service_name, e),
+        },
+    }
 }
 
 /// Connections to source services, made on demand and shared by all workers.
-type SourceCache = Mutex<HashMap<String, Backend>>;
+type SourceCache = Mutex<HashMap<String, Arc<BackendSlot>>>;
 
-/// Get or create a cached connection to a source service.
+/// Get or create the connection slot of a source service.
 fn get_or_connect_source(
     sources_dir: &Path,
     name: &str,
     cache: &SourceCache,
-) -> Result<Backend, String> {
+) -> Result<Arc<BackendSlot>, String> {
     // Validate source name (prevent path traversal)
     if name.contains('/') || name.contains("..") || name.contains('\0') {
         return Err(format!("invalid source name: {}", name));
@@ -287,21 +394,24 @@ fn get_or_connect_source(
 
     // The lock is held only for the lookup/insert, never while talking to a source.
     let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(backend) = cache.get(name) {
-        return Ok(backend.clone());
-    }
 
+    // A source whose socket file is gone has stopped: evict its slot.
     let socket_path = sources_dir.join(format!("{}.sock", name));
     if !socket_path.exists() {
+        cache.remove(name);
         return Err(format!("source '{}' not found", name));
     }
 
-    let address = format!("ipc://{}", socket_path.display());
-    let backend = connect_backend(&address, SOURCE_RECV_TIMEOUT)
-        .map_err(|e| format!("failed to connect to source '{}': {}", name, e))?;
+    if let Some(slot) = cache.get(name) {
+        return Ok(Arc::clone(slot));
+    }
 
-    cache.insert(name.to_string(), backend.clone());
-    Ok(backend)
+    let slot = Arc::new(BackendSlot::source(format!(
+        "ipc://{}",
+        socket_path.display()
+    )));
+    cache.insert(name.to_string(), Arc::clone(&slot));
+    Ok(slot)
 }
 
 /// Scan the sources directory for available source sockets.
@@ -368,6 +478,15 @@ fn spawn_event_bridge(event_pub: Arc<nng::Socket>, source_addr: String) {
     });
 }
 
+/// A core service's slot, connected now so a misconfigured address fails at startup.
+fn core_slot(name: &str, address: &str) -> Result<BackendSlot> {
+    let slot = BackendSlot::service(address);
+    slot.get()
+        .map_err(|e| color_eyre::eyre::eyre!("Failed to connect to {}: {}", name, e))?;
+    tracing::info!(address = %address, "Connected to {} backend", name);
+    Ok(slot)
+}
+
 fn main() -> Result<()> {
     color_eyre::install()?;
 
@@ -407,23 +526,6 @@ fn main() -> Result<()> {
     tracing::info!(address = %args.listen, "Gateway listening");
     tracing::info!(address = %args.event_listen, "Event publishing on TCP");
 
-    // Connect to core backends
-    let library_backend = connect_backend(&args.library_socket, SERVICE_RECV_TIMEOUT)
-        .map_err(|e| color_eyre::eyre::eyre!("Failed to connect to library: {}", e))?;
-    tracing::info!(address = %args.library_socket, "Connected to library backend");
-
-    let playback_backend = connect_backend(&args.playback_socket, SERVICE_RECV_TIMEOUT)
-        .map_err(|e| color_eyre::eyre::eyre!("Failed to connect to playback: {}", e))?;
-    tracing::info!(address = %args.playback_socket, "Connected to playback backend");
-
-    let acid_backend = connect_backend(&args.acid_socket, SERVICE_RECV_TIMEOUT)
-        .map_err(|e| color_eyre::eyre::eyre!("Failed to connect to acid: {}", e))?;
-    tracing::info!(address = %args.acid_socket, "Connected to acid backend");
-
-    let admin_backend = connect_backend(&args.admin_socket, SERVICE_RECV_TIMEOUT)
-        .map_err(|e| color_eyre::eyre::eyre!("Failed to connect to admin: {}", e))?;
-    tracing::info!(address = %args.admin_socket, "Connected to admin backend");
-
     // Bridge playback events (playback/ topic)
     spawn_event_bridge(Arc::clone(&event_pub), args.event_source.clone());
 
@@ -432,10 +534,10 @@ fn main() -> Result<()> {
 
     let gateway = Arc::new(Gateway {
         identity,
-        library: library_backend,
-        playback: playback_backend,
-        acid: acid_backend,
-        admin: admin_backend,
+        library: core_slot("library", &args.library_socket)?,
+        playback: core_slot("playback", &args.playback_socket)?,
+        acid: core_slot("acid", &args.acid_socket)?,
+        admin: core_slot("admin", &args.admin_socket)?,
         sources_dir: args.sources_dir.clone(),
         source_cache: Mutex::new(HashMap::new()),
     });
@@ -451,43 +553,24 @@ fn main() -> Result<()> {
 /// Everything needed to answer a request: backends, source discovery and identity.
 struct Gateway {
     identity: NodeIdentity,
-    library: Backend,
-    playback: Backend,
-    acid: Backend,
-    admin: Backend,
+    library: BackendSlot,
+    playback: BackendSlot,
+    acid: BackendSlot,
+    admin: BackendSlot,
     sources_dir: PathBuf,
     source_cache: SourceCache,
 }
 
 impl Gateway {
-    /// Drop `backend` from the source cache, unless another worker has already
-    /// replaced it with a newer connection.
-    fn forget_source(&self, name: &str, backend: &Backend) {
-        let mut cache = self.source_cache.lock().unwrap_or_else(|e| e.into_inner());
-        if cache
-            .get(name)
-            .is_some_and(|cached| cached.socket == backend.socket)
-        {
-            cache.remove(name);
-        }
-    }
-
     /// Whether the named source answers a ping within `SOURCE_PING_TIMEOUT`.
     fn source_answers_ping(&self, name: &str) -> bool {
-        let Ok(backend) = get_or_connect_source(&self.sources_dir, name, &self.source_cache) else {
+        let Ok(slot) = get_or_connect_source(&self.sources_dir, name, &self.source_cache) else {
             return false;
         };
         let ping_bytes = serde_json::to_vec(&SourceRequest::Ping)
             .expect("SourceRequest::Ping serialization must not fail");
-        match forward_raw(&backend, &ping_bytes, SOURCE_PING_TIMEOUT) {
-            Ok(_) => true,
-            Err(e) => {
-                if e.is_connection_failure() {
-                    self.forget_source(name, &backend);
-                }
-                false
-            }
-        }
+        slot.exchange_within(&ping_bytes, SOURCE_PING_TIMEOUT)
+            .is_ok()
     }
 
     /// Answer one request envelope. Blocks while waiting for the backend, so it
@@ -500,52 +583,39 @@ impl Gateway {
 
         match envelope {
             GatewayRequest::Library { request } => {
-                match forward_typed(&self.library, &request, "library") {
-                    Ok(resp) => GatewayResponse::Library { response: resp },
-                    Err(e) => e.response,
-                }
+                forward_via(&self.library, &request, "library", |response| {
+                    GatewayResponse::Library { response }
+                })
             }
 
             GatewayRequest::Playback { request } => {
-                match forward_typed(&self.playback, &request, "playback") {
-                    Ok(resp) => GatewayResponse::Playback { response: resp },
-                    Err(e) => e.response,
-                }
+                forward_via(&self.playback, &request, "playback", |response| {
+                    GatewayResponse::Playback { response }
+                })
             }
 
             GatewayRequest::Source { name, request } => {
                 match get_or_connect_source(&self.sources_dir, name.as_str(), &self.source_cache) {
-                    Ok(backend) => {
+                    Ok(slot) => {
                         let svc = format!("source '{}'", name);
-                        match forward_typed::<_, SourceResponse>(&backend, &request, &svc) {
-                            Ok(resp) => GatewayResponse::Source {
-                                name,
-                                response: resp,
-                            },
-                            Err(e) => {
-                                if e.drop_connection {
-                                    self.forget_source(name.as_str(), &backend);
-                                }
-                                e.response
-                            }
-                        }
+                        forward_via::<_, SourceResponse>(&slot, &request, &svc, |response| {
+                            GatewayResponse::Source { name, response }
+                        })
                     }
                     Err(e) => GatewayResponse::Error { message: e },
                 }
             }
 
             GatewayRequest::Acid { request } => guard_acid(&request, |req| {
-                match forward_typed(&self.acid, req, "acid") {
-                    Ok(resp) => GatewayResponse::Acid { response: resp },
-                    Err(e) => e.response,
-                }
+                forward_via(&self.acid, req, "acid", |response| GatewayResponse::Acid {
+                    response,
+                })
             }),
 
             GatewayRequest::Admin { request } => {
-                match forward_typed(&self.admin, &request, "admin") {
-                    Ok(resp) => GatewayResponse::Admin { response: resp },
-                    Err(e) => e.response,
-                }
+                forward_via(&self.admin, &request, "admin", |response| {
+                    GatewayResponse::Admin { response }
+                })
             }
 
             GatewayRequest::Identify => GatewayResponse::Identity {
@@ -747,11 +817,7 @@ mod tests {
 
     #[test]
     fn backend_never_resends_requests() {
-        let backend = connect_backend(
-            "ipc:///tmp/mdma-gateway-test-no-backend.sock",
-            SOURCE_RECV_TIMEOUT,
-        )
-        .unwrap();
+        let backend = connect_backend("ipc:///tmp/mdma-gateway-test-no-backend.sock").unwrap();
         assert_eq!(
             backend
                 .socket
@@ -765,6 +831,7 @@ mod tests {
     fn connection_failures_are_send_errors_and_closed_but_not_reply_timeouts() {
         assert!(ForwardError::Send(nng::Error::TimedOut).is_connection_failure());
         assert!(ForwardError::Recv(nng::Error::Closed).is_connection_failure());
+        assert!(ForwardError::Recv(nng::Error::ConnectionReset).is_connection_failure());
         assert!(!ForwardError::Recv(nng::Error::TimedOut).is_connection_failure());
     }
 
@@ -867,13 +934,20 @@ mod tests {
 
     /// Like [`start_gateway`], with playback at `playback_address`.
     fn start_gateway_with_playback(dir: &Path, playback_address: &str) -> String {
+        let playback = BackendSlot::service(playback_address);
+        start_gateway_with(dir, playback).0
+    }
+
+    /// Like [`start_gateway`], with `playback` as the playback backend; also
+    /// returns the gateway, so a test can reach its slots.
+    fn start_gateway_with(dir: &Path, playback: BackendSlot) -> (String, Arc<Gateway>) {
         let unused = format!("ipc://{}/none.sock", dir.display());
         let gateway = Arc::new(Gateway {
             identity: build_identity(Some("test"), None),
-            library: connect_backend(&unused, SERVICE_RECV_TIMEOUT).unwrap(),
-            playback: connect_backend(playback_address, SERVICE_RECV_TIMEOUT).unwrap(),
-            acid: connect_backend(&unused, SERVICE_RECV_TIMEOUT).unwrap(),
-            admin: connect_backend(&unused, SERVICE_RECV_TIMEOUT).unwrap(),
+            library: BackendSlot::service(&unused),
+            playback,
+            acid: BackendSlot::service(&unused),
+            admin: BackendSlot::service(&unused),
             sources_dir: dir.to_path_buf(),
             source_cache: Mutex::new(HashMap::new()),
         });
@@ -888,7 +962,7 @@ mod tests {
                 let _ = w.join();
             }
         });
-        address
+        (address, gateway)
     }
 
     /// Send `request` through the gateway as a separate client.
@@ -922,11 +996,25 @@ mod tests {
         }
     }
 
+    /// A running fake playback service; `stop` closes it, like a restarting service.
+    struct FakePlayback {
+        address: String,
+        commands: std::sync::mpsc::Receiver<media_protocol::Command>,
+        socket: nng::Socket,
+        thread: std::thread::JoinHandle<()>,
+    }
+
+    impl FakePlayback {
+        /// Close the socket (so the service's recv returns `Closed`) and wait for it.
+        fn stop(self) {
+            self.socket.close();
+            self.thread.join().unwrap();
+        }
+    }
+
     /// A playback service that records the commands it parses and answers
     /// `GetTransport` with a fixed status and everything else with `Ok`.
-    fn spawn_fake_playback(
-        dir: &Path,
-    ) -> (String, std::sync::mpsc::Receiver<media_protocol::Command>) {
+    fn spawn_fake_playback(dir: &Path) -> FakePlayback {
         use media_protocol::{
             Command, PositionMs, Response, ResponseData, Transport, TransportStatus,
         };
@@ -934,8 +1022,9 @@ mod tests {
         let socket = nng::Socket::new(nng::Protocol::Rep0).unwrap();
         socket.listen(&address).unwrap();
         let (seen, commands) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            while let Ok(msg) = socket.recv() {
+        let served = socket.clone();
+        let thread = std::thread::spawn(move || {
+            while let Ok(msg) = served.recv() {
                 let command: Command = serde_json::from_slice(&msg).unwrap();
                 let response = match &command {
                     Command::GetTransport { .. } | Command::Seek { .. } => Response::Ok {
@@ -950,10 +1039,145 @@ mod tests {
                     _ => Response::Ok { data: None },
                 };
                 seen.send(command).unwrap();
-                let _ = socket.send(serde_json::to_vec(&response).unwrap().as_slice());
+                let _ = served.send(serde_json::to_vec(&response).unwrap().as_slice());
             }
         });
+        FakePlayback {
+            address,
+            commands,
+            socket,
+            thread,
+        }
+    }
+
+    /// A playback request any fake answers with `Ok`.
+    fn ask_playback(address: &str) -> GatewayResponse {
+        ask(
+            address,
+            &GatewayRequest::Playback {
+                request: media_protocol::Command::GetTransport {
+                    deck: media_protocol::Deck::A,
+                },
+            },
+        )
+    }
+
+    /// A playback slot with short timeouts, so a test does not wait out the real ones.
+    fn quick_playback_slot(address: &str) -> BackendSlot {
+        BackendSlot::new(
+            address.to_string(),
+            Duration::from_millis(300),
+            Duration::from_secs(2),
+        )
+    }
+
+    fn assert_playback_ok(reply: GatewayResponse) {
+        assert!(
+            matches!(
+                reply,
+                GatewayResponse::Playback {
+                    response: media_protocol::Response::Ok { .. }
+                }
+            ),
+            "{reply:?}"
+        );
+    }
+
+    /// A playback that reads one request, reports it and closes without replying.
+    fn spawn_fake_playback_dropping_request(
+        dir: &Path,
+    ) -> (String, std::sync::mpsc::Receiver<media_protocol::Command>) {
+        let address = format!("ipc://{}/playback.sock", dir.display());
+        let socket = nng::Socket::new(nng::Protocol::Rep0).unwrap();
+        socket.listen(&address).unwrap();
+        let (seen, commands) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let msg = socket.recv().unwrap();
+            seen.send(serde_json::from_slice(&msg).unwrap()).unwrap();
+            socket.close();
+        });
         (address, commands)
+    }
+
+    /// Safety invariant: a request that reached the service is never resent, so a
+    /// failed receive is reported and the service sees the command exactly once.
+    #[test]
+    fn a_request_the_service_took_is_not_retried_after_a_recv_failure() {
+        let dir = temp_dir("no-retry");
+        let (address, commands) = spawn_fake_playback_dropping_request(&dir);
+        let slot = BackendSlot::new(
+            address,
+            Duration::from_millis(300),
+            Duration::from_millis(500),
+        );
+        let (gateway_address, _gateway) = start_gateway_with(&dir, slot);
+
+        match ask_playback(&gateway_address) {
+            GatewayResponse::Error { message } => assert!(
+                message.starts_with("playback service unreachable: recv failed:"),
+                "{message}"
+            ),
+            other => panic!("unexpected reply: {other:?}"),
+        }
+        commands.recv().unwrap();
+        assert!(commands.try_recv().is_err(), "the request was resent");
+    }
+
+    #[test]
+    fn forget_drops_only_the_connection_it_was_given() {
+        let slot = BackendSlot::service("ipc:///tmp/mdma-gateway-test-no-backend.sock");
+        let a = slot.get().unwrap();
+        slot.forget(&a);
+        let b = slot.get().unwrap();
+        assert!(a.socket != b.socket);
+
+        slot.forget(&a);
+        assert!(
+            slot.get().unwrap().socket == b.socket,
+            "B was dropped by A's forget"
+        );
+    }
+
+    /// A source whose socket file is gone is no longer found, and its slot is evicted.
+    #[test]
+    fn a_source_whose_socket_file_is_gone_is_evicted() {
+        let dir = temp_dir("evict");
+        std::fs::write(dir.join("gone.sock"), b"").unwrap();
+        let cache: SourceCache = Mutex::new(HashMap::new());
+        get_or_connect_source(&dir, "gone", &cache).unwrap();
+        assert!(cache.lock().unwrap().contains_key("gone"));
+
+        std::fs::remove_file(dir.join("gone.sock")).unwrap();
+        let err = get_or_connect_source(&dir, "gone", &cache).err().unwrap();
+        assert_eq!(err, "source 'gone' not found");
+        assert!(cache.lock().unwrap().is_empty());
+    }
+
+    /// Regression guard for a clean restart between requests. It is not the proof
+    /// for #111: the dead-dialer test below is.
+    #[test]
+    fn playback_restart_between_requests_still_answers() {
+        let dir = temp_dir("restart");
+        let first = spawn_fake_playback(&dir);
+        let (address, _gateway) = start_gateway_with(&dir, quick_playback_slot(&first.address));
+        assert_playback_ok(ask_playback(&address));
+
+        first.stop();
+        let _second = spawn_fake_playback(&dir);
+        assert_playback_ok(ask_playback(&address));
+    }
+
+    /// #111: NNG's dialer can die for good. The next request must replace the
+    /// socket and retry once.
+    #[test]
+    fn a_dead_dialer_is_replaced_and_the_request_retried() {
+        let dir = temp_dir("dead-dialer");
+        let fake = spawn_fake_playback(&dir);
+        let (address, gateway) = start_gateway_with(&dir, quick_playback_slot(&fake.address));
+        assert_playback_ok(ask_playback(&address));
+
+        gateway.playback.close_dialer();
+        assert_playback_ok(ask_playback(&address));
     }
 
     /// ADR-017: the gateway parses and re-serialises `Command`, so a variant
@@ -964,7 +1188,11 @@ mod tests {
             Command, Deck, PositionMs, Response, ResponseData, Transport, TransportStatus,
         };
         let dir = temp_dir("transport");
-        let (playback, commands) = spawn_fake_playback(&dir);
+        let FakePlayback {
+            address: playback,
+            commands,
+            ..
+        } = spawn_fake_playback(&dir);
         let address = start_gateway_with_playback(&dir, &playback);
 
         let seek = ask(
@@ -1031,7 +1259,11 @@ mod tests {
     fn preview_and_end_preview_pass_through_the_gateway() {
         use media_protocol::{Command, ContentHash, Deck, Response};
         let dir = temp_dir("preview");
-        let (playback, commands) = spawn_fake_playback(&dir);
+        let FakePlayback {
+            address: playback,
+            commands,
+            ..
+        } = spawn_fake_playback(&dir);
         let address = start_gateway_with_playback(&dir, &playback);
         let hash = ContentHash::new(format!("sha256:{}", "b".repeat(64)));
 
