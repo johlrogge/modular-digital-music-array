@@ -196,6 +196,30 @@ fn print_event_human(event: &PlaybackEvent, library: Option<&LibraryBackend>) {
         PlaybackEvent::OutputChanged { health } => {
             println!("{} {}", "◈ output".cyan().bold(), health);
         }
+        PlaybackEvent::PreviewStarted { hash, back_to } => {
+            println!(
+                "{} {} {}",
+                "◐ preview".magenta().bold(),
+                hash.as_str().bright_black(),
+                match back_to {
+                    Some(held) => format!("(back to {})", held.as_str()),
+                    None => "(back stops)".to_string(),
+                }
+                .bright_black()
+            );
+        }
+        PlaybackEvent::PreviewEnded { hash, resumed } => {
+            println!(
+                "{} {} {}",
+                "◑ preview ended".magenta().bold(),
+                hash.as_str().bright_black(),
+                match resumed {
+                    Some(held) => format!("(back to {})", held.as_str()),
+                    None => "(stopped)".to_string(),
+                }
+                .bright_black()
+            );
+        }
     }
 }
 

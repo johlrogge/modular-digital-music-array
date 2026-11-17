@@ -17,6 +17,7 @@ pub enum Command {
         path: PathBuf,
         deck: Deck,
     },
+    /// Resume a paused track or preview; a no-op otherwise.
     Play {
         deck: Deck,
     },
@@ -50,6 +51,20 @@ pub enum Command {
     GetTransport {
         deck: Deck,
     },
+    /// Play `hash` at once without losing what is audible (ADR-031): playback
+    /// holds that track, its position and its transport, and goes back to it
+    /// when the preview ends by itself or on `EndPreview`. Previewing again
+    /// replaces the preview and keeps the hold. A preview is not a play.
+    Preview {
+        deck: Deck,
+        hash: ContentHash,
+    },
+    /// End the preview and restore what was held. A no-op when nothing is
+    /// previewing. Answers `ResponseData::NowPlaying` with the track that is
+    /// audible afterwards (`None`: nothing).
+    EndPreview {
+        deck: Deck,
+    },
     GetLength {
         deck: Deck,
     },
@@ -73,7 +88,9 @@ pub enum Command {
     QueueReplace {
         entries: Vec<(ContentHash, SourceName)>,
     },
-    /// Pop from queue head, load on deck A, and start playing.
+    /// Pop from queue head, load on deck A, and start playing. Resumes a
+    /// paused track instead; refused while previewing, whatever the queue
+    /// holds ("Previewing: go back first").
     PlayQueue,
     /// Return the hash of the track currently loaded on deck A (None if nothing playing).
     NowPlaying,
@@ -102,9 +119,11 @@ pub enum Response {
 }
 
 impl Command {
-    /// The content hashes this command carries, for the queue commands.
+    /// The content hashes this command carries, for the queue commands and
+    /// `Preview`.
     pub fn hashes_held(&self) -> Vec<&ContentHash> {
         match self {
+            Command::Preview { hash, .. } => vec![hash],
             Command::QueueAppend { hash, .. } | Command::QueueNext { hash, .. } => vec![hash],
             Command::QueueRemove { hashes } => hashes.iter().collect(),
             Command::QueueReplace { entries } => entries.iter().map(|(h, _)| h).collect(),
@@ -153,12 +172,19 @@ pub enum Transport {
     Paused,
 }
 
-/// Where the audible track would return to when a preview ends (ADR-031).
-/// Never sent until the preview hold exists.
+/// The track a preview goes back to: which, where in it, and whether it played.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Held {
+    pub hash: ContentHash,
+    pub at: PositionMs,
+    pub transport: Transport,
+}
+
+/// What a running preview goes back to (ADR-031). `back_to` is `None` when the
+/// preview started over nothing: going back stops.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PreviewStatus {
-    pub back_to: Option<ContentHash>,
-    pub back_at_ms: Option<PositionMs>,
+    pub back_to: Option<Held>,
 }
 
 /// The answer to `GetTransport`, and to a successful `Seek`. An idle deck has
@@ -175,7 +201,7 @@ pub enum TransportStatus {
         /// `None` when the source cannot say (an old source, or a failed poll).
         position_ms: Option<PositionMs>,
         duration_ms: Option<PositionMs>,
-        /// Always `None` until the preview hold (ADR-031 phase S2) exists.
+        /// `Some` while the audible track (`now`) is a preview.
         #[serde(default)]
         preview: Option<PreviewStatus>,
     },
@@ -269,6 +295,62 @@ mod tests {
         assert!(Command::GetTransport { deck: Deck::A }
             .hashes_held()
             .is_empty());
+    }
+
+    #[test]
+    fn preview_carries_a_deck_and_a_hash_that_check_canonical_covers() {
+        let hash = ContentHash::new("9fb4105e");
+        let preview = Command::Preview {
+            deck: Deck::A,
+            hash: hash.clone(),
+        };
+        let json = serde_json::to_string(&preview).unwrap();
+        assert_eq!(json, r#"{"preview":{"deck":"A","hash":"9fb4105e"}}"#);
+        assert!(matches!(
+            serde_json::from_str::<Command>(&json).unwrap(),
+            Command::Preview { deck: Deck::A, hash: h } if h == hash
+        ));
+        assert_eq!(preview.hashes_held(), vec![&hash]);
+        assert!(preview.check_canonical().is_err(), "a prefix is refused");
+        assert!(serde_json::from_str::<Command>(r#"{"preview":{"hash":"abc"}}"#).is_err());
+    }
+
+    #[test]
+    fn end_preview_requires_a_deck_and_holds_no_hash() {
+        let json = serde_json::to_string(&Command::EndPreview { deck: Deck::B }).unwrap();
+        assert_eq!(json, r#"{"end_preview":{"deck":"B"}}"#);
+        assert!(serde_json::from_str::<Command>(r#""end_preview""#).is_err());
+        assert!(Command::EndPreview { deck: Deck::A }
+            .hashes_held()
+            .is_empty());
+    }
+
+    #[test]
+    fn a_previewing_transport_names_what_it_goes_back_to() {
+        let status = TransportStatus::Loaded {
+            transport: Transport::Playing,
+            now: ContentHash::new("preview"),
+            position_ms: Some(PositionMs::new(1_000)),
+            duration_ms: None,
+            preview: Some(PreviewStatus {
+                back_to: Some(Held {
+                    hash: ContentHash::new("held"),
+                    at: PositionMs::new(90_000),
+                    transport: Transport::Paused,
+                }),
+            }),
+        };
+        let json = serde_json::to_string(&status).unwrap();
+        assert!(
+            json.contains(
+                r#""preview":{"back_to":{"hash":"held","at":90000,"transport":"paused"}}"#
+            ),
+            "{json}"
+        );
+        assert_eq!(
+            serde_json::from_str::<TransportStatus>(&json).unwrap(),
+            status
+        );
     }
 
     #[test]

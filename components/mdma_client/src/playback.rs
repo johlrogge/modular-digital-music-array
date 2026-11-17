@@ -1,8 +1,9 @@
 //! Playback backend abstraction — works in both gateway and direct mode.
 
 use media_client::{
-    into_transport, AudioOutputConfig, AudioSinkInfo, ClientError, Command, ContentHash, Deck,
-    MediaClient, PositionMs, Response, ResponseData, SourceName, TransportStatus,
+    into_now_playing, into_transport, AudioOutputConfig, AudioSinkInfo, ClientError, Command,
+    ContentHash, Deck, MediaClient, PositionMs, Response, ResponseData, SourceName,
+    TransportStatus,
 };
 
 /// Abstraction for playback commands, works in both gateway and direct mode.
@@ -92,6 +93,27 @@ impl PlaybackBackend {
                 },
                 into_transport,
             ),
+        }
+    }
+
+    /// Play `hash` (a full one) at once, holding what is audible to go back to
+    /// (ADR-031). Previewing again replaces the preview.
+    pub fn preview(&self, deck: Deck, hash: ContentHash) -> Result<(), ClientError> {
+        match self {
+            PlaybackBackend::Direct(c) => c.preview(deck, hash),
+            PlaybackBackend::Gateway(gw) => gw_command(gw, Command::Preview { deck, hash }),
+        }
+    }
+
+    /// End the preview and go back to what it held; nothing happens when no
+    /// preview runs. Answers the track that is audible afterwards (`None`:
+    /// nothing was held, so playback is idle).
+    pub fn end_preview(&self, deck: Deck) -> Result<Option<ContentHash>, ClientError> {
+        match self {
+            PlaybackBackend::Direct(c) => c.end_preview(deck),
+            PlaybackBackend::Gateway(gw) => {
+                gw_extract(gw, Command::EndPreview { deck }, into_now_playing)
+            }
         }
     }
 

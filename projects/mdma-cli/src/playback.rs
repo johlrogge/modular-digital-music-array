@@ -1,5 +1,6 @@
 use crate::ctx::Ctx;
 use crate::output::{display_error, library_error};
+use crate::preview::PreviewTarget;
 use crate::seek::SeekArg;
 use color_eyre::eyre::eyre;
 use color_eyre::Result;
@@ -68,6 +69,31 @@ pub(crate) fn seek(target: SeekArg, ctx: &Ctx) -> Result<()> {
     println!(
         "{}",
         crate::seek::run(&playback, || ctx.node().library(), target)?
+    );
+    Ok(())
+}
+
+/// Preview a track over what is playing on deck A, or go back
+///
+/// Give a HASH to hear that track at once. What was playing is held (which
+/// track, where in it, and whether it played), and playback goes back to it by
+/// itself when the preview ends. Previewing again replaces the preview and
+/// keeps what is held. `--back` goes back now. While previewing, pause, resume
+/// and seek act on the preview, skip and starting the queue are refused, and
+/// stop ends everything. A preview is not a play.
+///
+/// # Examples
+///
+/// ```sh
+/// mdma playback preview abcd1234
+/// mdma playback preview --back
+/// ```
+#[hicli::command]
+pub(crate) fn preview(target: PreviewTarget, ctx: &Ctx) -> Result<()> {
+    let playback = ctx.node().playback()?;
+    println!(
+        "{}",
+        crate::preview::run(&playback, || ctx.node().library(), target)?
     );
     Ok(())
 }
