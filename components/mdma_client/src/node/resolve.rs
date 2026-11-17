@@ -7,9 +7,11 @@
 use std::io::{BufRead, IsTerminal, Write};
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use super::NodeError;
+use super::{Answer, NodeError};
+use crate::error::connect_failure;
 use crate::ClientConfig;
 use gateway_client::{GatewayClient, IdentifyError, NodeIdentity};
 use node_discovery::{
@@ -238,7 +240,12 @@ fn verify_error_message(err: &VerifyError) -> String {
 }
 
 fn unreachable_message(node: &DiscoveredNode) -> String {
-    format!("{} ({}) did not answer.", display_name(node), ips(node))
+    format!("{}.", did_not_answer(display_name(node), &ips(node)))
+}
+
+/// `<who> (<ips>) did not answer`, the start of every text about a silent node.
+fn did_not_answer(who: &str, ips: &str) -> String {
+    format!("{who} ({ips}) did not answer")
 }
 
 fn identify_failed_message(node: &DiscoveredNode) -> String {
@@ -271,24 +278,66 @@ fn identity_mismatch_message(node: &DiscoveredNode, reported: Option<&str>) -> S
 fn identity_check(
     answer: Result<NodeIdentity, IdentifyError>,
 ) -> Result<IdentityCheck, Unreachable> {
-    use gateway_client::ClientError;
-    match answer {
-        Ok(NodeIdentity { id: Some(id), .. }) => Ok(IdentityCheck::Id(id)),
-        Ok(NodeIdentity { id: None, .. }) | Err(IdentifyError::Unsupported(_)) => {
-            Ok(IdentityCheck::Unverifiable)
-        }
-        Err(IdentifyError::Client(ClientError::Service(_))) => Ok(IdentityCheck::Failed),
-        Err(IdentifyError::Client(_)) => Err(Unreachable),
+    match Answer::from_identify(answer) {
+        Ok(Answer::Identity(NodeIdentity { id: Some(id), .. })) => Ok(IdentityCheck::Id(id)),
+        Ok(Answer::Identity(_) | Answer::Unsupported(_)) => Ok(IdentityCheck::Unverifiable),
+        Ok(Answer::Failed(_)) => Ok(IdentityCheck::Failed),
+        Err(_) => Err(Unreachable),
     }
 }
 
-/// Ask the gateway at `ip:port` who it is; connecting and the answer are each
-/// bounded by [`IDENTIFY_TIMEOUT`].
+/// Ask the gateway at `address` who it is. Connecting does not wait for the
+/// connection: the request is bounded by [`IDENTIFY_TIMEOUT`] to send and again
+/// to receive, so the call takes at most twice that, plus name resolution for a
+/// host name.
+fn identify_address(address: &str) -> Result<NodeIdentity, IdentifyError> {
+    GatewayClient::connect_with_timeout(address, IDENTIFY_TIMEOUT)
+        .map_err(IdentifyError::Client)?
+        .identify()
+}
+
+/// Ask the gateway at `ip:port` who it is, bounded as [`identify_address`].
+fn identify_raw(ip: Ipv4Addr, port: u16) -> Result<NodeIdentity, IdentifyError> {
+    identify_address(&format!("tcp://{ip}:{port}"))
+}
+
+/// Ask the gateway at `ip:port` who it is, as the resolver wants the answer.
 pub fn identify_at(ip: Ipv4Addr, port: u16) -> Result<IdentityCheck, Unreachable> {
-    let address = format!("tcp://{ip}:{port}");
-    let client =
-        GatewayClient::connect_with_timeout(&address, IDENTIFY_TIMEOUT).map_err(|_| Unreachable)?;
-    identity_check(client.identify())
+    identity_check(identify_raw(ip, port))
+}
+
+/// Ask the gateway of `target` who it is: the reachability check. Bounded as
+/// [`identify_address`]. The error is the text for the user.
+pub(super) fn probe_node(target: &RemoteTarget) -> Result<Answer, String> {
+    let address = format!("tcp://{}:{}", address_of(target), target.port);
+    probe_outcome(identify_address(&address), target)
+}
+
+/// What the answer to "who are you" says about the node at `target`. Any answer
+/// means the node is there, even "I cannot say" from an old gateway or an error
+/// from one that is unconfigured. Silence is `did not answer in time`: the dial
+/// is asynchronous, so a refused or unreachable node shows up as a timeout, never
+/// as "refused". A dial that fails outright (a bad address) and any other transport
+/// failure keep their wording.
+fn probe_outcome(
+    answer: Result<NodeIdentity, IdentifyError>,
+    target: &RemoteTarget,
+) -> Result<Answer, String> {
+    use gateway_client::ClientError;
+    Answer::from_identify(answer).map_err(|e| match e {
+        ClientError::Nng(nng::Error::TimedOut) => {
+            let ips = target
+                .ip
+                .map_or_else(|| "-".to_string(), |ip| ip.to_string());
+            format!("{} in time", did_not_answer(&target.host, &ips))
+        }
+        ClientError::Connection(e) => connect_failure("node", &e),
+        other => format!(
+            "Failed to connect to node at tcp://{}:{}: {other}",
+            address_of(target),
+            target.port
+        ),
+    })
 }
 
 fn resolve_name_fresh(host: &str) -> Option<Ipv4Addr> {
@@ -390,15 +439,44 @@ pub fn request(explicit: Option<&NodeSpec>, local_ipc: bool) -> Result<Request, 
     })
 }
 
+/// Whether resolving may ask the user to pick a node. Only the first resolution
+/// of a process may: a retry after a failure runs in the background of whatever
+/// the client is doing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Interactive {
+    Yes,
+    No,
+}
+
 /// Resolve the node once at startup, remembering it when the resolver says
 /// so. Prints a note for implicit choices; fails with advice when no node
 /// can be resolved.
+///
+/// A gateway that answered "who are you" while the resolver verified the node
+/// is a node that has been reached: its answer comes back with the target, so
+/// the reachability check does not ask again.
 pub(super) fn resolve_startup(
     explicit: Option<&NodeSpec>,
     local_ipc: bool,
     notes: Notes,
-) -> Result<Target, NodeError> {
-    match resolve(request(explicit, local_ipc)?, &mut real_effects()) {
+    interactive: Interactive,
+) -> Result<Resolved, NodeError> {
+    let request = request(explicit, local_ipc)?;
+    // The effects outlive this scope's borrows, so the answers go through a shared cell.
+    let heard: Arc<Mutex<Option<(Ipv4Addr, u16, NodeIdentity)>>> = Arc::new(Mutex::new(None));
+    let mut effects = real_effects();
+    if interactive == Interactive::No {
+        effects.is_tty = false;
+    }
+    let sink = Arc::clone(&heard);
+    effects.identify_at = Box::new(move |ip, port| {
+        let answer = identify_raw(ip, port);
+        if let Ok(identity) = &answer {
+            *sink.lock().unwrap_or_else(|p| p.into_inner()) = Some((ip, port, identity.clone()));
+        }
+        identity_check(answer)
+    });
+    match resolve(request, &mut effects) {
         Ok(resolution) => {
             if let Some(update) = &resolution.cache_update {
                 save_cache(update);
@@ -406,10 +484,31 @@ pub(super) fn resolve_startup(
             if let Some(note) = note_to_print(&resolution.target, notes) {
                 eprintln!("{note}");
             }
-            Ok(resolution.target)
+            let answer = match (
+                &resolution.target,
+                heard.lock().ok().and_then(|h| h.clone()),
+            ) {
+                (Target::Remote(remote), Some((ip, port, identity)))
+                    if remote.ip == Some(ip) && remote.port == port =>
+                {
+                    Some(Answer::Identity(identity))
+                }
+                _ => None,
+            };
+            Ok(Resolved {
+                target: resolution.target,
+                answer,
+            })
         }
         Err(e) => Err(NodeError::Resolve(e)),
     }
+}
+
+/// A resolved node, and what its gateway said if the resolver asked it.
+#[derive(Debug)]
+pub struct Resolved {
+    pub target: Target,
+    pub answer: Option<Answer>,
 }
 
 #[cfg(test)]
@@ -453,7 +552,7 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let original = std::env::var_os(NODE_ENV);
         std::env::set_var(NODE_ENV, "mdma.local:nope");
-        let result = resolve_startup(None, false, Notes::Print);
+        let result = resolve_startup(None, false, Notes::Print, Interactive::Yes);
         match original {
             Some(value) => std::env::set_var(NODE_ENV, value),
             None => std::env::remove_var(NODE_ENV),
@@ -740,6 +839,70 @@ mod tests {
         assert_eq!(
             identity_check(Err(IdentifyError::Client(err))),
             Ok(IdentityCheck::Failed)
+        );
+    }
+
+    #[test]
+    fn an_identity_is_an_answer() {
+        assert_eq!(
+            probe_outcome(
+                Ok(identity(Some("mdma-stage"))),
+                &remote_target(Source::Cache)
+            ),
+            Ok(Answer::Identity(identity(Some("mdma-stage"))))
+        );
+    }
+
+    #[test]
+    fn an_old_gateway_is_still_an_answer() {
+        assert_eq!(
+            probe_outcome(
+                Err(IdentifyError::Unsupported("old".into())),
+                &remote_target(Source::Cache)
+            ),
+            Ok(Answer::Unsupported("old".into()))
+        );
+    }
+
+    #[test]
+    fn a_gateway_error_is_still_an_answer() {
+        let err = gateway_client::ClientError::Service("boom".into());
+        assert_eq!(
+            probe_outcome(
+                Err(IdentifyError::Client(err)),
+                &remote_target(Source::Cache)
+            ),
+            Ok(Answer::Failed("boom".into()))
+        );
+    }
+
+    #[test]
+    fn silence_says_who_did_not_answer_in_time() {
+        let err = gateway_client::ClientError::Nng(nng::Error::TimedOut);
+        assert_eq!(
+            probe_outcome(
+                Err(IdentifyError::Client(err)),
+                &remote_target(Source::Cache)
+            ),
+            Err("mdma-stage.local (192.168.0.238) did not answer in time".to_string())
+        );
+    }
+
+    #[test]
+    fn a_dial_that_fails_outright_keeps_its_wording() {
+        let err = gateway_client::ClientError::Connection(nng_transport::ConnectionError::Dial {
+            address: "tcp://192.168.0.238:5555".into(),
+            cause: nng::Error::ConnectionRefused,
+        });
+        assert_eq!(
+            probe_outcome(
+                Err(IdentifyError::Client(err)),
+                &remote_target(Source::Cache)
+            ),
+            Err(
+                "Failed to connect to node at tcp://192.168.0.238:5555: Connection refused"
+                    .to_string()
+            )
         );
     }
 

@@ -711,7 +711,10 @@ mod tests {
             crate::test_support::failure_text(mark(nothing(), &ctx)),
             crate::test_support::failure_text(unmark(nothing(), &ctx)),
         ] {
-            assert!(text.starts_with("Failed to connect to library"), "{text}");
+            assert!(
+                text.starts_with("mdma needs the node: Failed to connect to library"),
+                "{text}"
+            );
         }
     }
 

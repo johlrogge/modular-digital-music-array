@@ -9,12 +9,25 @@ use std::path::{Path, PathBuf};
 
 use hicli::Arg;
 use mdma_client::node::DEFAULT_LIBRARY_SOCKET;
-use mdma_client::NodeOptions;
+use mdma_client::{NeededBy, NodeOptions};
 use node_discovery::NodeSpec;
 
 use crate::node;
 
 pub(crate) type Ctx = mdma_client::Node;
+
+/// What needed the node when the command at `path` ran: `mdma` and the canonical
+/// command path, e.g. `mdma queue append`. A line that did not parse as a command
+/// names only the program.
+pub(crate) fn needed_by(path: Option<&[&str]>) -> NeededBy {
+    let words = path.unwrap_or_default().iter().copied();
+    NeededBy::new(
+        std::iter::once("mdma")
+            .chain(words)
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
+}
 
 /// Node hostname (e.g. mdma-909.local), optionally with a port. Also read from
 /// MDMA_NODE. Without either, the remembered or discovered node is used.
@@ -119,6 +132,16 @@ mod tests {
             failure_text(local_ctx().admin().map_err(Into::into)),
             "admin commands need a gateway; use --node (or MDMA_NODE) to name the node"
         );
+    }
+
+    #[test]
+    fn the_label_is_the_command_as_typed() {
+        assert_eq!(
+            needed_by(Some(&["queue", "append"])),
+            NeededBy::new("mdma queue append")
+        );
+        assert_eq!(needed_by(Some(&["ping"])), NeededBy::new("mdma ping"));
+        assert_eq!(needed_by(None), NeededBy::new("mdma"));
     }
 
     #[test]

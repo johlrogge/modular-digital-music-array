@@ -8,22 +8,23 @@ mod resolve;
 
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
-use std::time::Duration;
+use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::time::{Duration, Instant};
 
-use gateway_client::GatewayClient;
+use gateway_client::{GatewayClient, IdentifyError, NodeIdentity};
 use library_ipc_client::ClientError;
 use nng_transport::NngClientError;
-use node_discovery::{NodeSpec, ResolveError, Target};
+use node_discovery::{NodeSpec, RemoteTarget, ResolveError, Target};
 
 use crate::error::{connect_failure, connect_failure_text};
 use crate::{source_label, LibraryBackend, PlaybackBackend, SourceClient};
 
 pub use resolve::{
     cache_path, env_node, identify_at, ips, is_tty, load_cache, load_cache_quiet, pick_interactive,
-    real_effects, request, resolve_error_message, select_error_message, Notes, NODE_ENV,
+    real_effects, request, resolve_error_message, select_error_message, Interactive, Notes,
+    Resolved, NODE_ENV,
 };
-use resolve::{client_config, local_ipc_wanted, remote_host, resolve_startup};
+use resolve::{client_config, local_ipc_wanted, probe_node, remote_host, resolve_startup};
 
 pub const DEFAULT_LIBRARY_SOCKET: &str = "ipc:///run/mdma/library.sock";
 pub const DEFAULT_PLAYBACK_SOCKET: &str = "ipc:///run/mdma/playback.sock";
@@ -59,6 +60,13 @@ pub enum NodeError {
     /// The sources directory cannot be given to the clients as text.
     #[error("the sources directory is not valid UTF-8")]
     SourcesDirNotUtf8,
+    /// `needed_by` could not get the node, for the reason `cause`. See
+    /// [`Node::labelled`].
+    #[error("{needed_by} needs the node: {cause}")]
+    Needed {
+        needed_by: NeededBy,
+        cause: Box<NodeError>,
+    },
 }
 
 /// The options that say which node to use and where its local services are, as
@@ -75,15 +83,152 @@ pub struct NodeOptions {
     pub sources_dir: Option<PathBuf>,
 }
 
+/// What needed the node, as the user would name it ("mdma queue append",
+/// "mdma-tui"). It is set once, by whoever creates the [`Node`], and names the
+/// cause in [`NodeError::Needed`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NeededBy(String);
+
+impl NeededBy {
+    pub fn new(label: impl Into<String>) -> Self {
+        Self(label.into())
+    }
+}
+
+impl std::fmt::Display for NeededBy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// How a node's gateway answered "who are you". Any of these means the node is
+/// there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Answer {
+    /// The node's identity.
+    Identity(NodeIdentity),
+    /// The gateway is too old to say.
+    Unsupported(String),
+    /// The gateway answered with an error.
+    Failed(String),
+}
+
+impl Answer {
+    /// The answer in `result`; a failure of the transport is the error.
+    pub fn from_identify(
+        result: Result<NodeIdentity, IdentifyError>,
+    ) -> Result<Self, gateway_client::ClientError> {
+        use gateway_client::ClientError;
+        match result {
+            Ok(identity) => Ok(Self::Identity(identity)),
+            Err(IdentifyError::Unsupported(message)) => Ok(Self::Unsupported(message)),
+            Err(IdentifyError::Client(ClientError::Service(message))) => Ok(Self::Failed(message)),
+            Err(IdentifyError::Client(error)) => Err(error),
+        }
+    }
+}
+
+/// After a failed check, attempts fail at once for this long.
+const RETRY_AFTER: Duration = Duration::from_secs(10);
+
+/// What a node does that reaches outside the process, injected so tests need
+/// neither a network nor a real clock.
+pub struct NodeEffects {
+    pub now: Box<dyn Fn() -> Instant + Send + Sync>,
+    pub resolve: ResolveFn,
+    pub probe: Probe,
+}
+
+/// Resolve the node: the `--node` flag, whether the local services are in use,
+/// whether a note may be printed, and whether the user may be asked to pick.
+pub type ResolveFn = Box<
+    dyn Fn(Option<&NodeSpec>, bool, Notes, Interactive) -> Result<Resolved, NodeError>
+        + Send
+        + Sync,
+>;
+
+/// Ask a remote node who it is, bounded in time. The error is the text for the
+/// user.
+pub type Probe = Box<dyn Fn(&RemoteTarget) -> Result<Answer, String> + Send + Sync>;
+
+impl NodeEffects {
+    pub fn real() -> Self {
+        Self {
+            now: Box::new(Instant::now),
+            resolve: Box::new(resolve_startup),
+            probe: Box::new(probe_node),
+        }
+    }
+}
+
+/// The last failure of something tried, and when. It is kept for
+/// [`RETRY_AFTER`]: until then asking again fails with it, without trying.
+struct Failure<E> {
+    at: Instant,
+    error: E,
+}
+
+impl<E: Clone> Failure<E> {
+    fn standing(&self, now: Instant) -> Option<E> {
+        (now.saturating_duration_since(self.at) < RETRY_AFTER).then(|| self.error.clone())
+    }
+}
+
+/// What this process knows about resolving the node.
+#[derive(Default)]
+struct Resolution {
+    /// Resolution has been tried: later tries are not interactive and print nothing.
+    attempted: bool,
+    failure: Option<Failure<ResolveError>>,
+}
+
+/// What this process knows about whether the remote node answers.
+enum Reach {
+    Untried,
+    Reached(Answer),
+    Failed(Failure<String>),
+}
+
 pub struct Node {
+    needed_by: NeededBy,
     options: NodeOptions,
     local_ipc: bool,
     target: OnceLock<Target>,
+    effects: NodeEffects,
+    resolution: Mutex<Resolution>,
+    reach: Mutex<Reach>,
+    // Each connection is made on first use and kept after the first success. A
+    // failure is not kept. Handing out a connection hands out a clone that
+    // shares the cached socket, which serialises requests. On a remote node the
+    // library, playback and admin connections are one gateway socket.
+    library: OnceLock<LibraryBackend>,
+    playback: OnceLock<PlaybackBackend>,
+    gateway_client: OnceLock<GatewayClient>,
+}
+
+/// The connection in `slot`, connecting with `connect` when there is none yet.
+fn cached<T: Clone>(
+    slot: &OnceLock<T>,
+    connect: impl FnOnce() -> Result<T, NodeError>,
+) -> Result<T, NodeError> {
+    // `OnceLock::get_or_try_init` is unstable.
+    if let Some(connection) = slot.get() {
+        return Ok(connection.clone());
+    }
+    let connection = connect()?;
+    Ok(slot.get_or_init(|| connection).clone())
+}
+
+/// The guard of `mutex`; what a panic left behind is still a valid state.
+fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Whether the local services are the node in use: sockets were given explicitly, or
 /// the library socket (`ipc://<path>` or a bare path) exists here. The one rule for
-/// `Node::new` and for completion, which has no `Node` and reads the environment.
+/// `Node::needed_by` and for completion, which has no `Node` and reads the environment.
 pub fn local_ipc_for(library_socket: &str, sockets_given: bool) -> bool {
     let path = library_socket
         .strip_prefix("ipc://")
@@ -97,14 +242,51 @@ fn given(value: &Option<String>) -> Option<&str> {
 }
 
 impl Node {
-    pub fn new(options: NodeOptions) -> Self {
-        let mut node = Self {
+    /// A node whose errors say that `needed_by` needed it. Nothing connects, and
+    /// no node is resolved, until something asks for a connection.
+    pub fn needed_by(needed_by: NeededBy, options: NodeOptions) -> Self {
+        let mut node = Self::unresolved(needed_by, options);
+        node.local_ipc = local_ipc_for(node.library_socket(), node.sockets_given());
+        node
+    }
+
+    fn unresolved(needed_by: NeededBy, options: NodeOptions) -> Self {
+        Self {
+            needed_by,
             options,
             local_ipc: false,
             target: OnceLock::new(),
-        };
-        node.local_ipc = local_ipc_for(node.library_socket(), node.sockets_given());
-        node
+            effects: NodeEffects::real(),
+            resolution: Mutex::new(Resolution::default()),
+            reach: Mutex::new(Reach::Untried),
+            library: OnceLock::new(),
+            playback: OnceLock::new(),
+            gateway_client: OnceLock::new(),
+        }
+    }
+
+    /// Replace what the node does outside the process.
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub fn with_effects(mut self, effects: NodeEffects) -> Self {
+        self.effects = effects;
+        self
+    }
+
+    /// The one place that says what needed the node: `error`, if it is about
+    /// resolving or reaching the node (`Resolve`, `Connect`), wrapped in the label.
+    /// Idempotent, so every method that can fail that way may apply it, and so may
+    /// a caller that connects on its own. Errors about the arguments (`MDMA_NODE`,
+    /// the sources directory), "no remote node" and "needs a gateway" are not about
+    /// reaching the node and pass unchanged.
+    pub fn labelled(&self, error: NodeError) -> NodeError {
+        match error {
+            NodeError::Resolve(_) | NodeError::Connect(_) => NodeError::Needed {
+                needed_by: self.needed_by.clone(),
+                cause: Box::new(error),
+            },
+            other => other,
+        }
     }
 
     /// The library socket: the one given by flag or environment, else the default.
@@ -123,14 +305,10 @@ impl Node {
             || given(&self.options.playback_socket).is_some()
     }
 
-    /// A node that is already resolved.
+    /// A node that is already resolved, needed by "mdma".
     #[cfg(any(test, feature = "test-support"))]
     pub fn with_target(options: NodeOptions, target: Target) -> Self {
-        let node = Self {
-            options,
-            local_ipc: false,
-            target: OnceLock::new(),
-        };
+        let node = Self::unresolved(NeededBy::new("mdma"), options);
         node.target
             .set(target)
             .unwrap_or_else(|_| unreachable!("target was just created empty"));
@@ -144,14 +322,52 @@ impl Node {
     }
 
     /// Like [`Node::target`], choosing whether the note is printed. Only the first
-    /// resolution matters: later calls reuse the cached target.
+    /// resolution matters: later calls reuse the cached target. A failure to
+    /// resolve is kept like a failure to reach the node: for [`RETRY_AFTER`],
+    /// asking again fails with it and neither browses nor prompts.
     pub fn target_with(&self, notes: Notes) -> Result<&Target, NodeError> {
         // `OnceLock::get_or_try_init` is unstable.
         if let Some(target) = self.target.get() {
             return Ok(target);
         }
-        let resolved = resolve_startup(self.options.node.as_ref(), self.local_ipc, notes)?;
-        Ok(self.target.get_or_init(|| resolved))
+        let mut resolution = locked(&self.resolution);
+        if let Some(failure) = &resolution.failure {
+            // Cancelling the prompt is the user's choice of no node, for the whole
+            // process; any other failure is tried again after the window.
+            let cancelled = failure.error == ResolveError::Cancelled;
+            if cancelled || failure.standing((self.effects.now)()).is_some() {
+                return Err(self.labelled(NodeError::Resolve(failure.error.clone())));
+            }
+        }
+        // Only the first resolution may ask the user or print a note.
+        let (notes, interactive) = if resolution.attempted {
+            (Notes::Silent, Interactive::No)
+        } else {
+            (notes, Interactive::Yes)
+        };
+        resolution.attempted = true;
+        match (self.effects.resolve)(
+            self.options.node.as_ref(),
+            self.local_ipc,
+            notes,
+            interactive,
+        ) {
+            Ok(resolved) => {
+                resolution.failure = None;
+                if let Some(answer) = resolved.answer {
+                    *locked(&self.reach) = Reach::Reached(answer);
+                }
+                Ok(self.target.get_or_init(|| resolved.target))
+            }
+            Err(NodeError::Resolve(error)) => {
+                resolution.failure = Some(Failure {
+                    at: (self.effects.now)(),
+                    error: error.clone(),
+                });
+                Err(self.labelled(NodeError::Resolve(error)))
+            }
+            Err(other) => Err(self.labelled(other)),
+        }
     }
 
     /// The `--node` flag, as given.
@@ -166,14 +382,66 @@ impl Node {
 
     /// The effective gateway address of the resolved node: `tcp://<ip>:<port>`.
     /// `None` for local IPC, where callers fall back to direct IPC.
+    ///
+    /// A remote node must answer first: see [`Node::reach`].
     pub fn gateway(&self) -> Result<Option<String>, NodeError> {
-        Ok(client_config(Some(self.target()?)).gateway_addr())
+        let target = self.target()?;
+        self.reach(target)?;
+        Ok(client_config(Some(target)).gateway_addr())
     }
 
     /// The effective event gateway address: `tcp://<ip>:5556`.
-    /// `None` for local IPC.
+    /// `None` for local IPC. Events are an address to subscribe to, not a
+    /// connection the node keeps; the node must have answered all the same.
     pub fn event_gateway(&self) -> Result<Option<String>, NodeError> {
-        Ok(client_config(Some(self.target()?)).event_addr())
+        let target = self.target()?;
+        self.reach(target)?;
+        Ok(client_config(Some(target)).event_addr())
+    }
+
+    /// The one reachability check, for every connection. A remote node is reached
+    /// when it has answered "who are you": while the resolver verified it, or to
+    /// the probe here, which connects and asks, at most twice
+    /// `IDENTIFY_TIMEOUT` (to send and to receive) plus name resolution. The outcome is kept for
+    /// the process. After a failure, further attempts fail at once for
+    /// [`RETRY_AFTER`], then the check is tried again. Local IPC needs no check.
+    fn reach(&self, target: &Target) -> Result<(), NodeError> {
+        let Target::Remote(remote) = target else {
+            return Ok(());
+        };
+        let mut reach = locked(&self.reach);
+        match &*reach {
+            Reach::Reached(_) => return Ok(()),
+            Reach::Failed(failure) => {
+                if let Some(text) = failure.standing((self.effects.now)()) {
+                    return Err(self.labelled(NodeError::Connect(text)));
+                }
+            }
+            Reach::Untried => {}
+        }
+        match (self.effects.probe)(remote) {
+            Ok(answer) => {
+                *reach = Reach::Reached(answer);
+                Ok(())
+            }
+            Err(text) => {
+                *reach = Reach::Failed(Failure {
+                    at: (self.effects.now)(),
+                    error: text.clone(),
+                });
+                Err(self.labelled(NodeError::Connect(text)))
+            }
+        }
+    }
+
+    /// What the remote node said when asked who it is, if it has been asked. It
+    /// has not for local IPC, which needs no check, nor before the first
+    /// connection.
+    pub fn identity(&self) -> Option<Answer> {
+        match &*locked(&self.reach) {
+            Reach::Reached(answer) => Some(answer.clone()),
+            Reach::Untried | Reach::Failed(_) => None,
+        }
     }
 
     /// Host and IP of the resolved node, for tools that are not NNG (scp, HTTP).
@@ -189,18 +457,37 @@ impl Node {
         self.remote_host()?.ok_or(NodeError::NoRemoteNode)
     }
 
-    /// Connect to the library backend (gateway or direct).
-    pub fn library(&self) -> Result<LibraryBackend, NodeError> {
-        let gateway = self.gateway()?;
-        LibraryBackend::connect(gateway.as_deref(), self.library_socket())
-            .map_err(|e| library_connect_failed(&e, gateway.is_none()))
+    /// The gateway connection of a remote node, shared by every service.
+    /// `what` names the service that asked, for the failure text.
+    fn gateway_connection(&self, what: &str, address: &str) -> Result<GatewayClient, NodeError> {
+        cached(&self.gateway_client, || {
+            GatewayClient::connect(address)
+                .map_err(|e| self.labelled(connect_failed(what, &e, false)))
+        })
     }
 
-    /// Connect to the playback backend (gateway or direct).
+    /// Connect to the library backend (gateway or direct).
+    /// Later calls reuse the first successful connection.
+    pub fn library(&self) -> Result<LibraryBackend, NodeError> {
+        cached(&self.library, || match self.gateway()? {
+            Some(address) => Ok(LibraryBackend::Gateway(
+                self.gateway_connection("library", &address)?,
+            )),
+            None => LibraryBackend::connect_direct(self.library_socket())
+                .map_err(|e| self.labelled(library_connect_failed(&e, true))),
+        })
+    }
+
+    /// Connect to the playback backend (gateway or direct). Later calls reuse
+    /// the first successful connection.
     pub fn playback(&self) -> Result<PlaybackBackend, NodeError> {
-        let gateway = self.gateway()?;
-        PlaybackBackend::connect(gateway.as_deref(), self.playback_socket())
-            .map_err(|e| connect_failed("playback", &e, gateway.is_none()))
+        cached(&self.playback, || match self.gateway()? {
+            Some(address) => Ok(PlaybackBackend::Gateway(
+                self.gateway_connection("playback", &address)?,
+            )),
+            None => PlaybackBackend::connect_direct(self.playback_socket())
+                .map_err(|e| self.labelled(connect_failed("playback", &e, true))),
+        })
     }
 
     /// Connect to a source, via gateway or direct IPC, with the default request
@@ -219,10 +506,10 @@ impl Node {
                 String::new()
             };
             let what = source_label(name);
-            NodeError::Connect(format!(
+            self.labelled(NodeError::Connect(format!(
                 "{}{running}\nHint: 'mdma source list' shows the available sources",
                 connect_text(&what, &e)
-            ))
+            )))
         })
     }
 
@@ -242,9 +529,12 @@ impl Node {
     /// Connect to the admin service via gateway.
     ///
     /// Fails with a message when there is no gateway to connect to (local IPC).
+    /// Later calls reuse the first successful connection.
     pub fn admin(&self) -> Result<GatewayClient, NodeError> {
-        let gateway = self.gateway()?.ok_or(NodeError::NeedsGateway)?;
-        GatewayClient::connect(&gateway).map_err(|e| connect_failed("gateway", &e, false))
+        let Some(address) = self.gateway()? else {
+            return Err(NodeError::NeedsGateway);
+        };
+        self.gateway_connection("gateway", &address)
     }
 }
 
@@ -281,6 +571,8 @@ mod tests {
     use node_discovery::{RemoteTarget, Source};
     use pretty_assertions::assert_eq;
     use std::error::Error as _;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     fn remote(ip: Ipv4Addr) -> Target {
         Target::Remote(RemoteTarget {
@@ -291,13 +583,314 @@ mod tests {
         })
     }
 
+    /// Effects that count what is asked of them, answer as the test says and read
+    /// a clock the test moves by hand.
+    struct Fake {
+        probes: Arc<AtomicUsize>,
+        /// How resolution was asked for, each time.
+        resolutions: Arc<Mutex<Vec<(Notes, Interactive)>>>,
+        /// What resolution fails with.
+        resolve_error: Arc<Mutex<ResolveError>>,
+        clock: Arc<Mutex<Instant>>,
+        /// `None` is a node that answers; `Some` is the text it fails with.
+        probe_failure: Arc<Mutex<Option<&'static str>>>,
+    }
+
+    impl Fake {
+        fn effects(probe_failure: Option<&'static str>) -> (NodeEffects, Self) {
+            let fake = Self {
+                probes: Arc::new(AtomicUsize::new(0)),
+                resolutions: Arc::new(Mutex::new(Vec::new())),
+                resolve_error: Arc::new(Mutex::new(ResolveError::NoNodesFound)),
+                clock: Arc::new(Mutex::new(Instant::now())),
+                probe_failure: Arc::new(Mutex::new(probe_failure)),
+            };
+            let clock = Arc::clone(&fake.clock);
+            let probes = Arc::clone(&fake.probes);
+            let failure = Arc::clone(&fake.probe_failure);
+            let resolutions = Arc::clone(&fake.resolutions);
+            let resolve_error = Arc::clone(&fake.resolve_error);
+            let effects = NodeEffects {
+                now: Box::new(move || *clock.lock().unwrap()),
+                resolve: Box::new(move |_, _, notes, interactive| {
+                    resolutions.lock().unwrap().push((notes, interactive));
+                    Err(NodeError::Resolve(resolve_error.lock().unwrap().clone()))
+                }),
+                probe: Box::new(move |_| {
+                    probes.fetch_add(1, Ordering::SeqCst);
+                    match *failure.lock().unwrap() {
+                        None => Ok(Answer::Failed("not asked".to_string())),
+                        Some(text) => Err(text.to_string()),
+                    }
+                }),
+            };
+            (effects, fake)
+        }
+
+        fn probes(&self) -> usize {
+            self.probes.load(Ordering::SeqCst)
+        }
+
+        fn resolutions(&self) -> usize {
+            self.resolutions.lock().unwrap().len()
+        }
+
+        fn advance(&self, by: Duration) {
+            *self.clock.lock().unwrap() += by;
+        }
+
+        fn answer_from_now_on(&self) {
+            *self.probe_failure.lock().unwrap() = None;
+        }
+    }
+
+    fn remote_node(needed_by: &str, probe_failure: Option<&'static str>) -> (Node, Fake) {
+        let (effects, fake) = Fake::effects(probe_failure);
+        let mut node = Node::with_target(
+            NodeOptions::default(),
+            remote(Ipv4Addr::new(192, 168, 0, 9)),
+        )
+        .with_effects(effects);
+        node.needed_by = NeededBy::new(needed_by);
+        (node, fake)
+    }
+
+    #[test]
+    fn constructing_and_resolving_a_node_does_not_connect() {
+        let (node, fake) = remote_node("mdma queue list", Some("down"));
+        node.target().unwrap();
+        node.remote_host().unwrap();
+        node.require_node().unwrap();
+        assert_eq!(fake.probes(), 0);
+    }
+
+    #[test]
+    fn a_reachable_node_is_probed_once() {
+        let (node, fake) = remote_node("mdma queue list", None);
+        for _ in 0..3 {
+            assert_eq!(
+                node.gateway().unwrap(),
+                Some("tcp://192.168.0.9:5555".to_string())
+            );
+        }
+        node.event_gateway().unwrap();
+        assert_eq!(fake.probes(), 1);
+    }
+
+    #[test]
+    fn a_node_the_resolver_verified_is_not_probed() {
+        let (node, fake) = remote_node("mdma queue list", Some("down"));
+        let answer = Answer::Identity(NodeIdentity {
+            id: Some("mdma-909".to_string()),
+            ..identity_fields()
+        });
+        *locked(&node.reach) = Reach::Reached(answer.clone());
+        node.gateway().unwrap();
+        assert_eq!(fake.probes(), 0);
+        assert_eq!(node.identity(), Some(answer));
+    }
+
+    fn identity_fields() -> NodeIdentity {
+        NodeIdentity {
+            id: None,
+            name: None,
+            version: "0.0.0".to_string(),
+            proto: 1,
+        }
+    }
+
+    #[test]
+    fn an_unreachable_node_fails_at_once_for_ten_seconds_then_is_tried_again() {
+        let (node, fake) = remote_node("mdma queue append", Some("no answer"));
+        let text = node.library().err().unwrap().to_string();
+        assert_eq!(text, "mdma queue append needs the node: no answer");
+        assert_eq!(fake.probes(), 1);
+
+        // Every way in fails without a new attempt.
+        fake.advance(Duration::from_secs(9));
+        assert_eq!(node.library().err().unwrap().to_string(), text);
+        assert_eq!(node.playback().err().unwrap().to_string(), text);
+        assert_eq!(node.admin().err().unwrap().to_string(), text);
+        assert_eq!(node.gateway().err().unwrap().to_string(), text);
+        assert_eq!(fake.probes(), 1);
+
+        fake.advance(Duration::from_secs(1));
+        assert_eq!(node.library().err().unwrap().to_string(), text);
+        assert_eq!(fake.probes(), 2);
+    }
+
+    #[test]
+    fn a_node_that_comes_back_is_used_after_the_retry_time() {
+        let (node, fake) = remote_node("mdma queue list", Some("no answer"));
+        assert!(node.gateway().is_err());
+        fake.answer_from_now_on();
+        assert!(node.gateway().is_err(), "still within the retry time");
+        fake.advance(RETRY_AFTER);
+        assert!(node.gateway().is_ok());
+        assert_eq!(fake.probes(), 2);
+    }
+
+    #[test]
+    fn a_failure_to_resolve_is_kept_like_a_failure_to_reach() {
+        let (effects, fake) = Fake::effects(None);
+        let node = Node::needed_by(NeededBy::new("mdma queue list"), NodeOptions::default())
+            .with_effects(effects);
+        let text = node.target().err().unwrap().to_string();
+        assert!(
+            text.starts_with("mdma queue list needs the node: No MDMA nodes found"),
+            "{text}"
+        );
+        assert_eq!(fake.resolutions(), 1);
+
+        // Within the window neither browsing nor prompting happens again.
+        fake.advance(Duration::from_secs(9));
+        assert_eq!(node.target().err().unwrap().to_string(), text);
+        assert_eq!(node.library().err().unwrap().to_string(), text);
+        assert_eq!(fake.resolutions(), 1);
+
+        fake.advance(Duration::from_secs(1));
+        assert!(node.target().is_err());
+        assert_eq!(fake.resolutions(), 2);
+    }
+
+    #[test]
+    fn only_the_first_resolution_is_interactive_and_prints() {
+        let (effects, fake) = Fake::effects(None);
+        let node = Node::needed_by(NeededBy::new("mdma queue list"), NodeOptions::default())
+            .with_effects(effects);
+        assert!(node.target().is_err());
+        fake.advance(RETRY_AFTER);
+        assert!(node.target().is_err());
+        assert_eq!(
+            *fake.resolutions.lock().unwrap(),
+            vec![
+                (Notes::Print, Interactive::Yes),
+                (Notes::Silent, Interactive::No)
+            ]
+        );
+    }
+
+    #[test]
+    fn a_cancelled_prompt_is_not_asked_again() {
+        let (effects, fake) = Fake::effects(None);
+        *fake.resolve_error.lock().unwrap() = ResolveError::Cancelled;
+        let node = Node::needed_by(NeededBy::new("mdma queue list"), NodeOptions::default())
+            .with_effects(effects);
+        let text = node.target().err().unwrap().to_string();
+        assert_eq!(
+            text,
+            "mdma queue list needs the node: Node selection cancelled."
+        );
+        fake.advance(RETRY_AFTER * 10);
+        assert_eq!(node.target().err().unwrap().to_string(), text);
+        assert_eq!(fake.resolutions(), 1);
+    }
+
+    #[test]
+    fn every_error_about_reaching_the_node_names_what_needed_it() {
+        let (node, _) = remote_node("mdma admin ls", Some("no answer"));
+        assert_eq!(
+            node.admin().err().unwrap().to_string(),
+            "mdma admin ls needs the node: no answer"
+        );
+    }
+
+    #[test]
+    fn labelling_is_idempotent_and_leaves_other_errors_alone() {
+        let node = Node::with_target(NodeOptions::default(), Target::LocalIpc);
+        let once = node.labelled(NodeError::Connect("down".to_string()));
+        assert_eq!(once.to_string(), "mdma needs the node: down");
+        assert_eq!(node.labelled(once).to_string(), "mdma needs the node: down");
+        for unchanged in [
+            NodeError::InvalidEnv("bad".to_string()),
+            NodeError::NoRemoteNode,
+            NodeError::SourcesDirNotUtf8,
+            NodeError::NeedsGateway,
+        ] {
+            let text = unchanged.to_string();
+            assert_eq!(node.labelled(unchanged).to_string(), text);
+        }
+    }
+
+    #[test]
+    fn admin_needs_a_gateway_over_ipc() {
+        let local = Node::with_target(NodeOptions::default(), Target::LocalIpc);
+        assert_eq!(
+            local.admin().err().unwrap().to_string(),
+            "admin commands need a gateway; use --node (or MDMA_NODE) to name the node"
+        );
+    }
+
+    #[test]
+    fn two_library_calls_dial_once() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let address = format!("ipc://{}/library.sock", dir.path().display());
+        let server = nng::Socket::new(nng::Protocol::Rep0).expect("server socket");
+        server.listen(&address).expect("listen");
+        let node = Node::with_target(
+            NodeOptions {
+                library_socket: Some(address),
+                ..NodeOptions::default()
+            },
+            Target::LocalIpc,
+        );
+
+        let (LibraryBackend::Direct(first), LibraryBackend::Direct(second)) =
+            (node.library().unwrap(), node.library().unwrap())
+        else {
+            panic!("local IPC is direct");
+        };
+        assert!(first.is_same_connection(&second));
+    }
+
+    #[test]
+    fn a_remote_nodes_services_share_one_gateway_socket() {
+        use nng::options::Options as _;
+        let server = nng::Socket::new(nng::Protocol::Rep0).expect("server socket");
+        let listener = nng::ListenerBuilder::new(&server, "tcp://127.0.0.1:0")
+            .expect("listener")
+            .start()
+            .map_err(|(_, e)| e)
+            .expect("listen");
+        let port = listener
+            .get_opt::<nng::options::transport::tcp::BoundPort>()
+            .expect("bound port");
+        let (effects, _) = Fake::effects(None);
+        let node = Node::with_target(
+            NodeOptions::default(),
+            Target::Remote(RemoteTarget {
+                host: "localhost".to_string(),
+                ip: Some(Ipv4Addr::LOCALHOST),
+                port,
+                source: Source::Cache,
+            }),
+        )
+        .with_effects(effects);
+
+        let (LibraryBackend::Gateway(library), PlaybackBackend::Gateway(playback)) =
+            (node.library().unwrap(), node.playback().unwrap())
+        else {
+            panic!("a remote node is reached through its gateway");
+        };
+        let admin = node.admin().unwrap();
+        assert!(library.is_same_connection(&playback));
+        assert!(library.is_same_connection(&admin));
+    }
+
+    #[test]
+    fn a_failed_connect_is_not_cached() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let node = local_node_in(&dir);
+        assert!(node.library().is_err());
+        assert!(node.library.get().is_none());
+        // The second call tries again, and fails the same way.
+        assert!(node.library().is_err());
+    }
+
     #[test]
     fn gateway_uses_resolved_target() {
         // The resolved target's IP and port give the gateway address
-        let node = Node::with_target(
-            NodeOptions::default(),
-            remote(Ipv4Addr::new(192, 168, 0, 9)),
-        );
+        let (node, _) = remote_node("mdma", None);
         assert_eq!(
             node.gateway().unwrap(),
             Some("tcp://192.168.0.9:5555".to_string())
@@ -386,7 +979,8 @@ mod tests {
         assert_eq!(
             text,
             format!(
-                "Failed to connect to library at ipc://{}/none.sock: Connection refused\n\
+                "mdma needs the node: \
+                 Failed to connect to library at ipc://{}/none.sock: Connection refused\n\
                  Is mdma-library running?",
                 dir.path().display()
             )
@@ -400,7 +994,9 @@ mod tests {
         assert_eq!(
             text,
             format!(
-                "Failed to connect to playback at ipc://{}/none-playback.sock: Connection refused\n\
+                "mdma needs the node: \
+                 Failed to connect to playback at ipc://{}/none-playback.sock: \
+                 Connection refused\n\
                  Is mdma-playback running?",
                 dir.path().display()
             )
@@ -418,7 +1014,8 @@ mod tests {
         assert_eq!(
             text,
             format!(
-                "Failed to connect to source 'bandcamp' at ipc://{}/bandcamp.sock: \
+                "mdma needs the node: \
+                 Failed to connect to source 'bandcamp' at ipc://{}/bandcamp.sock: \
                  Connection refused\n\
                  Is mdma-bandcamp running?\n\
                  Hint: 'mdma source list' shows the available sources",
@@ -428,54 +1025,21 @@ mod tests {
     }
 
     #[test]
-    fn admin_needs_a_gateway_over_ipc() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        assert_eq!(
-            local_node_in(&dir).admin().err().unwrap().to_string(),
-            "admin commands need a gateway; use --node (or MDMA_NODE) to name the node"
-        );
-    }
-
-    #[test]
-    fn library_connect_failure_to_a_dead_node_has_no_ipc_hint() {
-        let (target, port, _guard) = dead_node();
-        let node = Node::with_target(NodeOptions::default(), target);
+    fn a_dead_node_says_what_needed_it_and_that_it_did_not_answer() {
+        // The one test of the real probe: connecting to a port that refuses.
+        let (target, _port, _guard) = dead_node();
+        let mut node = Node::with_target(NodeOptions::default(), target);
+        node.needed_by = NeededBy::new("mdma queue list");
         assert_eq!(
             node.library().err().unwrap().to_string(),
-            format!("Failed to connect to library at tcp://127.0.0.1:{port}: Connection refused")
-        );
-    }
-
-    #[test]
-    fn source_connect_failure_to_a_dead_node_has_no_ipc_hint() {
-        let (target, port, _guard) = dead_node();
-        let node = Node::with_target(NodeOptions::default(), target);
-        assert_eq!(
-            node.source("bandcamp", None).err().unwrap().to_string(),
-            format!(
-                "Failed to connect to source 'bandcamp' at tcp://127.0.0.1:{port}: \
-                 Connection refused\n\
-                 Hint: 'mdma source list' shows the available sources"
-            )
-        );
-    }
-
-    #[test]
-    fn admin_connect_failure_to_a_dead_node_names_the_gateway() {
-        let (target, port, _guard) = dead_node();
-        let node = Node::with_target(NodeOptions::default(), target);
-        assert_eq!(
-            node.admin().err().unwrap().to_string(),
-            format!("Failed to connect to gateway at tcp://127.0.0.1:{port}: Connection refused")
+            "mdma queue list needs the node: localhost (127.0.0.1) did not answer in time"
         );
     }
 
     #[test]
     fn node_is_not_resolved_until_needed() {
         // Nothing resolves a node on construction, only on first use of the target.
-        // The one deliberate use of `Node::new` in tests: it is what checks that
-        // `Node::new` is lazy. Every other test uses `Node::with_target`.
-        let node = Node::new(NodeOptions::default());
+        let node = Node::needed_by(NeededBy::new("mdma"), NodeOptions::default());
         assert!(node.target.get().is_none());
         let node = Node::with_target(NodeOptions::default(), Target::LocalIpc);
         assert_eq!(node.target().unwrap(), &Target::LocalIpc);
@@ -497,5 +1061,10 @@ mod tests {
         assert!(NodeError::Resolve(ResolveError::NoNodesFound)
             .source()
             .is_none());
+        let labelled = NodeError::Needed {
+            needed_by: NeededBy::new("mdma"),
+            cause: Box::new(NodeError::NeedsGateway),
+        };
+        assert!(labelled.source().is_none());
     }
 }

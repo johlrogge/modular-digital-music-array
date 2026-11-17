@@ -22,7 +22,9 @@ use browser_pane::BrowserPane;
 use clap::Parser;
 use color_eyre::Result;
 use events::spawn_event_subscriber;
-use mdma_client::{LibraryBackend, Node, NodeError, NodeOptions, NodeSpec, PlaybackBackend};
+use mdma_client::{
+    LibraryBackend, NeededBy, Node, NodeError, NodeOptions, NodeSpec, PlaybackBackend,
+};
 use queue_pane::QueuePane;
 use std::rc::Rc;
 use tracing_subscriber::EnvFilter;
@@ -76,7 +78,7 @@ type Connections = (LibraryBackend, PlaybackBackend, Option<String>);
 /// Resolve the node and connect. Runs before raw mode so the pick prompt and
 /// notes print on the normal terminal.
 fn connect(options: NodeOptions) -> Result<Connections, NodeError> {
-    let node = Node::new(options);
+    let node = Node::needed_by(NeededBy::new("mdma-tui"), options);
     node.target()?;
     Ok((node.library()?, node.playback()?, node.event_gateway()?))
 }

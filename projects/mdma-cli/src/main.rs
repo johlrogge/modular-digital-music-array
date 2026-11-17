@@ -124,9 +124,13 @@ fn main() -> std::process::ExitCode {
     // that ran is known afterwards.
     let args: Vec<String> = std::env::args().skip(1).collect();
     let command = background::parse_command(&args);
+    // What a failure to reach the node says needed it: the command path as typed.
+    let needed_by = ctx::needed_by(command.as_ref().map(|ran| ran.path.as_slice()));
     // The node is resolved once, on first use, so only commands that talk to
     // one resolve it.
-    let code = app().run_with_args(args, |globals| Ok(Ctx::new(globals.into())));
+    let code = app().run_with_args(args, |globals| {
+        Ok(Ctx::needed_by(needed_by.clone(), globals.into()))
+    });
     // Once, here, for every command that ran (any exit code but 2, a usage error):
     // start a detached sync if the replica is stale or the command wrote. It never
     // waits, and never runs inside a command.

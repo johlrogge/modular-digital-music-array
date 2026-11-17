@@ -14,10 +14,11 @@ use fact_replica::{
     default_nodes_dir, id_for_host, release_host_elsewhere, should_attempt, Host, Meta, NodeId,
     ReadFailure, Replica, SyncLock, SyncReport, UnixSecs,
 };
-use gateway_client::{GatewayClient, IdentifyError, NodeIdentity};
+use gateway_client::{GatewayClient, NodeIdentity};
 use hicli::Arg;
 use library_ipc_client::{LibraryRequest, LibraryResponse};
 use library_projection::{project_lines, Projection};
+use mdma_client::Answer;
 use mdma_client::LibraryBackend;
 use serde::{Deserialize, Serialize};
 
@@ -114,18 +115,20 @@ impl Probe {
 // ---------------------------------------------------------------------------
 
 /// The node id from an identify answer; a node that cannot say gets no replica.
-fn node_id_from(answer: Result<NodeIdentity, IdentifyError>) -> Result<NodeId> {
+fn node_id_from(answer: Answer) -> Result<NodeId> {
     match answer {
-        Ok(NodeIdentity { id: Some(id), .. }) => {
+        Answer::Identity(NodeIdentity { id: Some(id), .. }) => {
             NodeId::new(id).map_err(|e| eyre!("the node reported an unusable id: {e}"))
         }
-        Ok(NodeIdentity { id: None, .. }) => Err(eyre!(
+        Answer::Identity(NodeIdentity { id: None, .. }) => Err(eyre!(
             "the node has no id configured, so it gets no replica"
         )),
-        Err(IdentifyError::Unsupported(_)) => Err(eyre!(
+        Answer::Unsupported(_) => Err(eyre!(
             "the node's gateway is too old to say which node it is, so it gets no replica"
         )),
-        Err(IdentifyError::Client(e)) => Err(eyre!("could not identify the node: {e}")),
+        Answer::Failed(message) => Err(eyre!(
+            "could not identify the node: service error: {message}"
+        )),
     }
 }
 
@@ -451,8 +454,15 @@ fn connect(ctx: &Ctx) -> Result<NodeLink> {
     };
     // Locally, a dead gateway gets the "Is mdma-gateway running?" hint.
     let client = GatewayClient::connect_with_timeout(&address, LINK_TIMEOUT)
-        .map_err(|e| connect_failed("gateway", &e, local))?;
-    let id = node_id_from(client.identify())?;
+        .map_err(|e| ctx.labelled(connect_failed("gateway", &e, local)))?;
+    // A remote node has already said who it is, to the resolver or the reachability
+    // check; only the local gateway, which needs neither, is asked here.
+    let answer = match ctx.identity() {
+        Some(answer) => answer,
+        None => Answer::from_identify(client.identify())
+            .map_err(|e| eyre!("could not identify the node: {e}"))?,
+    };
+    let id = node_id_from(answer)?;
     let read: Reader = Box::new(move |cursor, limit, expect| {
         let request = AcidRequest::ReadStream {
             cursor,
@@ -504,7 +514,7 @@ fn probe_playlists(ctx: &Ctx) -> Result<Vec<String>> {
     let local = remote.is_none();
     let gateway = sync_gateway(remote);
     let library = LibraryBackend::connect(Some(&gateway), ctx.library_socket())
-        .map_err(|e| library_connect_failed(&e, local))?;
+        .map_err(|e| ctx.labelled(library_connect_failed(&e, local)))?;
     interpret_library(
         library.request(&LibraryRequest::PlaylistList),
         |response| match response {
@@ -763,17 +773,21 @@ mod tests {
     #[test]
     fn a_node_that_cannot_say_who_it_is_gets_no_replica() {
         assert_eq!(
-            node_id_from(Ok(identity(Some("mdma-stage")))).unwrap(),
+            node_id_from(Answer::Identity(identity(Some("mdma-stage")))).unwrap(),
             id("mdma-stage")
         );
-        let none = crate::test_support::failure_text(node_id_from(Ok(identity(None))));
+        let none =
+            crate::test_support::failure_text(node_id_from(Answer::Identity(identity(None))));
         assert_eq!(none, "the node has no id configured, so it gets no replica");
-        let old = crate::test_support::failure_text(node_id_from(Err(IdentifyError::Unsupported(
-            "old".into(),
-        ))));
+        let old =
+            crate::test_support::failure_text(node_id_from(Answer::Unsupported("old".into())));
         assert!(old.starts_with("the node's gateway is too old"), "{old}");
-        let unsafe_id = crate::test_support::failure_text(node_id_from(Ok(identity(Some("../x")))));
+        let unsafe_id = crate::test_support::failure_text(node_id_from(Answer::Identity(
+            identity(Some("../x")),
+        )));
         assert!(unsafe_id.starts_with("the node reported an unusable id"));
+        let failed = crate::test_support::failure_text(node_id_from(Answer::Failed("boom".into())));
+        assert_eq!(failed, "could not identify the node: service error: boom");
     }
 
     // --- which replica -------------------------------------------------------
