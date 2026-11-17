@@ -563,6 +563,103 @@ mod tests {
         assert_eq!(info.state, StreamPlaybackState::Paused);
     }
 
+    /// Consume samples as the output would until `Loaded` satisfies `done`;
+    /// returns that `Loaded`. Fails after 5 s.
+    fn pull_until_loaded(
+        server: &mut Server,
+        what: &str,
+        done: impl Fn(&StreamTrackInfo) -> bool,
+    ) -> StreamTrackInfo {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            server.engine.pull_for_test(2_048);
+            let StreamResponse::Loaded {
+                info: Some(info), ..
+            } = server.handle_loaded()
+            else {
+                panic!("Loaded lost the track while waiting for {what}");
+            };
+            if done(&info) {
+                return info;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {what}; Loaded: {info:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    /// A seek while playing must leave the track playing: position moves on
+    /// past the target, the hash stays, and the track finishes when played out.
+    #[tokio::test]
+    async fn a_seek_while_playing_keeps_the_track_playing_to_its_end() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../components/audio_decoder/benches/test_data/medium.flac");
+        let mut server = make_server();
+        server
+            .engine
+            .load_track(&path)
+            .await
+            .expect("load the fixture");
+        let id = server.engine.audible_track_id().expect("a loaded track");
+        server.tracks.insert(id, track("a"));
+        let played = server.handle_command(StreamCommand::Play).await;
+        assert!(matches!(played, StreamResponse::Ok), "{played:?}");
+
+        let seek = |ms| StreamCommand::Seek {
+            position_ms: PositionMs::new(ms),
+        };
+        let response = server.handle_command(seek(10_000)).await;
+        assert!(matches!(response, StreamResponse::Ok), "{response:?}");
+        let info = pull_until_loaded(&mut server, "the position to pass the target", |i| {
+            i.position_ms.is_some_and(|p| p >= 11_000)
+        });
+        assert_eq!(info.content_hash, Some(ContentHash::new("a")));
+        assert_eq!(info.state, StreamPlaybackState::Playing);
+
+        let duration = info.duration_ms.expect("a duration");
+        let response = server.handle_command(seek(duration - 300)).await;
+        assert!(matches!(response, StreamResponse::Ok), "{response:?}");
+        let info = pull_until_loaded(&mut server, "the track to finish", |i| {
+            i.state == StreamPlaybackState::Finished
+        });
+        assert_eq!(info.content_hash, Some(ContentHash::new("a")));
+    }
+
+    /// How playback restores a held track: Load (the source is Paused), Seek
+    /// while not playing, then Play. The track must play on from the target.
+    #[tokio::test]
+    async fn load_then_seek_while_paused_then_play_plays_from_the_target() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../components/audio_decoder/benches/test_data/medium.flac");
+        let mut server = make_server();
+        // What `handle_load` does once the library has resolved the path.
+        server
+            .engine
+            .load_track(&path)
+            .await
+            .expect("load the fixture");
+        let id = server.engine.audible_track_id().expect("a loaded track");
+        server.tracks.insert(id, track("a"));
+        server.play_state = LoadedState::Paused;
+
+        let seek = server
+            .handle_command(StreamCommand::Seek {
+                position_ms: PositionMs::new(10_000),
+            })
+            .await;
+        assert!(matches!(seek, StreamResponse::Ok), "{seek:?}");
+        let play = server.handle_command(StreamCommand::Play).await;
+        assert!(matches!(play, StreamResponse::Ok), "{play:?}");
+
+        let info = pull_until_loaded(&mut server, "the position to pass the target", |i| {
+            i.position_ms.is_some_and(|p| p >= 11_000)
+        });
+        assert_eq!(info.content_hash, Some(ContentHash::new("a")));
+        assert_eq!(info.state, StreamPlaybackState::Playing);
+    }
+
     /// Loaded with nothing loaded returns Loaded { info: None }.
     #[tokio::test]
     async fn loaded_when_nothing_loaded_returns_none() {
