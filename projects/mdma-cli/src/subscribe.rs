@@ -44,8 +44,8 @@ fn complete_topics(typed: &str) -> Vec<hicli::Candidate> {
 pub(crate) fn subscribe(topic: TopicArg, ctx: &Ctx) -> Result<()> {
     let TopicArg(topic) = topic;
     // Event gateway of the resolved node (tcp://<ip>:5556)
-    let addr = ctx.event_gateway()?.ok_or_else(needs_remote_node)?;
-    let library = ctx.library()?;
+    let addr = ctx.node().event_gateway()?.ok_or_else(needs_remote_node)?;
+    let library = ctx.node().library()?;
     listen(&addr, topic.as_deref(), Some(&library))
 }
 

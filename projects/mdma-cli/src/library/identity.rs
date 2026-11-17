@@ -88,7 +88,7 @@ pub(crate) fn backfill(args: BackfillArgs, ctx: &Ctx) -> Result<()> {
         pcm: Pcm(pcm),
         no_wait: NoWait(no_wait),
     } = args;
-    let library = ctx.library()?;
+    let library = ctx.node().library()?;
     match library.identity_backfill(pcm).map_err(display_error)? {
         IdentityBackfillStart::Started(p) => {
             println!("Identity backfill started: {} tracks to process", p.total)
@@ -131,7 +131,7 @@ pub(crate) fn backfill(args: BackfillArgs, ctx: &Ctx) -> Result<()> {
 /// Show progress of the identity-hash backfill
 #[hicli::command]
 pub(crate) fn status(ctx: &Ctx) -> Result<()> {
-    let library = ctx.library()?;
+    let library = ctx.node().library()?;
     let status = library.identity_backfill_status().map_err(display_error)?;
     println!("{}", format_identity_status(&status));
     Ok(())
@@ -141,7 +141,7 @@ pub(crate) fn status(ctx: &Ctx) -> Result<()> {
 #[hicli::command]
 pub(crate) fn cancel(ctx: &Ctx) -> Result<()> {
     use library_ipc_client::IdentityBackfillStatus;
-    let library = ctx.library()?;
+    let library = ctx.node().library()?;
     match library.identity_backfill_cancel().map_err(display_error)? {
         IdentityBackfillStatus::Running(_) => println!(
             "Cancelling after the current track; progress is kept. \

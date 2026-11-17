@@ -126,7 +126,7 @@ fn accept_pong(response: LibraryResponse) -> Option<()> {
 pub(crate) fn list(ctx: &Ctx) -> Result<()> {
     use library_ipc_client::{DurationSeconds, LibraryRequest};
 
-    let library = ctx.library()?;
+    let library = ctx.node().library()?;
     let names = interpret_library(
         library.request(&LibraryRequest::PlaylistList),
         playlist_names,
@@ -214,7 +214,7 @@ fn entry_line(entry: &PlaylistEntry) -> String {
 /// ```
 #[hicli::command]
 pub(crate) fn entries(name: PlaylistArg, ctx: &Ctx) -> Result<()> {
-    let library = ctx.library()?;
+    let library = ctx.node().library()?;
     let PlaylistArg(pname) = name;
     for entry in library.playlist_entries(&pname).map_err(library_error)? {
         println!("{}", entry_line(&entry));
@@ -236,7 +236,7 @@ pub(crate) fn entries(name: PlaylistArg, ctx: &Ctx) -> Result<()> {
 #[hicli::command]
 pub(crate) fn get(name: PlaylistInput, ctx: &Ctx) -> Result<()> {
     use library_ipc_client::LibraryRequest;
-    let library = ctx.library()?;
+    let library = ctx.node().library()?;
     match name.0 {
         OrStdin::Value(pname) => {
             let content = interpret_library(
@@ -275,7 +275,7 @@ pub(crate) fn get(name: PlaylistInput, ctx: &Ctx) -> Result<()> {
 pub(crate) fn contains(mode: ContainsMode, _stdin: StdinDash, ctx: &Ctx) -> Result<()> {
     use library_ipc_client::LibraryRequest;
 
-    let library = ctx.library()?;
+    let library = ctx.node().library()?;
 
     // 1. Read hashes from stdin, and resolve them to full hashes, as the entries are
     let input_hashes = require_stdin_hashes_or_usage(&[])?;
@@ -326,7 +326,7 @@ pub(crate) fn contains(mode: ContainsMode, _stdin: StdinDash, ctx: &Ctx) -> Resu
 #[hicli::command]
 pub(crate) fn new(name: NewPlaylistArg, _stdin: StdinDash, ctx: &Ctx) -> Result<()> {
     use library_ipc_client::LibraryRequest;
-    let library = ctx.library()?;
+    let library = ctx.node().library()?;
     let NewPlaylistArg(pname) = name;
     let content = read_stdin_to_string()?;
     interpret_library(
@@ -352,7 +352,7 @@ pub(crate) fn new(name: NewPlaylistArg, _stdin: StdinDash, ctx: &Ctx) -> Result<
 #[hicli::command]
 pub(crate) fn append(name: PlaylistArg, _stdin: StdinDash, ctx: &Ctx) -> Result<()> {
     use library_ipc_client::LibraryRequest;
-    let library = ctx.library()?;
+    let library = ctx.node().library()?;
     let PlaylistArg(pname) = name;
     let content = read_stdin_to_string()?;
     interpret_library(
@@ -378,7 +378,7 @@ pub(crate) fn append(name: PlaylistArg, _stdin: StdinDash, ctx: &Ctx) -> Result<
 #[hicli::command]
 pub(crate) fn replace(name: PlaylistArg, _stdin: StdinDash, ctx: &Ctx) -> Result<()> {
     use library_ipc_client::LibraryRequest;
-    let library = ctx.library()?;
+    let library = ctx.node().library()?;
     let PlaylistArg(pname) = name;
     let content = read_stdin_to_string()?;
     interpret_library(
@@ -397,7 +397,7 @@ pub(crate) fn replace(name: PlaylistArg, _stdin: StdinDash, ctx: &Ctx) -> Result
 pub(crate) fn edit(name: PlaylistArg, ctx: &Ctx) -> Result<()> {
     use library_ipc_client::{LibraryRequest, LibraryResponse, ProtocolError};
 
-    let library = ctx.library()?;
+    let library = ctx.node().library()?;
     let PlaylistArg(pname) = name;
 
     // 1. Get current content (or start empty if not found)
@@ -427,7 +427,7 @@ pub(crate) fn edit(name: PlaylistArg, ctx: &Ctx) -> Result<()> {
 #[hicli::command]
 pub(crate) fn remove(name: PlaylistArg, ctx: &Ctx) -> Result<()> {
     use library_ipc_client::LibraryRequest;
-    let library = ctx.library()?;
+    let library = ctx.node().library()?;
     let PlaylistArg(pname) = name;
     interpret_library(
         library.request(&LibraryRequest::PlaylistRemove {
@@ -443,7 +443,7 @@ pub(crate) fn remove(name: PlaylistArg, ctx: &Ctx) -> Result<()> {
 #[hicli::command]
 pub(crate) fn rename(args: RenameArgs, ctx: &Ctx) -> Result<()> {
     use library_ipc_client::LibraryRequest;
-    let library = ctx.library()?;
+    let library = ctx.node().library()?;
     let FromPlaylist(PlaylistArg(from_name)) = args.from;
     let ToPlaylist(NewPlaylistArg(to_name)) = args.to;
     interpret_library(

@@ -2849,6 +2849,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "client-facts"
+version = "0.38.3"
+dependencies = [
+ "acid-protocol",
+ "color-eyre",
+ "fact-replica",
+ "gateway-client",
+ "library-ipc-client",
+ "library-projection",
+ "mdma-client",
+ "music-facts",
+ "nng",
+ "node-discovery",
+ "pretty_assertions",
+ "private-file",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "clipboard-win"
 version = "5.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5652,8 +5674,10 @@ dependencies = [
 name = "library-projection"
 version = "0.4.0"
 dependencies = [
+ "acid-protocol",
  "chrono",
  "library-ipc-protocol",
+ "library-search",
  "music-facts",
  "pretty_assertions",
  "serde_json",
@@ -5712,9 +5736,7 @@ dependencies = [
  "chrono",
  "library-ipc-protocol",
  "library-projection",
- "library-search",
  "music-facts",
- "music-primitives",
  "nng",
  "playlist-edit",
  "serde",
@@ -6035,6 +6057,7 @@ version = "0.1.0"
 dependencies = [
  "bdd-runner",
  "chrono",
+ "client-facts",
  "cucumber",
  "date-expression",
  "library-ipc-protocol",
@@ -6087,11 +6110,11 @@ dependencies = [
 name = "mdma-cli"
 version = "0.38.3"
 dependencies = [
- "acid-protocol",
  "audio-transcoder",
  "bpaf",
  "chrono",
  "cli-base",
+ "client-facts",
  "color-eyre",
  "colored",
  "dirs",
@@ -6102,7 +6125,6 @@ dependencies = [
  "inbox-utils",
  "libc",
  "library-ipc-client",
- "library-projection",
  "library-search",
  "mdma-client",
  "music-facts",
@@ -6111,11 +6133,9 @@ dependencies = [
  "node-discovery",
  "playlist-import",
  "pretty_assertions",
- "private-file",
  "rekordbox-roundtrip",
  "rekordbox-xml",
  "reqwest",
- "serde",
  "serde_json",
  "source-protocol",
  "storage_primitives",
@@ -6250,6 +6270,7 @@ name = "mdma-tui"
 version = "0.38.3"
 dependencies = [
  "clap",
+ "client-facts",
  "color-eyre",
  "corsett",
  "crossterm",
@@ -6257,11 +6278,14 @@ dependencies = [
  "library-ipc-protocol",
  "library-search",
  "mdma-client",
+ "music-facts",
  "music-primitives",
  "nng",
  "nng-transport",
+ "node-discovery",
  "ratatui",
  "serde_json",
+ "tempfile",
  "thiserror 1.0.69",
  "tracing",
  "tracing-subscriber",

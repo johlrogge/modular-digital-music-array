@@ -186,7 +186,7 @@ pub(crate) fn add(args: FactArgs, ctx: &Ctx) -> Result<hicli::Success> {
         value: FactValueArg { raw, value },
         hash,
     } = args;
-    let library = ctx.library()?;
+    let library = ctx.node().library()?;
     let hashes = dedup_hashes(hashes_of_input(hash)?);
     let source = library_ipc_client::user_fact_source(env!("CARGO_PKG_VERSION"));
     for_each_track(hashes, |hash| {
@@ -272,7 +272,7 @@ pub(crate) fn retract(args: RetractArgs, ctx: &Ctx) -> Result<hicli::Success> {
             },
     } = args;
     let origin = origin.map_or_else(user_origin, |OriginArg(kind)| kind);
-    let library = ctx.library()?;
+    let library = ctx.node().library()?;
     let hashes = dedup_hashes(hashes_of_input(hash)?);
     let source = FactSource::new(USER_TOOL, env!("CARGO_PKG_VERSION"), origin.as_str());
     // A retract that matched nothing is a failed line, so scripts can tell.

@@ -1,10 +1,11 @@
+use crate::link::Link;
 use crate::pane::{Pane, PaneAction, PaneKind};
 use crate::search_parse::parse_query;
 use crate::selection::SelectionState;
 use crate::theme::{INPUT_ACTIVE, MUTED};
 use crate::track_list::render_track_list;
 use crossterm::event::{KeyCode, KeyEvent};
-use mdma_client::{ContentHash, LibraryBackend, PlaylistName, TrackInfo};
+use mdma_client::{ContentHash, PlaylistName, TrackInfo};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::Style,
@@ -12,7 +13,6 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph},
     Frame,
 };
-use std::rc::Rc;
 
 /// Search pane — lets the user type a query and browse the results.
 #[derive(Clone)]
@@ -21,19 +21,19 @@ pub struct SearchPane {
     editing: bool,
     tracks: Vec<TrackInfo>,
     selection: SelectionState,
-    library: Rc<LibraryBackend>,
+    link: Link,
     /// The query string that produced the current `tracks` list (empty = no search run yet).
     last_executed_query: String,
 }
 
 impl SearchPane {
-    pub fn new(library: Rc<LibraryBackend>) -> Self {
+    pub fn new(link: Link) -> Self {
         Self {
             query_text: String::new(),
             editing: false,
             tracks: Vec::new(),
             selection: SelectionState::new(0),
-            library,
+            link,
             last_executed_query: String::new(),
         }
     }
@@ -41,26 +41,27 @@ impl SearchPane {
     /// Construct a `SearchPane` with a pre-filled query and immediately execute it.
     ///
     /// The pane starts in non-editing mode so the user can browse results right away.
-    pub fn with_query(library: Rc<LibraryBackend>, query: String) -> (Self, PaneAction) {
+    pub fn with_query(link: Link, query: String) -> (Self, PaneAction) {
         let mut pane = Self {
             query_text: query,
             editing: false,
             tracks: Vec::new(),
             selection: SelectionState::new(0),
-            library,
+            link,
             last_executed_query: String::new(),
         };
         let action = pane.execute_search();
         (pane, action)
     }
 
-    /// Execute the current `query_text` against the library backend.
+    /// Execute the current `query_text` against the facts: in memory over the one
+    /// fold of the replica, so it is cheap on every keystroke.
     ///
     /// On success updates `tracks` and resets selection.
     /// On failure returns a `PaneAction::Error`.
     fn execute_search(&mut self) -> PaneAction {
         let query = parse_query(&self.query_text);
-        match self.library.search(&query) {
+        match self.link.search(&query) {
             Ok(tracks) => {
                 self.last_executed_query = self.query_text.clone();
                 let len = tracks.len();
@@ -235,6 +236,15 @@ impl Pane for SearchPane {
         self.editing
     }
 
+    /// The facts were read again: run the query again over them.
+    fn refresh(&mut self) -> PaneAction {
+        if self.last_executed_query.is_empty() {
+            PaneAction::Consumed
+        } else {
+            self.execute_search()
+        }
+    }
+
     fn clone_box(&self) -> Box<dyn Pane> {
         Box::new(self.clone())
     }
@@ -244,9 +254,6 @@ impl Pane for SearchPane {
 // Tests
 // =========================================================================
 //
-// NOTE: `SearchPane` requires a live `LibraryBackend` (IPC socket) to
-// construct. Tests exercise the pure logic — the same resolve logic used in
-// `resolve_selection` — directly on `SelectionState` + a track slice.
 // `capturing_text_input` behaviour is verified via the `CapturingPane` stub
 // in `pane.rs` tests, which cover the trait contract.  The one-liner
 // `SearchPane::capturing_text_input` (returning `self.editing`) is simple
@@ -256,6 +263,74 @@ impl Pane for SearchPane {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{catalog, World, ATOMIC, BLUE};
+    use crossterm::event::KeyModifiers;
+
+    fn key(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+    }
+
+    fn titles(pane: &SearchPane) -> Vec<&str> {
+        pane.tracks
+            .iter()
+            .filter_map(|t| t.title.as_deref())
+            .collect()
+    }
+
+    /// Typing searches the replica as it goes, with the node dead, and never asks
+    /// the node.
+    #[test]
+    fn typing_searches_the_replica_on_each_keystroke() {
+        let world = World::new(Some(catalog()));
+        let link = world.link();
+        let mut pane = SearchPane::new(link.clone());
+
+        pane.handle_key(key('/'));
+        for c in "new order".chars() {
+            assert!(matches!(pane.handle_key(key(c)), PaneAction::Consumed));
+        }
+
+        assert_eq!(titles(&pane), ["Blue Monday", "Ceremony"]);
+        assert_eq!(pane.item_count(), 2);
+        assert_eq!(
+            pane.resolve_selection(),
+            [ContentHash::new(BLUE)],
+            "the cursor is on the first result"
+        );
+        let status = link.status_text().unwrap();
+        assert!(!status.contains("unreachable"), "{status}");
+
+        pane.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        assert_eq!(titles(&pane), ["Blue Monday", "Ceremony"], "still matches");
+        for _ in 0..8 {
+            pane.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        }
+        assert_eq!(pane.item_count(), 3, "the empty query lists everything");
+    }
+
+    #[test]
+    fn a_query_given_up_front_is_answered_from_the_replica() {
+        let world = World::new(Some(catalog()));
+
+        let (pane, action) = SearchPane::with_query(world.link(), ":artist blondie".to_string());
+
+        assert!(matches!(action, PaneAction::Consumed));
+        assert_eq!(pane.resolve_selection(), [ContentHash::new(ATOMIC)]);
+        assert_eq!(pane.item_count(), 1);
+    }
+
+    #[test]
+    fn without_a_replica_the_search_says_how_to_get_one() {
+        let world = World::new(None);
+
+        let (pane, action) = SearchPane::with_query(world.link(), "x".to_string());
+
+        let PaneAction::Error(text) = action else {
+            panic!("a search without facts is an error");
+        };
+        assert!(text.contains("`mdma replica sync`"), "{text}");
+        assert_eq!(pane.item_count(), 0);
+    }
 
     /// Build a minimal `TrackInfo` with just the content_hash set.
     fn make_track(hash: &str) -> TrackInfo {
@@ -278,6 +353,9 @@ mod tests {
             beat_grid: None,
             role: None,
             energy: None,
+            genre: None,
+            label: None,
+            styles: vec![],
         }
     }
 

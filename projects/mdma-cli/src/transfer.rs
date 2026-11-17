@@ -237,7 +237,8 @@ fn scp_file(
 
 /// The host to scp to: the resolved node, by IP when known.
 fn upload_host(ctx: &Ctx) -> Result<String> {
-    ctx.remote_host()?
+    ctx.node()
+        .remote_host()?
         .map(|(host, ip)| ip.map_or(host, |ip| ip.to_string()))
         .ok_or_else(|| eyre!("Upload requires --node or MDMA_NODE to determine the Pi hostname"))
 }
@@ -287,7 +288,7 @@ pub(crate) fn upload(args: UploadArgs, ctx: &Ctx) -> Result<Success> {
     }
 
     // 4. Ingest each file via the library service
-    let library = ctx.library()?;
+    let library = ctx.node().library()?;
     let mut success_count = 0;
     let mut fail_count = 0;
 
@@ -744,9 +745,9 @@ pub(crate) fn export(args: ExportArgs, _stdin: StdinDash, ctx: &Ctx) -> Result<S
         output: OutputDir(output),
     } = args;
     let output = output.unwrap_or_else(|| std::path::PathBuf::from(DEFAULT_EXPORT_DIR));
-    let library = ctx.library()?;
+    let library = ctx.node().library()?;
 
-    let (node, node_ip) = ctx.require_node()?;
+    let (node, node_ip) = ctx.node().require_node()?;
 
     // Read hashes from stdin
     let raw_hashes =

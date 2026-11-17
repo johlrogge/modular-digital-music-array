@@ -929,6 +929,64 @@ pcm-bench-cross:
     file target/aarch64-unknown-linux-gnu/release/examples/pcm_bench
     ls -lh target/aarch64-unknown-linux-gnu/release/examples/pcm_bench
 
+# Stage-by-stage cost of folding a replica's facts.jsonl (release, production profile; ADR-030 P6)
+[group('test')]
+replica-fold-cost path iterations="20" artist="":
+    cargo polylith cargo --profile production run --release -p library-projection --example fold_cost -- {{path}} {{iterations}} {{artist}}
+
+# Time end-to-end runs of the release mdma against a copy of a real replica (ADR-030 P6)
+[group('test')]
+replica-search-timing node="mdma-stage2" artist="" runs="20":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo polylith cargo --profile production build --release --bin mdma
+    cargo polylith cargo --profile production build --release -p library-projection --example fold_cost
+    MDMA=target/release/mdma
+    SRC="${XDG_CACHE_HOME:-$HOME/.cache}/mdma/nodes/{{node}}"
+    ARTIST="{{artist}}"
+    if [ -z "$ARTIST" ]; then
+        ARTIST=$(target/release/examples/fold_cost "$SRC/facts.jsonl" 1 | sed -n 's/^artist filter: //p')
+    fi
+    # Work on a copy so the real cache is never touched, and so the background sync
+    # throttle sees a fresh attempt (no detached sync lands in the timings).
+    TMP=$(mktemp -d)
+    trap 'rm -rf "$TMP"' EXIT
+    mkdir -p "$TMP/mdma/nodes"
+    cp -r "$SRC" "$TMP/mdma/nodes/{{node}}"
+    META="$TMP/mdma/nodes/{{node}}/meta.json"
+    export XDG_CACHE_HOME="$TMP"
+    unset MDMA_FACTS
+    # synced_at and last_attempt both become "now", so the replica reads as freshly
+    # synced and the staleness note stays normal.
+    refresh() {
+        now=$(date +%s)
+        sed -i -E "s/\"(last_attempt|synced_at)\": *[0-9]+/\"\1\": $now/" "$META"
+    }
+    stats() {
+        sort -n | awk -v n="{{runs}}" '{ v[NR]=$1 }
+            END { p50=int((n*50+99)/100); p95=int((n*95+99)/100);
+                  printf "  p50 %.1f ms   p95 %.1f ms\n", v[p50]/1e6, v[p95]/1e6 }'
+    }
+    echo "mdma: $("$MDMA" --version)   node: {{node}}   artist: $ARTIST   runs: {{runs}}"
+    echo "replica: $(wc -l < "$SRC/facts.jsonl") lines, $(wc -c < "$SRC/facts.jsonl") bytes"
+    echo "search --artist:"
+    for _ in $(seq {{runs}}); do
+        refresh
+        s=$(date +%s%N)
+        "$MDMA" --node {{node}} --facts=replica search --artist "$ARTIST" > /dev/null
+        e=$(date +%s%N)
+        echo $((e - s))
+    done | stats
+    echo "search --artist | view --title -:"
+    for _ in $(seq {{runs}}); do
+        refresh
+        s=$(date +%s%N)
+        "$MDMA" --node {{node}} --facts=replica search --artist "$ARTIST" \
+            | "$MDMA" --node {{node}} --facts=replica view --title - > /dev/null
+        e=$(date +%s%N)
+        echo $((e - s))
+    done | stats
+
 # Cross-compile bandcamp for aarch64 (dev profile workspace)
 [group('build')]
 bandcamp-cross:

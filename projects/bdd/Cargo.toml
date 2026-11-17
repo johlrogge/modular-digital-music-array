@@ -17,6 +17,7 @@ cucumber = "0.21"
 tokio = { version = "1.36", features = ["full"] }
 tempfile = "3"
 mdma-client = { path = "../../components/mdma_client" }
+client-facts = { path = "../../components/client_facts_replica", features = ["test-support"] }
 date-expression = { path = "../../components/date_expression" }
 media-protocol = { path = "../../components/media_protocol" }
 playback-primitives = { path = "../../components/playback_primitives" }
