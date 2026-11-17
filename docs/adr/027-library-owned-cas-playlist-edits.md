@@ -60,7 +60,7 @@ enum Duplicates { Skip, Keep }
 
 ### 4. Edits preserve lines
 
-1. **Decided:** edits work on `PlaylistDoc`, a `Vec<Line>` with `Line::Entry(StoredLine)` or `Line::Other { raw }`, plus whether the file ends in a newline. `StoredLine` is a validated single entry line. Entry lines are classified by the same rule as `playlist_hashes`: one definition.
+1. **Decided:** edits work on `PlaylistDoc`, a `Vec<Line>` with `Line::Entry(StoredLine)` or `Line::Other { raw }`, plus whether the file ends in a newline. `StoredLine` is a validated single entry line. Entry lines are classified by the same rule as `playlist_hashes`: one definition. The on-read repair (successor chain) and the dedup rewrite use the same parser: both go through `replace_tokens`, which changes only the hash token of the lines it names and returns nothing when no line changes. So they keep CRLF, comments and trailing text byte for byte, and a file that needs no repair is passed on as it was read.
 2. `render(parse(bytes)) == bytes` for every input; an exhaustive test over all strings up to length 7 checks it.
 3. An op touches only the lines it names. Every other line stays byte-identical, including short IDs, trailing text, `# reason` lines, comments and blank lines.
 4. An insert into a CRLF file writes LF lines; readers trim the `\r`, so the mix is harmless.
@@ -93,17 +93,17 @@ LibraryRequest::PlaylistRevert { name: PlaylistName, version: PlaylistVersion, c
 
 1. **Decided:** a single `playlists_lock` in the library service is held by every playlist writer and every read-modify-write:
    - the IPC handlers: New, Append, Replace, Edit, Revert, Delete, Remove, Rename;
-   - the on-read repair: read, repair and write are one critical section, and Snapshot and Entries read under the lock;
+   - the on-read repair: read, repair and write are one critical section, and Get, Append, Snapshot and Entries read under the lock (Append appends to the repaired content);
    - the dedup rewrite, for its whole sweep.
 2. Lock order: `playlists_lock` before `tracks`, since repair and Insert resolution take `tracks` inside it.
-3. **Decided:** every playlist write goes through one function, `write_playlist_atomic(path, bytes)`, built on `private_file::write_file_atomic(path, bytes, 0o644)`. It writes a sibling temp file, fsyncs it and renames it over the target. The temp names end in `.tmp`, so the `.plist` listing ignores them.
+3. **Decided:** every playlist write goes through one function, `write_playlist_atomic(path, bytes)`, built on `private_file::write_file_atomic(path, bytes, 0o644)`. It writes a sibling temp file, fsyncs it and renames it over the target. The temp names end in `.tmp`, so the `.plist` listing ignores them. `write_playlist_atomic` itself creates the playlists directory if it is missing (`write_file_atomic` does not). A read error other than "not found", including content that is not UTF-8, is `Internal`, not PlaylistNotFound.
 4. Hand edits over SSH bypass the lock. The version check still catches them before an edit lands.
 
 ### 8. The `playlist_edit` component
 
-1. A new pure component with no IO. It holds `PlaylistDoc` parse and render and `apply(doc, ops, tracks, to_info) -> Result<Edited { doc, skipped }, EditError>`. The caller passes the library's tracks (`&[T: HashedTrack]`) and a `T -> TrackInfo` for writing new lines; hashes resolve inside `apply` with `library_projection::resolve_entry_track` (the rule behind `resolve_entry`, over `resolve_visible`), so the service and the stub cannot drift apart. `apply` does not compute undo.
-2. The wire types (`EditOp`, `Duplicates`, `StoredPlaylist`, `PlaylistVersion` with `of(bytes)`, `PlaylistSnapshot`, `EditOutcome`) live in `library_ipc_protocol`, because the gateway decodes them. The caller decides whether anything changed by comparing `PlaylistVersion::of(rendered)` with the old version. `StoredLine` (one validated entry line) is internal to `playlist_edit`, not on the wire. `playlist_edit` depends on the protocol, `library_projection` and `track_formatter`.
-3. `library_service` and `library_service_stub` both call it, so console and BDD tests run the same rules. The stub gains Snapshot, Edit, Revert, Delete, Rename and Remove; today it refuses Append, Remove and Rename.
+1. A new pure component with no IO. It holds `PlaylistDoc` parse and render and `apply(doc, ops, tracks, to_info) -> Result<Edited { doc, skipped }, EditError>`. The caller passes the library's tracks (`&[T: HashedTrack]`) and a `T -> TrackInfo` for writing new lines; hashes resolve inside `apply` with `library_projection::resolve_entry_track` (the rule behind `resolve_entry`, over `resolve_visible`), so the service and the stub cannot drift apart. `apply` does not compute undo. A `plan` module builds on `apply` and answers each request from the file's current bytes: `entries`, `snapshot`, `plan_edit`, `plan_revert`, `plan_delete`, `appended` (the one rule of Append). A `Planned` is either an answer with nothing to write or bytes to write with the answer. The contract scenarios (`playlist_edit::contract`, one `#[test]` each through `playlist_contract_tests!`) are behind the `test-support` feature, and the service and the stub run them as dev-dependencies.
+2. The wire types (`EditOp`, `Duplicates`, `StoredPlaylist`, `PlaylistVersion` with `of(bytes)`, `PlaylistSnapshot`, `EditOutcome`) live in `library_ipc_protocol`, because the gateway decodes them. `plan` decides whether anything changed: it answers with nothing to write when the rendered bytes equal the old ones, so the version stays the same. `StoredLine` (one validated entry line) is internal to `playlist_edit`, not on the wire. `playlist_edit` depends on the protocol, `library_projection` and `track_formatter`.
+3. `library_service` and `library_service_stub` both call it, so console and BDD tests run the same rules. The stub holds its playlists in memory, and implements every playlist request: List, Get, Entries, Snapshot, New, Append, Replace, Edit, Revert, Delete, Rename and Remove. Its one mutex on the playlists plays the part of `playlists_lock` (taken before `tracks`).
 
 ### 9. Gateway, console, deploy
 

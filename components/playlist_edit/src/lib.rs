@@ -9,6 +9,12 @@
 //! Only the lines an op names change; every other line, including comments,
 //! short IDs and `# reason` text, stays byte for byte.
 
+#[cfg(any(test, feature = "test-support"))]
+pub mod contract;
+mod plan;
+
+pub use plan::{appended, entries, plan_delete, plan_edit, plan_revert, snapshot, Planned};
+
 use library_ipc_protocol::{
     entry_token, is_entry_line, CanonicalHash, ContentHash, Duplicates, EditOp, EntryError,
     PlaylistEntry, ProtocolError, Skipped, TrackInfo,
@@ -51,6 +57,22 @@ impl StoredLine {
     pub fn token(&self) -> &str {
         // An entry line always has a token; validated on construction.
         entry_token(&self.0).unwrap_or_default()
+    }
+
+    /// The line with its hash token replaced; everything else (leading
+    /// whitespace, trailing text, a `\r`) stays byte for byte. `None` if
+    /// `token` would not leave an entry line.
+    fn with_token(&self, token: &str) -> Option<Self> {
+        let old = self.token();
+        // Only whitespace precedes the token, so its first occurrence is it.
+        let start = self.0.find(old)?;
+        let raw = format!(
+            "{}{}{}",
+            &self.0[..start],
+            token,
+            &self.0[start + old.len()..]
+        );
+        Self::new(raw).ok()
     }
 }
 
@@ -180,6 +202,40 @@ impl PlaylistDoc {
             self.lines[slot] = Line::Entry(entry);
         }
     }
+}
+
+/// Replace the hash token of every entry line for which `replacement` gives a
+/// different token; only the token changes. `None` when no line changes, so a
+/// caller leaves the file's bytes alone then. The one rewriter of tokens for
+/// the successor repair and the dedup rewrite.
+pub fn replace_tokens(
+    doc: &PlaylistDoc,
+    replacement: impl Fn(&str) -> Option<String>,
+) -> Option<PlaylistDoc> {
+    let mut changed = false;
+    let lines = doc
+        .lines
+        .iter()
+        .map(|line| match line {
+            Line::Entry(entry) => {
+                let new = replacement(entry.token())
+                    .filter(|token| token != entry.token())
+                    .and_then(|token| entry.with_token(&token));
+                match new {
+                    Some(new) => {
+                        changed = true;
+                        Line::Entry(new)
+                    }
+                    None => line.clone(),
+                }
+            }
+            Line::Other { .. } => line.clone(),
+        })
+        .collect();
+    changed.then_some(PlaylistDoc {
+        lines,
+        trailing_newline: doc.trailing_newline,
+    })
 }
 
 /// Why an edit was refused. Nothing is changed.
@@ -431,6 +487,32 @@ mod tests {
             info: info(hash, title),
             hidden: false,
         }
+    }
+
+    #[test]
+    fn replace_tokens_changes_only_the_token_and_keeps_crlf_and_trailing_text() {
+        let text = "# c\r\n  aa11\t Artist - T  [3:00]\r\n\r\nbb22\r\nno newline";
+        let doc = PlaylistDoc::parse(text);
+        let replaced = replace_tokens(&doc, |token| (token == "aa11").then(|| "AA".to_string()))
+            .expect("one line changes");
+        assert_eq!(
+            replaced.render(),
+            "# c\r\n  AA\t Artist - T  [3:00]\r\n\r\nbb22\r\nno newline"
+        );
+    }
+
+    #[test]
+    fn replace_tokens_is_none_when_nothing_changes() {
+        let doc = PlaylistDoc::parse("a\r\n# a\r\nb\r\n");
+        assert_eq!(replace_tokens(&doc, |_| None), None);
+        assert_eq!(replace_tokens(&doc, |token| Some(token.to_string())), None);
+    }
+
+    #[test]
+    fn appended_starts_on_a_new_line() {
+        assert_eq!(appended("", "x\n"), "x\n");
+        assert_eq!(appended("a", "x\n"), "a\nx\n");
+        assert_eq!(appended("a\n", "x\n"), "a\nx\n");
     }
 
     /// Tracks a, b and c (hashes of that letter repeated), a hidden e, a

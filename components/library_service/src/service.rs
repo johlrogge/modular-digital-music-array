@@ -4,10 +4,10 @@
 
 use crate::identity::{identity_facts_for_blob, IdentityOpts};
 use crate::ipc::{
-    bookmark_scope_mark, parse_request, playlist_hashes, AttributeList, BeatGridInfo, Bpm,
-    ContentHash, CueInfo, DurationSeconds, FactType, InboxPath, IngestAllItem, IngestResult,
-    IpcServer, LibraryRequest, LibraryResponse, Mark, MarkWrite, OrphanInfo, OrphanReason,
-    PlaylistName, ProtocolError, ServiceStatus, TrackInfo, TrackQuery, Unmark,
+    bookmark_scope_mark, parse_request, AttributeList, BeatGridInfo, Bpm, ContentHash, CueInfo,
+    DurationSeconds, FactType, InboxPath, IngestAllItem, IngestResult, IpcServer, LibraryRequest,
+    LibraryResponse, Mark, MarkWrite, OrphanInfo, OrphanReason, PlaylistName, ProtocolError,
+    ServiceStatus, TrackInfo, TrackQuery, Unmark,
 };
 use crate::pipeline::InboxFile;
 use crate::sources::{self, LibrarySources, ReleaseVersion};
@@ -15,7 +15,7 @@ use acid_client::AcidClient;
 use event_protocol::{acid_event_from_topic_message, AcidEvent, TOPIC_ACID};
 use library_projection::{
     apply_fact, distinct_retractions, hash_key, is_play_event, is_provenance_tracked, project,
-    remove_cancelled, resolve_entry, resolve_prefix, resolve_visible, retain_live, retract_matches,
+    remove_cancelled, resolve_prefix, resolve_visible, retain_live, retract_matches,
     try_parse_fact_line, IndexedTrackInfo, MusicFact, PlayLog, Unresolved,
 };
 #[cfg(test)]
@@ -132,6 +132,23 @@ pub struct LibraryService {
     /// the gate, so the compiler proves their callers hold this mutex.
     /// Lock order: before `cursor`; see there.
     retire_gate: Mutex<gate::RetireToken>,
+    /// Serialises every playlist writer and every playlist read-modify-write
+    /// (ADR-027 §7): the IPC handlers (New, Append, Replace, Edit, Revert, Delete,
+    /// Remove, Rename), the on-read repair (read, repair and write are one critical
+    /// section, so Get, Entries and Snapshot read under it), and the dedup rewrite
+    /// (for its whole sweep). Without it a repair or dedup pass that read before an
+    /// edit would write the old content back over it. Playlists are small and rare
+    /// to change, so one lock for all of them is enough.
+    ///
+    /// The guard (`MutexGuard<PlaylistsToken>`) is passed to the functions that need
+    /// the lock, so the compiler proves their callers hold it. The mutex is not reentrant.
+    ///
+    /// Lock order: `playlists_lock` -> `tracks` (repair and Insert resolution take
+    /// `tracks` inside it) -> `album_cover_cache` (writing a new line). Outermost
+    /// among the playlist-related locks: never take `retire_gate`, `cursor` or
+    /// `identity_backfill` while holding it, and never take it while holding
+    /// `tracks` or any lock listed under `cursor`.
+    playlists_lock: Mutex<PlaylistsToken>,
     /// Test-only: called by the backfill worker after hashing a track and before
     /// the liveness check + write, to inject a concurrent change at that point.
     #[cfg(test)]
@@ -149,6 +166,51 @@ pub struct LibraryService {
     /// change (a re-ingest) in that window.
     #[cfg(test)]
     merge_pre_archive_hook: Mutex<Option<IdentityWriteHook>>,
+}
+
+fn playlist_not_found(name: &PlaylistName) -> ProtocolError {
+    ProtocolError::PlaylistNotFound {
+        name: name.to_string(),
+    }
+}
+
+/// Write a playlist file: all of `bytes` or nothing (ADR-027 §7). The one
+/// function every playlist write goes through. The caller holds `playlists_lock`.
+///
+/// The bytes go to a sibling temp file (its name ends in `.tmp`, so the `.plist`
+/// listing ignores it), which is fsynced and renamed over `path`. A missing
+/// playlists directory is created.
+fn write_playlist_atomic(path: &std::path::Path, bytes: &[u8]) -> Result<(), ProtocolError> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| ProtocolError::Internal {
+            message: format!("Failed to create playlist directory: {e}"),
+        })?;
+    }
+    private_file::write_file_atomic(path, bytes, 0o644).map_err(|e| ProtocolError::Internal {
+        message: format!("Failed to write playlist: {e}"),
+    })
+}
+
+/// Delete a playlist file and answer `done`. The caller holds `playlists_lock`.
+fn remove_playlist_file(path: &std::path::Path, done: LibraryResponse) -> LibraryResponse {
+    match std::fs::remove_file(path) {
+        Ok(()) => done,
+        Err(e) => LibraryResponse::Error(ProtocolError::Internal {
+            message: format!("Failed to remove playlist: {e}"),
+        }),
+    }
+}
+
+/// Store what `planned` says to write, and answer its outcome. The caller holds
+/// `playlists_lock`.
+fn commit_playlist(path: &std::path::Path, planned: playlist_edit::Planned) -> LibraryResponse {
+    let (write, outcome) = planned.into_parts();
+    if let Some(bytes) = write {
+        if let Err(e) = write_playlist_atomic(path, bytes.as_bytes()) {
+            return LibraryResponse::Error(e);
+        }
+    }
+    LibraryResponse::PlaylistEdited(outcome)
 }
 
 #[cfg(test)]
@@ -169,11 +231,22 @@ mod gate {
     pub(super) fn new_gate() -> Mutex<RetireToken> {
         Mutex::new(RetireToken(()))
     }
+
+    /// The payload of `playlists_lock`; made only by `new_playlists_lock`, so a
+    /// `MutexGuard<PlaylistsToken>` is proof of holding the real lock.
+    pub(super) struct PlaylistsToken(());
+
+    pub(super) fn new_playlists_lock() -> Mutex<PlaylistsToken> {
+        Mutex::new(PlaylistsToken(()))
+    }
 }
-use gate::RetireToken;
+use gate::{PlaylistsToken, RetireToken};
 
 /// Proof that the caller holds `retire_gate`.
 type RetireGuard<'a> = std::sync::MutexGuard<'a, RetireToken>;
+
+/// Proof that the caller holds `playlists_lock`.
+type PlaylistsGuard<'a> = std::sync::MutexGuard<'a, PlaylistsToken>;
 
 /// The files a retired track owned, relative to `music_dir`. Captured before the
 /// retire removes the track's index entry.
@@ -356,6 +429,7 @@ impl LibraryService {
             identity_backfill: Mutex::new(crate::ipc::IdentityBackfillStatus::Idle),
             identity_cancel: std::sync::atomic::AtomicBool::new(false),
             retire_gate: gate::new_gate(),
+            playlists_lock: gate::new_playlists_lock(),
             #[cfg(test)]
             identity_write_hook: Mutex::new(None),
             #[cfg(test)]
@@ -1082,114 +1156,100 @@ impl LibraryService {
                 LibraryResponse::PlaylistNames(names)
             }
 
-            LibraryRequest::PlaylistGet { name } => match self.read_playlist(&name) {
-                Ok(content) => LibraryResponse::PlaylistContent(content),
-                Err(e) => LibraryResponse::Error(e),
-            },
+            LibraryRequest::PlaylistGet { name } => self.with_playlist(&name, |_, content| {
+                LibraryResponse::PlaylistContent(content.to_string())
+            }),
 
-            LibraryRequest::PlaylistEntries { name } => match self.read_playlist(&name) {
-                Ok(content) => {
+            LibraryRequest::PlaylistEntries { name } => self.with_playlist(&name, |_, content| {
+                let tracks = self.tracks.lock().unwrap();
+                LibraryResponse::PlaylistEntries(playlist_edit::entries(content, &tracks))
+            }),
+
+            LibraryRequest::PlaylistSnapshot { name } => self.with_playlist(&name, |_, content| {
+                let tracks = self.tracks.lock().unwrap();
+                LibraryResponse::PlaylistSnapshot(playlist_edit::snapshot(content, &tracks))
+            }),
+
+            LibraryRequest::PlaylistEdit { name, version, ops } => {
+                self.with_playlist(&name, |path, content| {
+                    let planned = {
+                        let tracks = self.tracks.lock().unwrap();
+                        playlist_edit::plan_edit(content, &version, &ops, &tracks, |t| {
+                            self.to_track_info(t)
+                        })
+                    };
+                    match planned {
+                        Ok(planned) => commit_playlist(path, planned),
+                        Err(e) => LibraryResponse::Error(e),
+                    }
+                })
+            }
+
+            LibraryRequest::PlaylistRevert {
+                name,
+                version,
+                content: to,
+            } => self.with_playlist(&name, |path, content| {
+                let planned = {
                     let tracks = self.tracks.lock().unwrap();
-                    LibraryResponse::PlaylistEntries(
-                        playlist_hashes(&content)
-                            .map(|token| resolve_entry(&tracks, token))
-                            .collect(),
-                    )
-                }
-                Err(e) => LibraryResponse::Error(e),
-            },
+                    playlist_edit::plan_revert(content, &version, &to, &tracks)
+                };
+                commit_playlist(path, planned)
+            }),
+
+            LibraryRequest::PlaylistDelete { name, version } => {
+                self.with_playlist(&name, |path, content| {
+                    let verdict = {
+                        let tracks = self.tracks.lock().unwrap();
+                        playlist_edit::plan_delete(content, &version, &tracks)
+                    };
+                    match verdict {
+                        Ok(()) => remove_playlist_file(path, LibraryResponse::PlaylistDeleted),
+                        Err(current) => LibraryResponse::PlaylistDeleteConflict { current },
+                    }
+                })
+            }
 
             LibraryRequest::PlaylistNew { name, content } => {
+                let _lock = self.playlists_lock.lock().unwrap();
                 let path = self.resolve_playlist_path(&name);
                 if path.exists() {
                     LibraryResponse::Error(ProtocolError::PlaylistAlreadyExists {
                         name: name.to_string(),
                     })
                 } else {
-                    if let Some(parent) = path.parent() {
-                        if let Err(e) = std::fs::create_dir_all(parent) {
-                            return LibraryResponse::Error(ProtocolError::Internal {
-                                message: format!("Failed to create playlist directory: {}", e),
-                            });
-                        }
-                    }
-                    match std::fs::write(&path, &content) {
+                    match write_playlist_atomic(&path, content.as_bytes()) {
                         Ok(()) => LibraryResponse::PlaylistContent(content),
-                        Err(e) => LibraryResponse::Error(ProtocolError::Internal {
-                            message: format!("Failed to write playlist: {}", e),
-                        }),
+                        Err(e) => LibraryResponse::Error(e),
                     }
                 }
             }
 
             LibraryRequest::PlaylistAppend { name, content } => {
-                let path = self.resolve_playlist_path(&name);
-                if !path.exists() {
-                    return LibraryResponse::Error(ProtocolError::PlaylistNotFound {
-                        name: name.to_string(),
-                    });
-                }
-                match std::fs::read_to_string(&path) {
-                    Ok(existing) => {
-                        let mut new_content = existing;
-                        if !new_content.is_empty() && !new_content.ends_with('\n') {
-                            new_content.push('\n');
-                        }
-                        new_content.push_str(&content);
-                        if let Some(parent) = path.parent() {
-                            if let Err(e) = std::fs::create_dir_all(parent) {
-                                return LibraryResponse::Error(ProtocolError::Internal {
-                                    message: format!("Failed to create playlist directory: {}", e),
-                                });
-                            }
-                        }
-                        match std::fs::write(&path, &new_content) {
-                            Ok(()) => LibraryResponse::PlaylistContent(new_content),
-                            Err(e) => LibraryResponse::Error(ProtocolError::Internal {
-                                message: format!("Failed to write playlist: {}", e),
-                            }),
-                        }
+                self.with_playlist(&name, |path, existing| {
+                    let new_content = playlist_edit::appended(existing, &content);
+                    match write_playlist_atomic(path, new_content.as_bytes()) {
+                        Ok(()) => LibraryResponse::PlaylistContent(new_content),
+                        Err(e) => LibraryResponse::Error(e),
                     }
-                    Err(e) => LibraryResponse::Error(ProtocolError::Internal {
-                        message: format!("Failed to read playlist: {}", e),
-                    }),
-                }
-            }
-
-            LibraryRequest::PlaylistReplace { name, content } => {
-                let path = self.resolve_playlist_path(&name);
-                if let Some(parent) = path.parent() {
-                    if let Err(e) = std::fs::create_dir_all(parent) {
-                        return LibraryResponse::Error(ProtocolError::Internal {
-                            message: format!("Failed to create playlist directory: {}", e),
-                        });
-                    }
-                }
-                match std::fs::write(&path, &content) {
-                    Ok(()) => LibraryResponse::PlaylistContent(content),
-                    Err(e) => LibraryResponse::Error(ProtocolError::Internal {
-                        message: format!("Failed to write playlist: {}", e),
-                    }),
-                }
-            }
-
-            // Phase 2 of ADR-027 implements these.
-            LibraryRequest::PlaylistSnapshot { .. }
-            | LibraryRequest::PlaylistEdit { .. }
-            | LibraryRequest::PlaylistRevert { .. }
-            | LibraryRequest::PlaylistDelete { .. } => {
-                LibraryResponse::Error(ProtocolError::Internal {
-                    message: "playlist edits not supported yet".to_string(),
                 })
             }
 
+            LibraryRequest::PlaylistReplace { name, content } => {
+                let _lock = self.playlists_lock.lock().unwrap();
+                let path = self.resolve_playlist_path(&name);
+                match write_playlist_atomic(&path, content.as_bytes()) {
+                    Ok(()) => LibraryResponse::PlaylistContent(content),
+                    Err(e) => LibraryResponse::Error(e),
+                }
+            }
+
             LibraryRequest::PlaylistRename { from, to } => {
+                let _lock = self.playlists_lock.lock().unwrap();
                 let from_path = self.resolve_playlist_path(&from);
                 let to_path = self.resolve_playlist_path(&to);
                 if !from_path.exists() {
-                    return LibraryResponse::Error(ProtocolError::PlaylistNotFound {
-                        name: from.to_string(),
-                    });
+                    return LibraryResponse::Error(playlist_not_found(&from));
                 }
                 if to_path.exists() {
                     return LibraryResponse::Error(ProtocolError::PlaylistAlreadyExists {
@@ -1205,18 +1265,12 @@ impl LibraryService {
             }
 
             LibraryRequest::PlaylistRemove { name } => {
+                let _lock = self.playlists_lock.lock().unwrap();
                 let path = self.resolve_playlist_path(&name);
                 if !path.exists() {
-                    return LibraryResponse::Error(ProtocolError::PlaylistNotFound {
-                        name: name.to_string(),
-                    });
+                    return LibraryResponse::Error(playlist_not_found(&name));
                 }
-                match std::fs::remove_file(&path) {
-                    Ok(()) => LibraryResponse::Pong,
-                    Err(e) => LibraryResponse::Error(ProtocolError::Internal {
-                        message: format!("Failed to remove playlist: {}", e),
-                    }),
-                }
+                remove_playlist_file(&path, LibraryResponse::Pong)
             }
 
             LibraryRequest::ReindexCovers => {
@@ -1856,7 +1910,8 @@ impl LibraryService {
         old_hash: &ContentHash,
         new_hash: &ContentHash,
     ) -> usize {
-        use std::io::Write;
+        // Held for the whole sweep: no edit lands between a read and its write.
+        let _lock = self.playlists_lock.lock().unwrap();
 
         let playlists_dir = self.metadata_dir.join("playlists");
         let old_clean = hash_key(old_hash.as_str());
@@ -1880,49 +1935,26 @@ impl LibraryService {
                 Err(_) => continue,
             };
 
-            let mut changed = false;
-            let new_content: String = content
-                .lines()
-                .map(|line| {
-                    // First whitespace-delimited field is the hash token
-                    let token = line.split_whitespace().next().unwrap_or("");
+            // Only the token of a matching line changes; the rest of the file,
+            // line endings included, stays as it was.
+            let Some(rewritten) = playlist_edit::replace_tokens(
+                &playlist_edit::PlaylistDoc::parse(&content),
+                |token| {
                     let token_clean = hash_key(token);
-
                     // A line matches if the stored token is a prefix of the old full hash,
                     // or the full hash starts with the stored token (short-hash support)
-                    if !token_clean.is_empty()
+                    (!token_clean.is_empty()
                         && (old_clean.starts_with(&token_clean)
-                            || token_clean.starts_with(&old_clean))
-                    {
-                        changed = true;
-                        // Replace only the hash token; preserve rest of line verbatim
-                        let rest = line[token.len()..].to_string();
-                        format!("{}{}", new_token, rest)
-                    } else {
-                        line.to_string()
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-
-            // Preserve trailing newline if original had one
-            let new_content = if content.ends_with('\n') {
-                format!("{}\n", new_content)
-            } else {
-                new_content
+                            || token_clean.starts_with(&old_clean)))
+                    .then(|| new_token.clone())
+                },
+            ) else {
+                continue;
             };
+            let new_content = rewritten.render();
 
-            if changed {
-                // Write atomically via temp file
-                let tmp_path = path.with_extension("plist.tmp");
-                if let Ok(mut f) = std::fs::File::create(&tmp_path) {
-                    if f.write_all(new_content.as_bytes()).is_ok() {
-                        let _ = std::fs::rename(&tmp_path, &path);
-                        total_rewritten += 1;
-                    } else {
-                        let _ = std::fs::remove_file(&tmp_path);
-                    }
-                }
+            if write_playlist_atomic(&path, new_content.as_bytes()).is_ok() {
+                total_rewritten += 1;
             }
         }
 
@@ -2656,7 +2688,10 @@ impl LibraryService {
     ///
     /// "Live" means: the track is in the index AND is not hidden (deleted_at is None).
     /// This is stricter than resolve_hash (which accepts hidden tracks).
-    fn resolve_through_replaces(&self, hash: &ContentHash) -> Option<ContentHash> {
+    fn resolve_through_replaces(
+        tracks: &[IndexedTrackInfo],
+        hash: &ContentHash,
+    ) -> Option<ContentHash> {
         const MAX_CHAIN_DEPTH: usize = 64;
 
         let normalize = |h: &str| h.strip_prefix("sha256:").unwrap_or(h).to_lowercase();
@@ -2671,22 +2706,19 @@ impl LibraryService {
             let current_clean = normalize(current.as_str());
 
             // Scan all tracks' provenance for Replaces(current)
-            let successor = {
-                let tracks = self.tracks.lock().unwrap();
-                tracks
-                    .iter()
-                    .find(|t| {
-                        t.provenance.iter().any(|(v, _)| {
-                            if let MusicValue::Replaces(old) = v {
-                                let old_clean = normalize(old.as_str());
-                                old_clean == current_clean
-                            } else {
-                                false
-                            }
-                        })
+            let successor = tracks
+                .iter()
+                .find(|t| {
+                    t.provenance.iter().any(|(v, _)| {
+                        if let MusicValue::Replaces(old) = v {
+                            let old_clean = normalize(old.as_str());
+                            old_clean == current_clean
+                        } else {
+                            false
+                        }
                     })
-                    .map(|t| t.content_hash.clone())
-            };
+                })
+                .map(|t| t.content_hash.clone());
 
             match successor {
                 None => {
@@ -2708,12 +2740,9 @@ impl LibraryService {
                     visited.insert(next_clean.clone());
 
                     // Check if next_hash is live (in index and not hidden)
-                    let is_live = {
-                        let tracks = self.tracks.lock().unwrap();
-                        tracks.iter().any(|t| {
-                            normalize(t.content_hash.as_str()) == next_clean && !t.is_hidden()
-                        })
-                    };
+                    let is_live = tracks.iter().any(|t| {
+                        normalize(t.content_hash.as_str()) == next_clean && !t.is_hidden()
+                    });
 
                     if is_live {
                         return Some(next_hash);
@@ -2735,81 +2764,79 @@ impl LibraryService {
     /// Read a playlist's content verbatim, after the lazy repair: follow the
     /// Replaces chain for any unresolvable hash line; a repair amends the playlist
     /// file in place (one-time heal).
-    fn read_playlist(&self, name: &PlaylistName) -> Result<String, ProtocolError> {
+    ///
+    /// A missing file is `PlaylistNotFound`; any other read failure (including
+    /// content that is not UTF-8) is `Internal`.
+    fn read_playlist(
+        &self,
+        lock: &PlaylistsGuard<'_>,
+        name: &PlaylistName,
+        path: &std::path::Path,
+    ) -> Result<String, ProtocolError> {
+        let content = std::fs::read_to_string(path).map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => playlist_not_found(name),
+            _ => ProtocolError::Internal {
+                message: format!("Failed to read playlist {name}: {e}"),
+            },
+        })?;
+        Ok(self.repair_playlist_content(lock, &content, path))
+    }
+
+    /// Run `f` on the path and the repaired content of playlist `name`, holding
+    /// `playlists_lock` from the read to the end of `f`: whatever `f` writes
+    /// replaces exactly the bytes it was given. A missing playlist is
+    /// `PlaylistNotFound`.
+    fn with_playlist(
+        &self,
+        name: &PlaylistName,
+        f: impl FnOnce(&std::path::Path, &str) -> LibraryResponse,
+    ) -> LibraryResponse {
+        let lock = self.playlists_lock.lock().unwrap();
         let path = self.resolve_playlist_path(name);
-        let content =
-            std::fs::read_to_string(&path).map_err(|_| ProtocolError::PlaylistNotFound {
-                name: name.to_string(),
-            })?;
-        Ok(self.repair_playlist_content(&content, &path))
+        match self.read_playlist(&lock, name, &path) {
+            Ok(content) => f(&path, &content),
+            Err(e) => LibraryResponse::Error(e),
+        }
     }
 
     /// Scan a playlist's content, follow the Replaces chain for any unresolvable
     /// hash, amend lines to the live successor, and persist the file if anything changed.
     ///
     /// Returns the (possibly amended) content string.
-    fn repair_playlist_content(&self, content: &str, plist_path: &std::path::Path) -> String {
-        use std::io::Write;
-
-        let mut changed = false;
-        let new_lines: Vec<String> = content
-            .lines()
-            .map(|line| {
-                let Some(token) = playlist_hashes(line).next() else {
-                    return line.to_string();
-                };
-
-                let candidate = ContentHash::new(token);
-
+    fn repair_playlist_content(
+        &self,
+        _lock: &PlaylistsGuard<'_>,
+        content: &str,
+        plist_path: &std::path::Path,
+    ) -> String {
+        // One view of the index for the whole repair. Only tokens change, so a
+        // file that needs no repair is returned as it was read, byte for byte.
+        let repaired = {
+            let tracks = self.tracks.lock().unwrap();
+            playlist_edit::replace_tokens(&playlist_edit::PlaylistDoc::parse(content), |token| {
                 // Live: the token resolves to a visible track. Ambiguous: leave it.
-                // Unknown or hidden: try the Replaces chain.
-                let leave_alone = {
-                    let tracks = self.tracks.lock().unwrap();
-                    match resolve_prefix(&tracks, token) {
-                        Ok(track) => !track.is_hidden(),
-                        Err(Unresolved::Ambiguous(_)) => true,
-                        Err(Unresolved::NotFound) => false,
-                    }
+                // Unknown or hidden: try the Replaces chain; a dead end leaves the line.
+                let leave_alone = match resolve_prefix(&tracks, token) {
+                    Ok(track) => !track.is_hidden(),
+                    Err(Unresolved::Ambiguous(_)) => true,
+                    Err(Unresolved::NotFound) => false,
                 };
-
                 if leave_alone {
-                    return line.to_string();
+                    return None;
                 }
-
-                // Not live — try repair via Replaces chain
-                match self.resolve_through_replaces(&candidate) {
-                    None => {
-                        // Dead end — leave line unchanged
-                        line.to_string()
-                    }
-                    Some(successor) => {
-                        changed = true;
-                        // Replace only the hash token; preserve the rest of the line verbatim
-                        line.replacen(token, successor.as_str(), 1)
-                    }
-                }
+                Self::resolve_through_replaces(&tracks, &ContentHash::new(token))
+                    .map(|successor| successor.as_str().to_string())
             })
-            .collect();
-
-        let new_content = new_lines.join("\n");
-        let new_content = if content.ends_with('\n') {
-            format!("{}\n", new_content)
-        } else {
-            new_content
+        };
+        let Some(repaired) = repaired else {
+            return content.to_string();
         };
 
-        if changed {
-            // Persist atomically via temp file (same approach as rewrite_playlists_replace_hash)
-            let tmp_path = plist_path.with_extension("plist.tmp");
-            if let Ok(mut f) = std::fs::File::create(&tmp_path) {
-                if f.write_all(new_content.as_bytes()).is_ok() {
-                    let _ = std::fs::rename(&tmp_path, plist_path);
-                } else {
-                    let _ = std::fs::remove_file(&tmp_path);
-                }
-            }
+        let new_content = repaired.render();
+        // A failed heal leaves the old file; the next read tries again.
+        if let Err(e) = write_playlist_atomic(plist_path, new_content.as_bytes()) {
+            tracing::warn!(path = %plist_path.display(), "Playlist repair not saved: {e}");
         }
-
         new_content
     }
 }
@@ -2955,6 +2982,7 @@ pub fn spawn_fact_subscriber(service: Arc<LibraryService>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use library_ipc_protocol::{Duplicates, EditOp, EditOutcome, PlaylistVersion};
 
     /// The release version the tests hand the service; deliberately not this
     /// component's own crate version.
@@ -6599,6 +6627,29 @@ mod tests {
         );
     }
 
+    /// The dedup rewrite changes the token only: CRLF, comments and trailing text stay.
+    #[test]
+    fn rewrite_playlists_keeps_crlf_and_leaves_other_playlists_alone() {
+        let old_hash = ContentHash::new("sha256:oldaabbccdd001122334455667788990000");
+        let new_hash = ContentHash::new("sha256:neweeff1100aabbccdd220044006688aa");
+        let (service, metadata_dir, _acid) = make_service_with_playlists_dir();
+        let playlists_dir = metadata_dir.path().join("playlists");
+        let hit = playlists_dir.join("hit.plist");
+        let miss = playlists_dir.join("miss.plist");
+        let other = "# nothing here\r\nffffffff  x\r\n";
+        std::fs::write(&hit, format!("# c\r\n{old_hash}  Artist - T\r\nlast")).unwrap();
+        std::fs::write(&miss, other).unwrap();
+
+        let count = service.rewrite_playlists_replace_hash(&old_hash, &new_hash);
+
+        assert_eq!(count, 1);
+        assert_eq!(
+            std::fs::read_to_string(&hit).unwrap(),
+            format!("# c\r\n{new_hash}  Artist - T\r\nlast")
+        );
+        assert_eq!(std::fs::read_to_string(&miss).unwrap(), other);
+    }
+
     // =========================================================================
     // Step A: Golden tests (capture current behavior before refactor)
     // =========================================================================
@@ -8259,6 +8310,234 @@ mod tests {
                 LibraryResponse::Error(ProtocolError::PlaylistNotFound { .. })
             ),
             "{resp:?}"
+        );
+    }
+
+    // The ADR-027 contract, stated once in `playlist_edit::contract`.
+
+    fn contract_setup(content: &str) -> playlist_edit::contract::Handler {
+        let (service, _path, dir, acid) = service_with_playlist(content);
+        Box::new(move |request| {
+            let _keep_alive = (&dir, &acid);
+            service.handle_request(request)
+        })
+    }
+
+    playlist_edit::playlist_contract_tests!(contract_setup);
+
+    #[test]
+    fn a_repair_keeps_crlf_line_ends_and_trailing_text() {
+        let old = ContentHash::new(full_hash("aaaa", 'a'));
+        let new = ContentHash::new(full_hash("bbbb", 'b'));
+        let (service, metadata_dir, _acid) =
+            make_service_with_replaces(&[(new.clone(), "New")], &[(new.clone(), old.clone())]);
+        let path = metadata_dir.path().join("playlists").join("set.plist");
+        std::fs::write(
+            &path,
+            format!("# c\r\n{old}  Artist - Title  [3:00]\r\nlast"),
+        )
+        .unwrap();
+        let expected = format!("# c\r\n{new}  Artist - Title  [3:00]\r\nlast");
+
+        let got = service.handle_request(LibraryRequest::PlaylistGet {
+            name: PlaylistName::new("set").unwrap(),
+        });
+        assert!(
+            matches!(&got, LibraryResponse::PlaylistContent(c) if *c == expected),
+            "{got:?}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+    }
+
+    #[test]
+    fn reading_a_playlist_that_is_not_utf8_is_internal_not_not_found() {
+        let (service, path, _dir, _acid) = service_with_playlist("");
+        std::fs::write(&path, [0xff, 0xfe, b'\n']).unwrap();
+        let resp = service.handle_request(LibraryRequest::PlaylistGet {
+            name: PlaylistName::new("set").unwrap(),
+        });
+        assert!(
+            matches!(resp, LibraryResponse::Error(ProtocolError::Internal { .. })),
+            "{resp:?}"
+        );
+    }
+
+    // ---- ADR-027: files, atomic writes and the lock -------------------------
+
+    fn playlist_files(dir: &std::path::Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir.join("playlists"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn edit_request(version: &PlaylistVersion, ops: Vec<EditOp>) -> LibraryRequest {
+        LibraryRequest::PlaylistEdit {
+            name: PlaylistName::new("set").unwrap(),
+            version: version.clone(),
+            ops,
+        }
+    }
+
+    fn insert_op(at: usize, hash: &str) -> EditOp {
+        EditOp::Insert {
+            at,
+            hashes: vec![ContentHash::new(hash)],
+            duplicates: Duplicates::Keep,
+        }
+    }
+
+    #[test]
+    fn playlist_list_ignores_temp_files() {
+        let (service, path, dir, _acid) = service_with_playlist("aaaaaaaa\n");
+        let playlists = path.parent().unwrap();
+        std::fs::write(playlists.join(".set.plist.Xy12.tmp"), "half").unwrap();
+        std::fs::write(playlists.join("other.plist.tmp"), "half").unwrap();
+        let _ = &dir;
+        match service.handle_request(LibraryRequest::PlaylistList) {
+            LibraryResponse::PlaylistNames(names) => {
+                let names: Vec<&str> = names.iter().map(|n| n.as_str()).collect();
+                assert_eq!(names, vec!["set"]);
+            }
+            other => panic!("expected PlaylistNames, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn every_playlist_write_leaves_no_temp_file_and_is_world_readable() {
+        use std::os::unix::fs::PermissionsExt;
+        let (service, path, dir, _acid) = service_with_playlist("aaaaaaaa\n");
+        let name = PlaylistName::new("set").unwrap();
+        let a = full_hash("aaaa", 'a');
+        service.handle_request(LibraryRequest::PlaylistReplace {
+            name: name.clone(),
+            content: format!("{a}\n"),
+        });
+        service.handle_request(LibraryRequest::PlaylistAppend {
+            name: name.clone(),
+            content: format!("{a}\n"),
+        });
+        service.handle_request(LibraryRequest::PlaylistNew {
+            name: PlaylistName::new("fresh").unwrap(),
+            content: String::new(),
+        });
+        let version = PlaylistVersion::of(std::fs::read(&path).unwrap().as_slice());
+        service.handle_request(edit_request(&version, vec![insert_op(0, &a)]));
+        assert_eq!(
+            playlist_files(dir.path()),
+            vec!["fresh.plist".to_string(), "set.plist".to_string()]
+        );
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o644);
+    }
+
+    #[test]
+    fn an_edit_that_changes_nothing_does_not_touch_the_file() {
+        let content = "aaaaaaaa\n";
+        let (service, path, _dir, _acid) = service_with_playlist(content);
+        let version = PlaylistVersion::of(content.as_bytes());
+        let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let skip_all = EditOp::Insert {
+            at: 0,
+            hashes: vec![ContentHash::new(full_hash("aaaa", 'a'))],
+            duplicates: Duplicates::Skip,
+        };
+        service.handle_request(edit_request(&version, vec![skip_all]));
+        service.handle_request(edit_request(&version, vec![]));
+        let after = std::fs::metadata(&path).unwrap().modified().unwrap();
+        assert_eq!(after, before);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), content);
+    }
+
+    #[test]
+    fn concurrent_edits_at_one_version_apply_exactly_once() {
+        const EDITORS: usize = 8;
+        let content = "aaaaaaaa\n";
+        let (service, path, _dir, _acid) = service_with_playlist(content);
+        let version = PlaylistVersion::of(content.as_bytes());
+        let a = full_hash("aaaa", 'a');
+        let barrier = std::sync::Barrier::new(EDITORS);
+
+        let responses: Vec<LibraryResponse> = std::thread::scope(|scope| {
+            let editors: Vec<_> = (0..EDITORS)
+                .map(|_| {
+                    scope.spawn(|| {
+                        barrier.wait();
+                        service.handle_request(edit_request(&version, vec![insert_op(0, &a)]))
+                    })
+                })
+                .collect();
+            editors.into_iter().map(|e| e.join().unwrap()).collect()
+        });
+
+        let outcomes: Vec<&EditOutcome> = responses
+            .iter()
+            .map(|r| match r {
+                LibraryResponse::PlaylistEdited(outcome) => outcome,
+                other => panic!("expected PlaylistEdited, got {other:?}"),
+            })
+            .collect();
+        let applied = outcomes
+            .iter()
+            .filter(|o| matches!(o, EditOutcome::Applied { .. }))
+            .count();
+        let conflicts = outcomes
+            .iter()
+            .filter(|o| matches!(o, EditOutcome::Conflict { .. }))
+            .count();
+        assert_eq!((applied, conflicts), (1, EDITORS - 1), "{responses:?}");
+        assert_eq!(playlist_entries(&service, "set").len(), 2);
+        assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 2);
+    }
+
+    #[test]
+    fn a_repair_racing_an_edit_does_not_lose_the_edit() {
+        const READERS: usize = 4;
+        let old = ContentHash::new(full_hash("aaaa", 'a'));
+        let new = ContentHash::new(full_hash("bbbb", 'b'));
+        let other = ContentHash::new(full_hash("cccc", 'c'));
+        let (service, metadata_dir, _acid) = make_service_with_replaces(
+            &[(new.clone(), "New"), (other.clone(), "Other")],
+            &[(new.clone(), old.clone())],
+        );
+        let path = metadata_dir.path().join("playlists").join("set.plist");
+        // On disk the line still names the replaced track; its repaired form is what
+        // every version is taken from.
+        std::fs::write(&path, format!("{old}\n")).unwrap();
+        let repaired = format!("{new}\n");
+        let version = PlaylistVersion::of(repaired.as_bytes());
+        let barrier = std::sync::Barrier::new(READERS + 1);
+
+        let response = std::thread::scope(|scope| {
+            for _ in 0..READERS {
+                scope.spawn(|| {
+                    barrier.wait();
+                    playlist_entries(&service, "set");
+                });
+            }
+            scope
+                .spawn(|| {
+                    barrier.wait();
+                    let ops = vec![insert_op(1, other.as_str())];
+                    service.handle_request(edit_request(&version, ops))
+                })
+                .join()
+                .unwrap()
+        });
+
+        assert!(
+            matches!(
+                response,
+                LibraryResponse::PlaylistEdited(EditOutcome::Applied { .. })
+            ),
+            "{response:?}"
+        );
+        assert_eq!(
+            playlist_entries(&service, "set"),
+            vec![track_entry(new.as_str()), track_entry(other.as_str())]
         );
     }
 

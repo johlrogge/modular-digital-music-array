@@ -5695,6 +5695,7 @@ dependencies = [
  "notify",
  "playlist-edit",
  "pretty_assertions",
+ "private-file",
  "rstest",
  "serde",
  "serde_json",

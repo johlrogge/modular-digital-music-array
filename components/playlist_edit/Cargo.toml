@@ -17,5 +17,9 @@ library-projection = { workspace = true }
 thiserror = { workspace = true }
 track-formatter = { workspace = true }
 
+[features]
+# The ADR-027 contract scenarios, run against the library service and its stub.
+test-support = []
+
 [dev-dependencies]
 pretty_assertions = { workspace = true }
