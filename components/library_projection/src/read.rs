@@ -42,31 +42,11 @@ impl AlbumCovers {
     pub fn get(&self, album: &str) -> Option<&str> {
         self.0.get(album).map(String::as_str)
     }
-
-    /// The albums whose cover is `cover`.
-    pub fn albums_showing(&self, cover: &str) -> Vec<String> {
-        self.0
-            .iter()
-            .filter(|(_, path)| path.as_str() == cover)
-            .map(|(album, _)| album.clone())
-            .collect()
-    }
-
-    /// Point `album` at another cover.
-    pub fn set(&mut self, album: String, cover: String) {
-        self.0.insert(album, cover);
-    }
-
-    /// Forget the cover of `album`.
-    pub fn evict(&mut self, album: &str) {
-        self.0.remove(album);
-    }
 }
 
 /// The cover an album shows: the cover of the track with the smallest content hash
 /// among `of_album` (the tracks of one album) that has one, whatever their order.
-/// The one choice, for building the cache and for repointing it.
-pub fn album_cover<'a>(of_album: impl IntoIterator<Item = &'a IndexedTrackInfo>) -> Option<String> {
+fn album_cover<'a>(of_album: impl IntoIterator<Item = &'a IndexedTrackInfo>) -> Option<String> {
     of_album
         .into_iter()
         .filter(|t| t.cover_art_path.is_some())

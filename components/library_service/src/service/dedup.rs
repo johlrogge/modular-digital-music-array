@@ -817,38 +817,17 @@ impl LibraryService {
         }
     }
 
-    /// Whether a live track shows the cover art `rel`: as its own, or through
-    /// `album_cover_cache`, which hands it to the album's tracks that have none. A
-    /// cache entry that points at `rel` but is not needed is repointed at another
-    /// cover of the album, or evicted, so it never names an archived file.
+    /// Whether a live track shows the cover art `rel`: as its own. An album's cover
+    /// is always the own cover of one of its tracks, and `album_cover_cache` is
+    /// rebuilt from the live tracks every time the projection catches up, so it
+    /// never names a cover that no live track holds: the loser's retract has already
+    /// been projected, and the album shows another cover or none.
     fn cover_art_in_use(&self, rel: &Path) -> bool {
-        let tracks = self.tracks.lock().unwrap();
-        if tracks
+        self.tracks
+            .lock()
+            .unwrap()
             .iter()
             .any(|t| t.cover_art_path.as_deref() == Some(rel))
-        {
-            return true;
-        }
-        let rel_str = rel.to_string_lossy();
-        let mut cache = self.album_cover_cache.lock().unwrap();
-        let albums = cache.albums_showing(&rel_str);
-        let mut serving = false;
-        for album in albums {
-            let of_album = || {
-                tracks
-                    .iter()
-                    .filter(|t| t.album.as_deref() == Some(album.as_str()))
-            };
-            if let Some(other) = library_projection::album_cover(of_album()) {
-                cache.set(album, other);
-            } else if of_album().next().is_some() {
-                // Tracks of the album without a cover of their own show this one.
-                serving = true;
-            } else {
-                cache.evict(&album);
-            }
-        }
-        serving
     }
 
     /// Archive cover art that no live track references any more.

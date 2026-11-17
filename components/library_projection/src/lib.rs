@@ -33,7 +33,7 @@
 mod read;
 
 pub use read::{
-    album_cover, entity_facts, fact_values, format_fact_for_display, marked, search, search_fields,
+    entity_facts, fact_values, format_fact_for_display, marked, search, search_fields,
     sort_catalog, track_info, visible, AlbumCovers,
 };
 

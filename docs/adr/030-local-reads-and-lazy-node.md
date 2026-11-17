@@ -44,7 +44,7 @@ File and line references below are as of 5d2cf8f.
    - Text compares case-insensitively, by `str::to_lowercase` (the folding ADR-016 uses for mark names). Equal folded text is then ordered by the original text, so the order is total.
    - Disc and track compare as numbers.
    - A missing value sorts last, for every key.
-3. The library service calls these under its locks. It refreshes plays (`refresh_event_timestamps`) before every read that returns `TrackInfo`, not only for date queries. `AlbumCovers` is rebuilt when the projection catches up. With those changes the node and a local fold over the same lines give the same answer.
+3. The library service calls these under its locks. It refreshes plays (`refresh_event_timestamps`) before every read that returns `TrackInfo` (Search, ListTracks, GetTrack, ListMarked and PlaylistEdit), not only for date queries. `AlbumCovers` is rebuilt when the projection catches up. With those changes the node and a local fold over the same lines give the same answer.
    - `AlbumCovers` picks deterministically: each album takes its cover from the track with the smallest content hash among those that have a cover (plain string comparison), so the choice does not depend on fold or track order.
 4. There is no second `TrackFields` mapping, no client-side re-count and no separate renderer for local results. Both sources yield `TrackInfo`, and the CLI prints it with `print_tracks`.
    - **Decided:** `library_service_stub`'s own fold is folded in now, not as a follow-up. That is `IndexedTrack`, its `apply_fact`/`retract_fact` and `as_fields` (stub `service.rs:58-161`, `:799-865`). The stub holds `library_projection::IndexedTrackInfo`, applies facts with `library_projection::apply_fact`, and answers through the §1 functions and `sort_catalog`. Its writes (`WriteMark`, `UnmarkTrack`) build the fact and apply it the same way. It already depends on `library-projection`.
@@ -113,6 +113,7 @@ File and line references below are as of 5d2cf8f.
 ### 6. Measuring decides whether a cache is needed
 
 - **Decided:** the replica is the default from the start (§2.3). Measurement decides only whether reads need a cache.
+- The plays refresh (§1.3) adds an ACID `read_stream` round trip to every `TrackInfo` read on the node. Measure it, because the console polls.
 - **Tools.**
   - `library_projection`'s example `fold_cost` times read, `project_lines`, `plays.apply_to`, `AlbumCovers::build`, search and sort over a given `facts.jsonl`, and prints p50 and p95 over 20 runs.
   - `hyperfine` times `mdma search --facts=replica` and `mdma search --facts=replica | mdma view --title -`.
@@ -147,7 +148,7 @@ The comparison covers every `TrackInfo` field and the order, serialised as JSON.
 
 - `library_projection` (interface `library-projection`) gains dependencies on `library-search` and `acid-protocol`. It already depends on `library-ipc-protocol` and `music-facts`. `library_search` does not depend on `library_projection`, so there is no cycle.
 - `client_facts_replica` (interface `client-facts`, new) depends on `mdma-client`, `fact-replica`, `library-projection`, `acid-protocol` and `gateway-client`.
-- `mdma_client` does not depend on `client-facts` or `library_projection`, so bevy-app and bdd stay light and there is no cycle.
+- `mdma_client` does not depend on `client-facts`, so bevy-app and bdd stay light and there is no cycle. It may depend on `library_projection`, which is pure, for the one hash-resolution rule; `library_projection` never depends on `mdma_client`.
 - `mdma-cli` and `mdma-tui` depend on `client-facts` and `mdma-client`. `mdma-cli` drops its direct `fact-replica` and `library-projection` dependencies (ADR-022 §4).
 - `library_service` and `library_service_stub` depend on `library-projection` for the §1 functions and `sort_catalog`.
 

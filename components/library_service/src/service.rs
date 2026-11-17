@@ -65,6 +65,7 @@ pub struct LibraryService {
     acid_client: AcidClient,
     /// Album name -> cover_art_path for tracks that have cover art.
     /// Used as a fallback when a track on the same album has no cover art of its own.
+    /// Rebuilt from `tracks` every time the projection catches up (`drop_non_live`).
     album_cover_cache: Mutex<AlbumCovers>,
     /// Generic fact value index: fact_type -> set of values
     /// Used for fast HasFact/HasFacts lookups (e.g., ItemId -> {"p123", "p456"})
@@ -80,8 +81,12 @@ pub struct LibraryService {
     ///
     /// Lock order: `retire_gate` -> `cursor` -> `tracks` -> `fact_index` ->
     /// `content_hashes`; `event_cursor` -> `tracks` -> `play_events`
-    /// (`refresh_event_timestamps`); `tracks` -> `album_cover_cache` (nothing taken while
-    /// holding it). `identity_backfill` is independent: take it alone and never
+    /// (`refresh_event_timestamps`).
+    ///
+    /// Covers: `tracks` -> `album_cover_cache` (nothing taken while holding it;
+    /// `drop_non_live` takes it inside `content_hashes`).
+    ///
+    /// `identity_backfill` is independent: take it alone and never
     /// together with another lock in this list.
     /// No projection lock may be held while calling `catch_up`.
     cursor: Mutex<Option<String>>,
@@ -830,7 +835,7 @@ impl LibraryService {
     ///
     /// Each line is a JSON-serialised `Fact<ContentHash, MusicValue, FactSource>`.
     /// Lines that do not parse are warned about and skipped.
-    pub fn apply_stream_lines(&self, lines: &[String]) {
+    fn apply_stream_lines(&self, lines: &[String]) {
         let (facts, unparseable) = parse_fact_lines(lines);
         self.unparseable_lines
             .fetch_add(unparseable, Ordering::Relaxed);
@@ -873,11 +878,16 @@ impl LibraryService {
     ///
     /// Run once after *all* pages of a catch-up, never per line or per page, so an
     /// ingest batch split across a page boundary is not dropped half-way.
+    ///
+    /// The album covers are rebuilt from the swept index here, the one place the
+    /// projection catches up, so a cover asserted or retracted after start shows
+    /// (ADR-030 §1.3).
     fn drop_non_live(&self) {
         let mut tracks = self.tracks.lock().unwrap();
         let mut content_hashes = self.content_hashes.lock().unwrap();
         retain_live(&mut tracks, &mut content_hashes);
         self.tracks_indexed.store(tracks.len(), Ordering::Relaxed);
+        *self.album_cover_cache.lock().unwrap() = AlbumCovers::build(&tracks);
     }
 
     /// Project every ACID stream line this service has not yet seen, using the
@@ -1161,6 +1171,9 @@ impl LibraryService {
             }),
 
             LibraryRequest::PlaylistEdit { name, version, ops } => {
+                // The outcome carries TrackInfo, so plays are refreshed like for
+                // every such read, before the playlists lock (ADR-030 §1.3).
+                self.refresh_event_timestamps();
                 self.with_playlist(&name, |path, content| {
                     let planned = {
                         let tracks = self.tracks.lock().unwrap();
@@ -2086,9 +2099,12 @@ impl LibraryService {
         track_info(t, &self.album_cover_cache.lock().unwrap())
     }
 
-    /// Run a read over the track index and the album covers, taking the locks in
-    /// their documented order (`tracks` -> `album_cover_cache`).
+    /// Run a read that returns `TrackInfo` over the track index and the album covers,
+    /// taking the locks in their documented order (`tracks` -> `album_cover_cache`).
+    /// Plays are refreshed first, for every such read (ADR-030 §1.3), so the answer
+    /// matches a local fold of the same log.
     fn with_catalog<R>(&self, read: impl FnOnce(&[IndexedTrackInfo], &AlbumCovers) -> R) -> R {
+        self.refresh_event_timestamps();
         let tracks = self.tracks.lock().unwrap();
         let covers = self.album_cover_cache.lock().unwrap();
         read(&tracks, &covers)
@@ -2167,17 +2183,18 @@ impl LibraryService {
     /// Get track by hash from in-memory index (supports partial hashes).
     /// Returns TrackNotFound for hidden (deleted/superseded) tracks.
     fn get_track(&self, hash: &ContentHash) -> Result<TrackInfo, ProtocolError> {
-        let tracks = self.tracks.lock().unwrap();
-        match resolve_visible(&tracks, hash.as_str()) {
-            Ok(track) => Ok(self.to_track_info(track)),
-            Err(Unresolved::NotFound) => Err(ProtocolError::TrackNotFound {
-                hash: hash.as_str().to_owned(),
-            }),
-            Err(Unresolved::Ambiguous(found)) => Err(ProtocolError::ambiguous_hash(
-                hash.as_str(),
-                found.iter().map(|t| t.content_hash.as_str()),
-            )),
-        }
+        self.with_catalog(
+            |tracks, covers| match resolve_visible(tracks, hash.as_str()) {
+                Ok(track) => Ok(track_info(track, covers)),
+                Err(Unresolved::NotFound) => Err(ProtocolError::TrackNotFound {
+                    hash: hash.as_str().to_owned(),
+                }),
+                Err(Unresolved::Ambiguous(found)) => Err(ProtocolError::ambiguous_hash(
+                    hash.as_str(),
+                    found.iter().map(|t| t.content_hash.as_str()),
+                )),
+            },
+        )
     }
 
     /// Get all facts for a track by hash (supports partial hashes)
@@ -2279,9 +2296,6 @@ impl LibraryService {
 
     /// Search tracks by structured query (uses library-search for evaluation; hidden tracks excluded)
     fn search_tracks(&self, query: &TrackQuery) -> Vec<TrackInfo> {
-        if query.started.is_some() || query.stopped.is_some() {
-            self.refresh_event_timestamps();
-        }
         self.with_catalog(|tracks, covers| search(tracks, covers, query))
     }
 
@@ -3874,44 +3888,17 @@ mod tests {
     fn make_service_with_facts(
         facts_file: &std::path::Path,
     ) -> (Arc<LibraryService>, tempfile::TempDir) {
-        let music_dir = tempfile::tempdir().unwrap();
-        // Use a shared metadata dir for both ACID and the service so that
-        // acid_service::start() can replay the facts file from it.
-        let metadata_dir = tempfile::tempdir().unwrap();
-        let facts_dest = metadata_dir.path().join("facts.jsonl");
-        std::fs::copy(facts_file, &facts_dest).unwrap();
-
-        let (acid_handle, facts_addr, events_addr) = {
-            let id = ACID_SERVER_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let pid = std::process::id();
-            let fa = format!("ipc:///tmp/mdma-test-acid-facts-{}-{}.sock", pid, id);
-            let ea = format!("ipc:///tmp/mdma-test-acid-events-{}-{}.sock", pid, id);
-            let rep = nng::Socket::new(nng::Protocol::Rep0).expect("rep socket");
-            rep.listen(&fa).expect("rep listen");
-            let pub_sock = nng::Socket::new(nng::Protocol::Pub0).expect("pub socket");
-            pub_sock.listen(&ea).expect("pub listen");
-            let handle = acid_service::start(rep, pub_sock, metadata_dir.path())
-                .expect("failed to start acid server");
-            std::thread::sleep(std::time::Duration::from_millis(20));
-            (handle, fa, ea)
-        };
-
-        let service = LibraryService::new_with_events(
-            music_dir.path().to_path_buf(),
-            metadata_dir.path().to_path_buf(),
-            &facts_addr,
-            &events_addr,
-            test_version(),
-        )
-        .unwrap();
-        // Leak the ACID ServerHandle so the background thread outlives this test.
-        // In a test process this is benign — the process exits when tests finish.
-        Box::leak(Box::new(acid_handle));
+        let (service, metadata_dir, _facts_addr) = make_service_with_facts_and_addr(facts_file);
         (service, metadata_dir)
     }
 
     /// Like `make_service_with_facts` but also returns the ACID request socket address
     /// so the caller can connect an external AcidClient and write additional facts.
+    ///
+    /// The metadata dir is shared by ACID and the service so that
+    /// `acid_service::start()` can replay the facts file from it. The ACID server
+    /// handle is leaked so its background thread outlives the test; in a test process
+    /// that is benign, the process exits when tests finish.
     fn make_service_with_facts_and_addr(
         facts_file: &std::path::Path,
     ) -> (Arc<LibraryService>, tempfile::TempDir, String) {
@@ -4037,6 +4024,360 @@ mod tests {
         assert_eq!(
             a_after.last_started, a_started,
             "hash_a last_started must be identical after second refresh (cursor advanced)"
+        );
+    }
+
+    // =========================================================================
+    // ADR-030 §7: the service and a local fold of the same log give the same reads
+    // =========================================================================
+
+    /// One log with a replaced track, a deleted one, plays (one on the replaced
+    /// track), two discs, a mark, a cover shared by an album and an untagged track.
+    fn equivalence_fixture() -> NamedTempFile {
+        use music_facts::{
+            Album, Artist, Bpm as BpmValue, CueKind, DiscNumber, DurationSeconds, EnergyLevel,
+            Mark, TrackNumber, TrackRole,
+        };
+        let at = |day| Utc.with_ymd_and_hms(2026, 1, day, 10, 0, 0).unwrap();
+        let mut facts = Vec::new();
+        let mut put = |hash: &str, value: MusicValue, day: u32| {
+            facts.push((ContentHash::new(hash), value, at(day), Operation::Assert));
+        };
+        let on_album = |put: &mut dyn FnMut(&str, MusicValue, u32),
+                        hash: &str,
+                        title: &str,
+                        artist: &str,
+                        album: &str| {
+            put(hash, MusicValue::Title(Title::new(title)), 1);
+            put(hash, MusicValue::Artist(Artist::new(artist)), 1);
+            put(hash, MusicValue::Album(Album::new(album)), 1);
+        };
+        on_album(&mut put, "sha256:eq_a1", "One", "Zed", "Alpha");
+        put(
+            "sha256:eq_a1",
+            MusicValue::DiscNumber(DiscNumber::new(1)),
+            1,
+        );
+        put(
+            "sha256:eq_a1",
+            MusicValue::TrackNumber(TrackNumber::new(2)),
+            1,
+        );
+        put(
+            "sha256:eq_a1",
+            MusicValue::CoverArtPath("cover-art/alpha.jpg".to_string()),
+            1,
+        );
+        put(
+            "sha256:eq_a1",
+            MusicValue::Bpm(BpmValue::from_f32(128.0).unwrap()),
+            1,
+        );
+        put("sha256:eq_a1", Mark::Default.fact_value(at(5)), 5);
+        // A blob path, so the startup backfills have something to write facts for.
+        put(
+            "sha256:eq_a1",
+            MusicValue::FilePath("blobs/aa/eq_a1.flac".into()),
+            1,
+        );
+        put(
+            "sha256:eq_a1",
+            MusicValue::Key("A Minor".parse().expect("valid key")),
+            1,
+        );
+        put("sha256:eq_a1", MusicValue::AddedAt(at(1)), 1);
+        put(
+            "sha256:eq_a1",
+            MusicValue::DurationSeconds(DurationSeconds::new(240)),
+            1,
+        );
+        put("sha256:eq_a1", MusicValue::Role(TrackRole::Peak), 1);
+        put(
+            "sha256:eq_a1",
+            MusicValue::Energy(EnergyLevel::new(8).unwrap()),
+            1,
+        );
+        put(
+            "sha256:eq_a1",
+            MusicValue::MemoryCue {
+                position_ms: 32_000,
+                kind: CueKind::Hot,
+                label: Some("Drop".to_string()),
+                index: Some(0),
+            },
+            1,
+        );
+        put(
+            "sha256:eq_a1",
+            MusicValue::BeatGrid {
+                first_beat_ms: 500,
+                bpm: BpmValue::from_f32(128.0).unwrap(),
+                beats_per_bar: 4,
+            },
+            1,
+        );
+        on_album(&mut put, "sha256:eq_a2", "Two", "Zed", "Alpha");
+        put(
+            "sha256:eq_a2",
+            MusicValue::DiscNumber(DiscNumber::new(2)),
+            1,
+        );
+        put(
+            "sha256:eq_a2",
+            MusicValue::TrackNumber(TrackNumber::new(1)),
+            1,
+        );
+        on_album(&mut put, "sha256:eq_a3", "Three", "zed", "Alpha");
+        put(
+            "sha256:eq_a3",
+            MusicValue::DiscNumber(DiscNumber::new(1)),
+            1,
+        );
+        put(
+            "sha256:eq_a3",
+            MusicValue::TrackNumber(TrackNumber::new(1)),
+            1,
+        );
+        on_album(&mut put, "sha256:eq_old", "Older", "Abe", "Beta");
+        on_album(&mut put, "sha256:eq_new", "Newer", "Abe", "Beta");
+        put(
+            "sha256:eq_new",
+            MusicValue::Replaces(ContentHash::new("sha256:eq_old")),
+            2,
+        );
+        on_album(&mut put, "sha256:eq_gone", "Gone", "Abe", "Beta");
+        put(
+            "sha256:eq_gone",
+            MusicValue::Deleted { timestamp: at(3) },
+            3,
+        );
+        put("sha256:eq_bare", MusicValue::ItemId("p9".to_string()), 1);
+        put(
+            "sha256:eq_a1",
+            MusicValue::TrackStarted(StartReason::OnRequest),
+            10,
+        );
+        put(
+            "sha256:eq_a1",
+            MusicValue::TrackStopped(StopReason::OnSkip),
+            11,
+        );
+        put(
+            "sha256:eq_old",
+            MusicValue::TrackStarted(StartReason::OnRequest),
+            12,
+        );
+        write_facts_file_with_operations(&facts)
+    }
+
+    /// The log as ACID holds it now (the backfills wrote their facts at startup),
+    /// folded the way a client replica folds it: `project_lines`, then the plays.
+    struct LocalView {
+        lines: usize,
+        projection: library_projection::Projection,
+        covers: AlbumCovers,
+    }
+
+    fn local_view(facts_addr: &str) -> LocalView {
+        const PAGE: usize = 1_000;
+        let client = AcidClient::connect(facts_addr).unwrap();
+        let mut lines = Vec::new();
+        let mut cursor = None;
+        loop {
+            let chunk = client.read_stream(cursor, PAGE).unwrap();
+            let last_page = chunk.lines.len() < PAGE;
+            lines.extend(chunk.lines);
+            cursor = Some(chunk.cursor);
+            if last_page {
+                break;
+            }
+        }
+        let mut projection = library_projection::project_lines(lines.iter().map(String::as_str));
+        projection.plays.apply_to(&mut projection.tracks);
+        let covers = AlbumCovers::build(&projection.tracks);
+        LocalView {
+            lines: lines.len(),
+            projection,
+            covers,
+        }
+    }
+
+    fn json<T: serde::Serialize>(value: &T) -> serde_json::Value {
+        serde_json::to_value(value).unwrap()
+    }
+
+    fn tracks_of(response: LibraryResponse) -> Vec<TrackInfo> {
+        match response {
+            LibraryResponse::Tracks(tracks) | LibraryResponse::SearchResults(tracks) => tracks,
+            LibraryResponse::Track(track) => vec![*track],
+            other => panic!("expected tracks, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_service_and_a_local_fold_of_its_log_give_the_same_reads() {
+        use library_search::query::DateQuery;
+
+        let fixture = equivalence_fixture();
+        let written = std::fs::read_to_string(fixture.path())
+            .unwrap()
+            .lines()
+            .count();
+        let (service, _metadata_dir, facts_addr) = make_service_with_facts_and_addr(fixture.path());
+        let local = local_view(&facts_addr);
+        // The startup backfills wrote facts of their own: the log is longer than the
+        // fixture, and the comparison below covers them.
+        assert!(
+            local.lines > written,
+            "{} lines, fixture {written}",
+            local.lines
+        );
+        assert_eq!(
+            *service.fact_index.lock().unwrap(),
+            local.projection.fact_index,
+            "fact index"
+        );
+        let (tracks, covers) = (&local.projection.tracks, &local.covers);
+        let ask = |request| tracks_of(service.handle_request(request));
+
+        let everything = TrackQuery::default();
+        let never_played = TrackQuery {
+            started: Some(DateQuery::NA),
+            ..Default::default()
+        };
+        for query in [everything, never_played] {
+            assert_eq!(
+                json(&ask(LibraryRequest::Search {
+                    query: query.clone()
+                })),
+                json(&library_projection::search(tracks, covers, &query)),
+                "search {query:?}"
+            );
+        }
+        for limit in [None, Some(2)] {
+            assert_eq!(
+                json(&ask(LibraryRequest::ListTracks { limit })),
+                json(&library_projection::visible(tracks, covers, limit)),
+                "list {limit:?}"
+            );
+        }
+        let filter = MarkFilter::Any;
+        assert_eq!(
+            json(&ask(LibraryRequest::ListMarked {
+                filter: filter.clone()
+            })),
+            json(&library_projection::marked(tracks, covers, &filter)),
+            "marked"
+        );
+        let visible = library_projection::visible(tracks, covers, None);
+        for expected in &visible {
+            assert_eq!(
+                json(&ask(LibraryRequest::GetTrack {
+                    hash: expected.content_hash.clone()
+                })),
+                json(&vec![expected.clone()]),
+                "get {}",
+                expected.content_hash.as_str()
+            );
+        }
+        for fact_type in local.projection.fact_index.keys() {
+            let response = service.handle_request(LibraryRequest::GetFactValues {
+                fact_type: fact_type.clone(),
+            });
+            let LibraryResponse::FactValues(values) = response else {
+                panic!("expected fact values, got {response:?}");
+            };
+            assert_eq!(
+                values,
+                library_projection::fact_values(&local.projection.fact_index, fact_type),
+                "values of {fact_type:?}"
+            );
+        }
+
+        // The fixture must exercise what it is for, or the comparison proves nothing.
+        let by_hash = |hash: &str| {
+            visible
+                .iter()
+                .find(|t| t.content_hash.as_str() == hash)
+                .unwrap_or_else(|| panic!("{hash} is visible"))
+        };
+        assert_eq!(visible.len(), 6, "the deleted track is hidden");
+        assert!(by_hash("sha256:eq_a1").started.is_some(), "a play");
+        assert!(
+            by_hash("sha256:eq_old").started.is_some(),
+            "a play on a replaced track"
+        );
+        assert!(
+            by_hash("sha256:eq_new").started.is_some(),
+            "the Replaces lineage credits the replaced track's plays"
+        );
+        let formats = service.handle_request(LibraryRequest::GetFactValues {
+            fact_type: FactType::new("Format"),
+        });
+        assert!(
+            matches!(&formats, LibraryResponse::FactValues(v) if !v.is_empty()),
+            "a backfilled Format fact: {formats:?}"
+        );
+        assert_eq!(
+            by_hash("sha256:eq_a2").cover_art_path.as_deref(),
+            Some("cover-art/alpha.jpg"),
+            "the album's cover"
+        );
+        assert!(by_hash("sha256:eq_bare").title.is_none(), "untagged");
+    }
+
+    #[test]
+    fn a_play_recorded_after_start_shows_in_a_search_that_is_not_a_date_query() {
+        let temp = write_facts_file(&[(
+            ContentHash::new("sha256:play_later"),
+            MusicValue::Title(Title::new("Later")),
+        )]);
+        let (service, _metadata_dir, facts_addr) = make_service_with_facts_and_addr(temp.path());
+        AcidClient::connect(&facts_addr)
+            .unwrap()
+            .write_music_facts(
+                &ContentHash::new("sha256:play_later"),
+                &[(
+                    MusicValue::TrackStarted(StartReason::OnRequest),
+                    FactSource::new("test-playback", "1.0.0", "Unknown"),
+                )],
+            )
+            .unwrap();
+
+        let found = service.search_tracks(&TrackQuery::default());
+
+        assert_eq!(found.len(), 1);
+        assert!(found[0].started.is_some(), "{:?}", found[0]);
+    }
+
+    #[test]
+    fn a_cover_asserted_after_start_shows_on_the_other_tracks_of_the_album() {
+        let album = || MusicValue::Album(music_facts::Album::new("Gamma"));
+        let temp = write_facts_file(&[
+            (ContentHash::new("sha256:cover_g1"), album()),
+            (ContentHash::new("sha256:cover_g2"), album()),
+        ]);
+        let (service, _metadata_dir, facts_addr) = make_service_with_facts_and_addr(temp.path());
+        AcidClient::connect(&facts_addr)
+            .unwrap()
+            .write_music_facts(
+                &ContentHash::new("sha256:cover_g1"),
+                &[(
+                    MusicValue::CoverArtPath("cover-art/gamma.jpg".to_string()),
+                    FactSource::new("test", "1.0.0", "Unknown"),
+                )],
+            )
+            .unwrap();
+        service.catch_up().unwrap();
+
+        let found = service.search_tracks(&TrackQuery::default());
+
+        assert_eq!(found.len(), 2);
+        assert!(
+            found
+                .iter()
+                .all(|t| t.cover_art_path.as_deref() == Some("cover-art/gamma.jpg")),
+            "{found:?}"
         );
     }
 

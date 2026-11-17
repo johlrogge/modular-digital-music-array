@@ -1522,7 +1522,7 @@ fn cover_file(service: &LibraryService, name: &str) -> String {
 }
 
 #[test]
-fn cover_art_that_the_album_cache_hands_to_other_tracks_is_kept() {
+fn cover_art_that_only_the_merged_loser_held_is_archived_and_the_album_stops_showing_it() {
     let (service, _d, _acid) = make_empty_service();
     let rel = cover_file(&service, "album");
     seed(
@@ -1539,23 +1539,54 @@ fn cover_art_that_the_album_cache_hands_to_other_tracks_is_kept() {
         "new",
         [base(1, Some("p1"), 2), vec![src(album("A"))]].concat(),
     );
-    // As built at startup: the album's cover is the old copy's.
-    service
-        .album_cover_cache
-        .lock()
-        .unwrap()
-        .set("A".into(), rel.clone());
+    // The album's cover is the old copy's.
+    assert_eq!(
+        service.album_cover_cache.lock().unwrap().get("A"),
+        Some(rel.as_str())
+    );
 
     apply(&service);
 
-    assert!(
-        service.music_dir.join(&rel).exists(),
-        "still shown for the album"
+    // The loser was the only holder: no live track shows it any more, so it is
+    // archived and the rebuilt album covers no longer name it.
+    assert!(archived(&service, &service.music_dir.join(&rel)).exists());
+    assert_eq!(service.album_cover_cache.lock().unwrap().get("A"), None);
+    assert_eq!(
+        service.get_track(&hash("new")).unwrap().cover_art_path,
+        None
     );
+}
+
+#[test]
+fn cover_art_that_another_track_of_the_album_holds_is_kept() {
+    let (service, _d, _acid) = make_empty_service();
+    let rel = cover_file(&service, "album");
+    let with_cover = |audio_n, item, day| {
+        [
+            base(audio_n, Some(item), day),
+            vec![src(album("A")), src(MusicValue::CoverArtPath(rel.clone()))],
+        ]
+        .concat()
+    };
+    seed(&service, "old", with_cover(1, "p1", 1));
+    seed(&service, "new", with_cover(1, "p1", 2));
+    seed(
+        &service,
+        "other",
+        [base(2, Some("p2"), 1), vec![src(album("A"))]].concat(),
+    );
+
+    apply(&service);
+
+    assert!(service.music_dir.join(&rel).exists(), "still shown");
     assert!(!archived(&service, &service.music_dir.join(&rel)).exists());
     assert_eq!(
         service.album_cover_cache.lock().unwrap().get("A"),
         Some(rel.as_str())
+    );
+    assert_eq!(
+        service.get_track(&hash("other")).unwrap().cover_art_path,
+        Some(rel)
     );
 }
 
@@ -1563,9 +1594,10 @@ fn cover_art_that_the_album_cache_hands_to_other_tracks_is_kept() {
 fn an_album_cache_entry_is_repointed_when_its_cover_is_archived() {
     let (service, _d, _acid) = make_empty_service();
     let (old_rel, new_rel) = (cover_file(&service, "old"), cover_file(&service, "new"));
+    // The old copy's hash is the smaller one, so its cover is the album's.
     seed(
         &service,
-        "old",
+        "a-old",
         [
             base(1, Some("p1"), 1),
             vec![
@@ -1587,11 +1619,10 @@ fn an_album_cache_entry_is_repointed_when_its_cover_is_archived() {
         ]
         .concat(),
     );
-    service
-        .album_cover_cache
-        .lock()
-        .unwrap()
-        .set("A".into(), old_rel.clone());
+    assert_eq!(
+        service.album_cover_cache.lock().unwrap().get("A"),
+        Some(old_rel.as_str())
+    );
 
     apply(&service);
 
@@ -1603,6 +1634,10 @@ fn an_album_cache_entry_is_repointed_when_its_cover_is_archived() {
         service.album_cover_cache.lock().unwrap().get("A"),
         Some(new_rel.as_str()),
         "the cache no longer names an archived file"
+    );
+    assert_eq!(
+        service.get_track(&hash("new")).unwrap().cover_art_path,
+        Some(new_rel)
     );
 }
 
@@ -1627,7 +1662,8 @@ fn the_repointed_album_cover_does_not_depend_on_track_order() {
         if reversed {
             others.reverse();
         }
-        seed(&service, "old", with_cover(1, "p1", &old_rel));
+        // The old copy's hash is the smallest, so its cover is the album's until it is merged.
+        seed(&service, "0-old", with_cover(1, "p1", &old_rel));
         for (name, facts) in others {
             seed(&service, name, facts);
         }
@@ -1636,11 +1672,10 @@ fn the_repointed_album_cover_does_not_depend_on_track_order() {
             "new",
             [base(1, Some("p1"), 2), vec![src(album("A"))]].concat(),
         );
-        service
-            .album_cover_cache
-            .lock()
-            .unwrap()
-            .set("A".into(), old_rel);
+        assert_eq!(
+            service.album_cover_cache.lock().unwrap().get("A"),
+            Some(old_rel.as_str())
+        );
 
         apply(&service);
 
