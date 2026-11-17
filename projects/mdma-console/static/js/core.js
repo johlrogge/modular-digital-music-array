@@ -12,6 +12,8 @@
 //   position   on every PositionUpdate from the server (about once a second while playing).
 //              detail and store.player.position are { hash, position_ms, duration_ms };
 //              position is reset to null whenever player.now changes.
+//   marks      when a track's marks (store.tracks.get(hash).marks) changed after a mark action, or the
+//              macro marks (store.macros) were loaded. Views redraw hearts and chips in place.
 //   filters    when store.f[key] was changed by the narrowing UI (emitted by narrow.js).
 //              detail is always the view key whose filters changed.
 //   sort       when store.sort was changed (emitted by narrow.js). No detail: the sort is global.
@@ -21,6 +23,8 @@
 // (e.g. { queued: k, error }): callers must inspect the body, a partial success does NOT reject.
 // Non-2xx rejects with ApiError (status 0 means the network failed, 409 means busy or stale).
 // Every /api/queue/* mutation returns the resulting { queue: [hash] }; pass it to applyQueue().
+
+import { LIKED, markLabel } from "./logic.js";
 
 /* ============================================================ store + events */
 
@@ -34,6 +38,7 @@ export const store = {
   f: {}, // per-view filters keyed by view key (like nb); absent means none. Read with narrow.js filtersOf(key). Sticky for the session
   ni: {}, // per-view instance (album or artist name) the narrowing state in nb/f belongs to; see narrow.js claimNarrowing
   sort: { by: "added", dir: "desc" },
+  macros: [], // the node's macro marks, in key order (Shift+1, Shift+2, ...); [] until GET /api/marks/config answers
 };
 
 /** Every track of the catalogue, in catalogue order. */
@@ -639,6 +644,76 @@ async function editQueue(expect, next, message) {
   return true;
 }
 
+/* ------------------------------------------------------------ marks */
+
+// A mark action is a set operation on the hash the caller SHOWED (never "whatever plays now"), so
+// it is safe to repeat; the caller picks mark or unmark from the marks it PAINTED, not from the
+// store at click time. The server answers { changed: [hash], tracks: [ApiTrack] }: `changed` holds
+// canonical hashes (so do the catalogue's, they compare as they are) of the tracks whose marks
+// really changed, and the toast with Undo is shown only then. `tracks` replace the catalogue's.
+
+/** The marks `hash` carries now, as the catalogue last said. */
+export const marksOf = (hash) => (store.tracks.get(hash) || {}).marks || [];
+
+/** Fetch the node's macro marks into store.macros. Fires "marks". Without an answer (an old node) there are none. */
+export async function loadMarksConfig() {
+  try {
+    store.macros = (await api("/api/marks/config")).macros || [];
+    emit("marks");
+  } catch (e) {
+    /* no macros */
+  }
+}
+
+/** Shift+1..9 as an index into the macros: the macro the key stands for, or null. */
+export function macroForKey(e) {
+  if (!e.shiftKey || e.altKey || e.ctrlKey || e.metaKey) return null;
+  const d = /^Digit([1-9])$/.exec(e.code || "");
+  return d ? store.macros[Number(d[1]) - 1] || null : null;
+}
+
+/** POST one mark change and apply the marks the server returns. The body, or null after toasting why not. */
+async function markCall(action, hash, mark) {
+  let body;
+  try {
+    body = await api("/api/marks", { body: { action, hashes: [hash], mark } });
+  } catch (e) {
+    toast("Couldn't change the mark: " + (e.message || "error"));
+    return null;
+  }
+  const marked = [];
+  for (const t of body.tracks || []) {
+    if (store.tracks.has(t.hash)) {
+      store.tracks.set(t.hash, t);
+      marked.push(t.hash);
+    }
+  }
+  if (marked.length) emit("marks", marked);
+  if (body.error) {
+    toast("Couldn't change the mark: " + body.error);
+    return null;
+  }
+  return body;
+}
+
+const SAID = {
+  mark: (m, what) => (m === LIKED ? "Liked “" + what + "”" : "Marked “" + what + "” as " + markLabel(m)),
+  unmark: (m, what) => (m === LIKED ? "Unliked “" + what + "”" : "Removed " + markLabel(m) + " from “" + what + "”"),
+};
+
+async function setMark(action, hash, subject, mark) {
+  const body = await markCall(action, hash, mark);
+  if (!body) return false;
+  if (body.changed.includes(hash)) {
+    const inverse = action === "mark" ? "unmark" : "mark";
+    toast(SAID[action](mark, subject), async () => {
+      const undone = await markCall(inverse, hash, mark);
+      if (undone && undone.changed.length) toast("Undone");
+    });
+  }
+  return true;
+}
+
 // `set` below is what to act on (ofHashes, ofPlaylist). `subject` is a noun phrase naming it
 // ("Song title", "12 tracks"); the action adds the verb. Defaults to "N tracks".
 export const actions = {
@@ -663,6 +738,10 @@ export const actions = {
     return true;
   },
   editQueue,
+  /** Mark the track `hash` (named `subject` in the toast) with `mark` ("liked" by default). Toast says "Liked “X”", with Undo when it changed. */
+  mark: (hash, subject, mark = LIKED) => setMark("mark", hash, subject, mark),
+  /** Take `mark` off the track. Toast says "Unliked “X”", with Undo when it changed. */
+  unmark: (hash, subject, mark = LIKED) => setMark("unmark", hash, subject, mark),
 };
 
 /** Read build facts the server put on #app. */

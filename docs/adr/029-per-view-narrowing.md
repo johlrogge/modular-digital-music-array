@@ -43,6 +43,14 @@ Related: ADR-009 §4, ADR-004, ADR-022 §4 (one fold).
   - an offline client appears that must narrow without the server.
 - Until then there is exactly one matcher.
 
+## Amendment 2026-11-17: the `marked` view and the mark facet
+
+- **A new view key, `marked`,** for the Marked view (`#/marked/:mark?`, ADR-016 amendment). It follows the rules above: its own text and filters, global sort, no instance reset. Which mark the page shows (All, Liked, a macro) is the address, not narrowing state, so changing the chip keeps the text and filters.
+- **A fourth filter group, Mark.** A view's filters are now BPM, key, added and mark (`f.mark`, `""` for any). It counts once in the Filters badge, shows as a removable chip, and is sent as `mark=` to `GET /api/tracks/match` and `GET /api/library/match`, where `SearchParams.mark` becomes `TrackQuery.mark` and the library matches it (`library_search`, so the one matcher still holds). A name the library cannot parse is a 400.
+  - The sheet offers Any, Liked and the node's macro marks. Filters saved before this amendment have no `mark` and read as any.
+  - Answers are cached per request string, so the cache is cleared when a mark changes.
+- **Marks as set algebra.** The Marked view's pool (which tracks carry the mark) comes from the catalogue's `marks`; text and filters narrow it through the server, and the browser only intersects, as in §3.
+
 ## Alternatives considered
 
 - Global filters with per-view overrides: two layers of state and a rule for which wins; clearing becomes ambiguous.

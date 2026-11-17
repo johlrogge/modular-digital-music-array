@@ -4,9 +4,9 @@
 // store.tracks by hash. Nothing here starts or stops audio except an explicit click on a transport
 // button: play/pause toggles pause/resume, and Play while idle goes through actions.start() (never
 // the raw /player/play-queue).
-import { isIdle, outputDown, trackTitle } from "./logic.js";
+import { isIdle, outputDown, trackTitle, LIKED, markLabel } from "./logic.js";
 import { artBg, setArt, setCover } from "./art.js";
-import { $, $$, ApiError, actions, api, appInfo, applyPlayer, enc, fmt, on, openMenu, refreshPlayer, store, toast } from "./core.js";
+import { $, $$, ApiError, actions, api, appInfo, applyPlayer, enc, fmt, h, icon, macroForKey, marksOf, on, openMenu, refreshPlayer, store, toast } from "./core.js";
 
 const DESKTOP = 1024; // px, matches the CSS breakpoint
 
@@ -87,6 +87,7 @@ function render() {
   if (idle && !p.queue.length) {
     b.hidden = true;
     b.inert = true;
+    renderMarks(null);
     closePlayer();
     return;
   }
@@ -119,6 +120,8 @@ function render() {
     $("#p-tint").style.backgroundImage = track ? artBg(track.album || track.title || "?") : "";
   }
 
+  renderMarks(idle ? null : track);
+
   const playing = p.state === "playing";
   const loading = p.state === "loading";
   $$("[data-pp]").forEach((btn) => {
@@ -135,6 +138,37 @@ function render() {
     r.disabled = !seekOn;
   });
   renderProgress();
+}
+
+// The track the hearts and the macro chips act on, and the marks painted for it: what the bar and
+// the player SHOW, taken at the last render. A click marks this hash, never "whatever is playing
+// now" (a track change in between cannot redirect it), and marks or unmarks from the painted marks
+// (not from the store at click time).
+let shown = null; // { track, marks } or null
+
+function renderMarks(track) {
+  const marks = track ? marksOf(track.hash) : [];
+  shown = track ? { track, marks } : null;
+  const liked = marks.includes(LIKED);
+  $$("[data-like-now]").forEach((b) => {
+    b.hidden = !track;
+    b.classList.toggle("on", liked);
+    b.setAttribute("aria-pressed", String(liked));
+    b.setAttribute("aria-label", (liked ? "Unlike " : "Like ") + (track ? trackTitle(track) : ""));
+    b.setAttribute("aria-keyshortcuts", "M");
+    b.title = liked ? "Unlike (M)" : "Like (M)";
+    b.querySelector("use").setAttribute("href", liked ? "#i-heart-fill" : "#i-heart");
+  });
+  $("#p-marks").replaceChildren(
+    ...(track ? store.macros : []).map((m, i) =>
+      h("button", { class: "chip", "data-macro": m, "aria-pressed": String(marks.includes(m)), "aria-keyshortcuts": "Shift+" + (i + 1), title: "Shift+" + (i + 1) }, [icon("tag", "sm"), markLabel(m)]),
+    ),
+  );
+}
+
+/** Mark the shown track with `mark`, or unmark it when the painted marks have it. */
+function flipShown(mark = LIKED) {
+  if (shown) (shown.marks.includes(mark) ? actions.unmark : actions.mark)(shown.track.hash, trackTitle(shown.track), mark);
 }
 
 function renderProgress() {
@@ -226,6 +260,7 @@ function closePlayer() {
 
 on("tracks", render);
 on("queue", render);
+on("marks", render);
 on("position", (pos) => {
   if (pos.hash !== store.player.now) return; // a late tick of the previous track
   advancing = !(lastPos && lastPos.hash === pos.hash && pos.position_ms === lastPos.position_ms);
@@ -271,6 +306,12 @@ document.addEventListener("click", (e) => {
     if (tr.album) items.push(["disc", "Go to album", () => (location.hash = "#/album/" + enc(tr.album))]);
     if (tr.artist) items.push(["user", "Go to artist", () => (location.hash = "#/artist/" + enc(tr.artist))]);
     if (items.length) openMenu(t, items, [trackTitle(tr), tr.artist || ""]);
+  } else if (t.hasAttribute("data-like-now")) {
+    e.stopPropagation();
+    flipShown();
+  } else if (t.hasAttribute("data-macro")) {
+    e.stopPropagation();
+    flipShown(t.getAttribute("data-macro"));
   } else if (t.hasAttribute("data-open-player")) {
     openPlayer();
   }
@@ -297,6 +338,22 @@ document.addEventListener("keydown", (e) => {
     if (a && a !== document.body && a !== playerEl()) return;
     e.preventDefault();
     togglePlay();
+    return;
+  }
+  // M likes and Shift+1..9 sets a macro mark on the track the bar shows, but only when no row has
+  // the focus (a row handles its own) and not from inside a text field, menu, sheet or dialog.
+  const a = document.activeElement;
+  if (!shown || e.ctrlKey || e.metaKey || e.altKey) return;
+  if (a && (/^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName) || a.closest(".trow,#menu,#fsheet,#confirm"))) return;
+  if ((e.key === "m" || e.key === "M") && !e.shiftKey) {
+    e.preventDefault();
+    if (!e.repeat) flipShown();
+  } else {
+    const macro = macroForKey(e);
+    if (macro) {
+      e.preventDefault();
+      if (!e.repeat) flipShown(macro);
+    }
   }
 });
 

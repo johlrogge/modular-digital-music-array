@@ -3,9 +3,10 @@
 // lists.js and narrow.js supply the rows, cards and the narrowing bar.
 import { h, icon, route, routeFallback, appInfo, store, catalogue, onView, enc, plural } from "./core.js";
 import { art } from "./art.js";
-import { groupAlbums, groupArtists, sortTracks, collate, visiblePlaylists, coverOf } from "./logic.js";
-import { pagedList, thead, bulkBar, emptyNote, albumCard, artistCard, playlistCard, playlistTracks, recentAlbums } from "./lists.js";
+import { groupAlbums, groupArtists, sortTracks, collate, visiblePlaylists, coverOf, LIKED, markLabel } from "./logic.js";
+import { pagedList, thead, bulkBar, emptyNote, albumCard, artistCard, playlistCard, playlistTracks, recentAlbums, narrowedTracks } from "./lists.js";
 import { narrowedView, matchLibrary, filterCount, setSort, LIBRARY_KEY, SEARCH_FAILED_NOTE, FILTERS_EMPTY_NOTE } from "./narrow.js";
+import { backLink, NONE } from "./collections.js";
 
 const GRID_LIMIT = 120;
 
@@ -16,10 +17,11 @@ function greeting(hour) {
   return "Good evening";
 }
 
-function topbar(title, sub) {
+function topbar(title, sub, link) {
+  const gear = h("a", { class: "icon-btn status-dot mobile-only", href: "#/settings", "aria-label": "Settings" }, [icon("gear")]);
   return h("div", { class: "topbar" }, [
     h("div", {}, [h("h1", { text: title }), sub ? h("div", { class: "sub", text: sub }) : null]),
-    h("a", { class: "icon-btn status-dot mobile-only", href: "#/settings", "aria-label": "Settings" }, [icon("gear")]),
+    link ? h("div", { style: "display:flex;align-items:center;gap:4px" }, [link, gear]) : gear,
   ]);
 }
 
@@ -93,7 +95,7 @@ const KEY = LIBRARY_KEY;
 
 function viewLibrary(root, params, query) {
   const tab = TABS.some((t) => t[0] === params.tab) ? params.tab : "tracks";
-  root.appendChild(topbar("Library"));
+  root.appendChild(topbar("Library", "", h("a", { class: "btn ghost", href: "#/marked", style: "text-decoration:none" }, [icon("heart", "sm"), "Marked"])));
   const segWrap = h("div", { class: "seg-scroll" });
   const region = h("div");
 
@@ -196,6 +198,52 @@ function viewLibrary(root, params, query) {
   };
 }
 
+/* ============================================================ marked */
+
+/**
+ * The tracks carrying marks: `#/marked/:mark?`, chips All · Liked · one per macro mark (and the
+ * mark in the address if it is another). The marks are the catalogue's (ApiTrack.marks), so a
+ * heart pressed here leaves the list at once; "All" means any live mark. Narrowed under the view
+ * key "marked" (ADR 029), with the global sort.
+ */
+function viewMarked(root, params) {
+  const mark = params.mark || "";
+  const marks = () => {
+    const all = [LIKED, ...store.macros];
+    return !mark || all.includes(mark) ? all : [...all, mark];
+  };
+  const pool = (m) => catalogue().filter((t) => (m ? t.marks.includes(m) : t.marks.length > 0));
+
+  root.appendChild(backLink("#/library/tracks", "Library"));
+  root.appendChild(topbar("Marked"));
+  const chips = h("div", { class: "chips mk-chips", role: "group", "aria-label": "Mark" });
+  function drawChips() {
+    chips.replaceChildren(
+      ...["", ...marks()].map((m) =>
+        h("a", { class: "chip", href: "#/marked" + (m ? "/" + enc(m) : ""), "aria-current": m === mark ? "page" : null }, [m ? markLabel(m) : "All", h("span", { class: "num", text: String(pool(m).length) })]),
+      ),
+    );
+  }
+  drawChips();
+  root.appendChild(chips);
+
+  const pane = narrowedTracks({
+    key: "marked",
+    placeholder: "Filter marked tracks",
+    tracks: () => pool(mark),
+    order: "global",
+    row: { lead: "art", sub: "artist" },
+    empty: { missing: () => ["Nothing marked yet", "Press M on any track, or use the heart, to like it."], none: NONE },
+  });
+  root.appendChild(pane.el);
+
+  // A mark changed or the catalogue came: the counts change (the pane redraws itself).
+  onView("marks", drawChips);
+  onView("tracks", drawChips);
+  return () => pane.dispose();
+}
+
 route("home", viewHome, { nav: "home" });
 route("library/:tab?", viewLibrary, { nav: "library" });
+route("marked/:mark?", viewMarked, { nav: "library" });
 routeFallback(viewHome, { nav: "home" });

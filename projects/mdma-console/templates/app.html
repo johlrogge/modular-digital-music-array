@@ -37,6 +37,7 @@
       <div class="info"><div class="t" id="bar-title"></div><div class="m" id="bar-artist"></div></div>
     </div>
     <div class="mob ctl">
+      <button class="icon-btn" data-like-now aria-label="Like" hidden><svg class="i"><use href="#i-heart"/></svg></button>
       <button class="icon-btn pp" data-pp aria-label="Pause"><svg class="i fill"><use href="#i-pause"/></svg><span class="spin"></span></button>
       <button class="icon-btn" data-next aria-label="Next song"><svg class="i fill"><use href="#i-next"/></svg></button>
     </div>
@@ -49,6 +50,7 @@
       <div class="seek num"><span data-el>0:00</span><input class="slider" type="range" min="0" max="1000" value="0" data-seek aria-label="Seek" disabled><span data-rem>-0:00</span></div>
     </div>
     <div class="desk right ctl">
+      <button class="icon-btn" data-like-now aria-label="Like" hidden><svg class="i"><use href="#i-heart"/></svg></button>
       <button class="icon-btn" data-open-queue aria-label="Up next"><svg class="i"><use href="#i-queue"/></svg></button>
       <a class="icon-btn" href="#/settings/speakers" aria-label="Speakers"><svg class="i"><use href="#i-speaker"/></svg></a>
     </div>
@@ -80,7 +82,9 @@
         <div>
           <div class="meta">
             <div style="min-width:0"><h2 id="p-title"></h2><a class="a" href="#/library" id="p-artist"></a></div>
+            <button class="icon-btn" data-like-now aria-label="Like" hidden><svg class="i"><use href="#i-heart"/></svg></button>
           </div>
+          <div class="chips pmarks" id="p-marks" role="group" aria-label="Marks"></div>
           <div class="seek num" style="margin-top:var(--s-4)"><span data-el>0:00</span><input class="slider" type="range" min="0" max="1000" value="0" data-seek aria-label="Seek" disabled><span data-rem>-0:00</span></div>
         </div>
         <div class="transport ctl">
@@ -121,6 +125,7 @@
       <label class="radio" style="padding:0;border:0;margin-top:var(--s-2)"><input type="checkbox" id="f-compat"><span class="ttl">Include keys that mix well<small style="display:block;color:var(--text-3);font-size:var(--fs-xs)">Neighbours on the key wheel and the relative major/minor</small></span></label>
     </div>
     <div class="fgroup"><span class="kicker">Added</span><div class="chips" id="f-added"></div></div>
+    <div class="fgroup"><span class="kicker">Mark</span><div class="chips" id="f-mark"></div></div>
   </div>
   <div class="foot"><button class="btn ghost" id="f-reset">Reset</button><button class="btn primary" id="f-apply">Show results</button></div>
 </div>

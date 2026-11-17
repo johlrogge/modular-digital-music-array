@@ -12,8 +12,8 @@ use axum::{
 };
 use gateway_client::{GatewayClient, LibraryRequest, LibraryResponse};
 use library_ipc_client::{
-    track_hashes, unresolved_entries, ClientError, PlaylistEntry, PlaylistName, PlaylistSnapshot,
-    PlaylistVersion, StringQuery, TrackInfo, TrackQuery,
+    track_hashes, unresolved_entries, ClientError, Mark, PlaylistEntry, PlaylistName,
+    PlaylistSnapshot, PlaylistVersion, StringQuery, TrackInfo, TrackQuery,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -27,6 +27,8 @@ pub struct SearchParams {
     pub bpm: Option<String>,
     pub key: Option<String>,
     pub added: Option<String>,
+    /// A mark's name: "liked" is the default mark.
+    pub mark: Option<String>,
 }
 
 /// Build the library query for `params`. Empty values count as absent; a value the library's
@@ -54,7 +56,17 @@ pub fn track_query_from(params: &SearchParams) -> Result<TrackQuery, String> {
     if let Some(added) = given(&params.added) {
         query.added = Some(library_search::parse_date_query(&added).map_err(|e| e.to_string())?);
     }
+    query.mark = mark_param(params.mark.as_deref())?;
     Ok(query)
+}
+
+/// The mark a request names: blank or absent is none, "liked" the default mark, any other valid
+/// name a named one; a bad name is the message for a 400 or 422.
+pub fn mark_param(name: Option<&str>) -> Result<Option<Mark>, String> {
+    match name.map(str::trim).filter(|n| !n.is_empty()) {
+        None => Ok(None),
+        Some(n) => n.parse::<Mark>().map(Some).map_err(|e| e.to_string()),
+    }
 }
 
 /// `GET /api/tracks`: the whole catalogue in one response.
@@ -308,6 +320,8 @@ pub struct ApiTrack {
     pub added: Option<String>,
     /// True when `/cover/<hash>` has an image. The browser requests covers only for these.
     pub has_cover: bool,
+    /// The marks the track carries live: "liked" for the default mark, then named marks.
+    pub marks: Vec<String>,
 }
 
 impl From<&TrackInfo> for ApiTrack {
@@ -324,6 +338,7 @@ impl From<&TrackInfo> for ApiTrack {
             duration_secs: t.duration.map(|d| d.value()),
             added: t.added.clone(),
             has_cover: t.cover_art_path.is_some(),
+            marks: t.marks.iter().map(Mark::to_string).collect(),
         }
     }
 }
@@ -341,7 +356,7 @@ mod tests {
     }
 
     /// The JS contract (static/js/logic.js): exactly these keys, always all present.
-    const KEYS: [&str; 11] = [
+    const KEYS: [&str; 12] = [
         "added",
         "album",
         "artist",
@@ -351,6 +366,7 @@ mod tests {
         "has_cover",
         "hash",
         "key",
+        "marks",
         "title",
         "track_number",
     ];
@@ -368,6 +384,7 @@ mod tests {
         t.track_number = Some(3);
         t.disc_number = Some(2);
         t.added = Some("2026-11-01T10:00:00+00:00".into());
+        t.marks = vec![Mark::Default, "banger".parse().unwrap()];
 
         let json = serde_json::to_value(ApiTrack::from(&t)).unwrap();
         assert_eq!(keys(&json), KEYS);
@@ -380,16 +397,39 @@ mod tests {
         assert_eq!(json["duration_secs"], 180);
         assert_eq!(json["added"], "2026-11-01T10:00:00+00:00");
         assert_eq!(json["has_cover"], true);
+        assert_eq!(json["marks"], json!(["liked", "banger"]));
     }
 
     #[test]
     fn minimal_track_keeps_every_key_as_null_or_false() {
         let json = serde_json::to_value(ApiTrack::from(&bare("sha256:dead"))).unwrap();
         assert_eq!(keys(&json), KEYS);
-        for k in KEYS.iter().filter(|k| **k != "hash" && **k != "has_cover") {
+        for k in KEYS
+            .iter()
+            .filter(|k| !["hash", "has_cover", "marks"].contains(k))
+        {
             assert!(json[*k].is_null(), "{k} should be null");
         }
         assert_eq!(json["has_cover"], false);
+        assert_eq!(json["marks"], json!([]));
+    }
+
+    #[test]
+    fn query_takes_a_mark_and_rejects_a_bad_name() {
+        let given = |mark: &str| {
+            track_query_from(&SearchParams {
+                mark: Some(mark.into()),
+                ..Default::default()
+            })
+        };
+        assert_eq!(
+            given("banger").unwrap().mark,
+            Some("banger".parse().unwrap())
+        );
+        assert_eq!(given("liked").unwrap().mark, Some(Mark::Default));
+        assert_eq!(given(" ").unwrap().mark, None);
+        assert!(given("a\u{200B}b").is_err());
+        assert!(!given("banger").unwrap().is_empty());
     }
 
     #[test]

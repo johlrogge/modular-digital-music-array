@@ -16,6 +16,7 @@ use serde::Serialize;
 use std::sync::Arc;
 
 pub mod library;
+pub mod marks;
 pub mod player;
 pub mod playlists;
 
@@ -25,6 +26,8 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/api/tracks", get(library::tracks))
         .route("/api/tracks/match", get(library::tracks_match))
         .route("/api/library/match", get(library::library_match))
+        .route("/api/marks", post(marks::marks))
+        .route("/api/marks/config", get(marks::config))
         .route("/api/playlists", get(library::playlists))
         .route(
             "/api/playlists/:name",
@@ -271,6 +274,15 @@ pub fn resolve_failed(e: ResolveError) -> Reply {
         _ => StatusCode::UNPROCESSABLE_ENTITY,
     };
     error_reply(status, e.to_string())
+}
+
+/// The hashes of a request as given, or the 400 response for none.
+#[allow(clippy::result_large_err)]
+pub fn parse_hashes(hashes: Vec<String>) -> Result<Vec<ContentHash>, Response> {
+    if hashes.is_empty() {
+        return Err(fail(StatusCode::BAD_REQUEST, "no hashes given".to_string()));
+    }
+    Ok(hashes.into_iter().map(ContentHash::new).collect())
 }
 
 /// The canonical hash of each of `hashes`, for adding to the queue: the one resolver for

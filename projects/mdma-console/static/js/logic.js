@@ -2,8 +2,9 @@
 //
 // Track shape: the ApiTrack JSON of GET /api/tracks (src/api/library.rs, pinned by a Rust test).
 // Every key is always present; absent facts are null:
-//   { hash, title, artist, album, track_number, disc, bpm, key, duration_secs, added, has_cover }
-//   hash "sha256:..."; bpm number|null; key string|null; added ISO 8601 string|null; has_cover bool.
+//   { hash, title, artist, album, track_number, disc, bpm, key, duration_secs, added, has_cover, marks }
+//   hash "sha256:..."; bpm number|null; key string|null; added ISO 8601 string|null; has_cover bool;
+//   marks [string]: the marks it carries live, "liked" for the default one.
 // Player shape: GET /api/player is { state: "idle"|"playing"|"paused"|"loading", now: hash|null, queue: [hash],
 //   output: "absent"|"starting"|"running"|"stalled"|null } (null: the node cannot say).
 //
@@ -178,6 +179,7 @@ export function placeholderTrack(hash) {
     duration_secs: null,
     added: null,
     has_cover: false,
+    marks: [],
   };
 }
 
@@ -204,11 +206,19 @@ export function playlistRows(entries, trackOf) {
 }
 
 /**
- * Number of active filter groups in `f` ({ bmin, bmax, key, compat, added }, all fields present):
- * tempo, key and added each count once.
+ * Number of active filter groups in `f` ({ bmin, bmax, key, compat, added, mark }, all fields
+ * present): tempo, key, added and mark each count once.
  */
 export function filterGroups(f) {
-  return (f.bmin || f.bmax ? 1 : 0) + (f.key ? 1 : 0) + (f.added !== "any" ? 1 : 0);
+  return (f.bmin || f.bmax ? 1 : 0) + (f.key ? 1 : 0) + (f.added !== "any" ? 1 : 0) + (f.mark ? 1 : 0);
+}
+
+/** The default mark's name: what the server calls the heart. Every other mark is a named one. */
+export const LIKED = "liked";
+
+/** A mark for people: "Liked", "Banger". */
+export function markLabel(m) {
+  return m.charAt(0).toUpperCase() + m.slice(1);
 }
 
 /** True when the search `text` has anything but blanks or any filter group of `f` is on. */

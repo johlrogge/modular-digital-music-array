@@ -2,9 +2,9 @@
 // Every click that can change what is heard goes through core's `actions`; nothing here calls a
 // playback route. A plain tap on a row or card opens a menu or a page and NEVER plays.
 // Play now is offered only when logic.isIdle(store.player) (paused counts as playing).
-import { h, icon, store, actions, setOf, enc, fmt, fmtTotal, plural, openMenu, onView } from "./core.js";
+import { $$, h, icon, store, actions, setOf, enc, fmt, fmtTotal, plural, openMenu, on, onView, marksOf, macroForKey } from "./core.js";
 import { art } from "./art.js";
-import { isIdle, groupAlbums, trackTitle, sortTracks, placeholderTrack, coverOf } from "./logic.js";
+import { isIdle, groupAlbums, trackTitle, sortTracks, placeholderTrack, coverOf, LIKED, markLabel } from "./logic.js";
 import { narrowedView, matchSet, setSort, SEARCH_FAILED_NOTE, FILTERS_EMPTY_NOTE } from "./narrow.js";
 
 const PAGE = 60;
@@ -123,6 +123,11 @@ export function trackMenu(anchor, track, extra, opts) {
   items.push(["plus", "Queue last", () => actions.queueLast(set, label)]);
   items.push(["queue", "Replace queue", () => actions.replaceQueue(set, label)]);
   if (extra) items.push(...extra);
+  // Each item does what its label says: mark or unmark is chosen from the same `marks` the labels came from.
+  const marks = marksOf(track.hash);
+  const flip = (m) => () => (marks.includes(m) ? actions.unmark : actions.mark)(track.hash, label, m);
+  items.push("-", ["heart", marks.includes(LIKED) ? "Unlike (M)" : "Like (M)", flip(LIKED)]);
+  store.macros.forEach((m, i) => items.push(["tag", (marks.includes(m) ? "Remove " + markLabel(m) + " mark" : "Mark as " + markLabel(m)) + " (Shift+" + (i + 1) + ")", flip(m)]));
   const nav = [];
   if (track.album) nav.push(["disc", "Go to album", () => (location.hash = "#/album/" + enc(track.album))]);
   if (track.artist) nav.push(["user", "Go to artist", () => (location.hash = "#/artist/" + enc(track.artist))]);
@@ -130,6 +135,8 @@ export function trackMenu(anchor, track, extra, opts) {
   const tech = [track.artist, track.bpm == null ? null : Math.round(track.bpm) + " BPM", track.key].filter(Boolean);
   openMenu(anchor, items, [label, tech.join(" · ")], opts);
 }
+
+on("marks", () => $$("[data-mid]").forEach((e) => e._msync && e._msync()));
 
 /** Menu for a set of tracks (a card or a collection): Play now only when idle, Queue next, Queue last, Replace queue. */
 export function collMenu(anchor, tracks, label) {
@@ -175,7 +182,8 @@ function unavailableRow(t, opts, index) {
  * number(t): a playlist's line number, an album's track number) or "art" (default); sub "artist"
  * (default) or "album" under the title; extra(t, i): menu items
  * spliced in after Queue last, where `i` is the row's index (a list may hold a track twice).
- * Tap/click opens the action menu; N / L queue next / last from the keyboard; on phones swipe
+ * Tap/click opens the action menu; N / L queue next / last from the keyboard, M likes and
+ * Shift+1..9 sets the node's macro marks (a heart and mark chips show what it carries); on phones swipe
  * right past ~96px runs opts.quick ({ label, run(t, i) }), by default Queue last.
  * More opts: end(t, i) -> nodes shown first in the row's button area (an unavailable line gets
  * them too), and decorate(li, row, t, i), called with every finished row: its <li> and its .trow element (a
@@ -196,10 +204,13 @@ function resolvedRow(t, opts, index) {
   const more = h("button", { class: "icon-btn more-btn", "aria-label": "Actions for " + title, tabindex: "-1" }, [icon("more", "sm")]);
   const qn = h("button", { class: "qa", title: "Queue next (N)", tabindex: "-1" }, [icon("next-up", "sm"), "Queue next"]);
   const ql = h("button", { class: "qa", title: "Queue last (L)", tabindex: "-1" }, [icon("plus", "sm"), "Queue last"]);
+  const heart = h("button", { class: "icon-btn more-btn heart-btn", tabindex: "-1" });
+  const mks = h("span", { class: "mks" });
   const row = h(
     "div",
     {
       class: "trow" + (numbered ? " numbered" : "") + (current ? " current" : ""),
+      "data-mid": t.hash,
       tabindex: "0",
       role: "button",
       "aria-haspopup": "menu",
@@ -211,16 +222,37 @@ function resolvedRow(t, opts, index) {
         : art(t.album || title, { cover: t.has_cover ? t.hash : null }),
       h("div", { style: "min-width:0" }, [
         h("div", { class: "t", text: title }),
-        h("div", { class: "m" }, [opts.sub === "album" ? t.album || "" : t.artist || "", tech ? h("span", { class: "tech", text: tech }) : null]),
+        h("div", { class: "m" }, [opts.sub === "album" ? t.album || "" : t.artist || "", tech ? h("span", { class: "tech", text: tech }) : null, mks]),
       ]),
       h("span", { class: "c", text: t.album || "" }),
       h("span", { class: "c num", text: bpmOf(t) }),
       h("span", { class: "c num", text: t.key || "" }),
       h("span", { class: "c num", text: dateOf(t.added) }),
       h("span", { class: "c num", text: t.duration_secs ? fmt(t.duration_secs) : "" }),
-      h("div", { class: "end" }, [...(opts.end ? opts.end(t, index) : []), qn, ql, more]),
+      h("div", { class: "end" }, [...(opts.end ? opts.end(t, index) : []), qn, ql, heart, more]),
     ],
   );
+  // The heart and the chips show what the catalogue says; a "marks" event repaints them in place.
+  // `painted` is what is on screen: the heart and the keys mark or unmark from it, so they do what
+  // the user saw, not what the store holds by the time of the click.
+  let painted = [];
+  const flip = (m) => (painted.includes(m) ? actions.unmark : actions.mark)(t.hash, title, m);
+  row._msync = () => {
+    painted = marksOf(t.hash);
+    const liked = painted.includes(LIKED);
+    heart.replaceChildren(icon(liked ? "heart-fill" : "heart", "sm"));
+    heart.classList.toggle("on", liked);
+    heart.setAttribute("aria-pressed", String(liked));
+    heart.setAttribute("aria-label", (liked ? "Unlike " : "Like ") + title);
+    heart.setAttribute("aria-keyshortcuts", "M");
+    heart.title = liked ? "Unlike (M)" : "Like (M)";
+    mks.replaceChildren(...painted.filter((m) => m !== LIKED).map((m) => h("span", { class: "mk", text: markLabel(m) })));
+  };
+  row._msync();
+  heart.addEventListener("click", (e) => {
+    e.stopPropagation();
+    flip(LIKED);
+  });
   const queueNext = () => actions.queueNext(setOf([t]), title);
   const queueLast = () => actions.queueLast(setOf([t]), title);
   qn.addEventListener("click", (e) => {
@@ -256,6 +288,14 @@ function resolvedRow(t, opts, index) {
       queueNext();
     } else if (e.key === "l" || e.key === "L") {
       queueLast();
+    } else if ((e.key === "m" || e.key === "M") && !e.shiftKey) {
+      if (!e.repeat) flip(LIKED);
+    } else {
+      const macro = macroForKey(e);
+      if (macro) {
+        e.preventDefault();
+        if (!e.repeat) flip(macro);
+      }
     }
   });
 
@@ -496,6 +536,8 @@ export function narrowedTracks(o) {
   const offs = [
     onView("tracks", () => redraw({ bar: !(view && view.el.contains(document.activeElement)), keep: true })),
     onView("player", () => view && view.refresh({ keep: true })),
+    // A mark changed: a list of marked tracks gains or loses rows, and a mark facet's answer is stale.
+    onView("marks", () => redraw({ keep: true })),
   ];
 
   return {

@@ -8,7 +8,7 @@
 
 use super::library::playlist_name;
 use super::{
-    error_reply, fail, gw, json_or_failure, library, library_failed, playback_failed,
+    error_reply, gw, json_or_failure, library, library_failed, parse_hashes, playback_failed,
     playback_failure_status, queue_entries, resolve_for_playback, resolve_for_queue_replace,
     respond, send, PlaybackFailure, Reply,
 };
@@ -218,14 +218,6 @@ fn snapshot(client: &GatewayClient) -> Result<Snapshot, PlaybackFailure> {
         queue: queue_of(client)?,
         output: output_of(client),
     })
-}
-
-#[allow(clippy::result_large_err)]
-fn parse_hashes(hashes: Vec<String>) -> Result<Vec<ContentHash>, Response> {
-    if hashes.is_empty() {
-        return Err(fail(StatusCode::BAD_REQUEST, "no hashes given".to_string()));
-    }
-    Ok(hashes.into_iter().map(ContentHash::new).collect())
 }
 
 /// `GET /api/player`: `{state, now, queue, output}`.

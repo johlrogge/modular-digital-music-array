@@ -10,7 +10,7 @@
 // closes). Changing the filters of a view emits "filters" with its key; changing the sort emits
 // "sort"; typing only calls the bar's onChange.
 import { $, $$, h, icon, store, api, emit, on, openMenu, toast } from "./core.js";
-import { filterGroups, isNarrowedBy } from "./logic.js";
+import { filterGroups, isNarrowedBy, LIKED, markLabel } from "./logic.js";
 
 /** Key of the Library view's narrowing state. */
 export const LIBRARY_KEY = "lib";
@@ -72,14 +72,14 @@ const BPM_PRESETS = [
   ["Fast", "140", "180"],
 ];
 
-const emptyFilters = () => ({ bmin: "", bmax: "", key: "", compat: false, added: "any" });
+const emptyFilters = () => ({ bmin: "", bmax: "", key: "", compat: false, added: "any", mark: "" });
 
 /** A copy of the filters of view `key` (all off when it has none). Safe to hold and to edit. */
 export function filtersOf(key) {
   return { ...emptyFilters(), ...store.f[key] };
 }
 
-/** Number of active filter groups (tempo, key, added) of view `key`. */
+/** Number of active filter groups (tempo, key, added, mark) of view `key`. */
 export function filterCount(key) {
   return filterGroups(filtersOf(key));
 }
@@ -98,6 +98,7 @@ export function matchQuery(f, text = "") {
     const days = Number(f.added);
     p.set("added", ">" + new Date(Date.now() - days * 864e5).toISOString().slice(0, 10));
   }
+  if (f.mark) p.set("mark", f.mark);
   return p.toString();
 }
 
@@ -122,6 +123,7 @@ const cache = new Map(); // "path?qs" -> Promise<parsed answer>
 // calls listeners in registration order: so the cache is already cleared when a view's own
 // "tracks" / "playlists" handler refreshes and asks again.
 on("tracks", () => cache.clear()); // the catalogue changed: ask again
+on("marks", () => cache.clear()); // a mark facet's answer is stale once a mark changed
 on("playlists", () => {
   // The library answers carry playlist names, so they are stale; plain track answers stay.
   for (const url of [...cache.keys()]) if (url.startsWith(LIBRARY_MATCH.path)) cache.delete(url);
@@ -314,6 +316,12 @@ function paintFilters() {
       h("button", { class: "chip", "aria-pressed": String(draft.added === val), onclick: () => ((draft.added = val), paintFilters()) }, [label]),
     );
   }
+
+  const marks = $("#f-mark");
+  marks.innerHTML = "";
+  for (const m of ["", LIKED, ...store.macros]) {
+    marks.appendChild(h("button", { class: "chip", "aria-pressed": String(draft.mark === m), onclick: () => ((draft.mark = m), paintFilters()) }, [m ? markLabel(m) : "Any"]));
+  }
 }
 
 for (const [id, field] of [["#f-bmin", "bmin"], ["#f-bmax", "bmax"]]) {
@@ -418,6 +426,7 @@ function narrowBar(o) {
     const a = ADDED.find((x) => x[0] === f.added);
     chip(a ? a[1] : f.added, (x) => (x.added = "any"));
   }
+  if (f.mark) chip(markLabel(f.mark), (x) => (x.mark = ""));
   const bar = h("div", { class: "nb" }, [row, chips]);
   if (o.hint) bar.appendChild(h("div", { class: "hint", text: o.hint }));
   bar.focusInput = () => input.focus();
