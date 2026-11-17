@@ -1025,6 +1025,60 @@ mod tests {
         ));
     }
 
+    /// ADR-031: `Preview` and `EndPreview` are new variants, so an old
+    /// gateway would drop them as unknown.
+    #[test]
+    fn preview_and_end_preview_pass_through_the_gateway() {
+        use media_protocol::{Command, ContentHash, Deck, Response};
+        let dir = temp_dir("preview");
+        let (playback, commands) = spawn_fake_playback(&dir);
+        let address = start_gateway_with_playback(&dir, &playback);
+        let hash = ContentHash::new(format!("sha256:{}", "b".repeat(64)));
+
+        let preview = ask(
+            &address,
+            &GatewayRequest::Playback {
+                request: Command::Preview {
+                    deck: Deck::A,
+                    hash: hash.clone(),
+                },
+            },
+        );
+        assert!(
+            matches!(
+                preview,
+                GatewayResponse::Playback {
+                    response: Response::Ok { .. }
+                }
+            ),
+            "{preview:?}"
+        );
+        assert!(matches!(
+            commands.recv().unwrap(),
+            Command::Preview { deck: Deck::A, hash: h } if h == hash
+        ));
+
+        let end = ask(
+            &address,
+            &GatewayRequest::Playback {
+                request: Command::EndPreview { deck: Deck::A },
+            },
+        );
+        assert!(
+            matches!(
+                end,
+                GatewayResponse::Playback {
+                    response: Response::Ok { .. }
+                }
+            ),
+            "{end:?}"
+        );
+        assert!(matches!(
+            commands.recv().unwrap(),
+            Command::EndPreview { deck: Deck::A }
+        ));
+    }
+
     #[test]
     fn slow_source_does_not_delay_a_fast_one() {
         let dir = temp_dir("slow-fast");

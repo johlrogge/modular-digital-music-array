@@ -35,6 +35,7 @@ mod playback;
 #[hicli::group]
 mod playlist;
 mod plays;
+mod preview;
 /// Queue management (feeds deck A)
 #[hicli::group]
 mod queue;
