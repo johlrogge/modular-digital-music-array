@@ -135,7 +135,7 @@ File and line references below are as of 5d2cf8f.
   - TUI start (one cold fold): at most 500 ms on the laptop.
 - **What the measurement triggers.**
   - **Within all thresholds:** record the numbers here (machine, replica lines and bytes, release) and do nothing more. Re-measure when the replica passes twice the recorded line count, or when a release changes the fold.
-  - **Over any threshold:** build the fold checkpoint (ADR-031, written when triggered). In short:
+  - **Over any threshold:** build the fold checkpoint (a future ADR, written when triggered). In short:
     - It is `library_projection::FoldState`, the unswept fold state with serde.
     - The sync writes it to `fold.ckpt` under `sync.lock`, keyed by `{epoch, lines, bytes, last_line_sha256}` and the release version. `completion.json` is built from the same state.
     - Readers validate the key, fold only the lines after it, and build the view.
@@ -166,7 +166,7 @@ File and line references below are as of 5d2cf8f.
     | `mdma --facts=replica search --artist` | 87.7 | 90.9 |
     | `search \| view --title -` | 98.2 | 102.0 |
 
-  - **Verdict: within every laptop threshold.** Search p95 91 ms against 150; the pipeline 102 ms against 300; the cold fold (TUI start proxy, `fold_cost` total) 79 ms against 500. No checkpoint, and ADR-031 is not triggered. Re-measure when the replica passes 48000 lines, or when a release changes the fold.
+  - **Verdict: within every laptop threshold.** Search p95 91 ms against 150; the pipeline 102 ms against 300; the cold fold (TUI start proxy, `fold_cost` total) 79 ms against 500. No checkpoint, and the checkpoint ADR is not triggered. Re-measure when the replica passes 48000 lines, or when a release changes the fold.
   - `project_lines` is about 90% of the cost; a checkpoint, if ever needed, would target it.
   - The Pi 5 threshold and the node-side plays refresh round trip are still unmeasured.
 - `facts <hash>` reads raw lines with a byte prefilter on the full hash, confirmed by ACID's `is_entity_match`. An entity index waits for stainless_facts (johlrogge/stainless_facts#17) or a measurement that shows the need.
@@ -233,11 +233,11 @@ All seven are answered (2026-11-17):
 6. The thresholds are in §6.
 7. The stub is folded in now.
 
-New: whether ADR-031 is needed is decided by §6's measurement.
+New: whether a checkpoint ADR is needed is decided by §6's measurement.
 
 ## Phasing
 
-P0a (read side into `library_projection`), P1 (`client_facts_replica` move) and P3 (lazy node) run in parallel. P0b (service consistency, equivalence test and the stub fold-in) follows P0a; P2 (`Facts`) follows P0a and P1; P4 (CLI) follows P2 and P3; P5 (TUI) follows P2 and P3 and depends on the reach cell (§4.4), which is part of the transport and `Node`; P6 (measure, record, and trigger ADR-031 if needed) is last.
+P0a (read side into `library_projection`), P1 (`client_facts_replica` move) and P3 (lazy node) run in parallel. P0b (service consistency, equivalence test and the stub fold-in) follows P0a; P2 (`Facts`) follows P0a and P1; P4 (CLI) follows P2 and P3; P5 (TUI) follows P2 and P3 and depends on the reach cell (§4.4), which is part of the transport and `Node`; P6 (measure, record, and trigger a checkpoint ADR if needed) is last.
 
 ## Related
 

@@ -1,6 +1,6 @@
 use playback_primitives::{
-    AudioOutputConfig, AudioSinkInfo, CanonicalHash, ContentHash, Deck, OutputHealth, SourceName,
-    Volume,
+    AudioOutputConfig, AudioSinkInfo, CanonicalHash, ContentHash, Deck, OutputHealth, PositionMs,
+    SourceName, Volume,
 };
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -38,9 +38,17 @@ pub enum Command {
     Unload {
         deck: Deck,
     },
+    /// Move the audible track to `position_ms` (kept within the track).
+    /// Playing stays playing and paused stays paused; Idle is refused. The
+    /// audio source drops its preload, which playback re-sends. Answers
+    /// `ResponseData::Transport` with where the track actually is.
     Seek {
         deck: Deck,
-        position: usize,
+        position_ms: PositionMs,
+    },
+    /// Where the deck is: transport state, audible track, position, duration.
+    GetTransport {
+        deck: Deck,
     },
     GetLength {
         deck: Deck,
@@ -134,6 +142,53 @@ pub enum ResponseData {
     AudioOutput(AudioOutputConfig),
     /// `None` until the source has reported its output health (see ADR-028).
     OutputStatus(Option<OutputHealth>),
+    Transport(TransportStatus),
+}
+
+/// Whether a loaded track is playing or paused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Transport {
+    Playing,
+    Paused,
+}
+
+/// Where the audible track would return to when a preview ends (ADR-031).
+/// Never sent until the preview hold exists.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreviewStatus {
+    pub back_to: Option<ContentHash>,
+    pub back_at_ms: Option<PositionMs>,
+}
+
+/// The answer to `GetTransport`, and to a successful `Seek`. An idle deck has
+/// no track, so it has no position either: the track and its transport exist
+/// together or not at all.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum TransportStatus {
+    Idle,
+    Loaded {
+        transport: Transport,
+        /// The audible track.
+        now: ContentHash,
+        /// `None` when the source cannot say (an old source, or a failed poll).
+        position_ms: Option<PositionMs>,
+        duration_ms: Option<PositionMs>,
+        /// Always `None` until the preview hold (ADR-031 phase S2) exists.
+        #[serde(default)]
+        preview: Option<PreviewStatus>,
+    },
+}
+
+impl TransportStatus {
+    /// The audible position, when a track is loaded and the source said where.
+    pub fn position(&self) -> Option<PositionMs> {
+        match self {
+            TransportStatus::Loaded { position_ms, .. } => *position_ms,
+            TransportStatus::Idle => None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -180,6 +235,80 @@ mod tests {
         assert_eq!(json, r#""get_output_status""#);
         let decoded: Command = serde_json::from_str(&json).unwrap();
         assert!(matches!(decoded, Command::GetOutputStatus));
+    }
+
+    #[test]
+    fn seek_carries_a_deck_and_milliseconds() {
+        let cmd = Command::Seek {
+            deck: Deck::A,
+            position_ms: PositionMs::new(90_000),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert_eq!(json, r#"{"seek":{"deck":"A","position_ms":90000}}"#);
+        let decoded: Command = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            decoded,
+            Command::Seek {
+                deck: Deck::A,
+                position_ms
+            } if position_ms == PositionMs::new(90_000)
+        ));
+    }
+
+    #[test]
+    fn the_old_seek_form_no_longer_parses() {
+        let old = r#"{"seek":{"deck":"A","position":441000}}"#;
+        assert!(serde_json::from_str::<Command>(old).is_err());
+    }
+
+    #[test]
+    fn get_transport_requires_a_deck() {
+        let json = serde_json::to_string(&Command::GetTransport { deck: Deck::B }).unwrap();
+        assert_eq!(json, r#"{"get_transport":{"deck":"B"}}"#);
+        assert!(serde_json::from_str::<Command>(r#""get_transport""#).is_err());
+        assert!(Command::GetTransport { deck: Deck::A }
+            .hashes_held()
+            .is_empty());
+    }
+
+    #[test]
+    fn transport_response_roundtrips_and_tolerates_a_missing_preview() {
+        let status = TransportStatus::Loaded {
+            transport: Transport::Paused,
+            now: ContentHash::new("abc"),
+            position_ms: Some(PositionMs::new(1_500)),
+            duration_ms: Some(PositionMs::new(240_000)),
+            preview: None,
+        };
+        let json = serde_json::to_string(&ResponseData::Transport(status.clone())).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"transport","value":{"state":"loaded","transport":"paused","now":"abc","position_ms":1500,"duration_ms":240000,"preview":null}}"#
+        );
+        let ResponseData::Transport(back) = serde_json::from_str(&json).unwrap() else {
+            panic!("expected Transport");
+        };
+        assert_eq!(back, status);
+
+        let no_preview = r#"{"type":"transport","value":{"state":"loaded","transport":"playing","now":"abc","position_ms":null,"duration_ms":null}}"#;
+        let ResponseData::Transport(loaded) = serde_json::from_str(no_preview).unwrap() else {
+            panic!("expected Transport");
+        };
+        assert!(matches!(
+            loaded,
+            TransportStatus::Loaded {
+                transport: Transport::Playing,
+                preview: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn an_idle_transport_has_no_track_to_put_a_position_on() {
+        let json = serde_json::to_string(&TransportStatus::Idle).unwrap();
+        assert_eq!(json, r#"{"state":"idle"}"#);
+        assert_eq!(TransportStatus::Idle.position(), None);
     }
 
     #[test]

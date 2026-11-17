@@ -6460,6 +6460,7 @@ name = "music-primitives"
 version = "0.10.1"
 dependencies = [
  "pretty_assertions",
+ "proptest",
  "rstest",
  "serde",
  "serde_json",

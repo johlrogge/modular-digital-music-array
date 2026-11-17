@@ -862,10 +862,16 @@ mod tests {
     /// Start a gateway on a fresh frontend; returns its address.
     fn start_gateway(dir: &Path) -> String {
         let unused = format!("ipc://{}/none.sock", dir.display());
+        start_gateway_with_playback(dir, &unused)
+    }
+
+    /// Like [`start_gateway`], with playback at `playback_address`.
+    fn start_gateway_with_playback(dir: &Path, playback_address: &str) -> String {
+        let unused = format!("ipc://{}/none.sock", dir.display());
         let gateway = Arc::new(Gateway {
             identity: build_identity(Some("test"), None),
             library: connect_backend(&unused, SERVICE_RECV_TIMEOUT).unwrap(),
-            playback: connect_backend(&unused, SERVICE_RECV_TIMEOUT).unwrap(),
+            playback: connect_backend(playback_address, SERVICE_RECV_TIMEOUT).unwrap(),
             acid: connect_backend(&unused, SERVICE_RECV_TIMEOUT).unwrap(),
             admin: connect_backend(&unused, SERVICE_RECV_TIMEOUT).unwrap(),
             sources_dir: dir.to_path_buf(),
@@ -914,6 +920,109 @@ mod tests {
             } => name.as_str().to_string(),
             other => panic!("unexpected reply: {other:?}"),
         }
+    }
+
+    /// A playback service that records the commands it parses and answers
+    /// `GetTransport` with a fixed status and everything else with `Ok`.
+    fn spawn_fake_playback(
+        dir: &Path,
+    ) -> (String, std::sync::mpsc::Receiver<media_protocol::Command>) {
+        use media_protocol::{
+            Command, PositionMs, Response, ResponseData, Transport, TransportStatus,
+        };
+        let address = format!("ipc://{}/playback.sock", dir.display());
+        let socket = nng::Socket::new(nng::Protocol::Rep0).unwrap();
+        socket.listen(&address).unwrap();
+        let (seen, commands) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            while let Ok(msg) = socket.recv() {
+                let command: Command = serde_json::from_slice(&msg).unwrap();
+                let response = match &command {
+                    Command::GetTransport { .. } | Command::Seek { .. } => Response::Ok {
+                        data: Some(ResponseData::Transport(TransportStatus::Loaded {
+                            transport: Transport::Playing,
+                            now: media_protocol::ContentHash::new("abc"),
+                            position_ms: Some(PositionMs::new(90_000)),
+                            duration_ms: Some(PositionMs::new(240_000)),
+                            preview: None,
+                        })),
+                    },
+                    _ => Response::Ok { data: None },
+                };
+                seen.send(command).unwrap();
+                let _ = socket.send(serde_json::to_vec(&response).unwrap().as_slice());
+            }
+        });
+        (address, commands)
+    }
+
+    /// ADR-017: the gateway parses and re-serialises `Command`, so a variant
+    /// it does not know (or knows differently) is dropped on the way.
+    #[test]
+    fn seek_and_get_transport_pass_through_the_gateway() {
+        use media_protocol::{
+            Command, Deck, PositionMs, Response, ResponseData, Transport, TransportStatus,
+        };
+        let dir = temp_dir("transport");
+        let (playback, commands) = spawn_fake_playback(&dir);
+        let address = start_gateway_with_playback(&dir, &playback);
+
+        let seek = ask(
+            &address,
+            &GatewayRequest::Playback {
+                request: Command::Seek {
+                    deck: Deck::A,
+                    position_ms: PositionMs::new(90_000),
+                },
+            },
+        );
+        assert!(
+            matches!(
+                seek,
+                GatewayResponse::Playback {
+                    response: Response::Ok {
+                        data: Some(ResponseData::Transport(TransportStatus::Loaded { .. }))
+                    }
+                }
+            ),
+            "{seek:?}"
+        );
+        assert!(matches!(
+            commands.recv().unwrap(),
+            Command::Seek {
+                deck: Deck::A,
+                position_ms
+            } if position_ms == PositionMs::new(90_000)
+        ));
+
+        let transport = ask(
+            &address,
+            &GatewayRequest::Playback {
+                request: Command::GetTransport { deck: Deck::A },
+            },
+        );
+        let GatewayResponse::Playback {
+            response:
+                Response::Ok {
+                    data: Some(ResponseData::Transport(status)),
+                },
+        } = transport
+        else {
+            panic!("unexpected reply: {transport:?}");
+        };
+        assert!(matches!(
+            status,
+            TransportStatus::Loaded {
+                transport: Transport::Playing,
+                position_ms: Some(position),
+                duration_ms: Some(duration),
+                ..
+            } if position == PositionMs::new(90_000) && duration == PositionMs::new(240_000)
+        ));
+        assert!(matches!(
+            commands.recv().unwrap(),
+            Command::GetTransport { deck: Deck::A }
+        ));
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use library_ipc_client::LibraryClient;
 use music_primitives::ContentHash;
 use playback_engine::{PlaybackEngine, TrackId};
-use playback_primitives::AudioSinkInfo;
+use playback_primitives::{AudioSinkInfo, PositionMs};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use stream_source_protocol::{
@@ -62,6 +62,15 @@ struct ResolvedTrack {
 /// reported as next (around a commit), so liveness is the only safe criterion.
 fn prune_tracks(tracks: &mut HashMap<TrackId, LoadedTrack>, is_live: impl Fn(TrackId) -> bool) {
     tracks.retain(|id, _| is_live(*id));
+}
+
+/// Move the metadata of track `from` to the id `to` it now has (a seek makes
+/// the engine restart the track under a new id). Nothing to move for an
+/// unknown id.
+fn carry_meta(tracks: &mut HashMap<TrackId, LoadedTrack>, from: TrackId, to: TrackId) {
+    if let Some(meta) = tracks.remove(&from) {
+        tracks.insert(to, meta);
+    }
 }
 
 /// Build the Loaded response payload describing the audible track and the
@@ -180,6 +189,7 @@ impl Server {
             StreamCommand::Play => self.handle_play(),
             StreamCommand::Pause => self.handle_pause(),
             StreamCommand::Stop => self.handle_stop(),
+            StreamCommand::Seek { position_ms } => self.handle_seek(position_ms),
             StreamCommand::Loaded => self.handle_loaded(),
             StreamCommand::ListOutputs => self.handle_list_outputs(),
             StreamCommand::SetOutput { device_name } => self.handle_set_output(device_name),
@@ -327,6 +337,38 @@ impl Server {
         StreamResponse::Ok
     }
 
+    /// Seek the audible track. The engine leaves the track stopped, so a
+    /// track that was playing is resumed: the play state stays as it was.
+    /// The engine also dropped any preload; the queue manager re-issues it.
+    fn handle_seek(&mut self, position: PositionMs) -> StreamResponse {
+        let Some(before) = self.engine.audible_track_id() else {
+            return StreamResponse::Error {
+                message: "nothing loaded".to_string(),
+            };
+        };
+        if let Err(e) = self.engine.seek_ms(position) {
+            warn!("Seek failed: {}", e);
+            return StreamResponse::Error {
+                message: format!("Seek failed: {}", e),
+            };
+        }
+        // The engine restarts the track under a new id: the metadata goes with
+        // it, or `Loaded` would report nothing after a seek.
+        if let Some(after) = self.engine.audible_track_id() {
+            carry_meta(&mut self.tracks, before, after);
+        }
+        self.prune();
+        if self.play_state == LoadedState::Playing {
+            if let Err(e) = self.engine.play() {
+                warn!("Resume after seek failed: {}", e);
+                return StreamResponse::Error {
+                    message: format!("Resume after seek failed: {}", e),
+                };
+            }
+        }
+        StreamResponse::Ok
+    }
+
     fn handle_loaded(&mut self) -> StreamResponse {
         // Commit observed promotions before reporting.
         self.engine.reconcile();
@@ -403,7 +445,8 @@ mod tests {
         // Leak the tempdir so the config file is available for the engine lifetime.
         std::mem::forget(tmp);
 
-        let engine = PlaybackEngine::new(config_path).unwrap();
+        // No audio output: CI has no sound server, and nothing here is heard.
+        let engine = PlaybackEngine::new_headless(config_path).unwrap();
         let socket = nng::Socket::new(nng::Protocol::Rep0).unwrap();
         Server::new(
             engine,
@@ -443,6 +486,81 @@ mod tests {
         if let StreamResponse::Error { message } = response {
             assert_eq!(message, "nothing loaded");
         }
+    }
+
+    /// Seek with nothing loaded returns error, like Play.
+    #[tokio::test]
+    async fn seek_nothing_loaded_returns_error() {
+        let mut server = make_server();
+        let response = server
+            .handle_command(StreamCommand::Seek {
+                position_ms: PositionMs::new(1_000),
+            })
+            .await;
+        let StreamResponse::Error { message } = response else {
+            panic!("expected error");
+        };
+        assert_eq!(message, "nothing loaded");
+    }
+
+    /// Seek is a state change, so it is logged at info like Play.
+    #[test]
+    fn seek_is_not_read_only() {
+        assert!(!is_read_only(&StreamCommand::Seek {
+            position_ms: PositionMs::START
+        }));
+    }
+
+    #[test]
+    fn carry_meta_moves_the_metadata_to_the_new_id() {
+        let mut t = tracks(&[(1, "a"), (2, "b")]);
+        carry_meta(&mut t, 1, 7);
+        let mut ids: Vec<_> = t.keys().copied().collect();
+        ids.sort();
+        assert_eq!(ids, vec![2, 7]);
+        assert_eq!(t[&7].content_hash, ContentHash::new("a"));
+    }
+
+    #[test]
+    fn carry_meta_for_an_unknown_id_changes_nothing() {
+        let mut t = tracks(&[(1, "a")]);
+        carry_meta(&mut t, 5, 7);
+        assert_eq!(t.keys().copied().collect::<Vec<_>>(), vec![1]);
+    }
+
+    /// The real engine restarts a seeked track under a new id. A fake source
+    /// cannot show that, so this loads a real file through the real decoder,
+    /// engine and seek path (the engine has no audio output here).
+    #[tokio::test]
+    async fn loaded_still_describes_the_track_after_a_seek() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../components/audio_decoder/benches/test_data/ascending.flac");
+        assert!(path.exists(), "fixture missing: {}", path.display());
+        let mut server = make_server();
+        server
+            .engine
+            .load_track(&path)
+            .await
+            .expect("load the fixture");
+        let id = server.engine.audible_track_id().expect("a loaded track");
+        server.tracks.insert(id, track("a"));
+        server.play_state = LoadedState::Paused;
+
+        let response = server
+            .handle_command(StreamCommand::Seek {
+                position_ms: PositionMs::new(100),
+            })
+            .await;
+        assert!(matches!(response, StreamResponse::Ok), "{response:?}");
+
+        let StreamResponse::Loaded {
+            info: Some(info), ..
+        } = server.handle_loaded()
+        else {
+            panic!("Loaded lost the track after a seek");
+        };
+        assert_eq!(info.content_hash, Some(ContentHash::new("a")));
+        assert_eq!(info.state, StreamPlaybackState::Paused);
     }
 
     /// Loaded with nothing loaded returns Loaded { info: None }.
