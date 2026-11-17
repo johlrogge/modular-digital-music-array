@@ -402,9 +402,23 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
         }
     };
 
+    // Where the facts come from and how the node is, right-aligned and as wide as
+    // it needs; the left side keeps the rest.
+    let source = app.source_text().unwrap_or_default();
+    let source_width = (source.chars().count() as u16).min(area.width / 2);
+    let [left_area, source_area] = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(0), Constraint::Length(source_width)])
+        .areas(area);
+
     f.render_widget(
         Paragraph::new(left_line).style(Style::default().bg(BG_SURFACE)),
-        area,
+        left_area,
+    );
+    f.render_widget(
+        Paragraph::new(Span::styled(source, Style::default().fg(TEXT_TERTIARY)))
+            .style(Style::default().bg(BG_SURFACE)),
+        source_area,
     );
 }
 

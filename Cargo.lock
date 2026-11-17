@@ -6057,6 +6057,7 @@ version = "0.1.0"
 dependencies = [
  "bdd-runner",
  "chrono",
+ "client-facts",
  "cucumber",
  "date-expression",
  "library-ipc-protocol",
@@ -6124,7 +6125,6 @@ dependencies = [
  "inbox-utils",
  "libc",
  "library-ipc-client",
- "library-projection",
  "library-search",
  "mdma-client",
  "music-facts",
@@ -6270,6 +6270,7 @@ name = "mdma-tui"
 version = "0.38.3"
 dependencies = [
  "clap",
+ "client-facts",
  "color-eyre",
  "corsett",
  "crossterm",
@@ -6277,11 +6278,14 @@ dependencies = [
  "library-ipc-protocol",
  "library-search",
  "mdma-client",
+ "music-facts",
  "music-primitives",
  "nng",
  "nng-transport",
+ "node-discovery",
  "ratatui",
  "serde_json",
+ "tempfile",
  "thiserror 1.0.69",
  "tracing",
  "tracing-subscriber",

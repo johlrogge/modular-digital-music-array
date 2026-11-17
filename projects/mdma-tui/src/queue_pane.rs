@@ -1,20 +1,17 @@
+use crate::link::{Link, ReadError};
 use crate::pane::{AddPlayingTarget, Pane, PaneAction, PaneKind};
 use crate::rows::{rows_for_hashes, ListRow};
 use crate::selection::SelectionState;
 use crate::theme::MUTED;
 use crate::track_list::render_track_list;
 use crossterm::event::{KeyCode, KeyEvent};
-use mdma_client::{
-    ContentHash, LibraryBackend, LibraryClientError, PlaybackBackend, PlaylistName, SourceName,
-    TrackInfo,
-};
+use mdma_client::{ContentHash, PlaylistName, SourceName, TrackInfo};
 use ratatui::{
     layout::{Alignment, Rect},
     style::Style,
     widgets::{Block, Borders, Paragraph},
     Frame,
 };
-use std::rc::Rc;
 
 /// What to tell the user after asking playback to remove tracks: what playback
 /// reports it removed, which can be fewer than were asked for (or none).
@@ -26,12 +23,12 @@ fn removed_message(removed: usize) -> String {
 }
 
 /// Build the queue's rows from the answer to listing it: one row per queue
-/// entry, in order. An entry the library has no track for stays as an
+/// entry, in order. An entry the facts have no track for stays as an
 /// unavailable row, so it can still be removed. A failed listing or any
 /// other failed lookup fails the load with its message.
 fn rows_for_queue<E: std::fmt::Display>(
     queue: Result<Vec<ContentHash>, E>,
-    get_track: impl FnMut(&ContentHash) -> Result<TrackInfo, LibraryClientError>,
+    get_track: impl FnMut(&ContentHash) -> Result<TrackInfo, ReadError>,
 ) -> Result<Vec<ListRow>, String> {
     let queue = queue.map_err(|e| format!("Could not list the queue: {e}"))?;
     rows_for_hashes(&queue, get_track).map_err(|e| format!("Could not load the queue: {e}"))
@@ -47,7 +44,8 @@ fn selected_hashes(rows: &[ListRow], selection: &SelectionState) -> Vec<ContentH
         .collect()
 }
 
-/// Minimal proof-of-life pane that shows the current playback queue.
+/// The playback queue. The queue comes from the node, and each row's metadata
+/// from the facts, so a node that cannot be reached leaves the pane showing why.
 #[allow(dead_code)]
 #[derive(Clone)]
 pub struct QueuePane {
@@ -57,40 +55,41 @@ pub struct QueuePane {
     load_error: Option<String>,
     selection: SelectionState,
     title: String,
-    playback: Rc<PlaybackBackend>,
-    library: Rc<LibraryBackend>,
+    link: Link,
 }
 
 impl QueuePane {
-    /// Create a new QueuePane, loading the queue from the playback backend
-    /// and resolving each hash against the library.
+    /// Create a new QueuePane, loading the queue from the node and resolving
+    /// each hash against the facts.
     ///
     /// If the queue cannot be loaded the pane shows why instead of a queue.
-    pub fn new(playback: Rc<PlaybackBackend>, library: Rc<LibraryBackend>) -> Self {
+    pub fn new(link: Link) -> Self {
         let mut pane = QueuePane {
             rows: Vec::new(),
             load_error: None,
             selection: SelectionState::new(0),
             title: "Queue".to_string(),
-            playback,
-            library,
+            link,
         };
         pane.reload();
         pane
     }
 
-    /// Load queue hashes from playback then resolve each via library.
-    fn load_queue(
-        playback: &PlaybackBackend,
-        library: &LibraryBackend,
-    ) -> Result<Vec<ListRow>, String> {
-        rows_for_queue(playback.queue_list(), |h| library.get_track(h))
+    /// Load queue hashes from playback then resolve each via the facts.
+    fn load_queue(link: &Link) -> Result<Vec<ListRow>, String> {
+        let queue = link
+            .playback()
+            .map_err(|e| e.to_string())
+            .and_then(|playback| playback.queue_list().map_err(|e| e.to_string()));
+        // The metadata of a row is the node's, not the replica's: the rows are what
+        // the node's queue holds, and what `d` removes.
+        rows_for_queue(queue, |h| link.node_track(h))
     }
 
     /// Replace the rows with the loaded queue. A failed load leaves no rows,
     /// so nothing stale can be acted on, and is returned as an error.
     fn reload(&mut self) -> PaneAction {
-        let loaded = Self::load_queue(&self.playback, &self.library);
+        let loaded = Self::load_queue(&self.link);
         let action = match &loaded {
             Ok(_) => PaneAction::Consumed,
             Err(e) => PaneAction::Error(e.clone()),
@@ -153,20 +152,19 @@ impl Pane for QueuePane {
                 }
                 // Resolved against the queue's own entries, so one whose track
                 // has left the library can still be removed.
-                let resolved = match self
-                    .playback
-                    .queue_list()
-                    .map_err(|e| e.to_string())
-                    .and_then(|queue| {
-                        mdma_client::resolve_in_queue(&queue, &hashes).map_err(|e| e.to_string())
-                    }) {
-                    Ok(resolved) => resolved,
-                    Err(e) => return PaneAction::Error(format!("Remove failed: {e}")),
-                };
-                match self
-                    .playback
-                    .queue_remove(resolved.into_iter().map(ContentHash::from).collect())
-                {
+                let removed =
+                    self.link
+                        .playback()
+                        .map_err(|e| e.to_string())
+                        .and_then(|playback| {
+                            let queue = playback.queue_list().map_err(|e| e.to_string())?;
+                            let resolved = mdma_client::resolve_in_queue(&queue, &hashes)
+                                .map_err(|e| e.to_string())?;
+                            playback
+                                .queue_remove(resolved.into_iter().map(ContentHash::from).collect())
+                                .map_err(|e| e.to_string())
+                        });
+                match removed {
                     Ok(removed) => {
                         self.refresh();
                         PaneAction::Info(removed_message(removed))
@@ -217,21 +215,28 @@ impl Pane for QueuePane {
     }
 
     fn accept_tracks(&mut self, hashes: &[ContentHash]) -> PaneAction {
-        let resolved = match self.library.resolve_for_playback(hashes) {
+        let (library, playback) = match self
+            .link
+            .library()
+            .and_then(|library| Ok((library, self.link.playback()?)))
+        {
+            Ok(both) => both,
+            Err(e) => return PaneAction::Error(e.to_string()),
+        };
+        let resolved = match library.resolve_for_playback(hashes) {
             Ok(resolved) => resolved,
             Err(e) => return PaneAction::Error(e.to_string()),
         };
-        let mut errors = Vec::new();
-        for hash in &resolved {
-            if let Err(e) = self.playback.queue_append(hash.into(), SourceName::audio()) {
-                errors.push(format!("{e}"));
-            }
-        }
-        if errors.is_empty() {
-            self.refresh();
-            PaneAction::Info(format!("Queued {} track(s)", hashes.len()))
-        } else {
-            PaneAction::Error(errors.join(", "))
+        // Stops at the first error: a node that stopped answering would otherwise be
+        // asked, and wait for, once per track.
+        let queued = resolved
+            .iter()
+            .try_for_each(|hash| playback.queue_append(hash.into(), SourceName::audio()));
+        // Some may be queued before the error, so the rows are read again either way.
+        self.refresh();
+        match queued {
+            Ok(()) => PaneAction::Info(format!("Queued {} track(s)", hashes.len())),
+            Err(e) => PaneAction::Error(e.to_string()),
         }
     }
 
@@ -256,6 +261,7 @@ impl Pane for QueuePane {
 mod tests {
     use super::*;
     use crate::rows::{make_track_info, not_found, transport_error};
+    use crate::test_support::{catalog, World, ATOMIC};
 
     fn hash(s: &str) -> ContentHash {
         ContentHash::new(s)
@@ -311,6 +317,81 @@ mod tests {
         });
 
         assert!(result.is_err());
+    }
+
+    /// Text of every cell of `pane` rendered into a wide, short terminal.
+    fn rendered(pane: &QueuePane) -> String {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut terminal = Terminal::new(TestBackend::new(240, 3)).unwrap();
+        terminal.draw(|f| pane.render(f, f.area())).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    /// With the node dead the queue cannot be listed: the pane says why and has no
+    /// rows, and nothing can be selected or removed from it.
+    #[test]
+    fn a_dead_node_shows_the_unreachable_text_and_no_rows() {
+        let world = World::new(Some(catalog()));
+
+        let pane = QueuePane::new(world.link());
+
+        assert_eq!(pane.item_count(), 0);
+        assert!(pane.resolve_selection().is_empty());
+        let shown = rendered(&pane);
+        assert!(shown.contains("Could not list the queue: "), "{shown}");
+        assert!(shown.contains("needs the node"), "{shown}");
+        assert!(!shown.contains("queue is empty"), "{shown}");
+    }
+
+    /// The rows are the node's own: with no replica at all, and the node up, the
+    /// queue loads.
+    #[test]
+    fn with_no_replica_and_the_node_up_the_queue_loads_its_rows() {
+        use crate::test_support::{node_hash, Services};
+        let world = World::new(None);
+        let _services = Services::start(&world);
+
+        let pane = QueuePane::new(world.link());
+
+        assert!(pane.load_error.is_none(), "{:?}", pane.load_error);
+        assert_eq!(pane.item_count(), 1);
+        assert_eq!(pane.resolve_selection(), [node_hash()]);
+        assert!(rendered(&pane).contains("Node Title"));
+    }
+
+    #[test]
+    fn with_no_node_selected_the_pane_says_how_to_select_one() {
+        let world = World::new(Some(catalog()));
+        let link = Link::new(world.cancelled_node(), client_facts::FactsChoice::Replica);
+
+        let pane = QueuePane::new(link);
+
+        assert_eq!(pane.item_count(), 0);
+        let shown = rendered(&pane);
+        assert!(
+            shown.contains("no node selected; run `mdma node select`"),
+            "{shown}"
+        );
+    }
+
+    #[test]
+    fn queueing_on_a_dead_node_is_an_error_not_a_change() {
+        let world = World::new(Some(catalog()));
+        let mut pane = QueuePane::new(world.link());
+
+        let action = pane.accept_tracks(&[hash(ATOMIC)]);
+
+        let PaneAction::Error(text) = action else {
+            panic!("a dead node cannot queue");
+        };
+        assert!(text.contains("needs the node"), "{text}");
+        assert_eq!(pane.item_count(), 0);
     }
 
     #[test]

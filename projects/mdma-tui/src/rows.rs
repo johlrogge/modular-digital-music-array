@@ -2,8 +2,9 @@
 //! the library could not resolve. Both kinds live in one vec so positions stay
 //! aligned with the stored entries, and nothing is ever dropped.
 
+use crate::link::ReadError;
 use crate::track_list::{ListedRow, Listing};
-use mdma_client::{ContentHash, EntryError, LibraryClientError, ProtocolError, TrackInfo};
+use mdma_client::{ContentHash, EntryError, TrackInfo};
 use track_formatter::{format_track_line, unavailable_line};
 
 /// One listed line: a resolved track, or a line the library could not resolve.
@@ -76,12 +77,12 @@ pub(crate) fn rows_content_for_write(rows: &[ListRow]) -> String {
 /// internal error) is returned, so nothing is dropped and nothing is guessed.
 pub(crate) fn row_for_lookup(
     hash: &ContentHash,
-    lookup: Result<TrackInfo, LibraryClientError>,
-) -> Result<ListRow, LibraryClientError> {
+    lookup: Result<TrackInfo, ReadError>,
+) -> Result<ListRow, ReadError> {
     match lookup {
         Ok(track) => Ok(ListRow::Track(track)),
-        Err(LibraryClientError::Protocol(ProtocolError::TrackNotFound { .. })) => {
-            tracing::warn!("Library has no track for {}", hash.as_str());
+        Err(error) if error.is_track_not_found() => {
+            tracing::warn!("Facts have no track for {}", hash.as_str());
             Ok(ListRow::Unresolved(EntryError::Unknown {
                 hash: hash.clone(),
             }))
@@ -90,12 +91,12 @@ pub(crate) fn row_for_lookup(
     }
 }
 
-/// Turn hashes into rows, in order, with the library's own message when a
+/// Turn hashes into rows, in order, with the facts' own message when a
 /// lookup fails for any reason `row_for_lookup` does not turn into a row.
 pub(crate) fn rows_for_hashes(
     hashes: &[ContentHash],
-    mut get_track: impl FnMut(&ContentHash) -> Result<TrackInfo, LibraryClientError>,
-) -> Result<Vec<ListRow>, LibraryClientError> {
+    mut get_track: impl FnMut(&ContentHash) -> Result<TrackInfo, ReadError>,
+) -> Result<Vec<ListRow>, ReadError> {
     hashes
         .iter()
         .map(|hash| row_for_lookup(hash, get_track(hash)))
@@ -129,19 +130,27 @@ pub(crate) fn make_track_info(
         beat_grid: None,
         role: None,
         energy: None,
+        genre: None,
+        label: None,
+        styles: vec![],
     }
 }
 
 #[cfg(test)]
-pub(crate) fn not_found(h: &ContentHash) -> LibraryClientError {
-    LibraryClientError::Protocol(ProtocolError::TrackNotFound {
-        hash: h.as_str().to_string(),
-    })
+pub(crate) fn not_found(h: &ContentHash) -> ReadError {
+    use mdma_client::ProtocolError;
+    ReadError::Facts(
+        ProtocolError::TrackNotFound {
+            hash: h.as_str().to_string(),
+        }
+        .into(),
+    )
 }
 
 #[cfg(test)]
-pub(crate) fn transport_error() -> LibraryClientError {
-    LibraryClientError::from(serde_json::from_str::<u8>("x").unwrap_err())
+pub(crate) fn transport_error() -> ReadError {
+    use mdma_client::LibraryClientError;
+    ReadError::Facts(LibraryClientError::from(serde_json::from_str::<u8>("x").unwrap_err()).into())
 }
 
 #[cfg(test)]
@@ -212,7 +221,10 @@ mod tests {
     #[test]
     fn rows_for_hashes_aborts_on_transport_error() {
         let result = rows_for_hashes(&[hash("sha256:aaa")], |_| Err(transport_error()));
-        assert!(matches!(result, Err(LibraryClientError::Transport(_))));
+        assert!(matches!(
+            result,
+            Err(ReadError::Facts(client_facts::FactsError::Transport(_)))
+        ));
     }
 
     /// Only "track not found" is an answer about the hash. Any other library
@@ -220,9 +232,12 @@ mod tests {
     #[test]
     fn rows_for_hashes_aborts_on_other_library_errors() {
         let result = rows_for_hashes(&[hash("sha256:aaa")], |_| {
-            Err(LibraryClientError::Protocol(ProtocolError::Internal {
-                message: "ambiguous hash sha256:aaa".to_string(),
-            }))
+            Err(ReadError::Facts(
+                mdma_client::ProtocolError::Internal {
+                    message: "ambiguous hash sha256:aaa".to_string(),
+                }
+                .into(),
+            ))
         });
 
         let err = result.err().expect("an Internal error must abort");

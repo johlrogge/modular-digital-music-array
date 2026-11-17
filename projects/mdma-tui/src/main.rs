@@ -1,9 +1,11 @@
 mod app;
+mod background;
 mod browse_field;
 mod browser_pane;
 mod commands;
 mod events;
 mod input;
+mod link;
 mod now_playing;
 mod pane;
 mod playlist_pane;
@@ -13,19 +15,18 @@ mod rows;
 mod search_pane;
 mod search_parse;
 mod selection;
+#[cfg(test)]
+mod test_support;
 mod theme;
 mod track_list;
 mod ui;
 
 use app::App;
-use browser_pane::BrowserPane;
 use clap::Parser;
+use client_facts::{FactsChoice, FactsWord, Urgency};
 use color_eyre::Result;
-use events::spawn_event_subscriber;
-use mdma_client::{
-    LibraryBackend, NeededBy, Node, NodeError, NodeOptions, NodeSpec, PlaybackBackend,
-};
-use queue_pane::QueuePane;
+use link::Link;
+use mdma_client::{NeededBy, Node, NodeOptions, NodeSpec};
 use std::rc::Rc;
 use tracing_subscriber::EnvFilter;
 
@@ -38,6 +39,7 @@ use tracing_subscriber::EnvFilter;
         \x20                the TUI uses 24-bit colour only when COLORTERM is truecolor or 24bit.\n  \
         \x20                Set it when COLORTERM is not forwarded, for example over SSH.\n  \
         MDMA_NODE        host[:port] of the node to use (same as --node).\n  \
+        MDMA_FACTS       replica|node. Where browsing and search read from (same as --facts).\n  \
         MDMA_LIBRARY_SOCKET, MDMA_PLAYBACK_SOCKET\n  \
         \x20                Local-mode socket paths on the node; ignored when --node or\n  \
         \x20                MDMA_NODE is set."
@@ -59,6 +61,19 @@ struct Cli {
     /// MDMA_NODE is set.
     #[arg(long, env = "MDMA_PLAYBACK_SOCKET")]
     playback_socket: Option<String>,
+
+    /// Where browsing and search read from: replica (the local copy of the node's
+    /// facts, works offline) or node. Defaults to replica. The flag wins over
+    /// MDMA_FACTS; an empty value counts as not given.
+    #[arg(long, env = "MDMA_FACTS")]
+    facts: Option<FactsWord>,
+}
+
+impl Cli {
+    /// The facts source asked for, the replica when none was.
+    fn facts_choice(&self) -> FactsChoice {
+        self.facts.and_then(FactsWord::choice).unwrap_or_default()
+    }
 }
 
 impl From<Cli> for NodeOptions {
@@ -72,28 +87,17 @@ impl From<Cli> for NodeOptions {
     }
 }
 
-/// Resolved node connections: library, playback and the event gateway address.
-type Connections = (LibraryBackend, PlaybackBackend, Option<String>);
-
-/// Resolve the node and connect. Runs before raw mode so the pick prompt and
-/// notes print on the normal terminal.
-fn connect(options: NodeOptions) -> Result<Connections, NodeError> {
-    let node = Node::needed_by(NeededBy::new("mdma-tui"), options);
-    node.target()?;
-    Ok((node.library()?, node.playback()?, node.event_gateway()?))
-}
-
 fn main() -> Result<()> {
-    // Node errors are advice for the user, not crashes: print them plainly,
-    // like the CLI, and keep color_eyre's crash report for unexpected errors.
     let cli = Cli::parse();
-    let (library, playback, event_gateway) = match connect(cli.into()) {
-        Ok(connections) => connections,
-        Err(e) => {
-            eprintln!("Error: {e}");
-            std::process::exit(1);
-        }
-    };
+    let facts = cli.facts_choice();
+    let node = Rc::new(Node::needed_by(NeededBy::new("mdma-tui"), cli.into()));
+
+    // Resolve the node, probe it once (at most 2 s for a remote node) and open the
+    // facts before raw mode, so the pick prompt and notes print on the normal
+    // terminal. A node that cannot be chosen or reached is a state the panes show,
+    // not a reason to exit. Events are subscribed to on the first tick, and again
+    // whenever the node comes back.
+    let link = Link::new(node, facts);
 
     color_eyre::install()?;
     tracing_subscriber::fmt()
@@ -105,26 +109,13 @@ fn main() -> Result<()> {
     // warning about a bad MDMA_TUI_COLORS stays visible.
     let color_mode = theme::mode_from_env();
 
-    let library = Rc::new(library);
-    let playback = Rc::new(playback);
+    // Left = Browser (Artists), right = Queue.
+    let mut app = App::start(link, color_mode);
 
-    // Subscribe to playback events from the resolved node.
-    // Non-fatal: TUI still works without live updates if subscription fails.
-    let event_rx = event_gateway.and_then(|addr| spawn_event_subscriber(&addr).ok());
-
-    // Build initial panes: left = Browser (Artists), right = Queue.
-    let left_pane: Box<dyn pane::Pane> = Box::new(BrowserPane::new(Rc::clone(&library)));
-    let right_pane: Box<dyn pane::Pane> =
-        Box::new(QueuePane::new(Rc::clone(&playback), Rc::clone(&library)));
-
-    let mut app = App::new(
-        left_pane,
-        right_pane,
-        Rc::clone(&library),
-        Rc::clone(&playback),
-        event_rx,
-        color_mode,
-    );
+    // A sync of the replica is due when it is stale; the TUI never syncs inline.
+    if let Some(problem) = app.request_sync(Urgency::WhenStale) {
+        app.set_status(problem);
+    }
 
     tui_base::run(&mut app, &tui_base::TuiConfig::default())?;
 
@@ -134,36 +125,28 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use crate::link::LinkError;
+    use crate::test_support::World;
+    use client_facts::test_support::{env_lock, EnvVars};
+    use mdma_client::NodeError;
 
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    fn options(args: &[&str]) -> Result<NodeOptions, clap::Error> {
-        Cli::try_parse_from(args).map(NodeOptions::from)
-    }
-
-    /// Run `f` under ENV_LOCK with the given vars set (`Some`) or removed
-    /// (`None`), restoring the previous values before returning.
-    fn with_env<T>(vars: &[(&str, Option<&str>)], f: impl FnOnce() -> T) -> T {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let saved: Vec<_> = vars
-            .iter()
-            .map(|(k, _)| (*k, std::env::var_os(k)))
-            .collect();
-        for (k, v) in vars {
-            match v {
-                Some(v) => std::env::set_var(k, v),
-                None => std::env::remove_var(k),
+    /// `args` parsed by [`Cli`] with the environment `vars` (set when `Some`, removed
+    /// when `None`) for the length of the parse, and `pick` taken of the result.
+    fn parsed<T>(
+        vars: &[(&'static str, Option<&str>)],
+        args: &[&str],
+        pick: impl FnOnce(Cli) -> T,
+    ) -> Result<T, clap::Error> {
+        // Declared first, so the environment is put back before the lock goes.
+        let _lock = env_lock();
+        let mut env = EnvVars::default();
+        for (name, value) in vars {
+            match value {
+                Some(value) => env.set(name, value),
+                None => env.unset(name),
             }
         }
-        let result = f();
-        for (k, v) in saved {
-            match v {
-                Some(v) => std::env::set_var(k, v),
-                None => std::env::remove_var(k),
-            }
-        }
-        result
+        Cli::try_parse_from(args).map(pick)
     }
 
     const NO_SOCKETS: [(&str, Option<&str>); 2] = [
@@ -171,47 +154,91 @@ mod tests {
         ("MDMA_PLAYBACK_SOCKET", None),
     ];
 
+    fn options(vars: &[(&'static str, Option<&str>)], args: &[&str]) -> NodeOptions {
+        parsed(vars, args, NodeOptions::from).unwrap()
+    }
+
+    /// The source asked for with `MDMA_FACTS` as `env` (unset when `None`) and `args`.
+    fn facts_choice(env: Option<&str>, args: &[&str]) -> Result<FactsChoice, clap::Error> {
+        parsed(&[("MDMA_FACTS", env)], args, |cli| cli.facts_choice())
+    }
+
     #[test]
     fn sockets_are_unset_unless_given() {
-        let (none, given) = with_env(&NO_SOCKETS, || {
-            (
-                options(&["mdma-tui"]),
-                options(&["mdma-tui", "--library-socket", "x"]),
-            )
-        });
-        let none = none.unwrap();
+        let none = options(&NO_SOCKETS, &["mdma-tui"]);
+        let given = options(&NO_SOCKETS, &["mdma-tui", "--library-socket", "x"]);
+
         assert_eq!(none.library_socket, None);
         assert_eq!(none.playback_socket, None);
-        assert_eq!(given.unwrap().library_socket.as_deref(), Some("x"));
+        assert_eq!(given.library_socket.as_deref(), Some("x"));
     }
 
     #[test]
     fn mdma_node_env_is_left_to_node() {
-        let parsed = with_env(&[("MDMA_NODE", Some("mdma.local"))], || {
-            options(&["mdma-tui"])
-        });
-        assert!(parsed.unwrap().node.is_none());
+        let parsed = options(&[("MDMA_NODE", Some("mdma.local"))], &["mdma-tui"]);
+
+        assert!(parsed.node.is_none());
     }
 
     #[test]
     fn node_flag_is_parsed_as_a_node_spec() {
-        let (good, bad) = with_env(&NO_SOCKETS, || {
-            (
-                options(&["mdma-tui", "--node", "mdma.local:6000"]),
-                options(&["mdma-tui", "--node", "mdma.local:nope"]),
-            )
-        });
-        let spec = good.unwrap().node.unwrap();
+        let good = options(&NO_SOCKETS, &["mdma-tui", "--node", "mdma.local:6000"]);
+        let bad = parsed(
+            &NO_SOCKETS,
+            &["mdma-tui", "--node", "mdma.local:nope"],
+            NodeOptions::from,
+        );
+
+        let spec = good.node.unwrap();
         assert_eq!(spec.host(), "mdma.local");
         assert_eq!(spec.port(), Some(6000));
         assert!(bad.is_err());
     }
 
+    /// A node that cannot even be named does not end the TUI: it is a state the node
+    /// panes show, and the facts are read from the replica all the same.
     #[test]
-    fn invalid_mdma_node_is_a_node_error() {
-        let result = with_env(&[("MDMA_NODE", Some("mdma.local:nope"))], || {
-            connect(NodeOptions::default())
-        });
-        assert!(matches!(result, Err(NodeError::InvalidEnv(_))));
+    fn invalid_mdma_node_is_a_node_error_not_a_reason_to_exit() {
+        // Declared before `env`, so the environment is put back before the lock goes.
+        let _world = World::new(None);
+        let mut env = EnvVars::default();
+        env.set("MDMA_NODE", "mdma.local:nope");
+        let node = Rc::new(Node::needed_by(
+            NeededBy::new("mdma-tui"),
+            NodeOptions::default(),
+        ));
+
+        let link = Link::new(node, FactsChoice::default());
+
+        let error = link.library().err().expect("the node cannot be named");
+        assert!(
+            matches!(error, LinkError::Node(NodeError::InvalidEnv(_))),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn facts_default_to_the_replica_and_the_flag_wins_over_the_variable() {
+        let default = facts_choice(None, &["mdma-tui"]);
+        let from_env = facts_choice(Some("node"), &["mdma-tui"]);
+        let flag = facts_choice(Some("node"), &["mdma-tui", "--facts=replica"]);
+        let invalid = facts_choice(None, &["mdma-tui", "--facts=cache"]);
+        let bad_env = facts_choice(Some("cache"), &["mdma-tui"]);
+
+        assert_eq!(default.unwrap(), FactsChoice::Replica);
+        assert_eq!(from_env.unwrap(), FactsChoice::Node);
+        assert_eq!(flag.unwrap(), FactsChoice::Replica);
+        assert!(invalid.is_err(), "an invalid value is a usage error");
+        assert!(bad_env.is_err(), "so is an invalid MDMA_FACTS");
+    }
+
+    /// An empty value counts as not given, for the variable and for the flag alike.
+    #[test]
+    fn an_empty_facts_choice_is_not_given() {
+        let empty_env = facts_choice(Some(""), &["mdma-tui"]);
+        let empty_flag = facts_choice(None, &["mdma-tui", "--facts="]);
+
+        assert_eq!(empty_env.unwrap(), FactsChoice::Replica);
+        assert_eq!(empty_flag.unwrap(), FactsChoice::Replica);
     }
 }
