@@ -5,12 +5,15 @@ use color_eyre::Result;
 use event_protocol::{to_topic_message, PlaybackEvent};
 use media_protocol::{
     require_canonical, CanonicalHash, Command, ContentHash, Response, ResponseData, SourceName,
+    Transport, TransportStatus,
 };
 use music_facts::{FactSource, MusicValue};
 use nng::Socket;
+use playback_primitives::PositionMs;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use stream_source_protocol::{OutputHealth, StreamPlaybackState, StreamTrackInfo};
@@ -31,6 +34,7 @@ fn is_read_only(command: &Command) -> bool {
             | Command::ListAudioOutputs
             | Command::GetAudioOutput
             | Command::GetOutputStatus
+            | Command::GetTransport { .. }
     )
 }
 
@@ -68,6 +72,8 @@ pub struct Server {
     /// Latest output health reported by the audio source; written by the
     /// poll task, read by `GetOutputStatus`.
     output: Arc<Mutex<Option<OutputHealth>>>,
+    /// Bumped by every seek, watched by the poll task (see [`SeekEpoch`]).
+    seek_epoch: SeekEpoch,
 }
 
 impl Server {
@@ -87,6 +93,21 @@ impl Server {
             event_pub,
             acid_client,
             output: Arc::new(Mutex::new(None)),
+            seek_epoch: SeekEpoch::default(),
+        }
+    }
+
+    /// What the poll task shares with this server.
+    fn poll_task(&self) -> PollTask {
+        PollTask {
+            audio: self.audio.clone(),
+            queue: self.queue.clone(),
+            state: self.state.clone(),
+            event_pub: self.event_pub.clone(),
+            acid_client: self.acid_client.clone(),
+            queue_file: self.queue_file.clone(),
+            output_cache: self.output.clone(),
+            seek_epoch: self.seek_epoch.clone(),
         }
     }
 
@@ -144,15 +165,7 @@ impl Server {
         *self.queue.lock().await = restored;
 
         // Background task: auto-advance to next queued track when current track finishes.
-        tokio::spawn(auto_advance_task(
-            self.audio.clone(),
-            self.queue.clone(),
-            self.state.clone(),
-            self.event_pub.clone(),
-            self.acid_client.clone(),
-            self.queue_file.clone(),
-            self.output.clone(),
-        ));
+        tokio::spawn(auto_advance_task(self.poll_task()));
 
         loop {
             // Receive command
@@ -206,12 +219,25 @@ impl Server {
             // ---------------------------------------------------------------
             // Deprecated low-level deck commands — not supported in split-architecture mode.
             // ---------------------------------------------------------------
-            Command::LoadTrack { .. }
-            | Command::SetVolume { .. }
-            | Command::Unload { .. }
-            | Command::Seek { .. } => Response::Err {
-                message: "This command is not supported in split-architecture mode".into(),
-            },
+            Command::LoadTrack { .. } | Command::SetVolume { .. } | Command::Unload { .. } => {
+                Response::Err {
+                    message: "This command is not supported in split-architecture mode".into(),
+                }
+            }
+            Command::Seek {
+                deck: _,
+                position_ms,
+            } => self.seek(position_ms).await,
+            Command::GetTransport { deck: _ } => {
+                let state = self.state.lock().await.state().clone();
+                let info = self.ask_source(&state).await;
+                Response::Ok {
+                    data: Some(ResponseData::Transport(transport_status(
+                        &state,
+                        info.as_ref(),
+                    ))),
+                }
+            }
             Command::Play { deck: _ } => {
                 info!("Play command");
                 if let Some(effects) = self.try_resume().await {
@@ -449,6 +475,53 @@ impl Server {
                 }
             }
         }
+    }
+
+    /// Seek the audible track. The transport is not touched: the source keeps
+    /// its play state across a seek, so playing stays playing and paused stays
+    /// paused. Idle has nothing to seek.
+    ///
+    /// Answers where the track is now, which is not always where it was asked
+    /// to go: the source keeps a position within the track.
+    async fn seek(&self, position: PositionMs) -> Response {
+        let state = self.state.lock().await.state().clone();
+        let Some(hash) = state_hash(&state) else {
+            return Response::Err {
+                message: "nothing loaded".to_string(),
+            };
+        };
+        info!("Seek to {position}");
+        if let Err(e) = self.audio.lock().await.seek(position) {
+            warn!("Seek failed: {e}");
+            return Response::Err {
+                message: e.to_string(),
+            };
+        }
+        // The source dropped its preload; tell the poll loop. After the
+        // source's acknowledgement, so a preload the loop sent in between is
+        // not mistaken for one that survived.
+        self.seek_epoch.bump();
+        // Let UIs rebase their clocks now rather than at the next tick.
+        let info = self.ask_source(&state).await;
+        if let Some(event) = info.as_ref().and_then(|i| position_update(hash, i)) {
+            publish_event_on_socket(&self.event_pub, &event);
+        }
+        Response::Ok {
+            data: Some(ResponseData::Transport(transport_status(
+                &state,
+                info.as_ref(),
+            ))),
+        }
+    }
+
+    /// What the source says about its track; nothing while `state` is idle
+    /// (there is nobody to ask) or when it cannot be asked.
+    async fn ask_source(&self, state: &PlaybackState) -> Option<StreamTrackInfo> {
+        state_hash(state)?;
+        self.audio.lock().await.loaded().unwrap_or_else(|e| {
+            warn!("Could not ask the source where it is: {e}");
+            None
+        })
     }
 
     /// If the state machine is Paused, resume it and return the effects.
@@ -772,30 +845,155 @@ async fn reconcile_preload(
     audio: &Arc<Mutex<StreamClient>>,
     queue: &Arc<Mutex<VecDeque<QueueEntry>>>,
     state: &PlaybackState,
-    last_sent: &mut Option<CanonicalHash>,
-    known_next: &mut Vec<CanonicalHash>,
+    book: &mut PreloadBook,
 ) {
     let desired = {
         let q = queue.lock().await;
         desired_preload(state, &q)
     };
-    let Some(action) = preload_action(desired.as_ref(), last_sent.as_ref()) else {
+    let Some(action) = preload_action(desired.as_ref(), book.last_sent.as_ref()) else {
         return;
     };
     let client = audio.lock().await;
     match action {
         PreloadAction::Preload(hash) => match client.preload(hash.clone().into()) {
             Ok(()) => {
-                remember_next(known_next, Some(&hash));
-                *last_sent = Some(hash);
+                remember_next(&mut book.known, Some(&hash));
+                book.last_sent = Some(hash);
             }
             Err(e) => warn!("Failed to preload {}: {}", hash, e),
         },
         PreloadAction::Clear => match client.clear_preload() {
-            Ok(()) => *last_sent = None,
+            Ok(()) => book.last_sent = None,
             Err(e) => warn!("Failed to clear preload: {}", e),
         },
     }
+}
+
+/// Counts the seeks. The audio source drops its preload on a seek, but the
+/// poll loop only re-sends a preload when it believes the source has none:
+/// that belief is reset when the track changes, and, through this counter,
+/// when a seek happened. Without it gapless silently breaks after any seek.
+#[derive(Debug, Clone, Default)]
+struct SeekEpoch(Arc<AtomicU64>);
+
+impl SeekEpoch {
+    /// Record that a seek completed. Call after the source acknowledged it:
+    /// a poll that sent a preload before the seek must still see the change.
+    fn bump(&self) {
+        self.0.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn current(&self) -> u64 {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
+/// What the poll loop believes about the source's preload.
+#[derive(Default)]
+struct PreloadBook {
+    /// The track the beliefs below were made for.
+    last_current: Option<CanonicalHash>,
+    /// Last preload value the source accepted.
+    last_sent: Option<CanonicalHash>,
+    /// Hashes the source may switch to while `last_current` plays (see `classify_poll`).
+    known: Vec<CanonicalHash>,
+    /// The seek epoch the beliefs were made in.
+    seen_epoch: u64,
+}
+
+impl PreloadBook {
+    /// Stopped: the source dropped its preload and the track.
+    fn idle(&mut self) {
+        self.last_current = None;
+        self.last_sent = None;
+        self.known.clear();
+    }
+
+    /// Note which track plays and in which seek epoch.
+    ///
+    /// A new track means everything remembered was for the old one. A seek
+    /// only means the source dropped its preload, so what was sent is sent
+    /// again; `known` is kept. It is the set of hashes the source may still
+    /// switch to, and clearing it would let a switch the source already
+    /// committed to look like an unknown track (and be played a second time).
+    ///
+    /// Remaining window: [`Server::seek`] takes the hash it reports from the
+    /// state machine while the source seeks whatever is audible. If a gapless
+    /// switch lands between the two, the position update names the old track.
+    /// The next poll sees the switch and corrects the state.
+    fn observe(&mut self, current: &CanonicalHash, epoch: u64) {
+        if self.last_current.as_ref() != Some(current) {
+            self.last_current = Some(current.clone());
+            self.last_sent = None;
+            self.known.clear();
+        }
+        if self.seen_epoch != epoch {
+            self.seen_epoch = epoch;
+            self.last_sent = None;
+        }
+    }
+}
+
+/// The track a state is about; none while idle.
+fn state_hash(state: &PlaybackState) -> Option<&CanonicalHash> {
+    match state {
+        PlaybackState::Idle => None,
+        PlaybackState::Playing { hash } | PlaybackState::Paused { hash } => Some(hash),
+    }
+}
+
+/// The `PositionUpdate` for `hash` from what the source reported, if it
+/// reported both position and duration.
+fn position_update(hash: &CanonicalHash, info: &StreamTrackInfo) -> Option<PlaybackEvent> {
+    Some(PlaybackEvent::PositionUpdate {
+        hash: hash.clone().into(),
+        position_ms: info.position_ms?,
+        duration_ms: info.duration_ms?,
+    })
+}
+
+/// Ask the source where it is and publish one `PositionUpdate` for `hash`.
+async fn publish_position(
+    audio: &Mutex<StreamClient>,
+    event_pub: &nng::Socket,
+    hash: &CanonicalHash,
+) {
+    if let Ok(Some(info)) = audio.lock().await.loaded() {
+        if let Some(event) = position_update(hash, &info) {
+            publish_event_on_socket(event_pub, &event);
+        }
+    }
+}
+
+/// The answer to `GetTransport` and `Seek` from the state machine's state and
+/// what the source reported (`None` when idle, or when the source could not be
+/// asked).
+fn transport_status(state: &PlaybackState, info: Option<&StreamTrackInfo>) -> TransportStatus {
+    let (transport, hash) = match state {
+        PlaybackState::Idle => return TransportStatus::Idle,
+        PlaybackState::Playing { hash } => (Transport::Playing, hash),
+        PlaybackState::Paused { hash } => (Transport::Paused, hash),
+    };
+    TransportStatus::Loaded {
+        transport,
+        now: hash.clone().into(),
+        position_ms: info.and_then(|i| i.position_ms).map(PositionMs::new),
+        duration_ms: info.and_then(|i| i.duration_ms).map(PositionMs::new),
+        preview: None,
+    }
+}
+
+/// What the poll task shares with the server.
+struct PollTask {
+    audio: Arc<Mutex<StreamClient>>,
+    queue: Arc<Mutex<VecDeque<QueueEntry>>>,
+    state: Arc<Mutex<PlaybackStateMachine>>,
+    event_pub: nng::Socket,
+    acid_client: Arc<AcidClient>,
+    queue_file: PathBuf,
+    output_cache: Arc<Mutex<Option<OutputHealth>>>,
+    seek_epoch: SeekEpoch,
 }
 
 /// Polls the audio source every 200 ms.
@@ -823,168 +1021,165 @@ async fn reconcile_preload(
 ///
 /// Auto-advance is suppressed while paused.
 /// Every 5th poll iteration (~1 s) broadcasts a `PositionUpdate` event while playing.
-async fn auto_advance_task(
-    audio: Arc<Mutex<StreamClient>>,
-    queue: Arc<Mutex<VecDeque<QueueEntry>>>,
-    state: Arc<Mutex<PlaybackStateMachine>>,
-    event_pub: nng::Socket,
-    acid_client: Arc<AcidClient>,
-    queue_file: PathBuf,
-    output_cache: Arc<Mutex<Option<OutputHealth>>>,
-) {
-    let mut tick: u8 = 0;
-    // Last output health reported by the source (None until it reports one).
-    let mut last_output: Option<OutputHealth> = None;
-    // Last preload value sent to the source, and the track it was sent for.
-    let mut last_sent: Option<CanonicalHash> = None;
-    let mut last_current: Option<CanonicalHash> = None;
-    // Hashes the source may switch to while `last_current` plays (see `classify_poll`).
-    let mut known: Vec<CanonicalHash> = Vec::new();
+async fn auto_advance_task(task: PollTask) {
+    let mut state = PollState::default();
     loop {
         tokio::time::sleep(Duration::from_millis(200)).await;
-        tick = tick.wrapping_add(1);
+        poll_once(&task, &mut state).await;
+    }
+}
 
-        // Every 5th tick (~1 s) broadcast a position update while playing.
-        if tick.is_multiple_of(5) {
-            let current_state = state.lock().await;
-            if let PlaybackState::Playing { hash } = current_state.state() {
-                let h = hash.clone();
-                drop(current_state);
-                if let Ok(Some(ref info)) = audio.lock().await.loaded() {
-                    if let (Some(position_ms), Some(duration_ms)) =
-                        (info.position_ms, info.duration_ms)
-                    {
-                        publish_event_on_socket(
-                            &event_pub,
-                            &PlaybackEvent::PositionUpdate {
-                                hash: h.into(),
-                                position_ms,
-                                duration_ms,
-                            },
-                        );
-                    }
-                }
-            }
+/// What the poll task remembers between ticks.
+#[derive(Default)]
+struct PollState {
+    tick: u8,
+    /// Last output health reported by the source (None until it reports one).
+    last_output: Option<OutputHealth>,
+    /// What we sent the source as a preload, and for which track.
+    book: PreloadBook,
+}
+
+/// One tick of the poll task (see [`auto_advance_task`]); a function of its
+/// own so a test drives exactly what the task runs.
+async fn poll_once(task: &PollTask, poll: &mut PollState) {
+    let PollTask {
+        audio,
+        queue,
+        state,
+        event_pub,
+        acid_client,
+        queue_file,
+        output_cache,
+        seek_epoch,
+    } = task;
+    let PollState {
+        tick,
+        last_output,
+        book,
+    } = poll;
+    *tick = tick.wrapping_add(1);
+
+    // Every 5th tick (~1 s) broadcast a position update while playing.
+    if tick.is_multiple_of(5) {
+        let current_state = state.lock().await;
+        if let PlaybackState::Playing { hash } = current_state.state() {
+            let h = hash.clone();
+            drop(current_state);
+            publish_position(audio, event_pub, &h).await;
         }
+    }
 
-        let snapshot = state.lock().await.state().clone();
-        let (current_hash, is_playing) = match &snapshot {
-            PlaybackState::Playing { hash } => (hash.clone(), true),
-            PlaybackState::Paused { hash } => (hash.clone(), false),
-            PlaybackState::Idle => {
-                // Stopped: the source dropped its preload; make sure we re-send later.
-                last_current = None;
-                last_sent = None;
-                known.clear();
-                // The output keeps running while Idle, so its health stays
-                // meaningful: keep watching it (~1 s).
-                if tick.is_multiple_of(5) {
-                    let _ =
-                        refresh_output(&audio, &event_pub, &output_cache, &mut last_output).await;
-                }
-                continue;
+    let snapshot = state.lock().await.state().clone();
+    let (current_hash, is_playing) = match &snapshot {
+        PlaybackState::Playing { hash } => (hash.clone(), true),
+        PlaybackState::Paused { hash } => (hash.clone(), false),
+        PlaybackState::Idle => {
+            // Stopped: the source dropped its preload; make sure we re-send later.
+            book.idle();
+            // The output keeps running while Idle, so its health stays
+            // meaningful: keep watching it (~1 s).
+            if tick.is_multiple_of(5) {
+                let _ = refresh_output(audio, event_pub, output_cache, last_output).await;
+            }
+            return;
+        }
+    };
+    // A new track (manual load, skip, advance) or a seek: the source's
+    // preload is gone, so re-send it.
+    book.observe(&current_hash, seek_epoch.current());
+
+    let polled = refresh_output(audio, event_pub, output_cache, last_output).await;
+    let (finished, heard, reported_next, position_ms, duration_ms) =
+        match polled.map(|(info, _)| info) {
+            Ok(Some(ref info)) => (
+                matches!(info.state, StreamPlaybackState::Finished),
+                // A hash the source reports that is not canonical is not one
+                // we queued, so it is as good as not reported.
+                info.content_hash
+                    .clone()
+                    .and_then(|h| CanonicalHash::try_from(h).ok()),
+                info.preloaded
+                    .clone()
+                    .and_then(|h| CanonicalHash::try_from(h).ok()),
+                info.position_ms,
+                info.duration_ms,
+            ),
+            Ok(None) => (false, None, None, None, None),
+            Err(e) => {
+                warn!("Failed to poll audio source: {e}");
+                (false, None, None, None, None)
             }
         };
-        if last_current.as_ref() != Some(&current_hash) {
-            // New track (manual load, skip, advance): re-send the preload.
-            last_current = Some(current_hash.clone());
-            last_sent = None;
-            known.clear();
-        }
+    remember_next(&mut book.known, reported_next.as_ref());
 
-        let polled = refresh_output(&audio, &event_pub, &output_cache, &mut last_output).await;
-        let (finished, heard, reported_next, position_ms, duration_ms) =
-            match polled.map(|(info, _)| info) {
-                Ok(Some(ref info)) => (
-                    matches!(info.state, StreamPlaybackState::Finished),
-                    // A hash the source reports that is not canonical is not one
-                    // we queued, so it is as good as not reported.
-                    info.content_hash
-                        .clone()
-                        .and_then(|h| CanonicalHash::try_from(h).ok()),
-                    info.preloaded
-                        .clone()
-                        .and_then(|h| CanonicalHash::try_from(h).ok()),
-                    info.position_ms,
-                    info.duration_ms,
-                ),
-                Ok(None) => (false, None, None, None, None),
-                Err(e) => {
-                    warn!("Failed to poll audio source: {e}");
-                    (false, None, None, None, None)
+    if !is_playing {
+        // Paused: no advancing, but keep the preload in sync.
+        reconcile_preload(audio, queue, &snapshot, book).await;
+        return;
+    }
+
+    // The snapshot predates the poll; a command (e.g. Skip) may have moved
+    // the state since. Drop this observation rather than act on it.
+    if state.lock().await.current_hash() != Some(&current_hash) {
+        return;
+    }
+
+    match classify_poll(finished, heard.as_ref(), &book.known, &current_hash) {
+        PollAction::Nothing => {
+            reconcile_preload(audio, queue, &snapshot, book).await;
+            return;
+        }
+        PollAction::Advanced(heard_hash) => {
+            let effects = {
+                let mut sm = state.lock().await;
+                let mut q = queue.lock().await;
+                let (effects, removed) =
+                    advance_and_dequeue(&mut sm, &mut q, &current_hash, heard_hash.clone());
+                if removed {
+                    persist_and_publish(queue_file, event_pub, &q);
                 }
+                effects
             };
-        remember_next(&mut known, reported_next.as_ref());
-
-        if !is_playing {
-            // Paused: no advancing, but keep the preload in sync.
-            reconcile_preload(&audio, &queue, &snapshot, &mut last_sent, &mut known).await;
-            continue;
-        }
-
-        // The snapshot predates the poll; a command (e.g. Skip) may have moved
-        // the state since. Drop this observation rather than act on it.
-        if state.lock().await.current_hash() != Some(&current_hash) {
-            continue;
-        }
-
-        match classify_poll(finished, heard.as_ref(), &known, &current_hash) {
-            PollAction::Nothing => {
-                reconcile_preload(&audio, &queue, &snapshot, &mut last_sent, &mut known).await;
-                continue;
+            if effects.is_empty() {
+                return;
             }
-            PollAction::Advanced(heard_hash) => {
-                let effects = {
-                    let mut sm = state.lock().await;
-                    let mut q = queue.lock().await;
-                    let (effects, removed) =
-                        advance_and_dequeue(&mut sm, &mut q, &current_hash, heard_hash.clone());
-                    if removed {
-                        persist_and_publish(&queue_file, &event_pub, &q);
-                    }
-                    effects
-                };
-                if effects.is_empty() {
-                    continue;
-                }
-                info!("Gapless advance: {:?} -> {:?}", current_hash, heard_hash);
-                if let Err(e) = execute_effects(effects, &audio, &event_pub, &acid_client).await {
-                    warn!("Gapless advance bookkeeping failed: {}", e);
-                }
-                // The source consumed its preload; new track resets via last_current.
-                continue;
+            info!("Gapless advance: {:?} -> {:?}", current_hash, heard_hash);
+            if let Err(e) = execute_effects(effects, audio, event_pub, acid_client).await {
+                warn!("Gapless advance bookkeeping failed: {}", e);
             }
-            PollAction::Finished => {}
+            // The source consumed its preload; new track resets via last_current.
+            return;
         }
-        let finished_hash = current_hash;
+        PollAction::Finished => {}
+    }
+    let finished_hash = current_hash;
 
-        // Track ended — drive the state machine; the queue front is popped only
-        // if it actually transitioned.
-        let (effects, next) = {
-            let mut sm = state.lock().await;
-            let mut q = queue.lock().await;
-            let (effects, popped) = finish_and_dequeue(&mut sm, &mut q, &finished_hash);
-            if popped.is_some() {
-                persist_and_publish(&queue_file, &event_pub, &q);
-            }
-            (effects, popped)
-        };
-        if effects.is_empty() {
-            continue;
+    // Track ended — drive the state machine; the queue front is popped only
+    // if it actually transitioned.
+    let (effects, next) = {
+        let mut sm = state.lock().await;
+        let mut q = queue.lock().await;
+        let (effects, popped) = finish_and_dequeue(&mut sm, &mut q, &finished_hash);
+        if popped.is_some() {
+            persist_and_publish(queue_file, event_pub, &q);
         }
+        (effects, popped)
+    };
+    if effects.is_empty() {
+        return;
+    }
 
-        info!(
-            "Track finished: {:?}, next: {}, position_ms={:?} duration_ms={:?}",
-            finished_hash,
-            next.as_ref()
-                .map_or_else(|| "end of queue".to_string(), |e| format!("{:?}", e.hash)),
-            position_ms,
-            duration_ms,
-        );
+    info!(
+        "Track finished: {:?}, next: {}, position_ms={:?} duration_ms={:?}",
+        finished_hash,
+        next.as_ref()
+            .map_or_else(|| "end of queue".to_string(), |e| format!("{:?}", e.hash)),
+        position_ms,
+        duration_ms,
+    );
 
-        if let Err(e) = execute_effects(effects, &audio, &event_pub, &acid_client).await {
-            warn!("Auto-advance failed: {}", e);
-        }
+    if let Err(e) = execute_effects(effects, audio, event_pub, acid_client).await {
+        warn!("Auto-advance failed: {}", e);
     }
 }
 
@@ -992,14 +1187,59 @@ async fn auto_advance_task(
 mod tests {
     use super::*;
     use acid_client::AcidClient;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::AtomicU64;
+    use stream_source_protocol::{StreamCommand, StreamResponse};
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
     fn make_server() -> Server {
+        make_harness(|_| StreamResponse::Ok).server
+    }
+
+    /// A server over stubs, with what the audio stub was sent and where its
+    /// events are published.
+    struct Harness {
+        server: Server,
+        /// Every command the audio stub received, in order.
+        sent: Arc<std::sync::Mutex<Vec<StreamCommand>>>,
+        event_addr: String,
+    }
+
+    impl Harness {
+        fn sent(&self) -> Vec<StreamCommand> {
+            self.sent.lock().unwrap().clone()
+        }
+
+        fn sent_preloads(&self) -> Vec<ContentHash> {
+            self.sent()
+                .into_iter()
+                .filter_map(|c| match c {
+                    StreamCommand::Preload { content_hash } => Some(content_hash),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        /// A subscriber to the server's events, connected before returning.
+        fn subscribe(&self) -> nng::Socket {
+            use nng::options::{protocol::pubsub::Subscribe, Options, RecvTimeout};
+            let sub = nng::Socket::new(nng::Protocol::Sub0).unwrap();
+            sub.set_opt::<Subscribe>(vec![]).unwrap();
+            sub.set_opt::<RecvTimeout>(Some(Duration::from_secs(2)))
+                .unwrap();
+            sub.dial(&self.event_addr).unwrap();
+            // A publisher drops what it sends before the pipe is up.
+            std::thread::sleep(Duration::from_millis(200));
+            sub
+        }
+    }
+
+    fn make_harness(reply: impl Fn(&StreamCommand) -> StreamResponse + Send + 'static) -> Harness {
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
         let socket = nng::Socket::new(nng::Protocol::Rep0).unwrap();
         let event_pub = nng::Socket::new(nng::Protocol::Pub0).unwrap();
+        let event_addr = format!("ipc:///tmp/test_events_{}_{}.sock", std::process::id(), id);
+        event_pub.listen(&event_addr).unwrap();
         // Create a dummy ACID listener so the client can connect.
         let acid_listen = nng::Socket::new(nng::Protocol::Rep0).unwrap();
         let acid_addr = format!("ipc:///tmp/test_acid_{}_{}.sock", std::process::id(), id);
@@ -1013,18 +1253,21 @@ mod tests {
         let audio_addr = format!("ipc:///tmp/test_audio_{}_{}.sock", std::process::id(), id);
         audio_stub.listen(&audio_addr).unwrap();
 
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = sent.clone();
         std::thread::spawn(move || {
-            use stream_source_protocol::StreamResponse;
-            while audio_stub.recv().is_ok() {
-                let reply = serde_json::to_vec(&StreamResponse::Ok).unwrap();
-                let _ = audio_stub.send(reply.as_slice());
+            while let Ok(msg) = audio_stub.recv() {
+                let command: StreamCommand = serde_json::from_slice(&msg).unwrap();
+                let response = reply(&command);
+                log.lock().unwrap().push(command);
+                let _ = audio_stub.send(serde_json::to_vec(&response).unwrap().as_slice());
             }
         });
 
         let audio_client = StreamClient::connect(&audio_addr).unwrap();
         let audio = Arc::new(tokio::sync::Mutex::new(audio_client));
 
-        Server::new(
+        let server = Server::new(
             audio,
             socket,
             PathBuf::from(format!(
@@ -1034,7 +1277,12 @@ mod tests {
             )),
             event_pub,
             acid_client,
-        )
+        );
+        Harness {
+            server,
+            sent,
+            event_addr,
+        }
     }
 
     /// PlayQueue while Paused must resume the paused track, not pop from the queue.
@@ -1669,6 +1917,330 @@ mod tests {
             .iter()
             .any(|e| matches!(e, PlaybackEffect::LoadAndPlay { hash, .. } if *hash == h("a"))));
         assert!(q.is_empty());
+    }
+
+    // -------------------------------------------------------------------------
+    // Seek and GetTransport
+    // -------------------------------------------------------------------------
+
+    fn loaded(hash: &str, state: StreamPlaybackState) -> StreamResponse {
+        StreamResponse::Loaded {
+            info: Some(StreamTrackInfo {
+                state,
+                content_hash: Some(full(hash)),
+                title: None,
+                artist: None,
+                album: None,
+                position_ms: Some(90_000),
+                duration_ms: Some(240_000),
+                preloaded: None,
+            }),
+            output: None,
+        }
+    }
+
+    /// A source that accepts everything and reports `a` at 1:30 of 4:00.
+    fn source_playing_a(command: &StreamCommand) -> StreamResponse {
+        match command {
+            StreamCommand::Loaded => loaded("a", StreamPlaybackState::Playing),
+            _ => StreamResponse::Ok,
+        }
+    }
+
+    fn seek_to(position_ms: u64) -> Command {
+        Command::Seek {
+            deck: media_protocol::Deck::A,
+            position_ms: PositionMs::new(position_ms),
+        }
+    }
+
+    fn transport_of(response: Response) -> TransportStatus {
+        match response {
+            Response::Ok {
+                data: Some(ResponseData::Transport(status)),
+            } => status,
+            other => panic!("expected Transport, got {other:?}"),
+        }
+    }
+
+    async fn start(server: &Server, label: &str) {
+        server
+            .state
+            .lock()
+            .await
+            .play_queue(h(label), SourceName::audio());
+    }
+
+    #[tokio::test]
+    async fn seek_while_playing_sends_the_position_and_stays_playing() {
+        let harness = make_harness(source_playing_a);
+        start(&harness.server, "a").await;
+
+        let response = harness.server.handle_command(seek_to(90_000)).await;
+
+        let status = transport_of(response);
+        assert_eq!(
+            status,
+            TransportStatus::Loaded {
+                transport: Transport::Playing,
+                now: full("a"),
+                position_ms: Some(PositionMs::new(90_000)),
+                duration_ms: Some(PositionMs::new(240_000)),
+                preview: None,
+            }
+        );
+        assert_eq!(
+            harness.sent(),
+            vec![
+                StreamCommand::Seek {
+                    position_ms: PositionMs::new(90_000)
+                },
+                // The follow-up for the PositionUpdate and the answer.
+                StreamCommand::Loaded,
+            ]
+        );
+        assert_eq!(
+            harness.server.state.lock().await.state(),
+            &PlaybackState::Playing { hash: h("a") }
+        );
+    }
+
+    /// The source keeps a seek within the track; the answer is where the
+    /// track is, not what was asked for.
+    #[tokio::test]
+    async fn the_answer_to_a_seek_is_where_the_source_says_the_track_is() {
+        let harness = make_harness(source_playing_a);
+        start(&harness.server, "a").await;
+
+        // 99:00 into a 4:00 track; the stub source reports 1:30.
+        let status = transport_of(harness.server.handle_command(seek_to(5_940_000)).await);
+
+        assert_eq!(status.position(), Some(PositionMs::new(90_000)));
+    }
+
+    #[tokio::test]
+    async fn seek_while_paused_stays_paused_and_never_plays() {
+        let harness = make_harness(source_playing_a);
+        start(&harness.server, "a").await;
+        harness.server.state.lock().await.pause();
+
+        let response = harness.server.handle_command(seek_to(5_000)).await;
+
+        assert!(matches!(response, Response::Ok { .. }), "{response:?}");
+        assert!(harness
+            .sent()
+            .iter()
+            .all(|c| !matches!(c, StreamCommand::Play)));
+        assert_eq!(
+            harness.server.state.lock().await.state(),
+            &PlaybackState::Paused { hash: h("a") }
+        );
+    }
+
+    #[tokio::test]
+    async fn seek_while_idle_says_nothing_is_loaded_and_asks_no_one() {
+        let harness = make_harness(source_playing_a);
+
+        let response = harness.server.handle_command(seek_to(1_000)).await;
+
+        let Response::Err { message } = response else {
+            panic!("expected Err, got {response:?}");
+        };
+        assert_eq!(message, "nothing loaded");
+        assert!(harness.sent().is_empty());
+        assert_eq!(harness.server.seek_epoch.current(), 0);
+    }
+
+    /// An older source does not know `seek` and answers "invalid command".
+    #[tokio::test]
+    async fn seek_on_an_old_source_is_refused_and_changes_nothing() {
+        let harness = make_harness(|command| match command {
+            StreamCommand::Seek { .. } => StreamResponse::Error {
+                message: "invalid command: unknown variant `seek`".to_string(),
+            },
+            other => source_playing_a(other),
+        });
+        start(&harness.server, "a").await;
+
+        let response = harness.server.handle_command(seek_to(1_000)).await;
+
+        let Response::Err { message } = response else {
+            panic!("expected Err, got {response:?}");
+        };
+        assert!(message.contains("invalid command"), "{message}");
+        assert_eq!(
+            harness.server.state.lock().await.state(),
+            &PlaybackState::Playing { hash: h("a") }
+        );
+        assert_eq!(
+            harness.server.seek_epoch.current(),
+            0,
+            "the source kept its preload, so the loop keeps its belief"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_position_update_follows_a_seek() {
+        let harness = make_harness(source_playing_a);
+        let events = harness.subscribe();
+        start(&harness.server, "a").await;
+
+        harness.server.handle_command(seek_to(90_000)).await;
+
+        let msg = events.recv().expect("an event after the seek");
+        let (_, event) = event_protocol::from_topic_message(msg.as_slice()).unwrap();
+        assert_eq!(
+            event,
+            PlaybackEvent::PositionUpdate {
+                hash: full("a"),
+                position_ms: 90_000,
+                duration_ms: 240_000,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn get_transport_while_idle_has_no_track() {
+        let harness = make_harness(source_playing_a);
+
+        let response = harness
+            .server
+            .handle_command(Command::GetTransport {
+                deck: media_protocol::Deck::A,
+            })
+            .await;
+
+        assert_eq!(transport_of(response), TransportStatus::Idle);
+        assert!(harness.sent().is_empty(), "idle needs no source");
+    }
+
+    #[tokio::test]
+    async fn get_transport_reports_state_track_position_and_duration() {
+        let harness = make_harness(source_playing_a);
+        start(&harness.server, "a").await;
+        harness.server.state.lock().await.pause();
+
+        let response = harness
+            .server
+            .handle_command(Command::GetTransport {
+                deck: media_protocol::Deck::A,
+            })
+            .await;
+
+        assert_eq!(
+            transport_of(response),
+            TransportStatus::Loaded {
+                transport: Transport::Paused,
+                now: full("a"),
+                position_ms: Some(PositionMs::new(90_000)),
+                duration_ms: Some(PositionMs::new(240_000)),
+                preview: None,
+            }
+        );
+    }
+
+    #[test]
+    fn get_transport_is_read_only_and_seek_is_not() {
+        assert!(is_read_only(&Command::GetTransport {
+            deck: media_protocol::Deck::A
+        }));
+        assert!(!is_read_only(&seek_to(0)));
+    }
+
+    // -------------------------------------------------------------------------
+    // The trap: a seek drops the source's preload
+    // -------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn the_preload_is_sent_once_while_nothing_changes() {
+        let harness = make_harness(source_playing_a);
+        start(&harness.server, "a").await;
+        harness.server.queue.lock().await.push_back(entry("b"));
+        let task = harness.server.poll_task();
+        let mut poll = PollState::default();
+
+        for _ in 0..3 {
+            poll_once(&task, &mut poll).await;
+        }
+
+        assert_eq!(harness.sent_preloads(), vec![full("b")]);
+    }
+
+    /// Regression: the engine drops the preload on seek, so the loop must send
+    /// it again even though the track (and the queue front) did not change.
+    #[tokio::test]
+    async fn the_preload_is_resent_after_a_seek() {
+        let harness = make_harness(source_playing_a);
+        start(&harness.server, "a").await;
+        harness.server.queue.lock().await.push_back(entry("b"));
+        let task = harness.server.poll_task();
+        let mut poll = PollState::default();
+        poll_once(&task, &mut poll).await;
+        poll_once(&task, &mut poll).await;
+        assert_eq!(harness.sent_preloads(), vec![full("b")]);
+
+        harness.server.handle_command(seek_to(90_000)).await;
+        poll_once(&task, &mut poll).await;
+
+        assert_eq!(harness.sent_preloads(), vec![full("b"), full("b")]);
+        poll_once(&task, &mut poll).await;
+        assert_eq!(harness.sent_preloads().len(), 2, "and only once per seek");
+    }
+
+    /// A seek means the source dropped its preload, so it is sent again. What
+    /// the source may still switch to stays known: clearing it would let a
+    /// switch the source already committed to look like an unknown track.
+    #[test]
+    fn a_seek_makes_the_book_send_the_preload_again_but_keeps_what_is_known() {
+        let mut book = PreloadBook::default();
+        book.observe(&h("a"), 0);
+        book.last_sent = Some(h("b"));
+        book.known.push(h("b"));
+
+        book.observe(&h("a"), 0);
+        assert_eq!(book.last_sent, Some(h("b")));
+
+        book.observe(&h("a"), 1);
+        assert_eq!(book.last_sent, None);
+        assert_eq!(book.known, vec![h("b")]);
+    }
+
+    #[test]
+    fn a_new_track_makes_the_book_forget_everything() {
+        let mut book = PreloadBook::default();
+        book.observe(&h("a"), 0);
+        book.last_sent = Some(h("b"));
+        book.known.push(h("b"));
+
+        book.observe(&h("b"), 0);
+        assert_eq!(book.last_sent, None);
+        assert!(book.known.is_empty());
+    }
+
+    #[test]
+    fn transport_status_of_a_playing_track_without_source_info_has_no_position() {
+        let status = transport_status(&PlaybackState::Playing { hash: h("a") }, None);
+        assert_eq!(
+            status,
+            TransportStatus::Loaded {
+                transport: Transport::Playing,
+                now: full("a"),
+                position_ms: None,
+                duration_ms: None,
+                preview: None,
+            }
+        );
+    }
+
+    #[test]
+    fn transport_status_while_idle_is_idle_whatever_the_source_says() {
+        let StreamResponse::Loaded { info, .. } = loaded("a", StreamPlaybackState::Playing) else {
+            unreachable!()
+        };
+        assert_eq!(
+            transport_status(&PlaybackState::Idle, info.as_ref()),
+            TransportStatus::Idle
+        );
     }
 
     #[test]

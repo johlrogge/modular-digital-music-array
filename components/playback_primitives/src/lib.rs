@@ -195,9 +195,48 @@ impl Deck {
     }
 }
 
+/// A position within a track, in milliseconds from its start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct PositionMs(u64);
+
+impl PositionMs {
+    pub const START: Self = Self(0);
+
+    pub fn new(ms: u64) -> Self {
+        Self(ms)
+    }
+
+    pub fn as_millis(self) -> u64 {
+        self.0
+    }
+}
+
+impl From<u64> for PositionMs {
+    fn from(ms: u64) -> Self {
+        Self(ms)
+    }
+}
+
+impl Display for PositionMs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}ms", self.0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn position_ms_is_a_plain_number_on_the_wire() {
+        let p = PositionMs::new(90_000);
+        assert_eq!(serde_json::to_string(&p).unwrap(), "90000");
+        assert_eq!(serde_json::from_str::<PositionMs>("90000").unwrap(), p);
+        assert_eq!(p.as_millis(), 90_000);
+        assert_eq!(PositionMs::from(5), PositionMs::new(5));
+        assert!(PositionMs::START < p);
+    }
 
     #[test]
     fn output_health_serializes_snake_case() {

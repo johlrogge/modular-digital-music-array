@@ -1,4 +1,5 @@
 mod audio_hash;
+mod beat_grid;
 mod bpm;
 mod content_hash;
 mod energy_level;
@@ -8,6 +9,7 @@ mod prefixed_hash;
 mod track_role;
 
 pub use audio_hash::{AudioHash, AudioHashParseError};
+pub use beat_grid::BeatGrid;
 pub use bpm::{Bpm, BpmError};
 // ContentHash is any form of hash; CanonicalHash only the full one.
 pub use content_hash::{CanonicalHash, ContentHash, NotCanonical};

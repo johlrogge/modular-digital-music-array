@@ -8,6 +8,7 @@ pub mod library;
 pub mod node;
 pub mod playback;
 mod queue_resolve;
+pub mod seek;
 pub mod source;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
@@ -19,6 +20,7 @@ pub use node::{Answer, NeededBy, Node, NodeError, NodeOptions};
 pub use node_discovery::{NodeSpec, RemoteTarget, Source, Target};
 pub use playback::PlaybackBackend;
 pub use queue_resolve::resolve_in_queue;
+pub use seek::{seek_to, skip_beats, Placement, SeekError};
 pub use source::{list_available_sources, SourceClient};
 
 // Re-export key types so clients don't need to depend on individual protocol crates.
@@ -31,7 +33,7 @@ pub use library_ipc_client::{
 };
 pub use library_search::TrackQuery;
 pub use media_client::{
-    AudioOutputConfig, AudioSinkInfo, ClientError as PlaybackClientError, Command, Deck, Response,
-    ResponseData, SourceName,
+    AudioOutputConfig, AudioSinkInfo, ClientError as PlaybackClientError, Command, Deck,
+    PositionMs, PreviewStatus, Response, ResponseData, SourceName, Transport, TransportStatus,
 };
 pub use source_protocol::{SourceRequest, SourceResponse};

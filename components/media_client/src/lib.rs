@@ -4,12 +4,21 @@
 //! Used by mdma-cli.
 
 pub use media_protocol::{
-    AudioOutputConfig, AudioSinkInfo, Command, ContentHash, Deck, Response, ResponseData,
-    SourceName,
+    AudioOutputConfig, AudioSinkInfo, Command, ContentHash, Deck, PreviewStatus, Response,
+    ResponseData, SourceName, Transport, TransportStatus,
 };
-pub use playback_primitives::Volume;
+pub use playback_primitives::{PositionMs, Volume};
 
 use std::path::PathBuf;
+
+/// The transport in a response's data, for the commands that answer one
+/// (`GetTransport` and `Seek`).
+pub fn into_transport(data: ResponseData) -> Option<TransportStatus> {
+    match data {
+        ResponseData::Transport(status) => Some(status),
+        _ => None,
+    }
+}
 
 /// Errors that can occur when communicating with the playback service.
 ///
@@ -92,9 +101,21 @@ impl MediaClient {
         result
     }
 
-    pub fn seek(&self, deck: Deck, position: usize) -> Result<(), ClientError> {
-        let cmd = Command::Seek { deck, position };
-        self.send_command(cmd)
+    /// Move the audible track to `position` (kept within the track); playing
+    /// stays playing, paused stays paused. Answers where the track is now.
+    pub fn seek(&self, deck: Deck, position: PositionMs) -> Result<TransportStatus, ClientError> {
+        self.send_command_with_response(
+            Command::Seek {
+                deck,
+                position_ms: position,
+            },
+            into_transport,
+        )
+    }
+
+    /// Transport state, audible track, position and duration of `deck`.
+    pub fn get_transport(&self, deck: Deck) -> Result<TransportStatus, ClientError> {
+        self.send_command_with_response(Command::GetTransport { deck }, into_transport)
     }
 
     pub fn get_length(&self, deck: Deck) -> Result<usize, ClientError> {

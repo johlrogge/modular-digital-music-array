@@ -15,10 +15,10 @@
 //! currently audible). `ClearPreload` cancels a pending preload.
 
 use music_primitives::ContentHash;
-pub use playback_primitives::{AudioOutputConfig, AudioSinkInfo, OutputHealth};
+pub use playback_primitives::{AudioOutputConfig, AudioSinkInfo, OutputHealth, PositionMs};
 
 /// Commands sent FROM the queue manager TO a stream source.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum StreamCommand {
     /// Load content by content hash. Used by file-backed sources (mdma-audio).
@@ -36,6 +36,10 @@ pub enum StreamCommand {
     Pause,
     /// Stop and unload current content.
     Stop,
+    /// Move the audible track to `position_ms`. The play state stays as it
+    /// was. The source drops any preload (re-issue `Preload` afterwards).
+    /// File playback sources only; an older source answers "invalid command".
+    Seek { position_ms: PositionMs },
     /// Query what is currently loaded and its playback state.
     Loaded,
     /// List available audio output devices. File playback sources only.
@@ -241,6 +245,17 @@ mod tests {
             parsed,
             StreamCommand::Preload { content_hash } if content_hash == ContentHash::new("next1")
         ));
+    }
+
+    #[test]
+    fn stream_command_seek_round_trip() {
+        let seek = StreamCommand::Seek {
+            position_ms: PositionMs::new(90_000),
+        };
+        let json = serde_json::to_string(&seek).unwrap();
+        assert_eq!(json, r#"{"cmd":"seek","position_ms":90000}"#);
+        let parsed: StreamCommand = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, seek);
     }
 
     #[test]

@@ -12,6 +12,11 @@ pub enum PlaybackError {
     #[error("No audio output: {0}")]
     NoAudioOutput(#[source] audio_output::AudioOutputError),
 
+    /// A source did not say how its samples are laid out, so a time in it
+    /// cannot be turned into a sample index.
+    #[error("The source reports no {0}")]
+    NoFormat(&'static str),
+
     #[error("No track loaded")]
     NoTrackLoaded,
 

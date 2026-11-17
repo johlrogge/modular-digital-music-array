@@ -1,6 +1,7 @@
 use media_protocol::ContentHash;
 use nng::options::{Options, RecvTimeout, SendTimeout};
 use nng::{Protocol, Socket};
+use playback_primitives::PositionMs;
 use std::time::Duration;
 use stream_source_protocol::{
     AudioOutputConfig, AudioSinkInfo, OutputHealth, StreamCommand, StreamResponse, StreamTrackInfo,
@@ -59,6 +60,14 @@ impl StreamClient {
 
     pub fn play(&self) -> Result<(), ServerError> {
         self.expect_ok(&StreamCommand::Play)
+    }
+
+    /// Move the audible track; its play state is unchanged. An older source
+    /// answers "invalid command", surfaced as a stream error.
+    pub fn seek(&self, position: PositionMs) -> Result<(), ServerError> {
+        self.expect_ok(&StreamCommand::Seek {
+            position_ms: position,
+        })
     }
 
     pub fn stop(&self) -> Result<(), ServerError> {

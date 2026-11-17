@@ -9,7 +9,7 @@ pub use music_facts::{
     Bpm, ContentHash, CueKind, DurationSeconds, FactKind, FactSource, Key, Mark, MarkFilter,
     MarkName, MarkNameError, MusicValue,
 };
-pub use music_primitives::{CanonicalHash, EnergyLevel, TrackRole};
+pub use music_primitives::{BeatGrid, CanonicalHash, EnergyLevel, TrackRole};
 // Re-export query types so clients can use them without depending on library-search directly
 pub use library_search::{
     DurationQuery, DurationUnit, KeyQuery, NumericQuery, StringQuery, TrackQuery,
@@ -969,6 +969,19 @@ pub struct BeatGridInfo {
     pub beats_per_bar: u8,
 }
 
+impl BeatGridInfo {
+    /// The grid to snap and step with. The beat arithmetic lives in
+    /// `music_primitives::BeatGrid`; this is only the way from the wire form.
+    /// `None` for a grid of zero beats per bar, which is not a grid.
+    pub fn grid(&self) -> Option<BeatGrid> {
+        Some(BeatGrid::new(
+            self.first_beat_ms,
+            self.bpm,
+            std::num::NonZeroU8::new(self.beats_per_bar)?,
+        ))
+    }
+}
+
 /// Track information for display.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrackInfo {
@@ -1295,6 +1308,30 @@ mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
     use rstest::rstest;
+
+    #[test]
+    fn beat_grid_info_gives_the_grid_with_the_same_anchor_tempo_and_bar() {
+        let info = BeatGridInfo {
+            first_beat_ms: 250,
+            bpm: Bpm::from_u32(120).unwrap(),
+            beats_per_bar: 4,
+        };
+        let grid = info.grid().expect("a grid");
+        assert_eq!(grid.first_beat_ms(), 250);
+        assert_eq!(grid.bpm(), info.bpm);
+        assert_eq!(grid.beats_per_bar().get(), 4);
+        assert_eq!(grid.beat_ms(2), 1_250);
+    }
+
+    #[test]
+    fn a_grid_of_zero_beats_per_bar_is_no_grid() {
+        let info = BeatGridInfo {
+            first_beat_ms: 0,
+            bpm: Bpm::from_u32(120).unwrap(),
+            beats_per_bar: 0,
+        };
+        assert_eq!(info.grid(), None);
+    }
 
     fn invalid_message(result: Result<LibraryRequest, ProtocolError>) -> String {
         match result {
