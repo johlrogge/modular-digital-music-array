@@ -54,6 +54,7 @@ File and line references below are as of 5d2cf8f.
 1. `client_facts_replica` (the ADR-022 §3 implementation of `client-facts`) exposes `Facts`, a closed enum with two variants:
    - `Replica(ReplicaView)`: the folded replica, with plays applied and `AlbumCovers`;
    - `Node(&Node)`: lazy (§4).
+   - As built, `Facts<N>` is `Replica(Box<ReplicaView>)` or `Node(N)` with `N: Deref<Target = Node>`, so the CLI holds `&Node` and the TUI holds `Rc<Node>`.
 2. `Facts` answers the reads that facts can answer: `search`, `tracks(limit)`, `track(hash)`, `marked(filter)`, `fact_values(type)`, `facts_of(hash)` and `plays`.
    - Each method is one `match` with two arms.
    - The replica arm calls the §1 functions.

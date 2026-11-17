@@ -2856,15 +2856,18 @@ dependencies = [
  "color-eyre",
  "fact-replica",
  "gateway-client",
+ "library-ipc-client",
  "library-projection",
  "mdma-client",
  "music-facts",
+ "nng",
  "node-discovery",
  "pretty_assertions",
  "private-file",
  "serde",
  "serde_json",
  "tempfile",
+ "thiserror 1.0.69",
 ]
 
 [[package]]

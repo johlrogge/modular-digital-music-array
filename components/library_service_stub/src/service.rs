@@ -11,8 +11,8 @@ use crate::ipc::{
 };
 use library_projection::{
     apply_fact, distinct_retractions, fact_values, marked, project, resolve_prefix,
-    resolve_visible, retain_live, search, track_info, visible, AlbumCovers, IndexedTrackInfo,
-    Unresolved,
+    resolve_visible, retain_live, search, track_info, unresolved_error, visible, AlbumCovers,
+    IndexedTrackInfo,
 };
 use music_facts::{FactSource, MusicValue};
 use stainless_facts::{Fact, Operation};
@@ -643,33 +643,19 @@ impl LibraryService {
     /// Resolve a partial hash to a full hash (the real service's `resolve_prefix`).
     fn resolve_hash(&self, partial: &ContentHash) -> Result<ContentHash, ProtocolError> {
         let tracks = self.tracks.lock().unwrap();
-        match resolve_prefix(&tracks, partial.as_str()) {
-            Ok(track) => Ok(track.content_hash.clone()),
-            Err(Unresolved::NotFound) => Err(ProtocolError::TrackNotFound {
-                hash: partial.as_str().to_owned(),
-            }),
-            Err(Unresolved::Ambiguous(found)) => Err(ProtocolError::ambiguous_hash(
-                partial.as_str(),
-                found.iter().map(|t| t.content_hash.as_str()),
-            )),
-        }
+        resolve_prefix(&tracks, partial.as_str())
+            .map(|track| track.content_hash.clone())
+            .map_err(|unresolved| unresolved_error(partial.as_str(), unresolved))
     }
 
     /// Look up a track by content hash (supports partial hashes).
     /// Returns TrackNotFound for hidden (deleted/superseded) tracks.
     fn get_track(&self, hash: &ContentHash) -> Result<TrackInfo, ProtocolError> {
-        self.with_catalog(
-            |tracks, covers| match resolve_visible(tracks, hash.as_str()) {
-                Ok(track) => Ok(track_info(track, covers)),
-                Err(Unresolved::NotFound) => Err(ProtocolError::TrackNotFound {
-                    hash: hash.as_str().to_owned(),
-                }),
-                Err(Unresolved::Ambiguous(found)) => Err(ProtocolError::ambiguous_hash(
-                    hash.as_str(),
-                    found.iter().map(|t| t.content_hash.as_str()),
-                )),
-            },
-        )
+        self.with_catalog(|tracks, covers| {
+            resolve_visible(tracks, hash.as_str())
+                .map(|track| track_info(track, covers))
+                .map_err(|unresolved| unresolved_error(hash.as_str(), unresolved))
+        })
     }
 
     /// Search tracks against a `TrackQuery` (hidden tracks excluded).

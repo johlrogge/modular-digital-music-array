@@ -481,11 +481,14 @@ pub enum ProtocolError {
 }
 
 impl ProtocolError {
-    /// `hash` starts every one of `candidates`, which are different tracks.
+    /// `hash` starts every one of `candidates`, which are different tracks. The
+    /// candidates are sorted, so the text does not depend on the order of the index.
     pub fn ambiguous_hash<'a>(hash: &str, candidates: impl IntoIterator<Item = &'a str>) -> Self {
+        let mut candidates: Vec<String> = candidates.into_iter().map(str::to_owned).collect();
+        candidates.sort();
         ProtocolError::AmbiguousHash {
             hash: hash.to_owned(),
-            candidates: candidates.into_iter().map(str::to_owned).collect(),
+            candidates,
         }
     }
 }

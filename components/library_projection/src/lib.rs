@@ -37,7 +37,7 @@ pub use read::{
     sort_catalog, track_info, visible, AlbumCovers,
 };
 
-use library_ipc_protocol::{CanonicalHash, EntryError, FactType, PlaylistEntry};
+use library_ipc_protocol::{CanonicalHash, EntryError, FactType, PlaylistEntry, ProtocolError};
 use music_facts::{ContentHash, Mark, MarkFilter, MusicValue, StartReason, StopReason};
 use stainless_facts::{aggregate_facts, Fact, Operation};
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -1541,6 +1541,23 @@ pub enum Unresolved<'a, T> {
     NotFound,
     /// Different hashes start with it: every track that does.
     Ambiguous(Vec<&'a T>),
+}
+
+/// The refusal the library answers with when `partial` names no single track: the one
+/// mapping from [`Unresolved`] to the protocol's error, for the service and for
+/// anything reading a replica.
+pub fn unresolved_error<T: HashedTrack>(
+    partial: &str,
+    unresolved: Unresolved<'_, T>,
+) -> ProtocolError {
+    match unresolved {
+        Unresolved::NotFound => ProtocolError::TrackNotFound {
+            hash: partial.to_owned(),
+        },
+        Unresolved::Ambiguous(found) => {
+            ProtocolError::ambiguous_hash(partial, found.iter().map(|t| t.content_hash()))
+        }
+    }
 }
 
 /// What to tell the user when `partial` matches several `tracks`: how many, and the

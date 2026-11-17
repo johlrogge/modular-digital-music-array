@@ -16,8 +16,8 @@ use event_protocol::{acid_event_from_topic_message, AcidEvent, TOPIC_ACID};
 use library_projection::{
     apply_fact, distinct_retractions, entity_facts, fact_values, hash_key, is_play_event,
     is_provenance_tracked, project, remove_cancelled, resolve_prefix, resolve_visible, retain_live,
-    retract_matches, search, track_info, try_parse_fact_line, visible, AlbumCovers,
-    IndexedTrackInfo, MusicFact, PlayLog, Unresolved,
+    retract_matches, search, track_info, try_parse_fact_line, unresolved_error, visible,
+    AlbumCovers, IndexedTrackInfo, MusicFact, PlayLog, Unresolved,
 };
 #[cfg(test)]
 use library_projection::{apply_fact_to_track, blob_path_for, IndexedCue};
@@ -2168,33 +2168,19 @@ impl LibraryService {
     /// Resolve a partial hash to a full hash (like git short refs)
     fn resolve_hash(&self, partial: &ContentHash) -> Result<ContentHash, ProtocolError> {
         let tracks = self.tracks.lock().unwrap();
-        match resolve_prefix(&tracks, partial.as_str()) {
-            Ok(track) => Ok(track.content_hash.clone()),
-            Err(Unresolved::NotFound) => Err(ProtocolError::TrackNotFound {
-                hash: partial.as_str().to_owned(),
-            }),
-            Err(Unresolved::Ambiguous(found)) => Err(ProtocolError::ambiguous_hash(
-                partial.as_str(),
-                found.iter().map(|t| t.content_hash.as_str()),
-            )),
-        }
+        resolve_prefix(&tracks, partial.as_str())
+            .map(|track| track.content_hash.clone())
+            .map_err(|unresolved| unresolved_error(partial.as_str(), unresolved))
     }
 
     /// Get track by hash from in-memory index (supports partial hashes).
     /// Returns TrackNotFound for hidden (deleted/superseded) tracks.
     fn get_track(&self, hash: &ContentHash) -> Result<TrackInfo, ProtocolError> {
-        self.with_catalog(
-            |tracks, covers| match resolve_visible(tracks, hash.as_str()) {
-                Ok(track) => Ok(track_info(track, covers)),
-                Err(Unresolved::NotFound) => Err(ProtocolError::TrackNotFound {
-                    hash: hash.as_str().to_owned(),
-                }),
-                Err(Unresolved::Ambiguous(found)) => Err(ProtocolError::ambiguous_hash(
-                    hash.as_str(),
-                    found.iter().map(|t| t.content_hash.as_str()),
-                )),
-            },
-        )
+        self.with_catalog(|tracks, covers| {
+            resolve_visible(tracks, hash.as_str())
+                .map(|track| track_info(track, covers))
+                .map_err(|unresolved| unresolved_error(hash.as_str(), unresolved))
+        })
     }
 
     /// Get all facts for a track by hash (supports partial hashes)

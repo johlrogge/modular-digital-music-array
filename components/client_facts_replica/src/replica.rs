@@ -13,14 +13,15 @@ use color_eyre::eyre::eyre;
 use color_eyre::Result;
 use fact_replica::{
     default_nodes_dir, id_for_host, release_host_elsewhere, should_attempt, Host, Meta, NodeId,
-    ReadFailure, Replica, SyncLock, SyncReport, UnixSecs,
+    ReadFailure, Replica, ReplicaError, SyncLock, SyncReport, UnixSecs,
 };
 use gateway_client::{GatewayClient, NodeIdentity};
 use library_projection::{project_lines, Projection};
-use mdma_client::node::{self, connect_failed, library_connect_failed};
+use mdma_client::node::{self, connect_failed, library_connect_failed, NodeError};
 use mdma_client::{Answer, LibraryBackend, Node};
 use serde::{Deserialize, Serialize};
 
+use crate::error::{FactsError, Missing, HOW_TO_GET_ONE};
 use crate::snapshot::CompletionSnapshot;
 
 /// How long the replica waits for the node, per request.
@@ -29,9 +30,6 @@ const LINK_TIMEOUT: Duration = Duration::from_secs(10);
 /// The name a node reached over local IPC is recorded under, so that `status`
 /// and `reset` can find its replica again without a network.
 const LOCAL_HOST: &str = "localhost";
-
-/// How a replica comes to exist, for the "no replica yet" messages.
-const HOW_TO_GET_ONE: &str = "a background sync creates it, or run `mdma replica sync`";
 
 /// How long probed playlist and source names are served.
 pub const PROBE_TTL_SECS: u64 = 24 * 60 * 60;
@@ -290,7 +288,7 @@ pub fn replicas_dir() -> Option<PathBuf> {
 }
 
 fn nodes_dir() -> Result<PathBuf> {
-    replicas_dir().ok_or_else(|| eyre!("no cache directory is available for the replica"))
+    replicas_dir().ok_or_else(|| eyre!("{}", FactsError::NoCacheDir))
 }
 
 /// Whether the local services are the node in use, as far as the environment says
@@ -327,47 +325,13 @@ pub fn replica_from_environment(nodes_dir: &Path, named: Option<&str>) -> Option
     )
 }
 
-/// Why no replica was found for the node in use.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum Missing {
-    /// A node was named (by `--node`, else `MDMA_NODE`) and no replica matches it.
-    Named(String),
-    /// On the node itself, and no sync has made its replica yet.
-    LocalNotSynced,
-    /// No node is named, remembered or running here.
-    NoNode,
-}
-
-impl Missing {
-    /// What was looked for: the `--node` flag; on the node itself, this node;
-    /// else `MDMA_NODE`.
-    fn named(explicit: Option<String>, local: bool, env: Option<&str>) -> Self {
-        match explicit {
-            Some(name) => Missing::Named(name),
-            None if local => Missing::LocalNotSynced,
-            None => env.map_or(Missing::NoNode, |name| Missing::Named(name.to_string())),
-        }
-    }
-
-    fn message(&self) -> String {
-        match self {
-            Missing::Named(name) => format!("no replica for '{name}'"),
-            Missing::LocalNotSynced => format!("no replica of this node yet; {HOW_TO_GET_ONE}"),
-            Missing::NoNode => {
-                "no node to find a replica for; use --node NAME or run `mdma node select`"
-                    .to_string()
-            }
-        }
-    }
-}
-
 /// The replica a command acts on, or what was looked for and not found.
 type Chosen = std::result::Result<NodeId, Missing>;
 
 /// The replica commands act on, decided offline; or what was looked for.
-fn find_replica(node: &Node, nodes_dir: &Path) -> Result<Chosen> {
+fn find_replica(node: &Node, nodes_dir: &Path) -> std::result::Result<Chosen, NodeError> {
     let explicit = node.node_flag().map(|spec| spec.host().to_string());
-    let env = node::env_node().map_err(|message| eyre!("{message}"))?;
+    let env = node::env_node().map_err(NodeError::InvalidEnv)?;
     let env_host = env.as_ref().map(|spec| spec.host());
     let remembered = node::load_cache();
     let found = pick_replica(
@@ -384,54 +348,66 @@ fn find_replica(node: &Node, nodes_dir: &Path) -> Result<Chosen> {
 
 /// The replica commands act on, decided offline.
 fn current_replica(node: &Node, nodes_dir: &Path) -> Result<NodeId> {
-    find_replica(node, nodes_dir)?.map_err(|missing| eyre!("{}", missing.message()))
+    find_replica(node, nodes_dir)?.map_err(|missing| eyre!("{missing}"))
 }
 
-/// The replica of the node in use, folded with `library_projection`.
+/// The replica of the node in use, folded with `library_projection`, and what the
+/// sync said about it (for the source note).
 pub struct ReplicaFold {
     pub id: NodeId,
     /// When the replica last synced; `None` if it never has.
     pub synced_at: Option<UnixSecs>,
+    /// When a sync last tried; `None` if none has.
+    pub last_attempt: Option<UnixSecs>,
+    /// Attempts that failed since the last success.
+    pub failures: u32,
     pub projection: Projection,
+    /// The replica the fold was read from, for reads of its raw lines.
+    pub replica: Replica,
 }
 
 /// Fold the replica of the node in use (decided offline, like `replica status`), for
 /// the commands that answer from the local facts. Reads only the local copy: a
 /// missing replica is an error that says how to get one, never an inline sync
 /// (ADR-021 §6; the client's `after_command` already starts one in the background).
-pub fn fold_current(node: &Node) -> Result<ReplicaFold> {
-    let nodes_dir = nodes_dir()?;
-    let id = current_replica(node, &nodes_dir)?;
+pub fn fold_current(node: &Node) -> std::result::Result<ReplicaFold, FactsError> {
+    let nodes_dir = replicas_dir().ok_or(FactsError::NoCacheDir)?;
+    let id = find_replica(node, &nodes_dir)?.map_err(FactsError::NoReplica)?;
     fold_replica(&nodes_dir, id)
 }
 
 /// Fold the replica of node `id` under `nodes_dir`.
-fn fold_replica(nodes_dir: &Path, id: NodeId) -> Result<ReplicaFold> {
+fn fold_replica(nodes_dir: &Path, id: NodeId) -> std::result::Result<ReplicaFold, FactsError> {
     let replica = Replica::new(nodes_dir, &id);
-    let Some(meta) = replica.meta().map_err(|e| eyre!("{e}"))? else {
-        return Err(eyre!("no replica of {id} yet; {HOW_TO_GET_ONE}"));
+    let unreadable = |e: ReplicaError| FactsError::unreadable(&id, &e);
+    // A meta with no sync (a failed attempt made it) has no lines to read.
+    let meta = match replica.meta().map_err(unreadable)? {
+        Some(meta) if meta.synced_at.is_some() => meta,
+        _ => return Err(FactsError::NoReplica(Missing::NotSynced(id))),
     };
-    let lines = replica.lines().map_err(|e| eyre!("{e}"))?;
+    let lines = replica.lines().map_err(unreadable)?;
     let projection = project_lines(lines.iter().map(String::as_str));
     Ok(ReplicaFold {
         id,
         synced_at: meta.synced_at,
+        last_attempt: meta.last_attempt,
+        failures: meta.failures,
         projection,
+        replica,
     })
 }
 
-/// What to say on stderr about the replica an answer comes from: which node, how old,
-/// and any lines it could not read.
-pub fn replica_notes(fold: &ReplicaFold, now: UnixSecs) -> Vec<String> {
-    let synced = ago(now, fold.synced_at);
-    let mut notes = vec![format!("replica of {}, synced {synced}", fold.id)];
-    let unreadable = fold.projection.unparseable_lines;
-    if unreadable > 0 {
-        let unread =
-            format!("{unreadable} lines this mdma cannot read; plays may be missing; upgrade mdma");
-        notes.push(unread);
-    }
-    notes
+/// What to say, under `--facts=node`, about the replica as the alternative to an
+/// unreachable node: how old it is. `None` when there is none (nothing is said about
+/// a replica that does not exist). Decided offline, like [`fold_current`].
+pub(crate) fn replica_hint(node: &Node, now: UnixSecs) -> Option<String> {
+    let nodes_dir = replicas_dir()?;
+    let id = find_replica(node, &nodes_dir).ok()?.ok()?;
+    let synced_at = Replica::new(&nodes_dir, &id).meta().ok()??.synced_at?;
+    Some(format!(
+        "--facts=replica answers from the local replica (synced {})",
+        ago(now, Some(synced_at))
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -596,9 +572,7 @@ pub fn status(node: &Node) -> Result<String> {
     let id = current_replica(node, &nodes_dir)?;
     let replica = Replica::new(&nodes_dir, &id);
     let Some(meta) = replica.meta().map_err(|e| eyre!("{e}"))? else {
-        return Ok(format!(
-            "No replica of {id} yet; `mdma replica sync` creates it."
-        ));
+        return Ok(format!("No replica of {id} yet; {HOW_TO_GET_ONE}."));
     };
     let now = UnixSecs::now();
     let probe = Probe::load(&replica).live(now);
@@ -627,7 +601,8 @@ fn reset_replica(nodes_dir: &Path, chosen: Chosen) -> Result<String> {
         Err(Missing::LocalNotSynced) => {
             return Ok("Nothing to reset: no replica of this node yet.".to_string());
         }
-        Err(missing @ Missing::NoNode) => return Err(eyre!("{}", missing.message())),
+        Err(Missing::NotSynced(id)) => return Ok(format!("Nothing to reset: no replica of {id}.")),
+        Err(missing @ Missing::NoNode) => return Err(eyre!("{missing}")),
     };
     let replica = Replica::new(nodes_dir, &id);
     Ok(if replica.reset().map_err(|e| eyre!("{e}"))? {
@@ -640,7 +615,9 @@ fn reset_replica(nodes_dir: &Path, chosen: Chosen) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{asserted, env_lock, failure_text, EnvVars};
+    use crate::test_support::{
+        asserted, env_lock, failure_text, nodes_dir, offline_env, replica_with_lines, EnvVars,
+    };
     use fact_replica::test_support::FakeNode;
     use mdma_client::NodeOptions;
     use pretty_assertions::assert_eq;
@@ -856,7 +833,7 @@ mod tests {
     #[test]
     fn with_no_replica_yet_the_node_itself_says_so_and_a_non_local_setup_has_no_node() {
         assert_eq!(
-            Missing::LocalNotSynced.message(),
+            Missing::LocalNotSynced.to_string(),
             "no replica of this node yet; a background sync creates it, or run `mdma replica sync`"
         );
         let dir = tempfile::tempdir().unwrap();
@@ -865,7 +842,7 @@ mod tests {
             "Nothing to reset: no replica of this node yet."
         );
         assert_eq!(
-            Missing::named(None, false, None).message(),
+            Missing::named(None, false, None).to_string(),
             "no node to find a replica for; use --node NAME or run `mdma node select`"
         );
     }
@@ -909,11 +886,8 @@ mod tests {
     fn a_second_reset_of_the_same_node_exits_zero_and_status_still_reports_the_missing_replica() {
         let _lock = env_lock();
         let dir = tempfile::tempdir().unwrap();
-        let mut env = EnvVars::default();
-        env.set("XDG_CACHE_HOME", dir.path().join("cache"));
-        env.set("XDG_CONFIG_HOME", dir.path().join("config"));
-        env.set("MDMA_NODE", "");
-        let nodes_dir = dir.path().join("cache").join("mdma").join("nodes");
+        let _env = offline_env(dir.path());
+        let nodes_dir = nodes_dir(dir.path());
         replica_with_host(&nodes_dir, "stage", "mdma-stage2.local");
         let node = node_named("mdma-stage2.local");
 
@@ -922,7 +896,8 @@ mod tests {
 
         assert_eq!(
             failure_text(status(&node)),
-            "no replica for 'mdma-stage2.local'",
+            "no replica for 'mdma-stage2.local' yet; \
+             a background sync creates it, or run `mdma replica sync`",
             "status keeps its error"
         );
     }
@@ -1176,16 +1151,6 @@ mod tests {
         vec![asserted(TRACK, title, at), asserted(TRACK, started, at)]
     }
 
-    fn replica_with_lines(dir: &Path, node: &str, host: &str, lines: Vec<String>) {
-        let mut fake = FakeNode::new("e1", 0);
-        fake.lines = lines;
-        Replica::new(dir, &id(node))
-            .sync(secs(1), Some(&Host::new(host)), &mut |c, l, p| {
-                fake.serve(c, l, p)
-            })
-            .unwrap();
-    }
-
     #[test]
     fn folding_a_replica_gives_its_node_its_age_and_its_projection() {
         let dir = tempfile::tempdir().unwrap();
@@ -1214,14 +1179,27 @@ mod tests {
     }
 
     #[test]
+    fn a_replica_only_a_failed_attempt_has_touched_is_not_synced() {
+        let dir = tempfile::tempdir().unwrap();
+        let replica = Replica::new(dir.path(), &id("failing"));
+        std::fs::create_dir_all(replica.dir()).unwrap();
+        assert!(replica.note_failure(secs(5)).unwrap());
+        assert!(replica.meta().unwrap().is_some(), "a meta, but no sync");
+
+        let result = fold_replica(dir.path(), id("failing"));
+
+        assert_eq!(
+            failure_text(result),
+            "no replica of failing yet; a background sync creates it, or run `mdma replica sync`"
+        );
+    }
+
+    #[test]
     fn the_current_replica_is_folded_from_the_cache_and_a_missing_one_is_an_error() {
         let _lock = env_lock();
         let dir = tempfile::tempdir().unwrap();
-        let mut env = EnvVars::default();
-        env.set("XDG_CACHE_HOME", dir.path().join("cache"));
-        env.set("XDG_CONFIG_HOME", dir.path().join("config"));
-        env.set("MDMA_NODE", "");
-        let nodes_dir = dir.path().join("cache").join("mdma").join("nodes");
+        let _env = offline_env(dir.path());
+        let nodes_dir = nodes_dir(dir.path());
         replica_with_lines(&nodes_dir, "stage", "mdma-stage2.local", play_lines());
         // A replica directory that no sync has filled yet.
         let bare = Replica::new(&nodes_dir, &id("bare"));
@@ -1256,49 +1234,31 @@ mod tests {
         assert_eq!(pick(Some("gamma.local")), None, "and does not fall back");
     }
 
-    // --- the note on stderr ----------------------------------------------------
-
-    fn fold_of(lines: &[String]) -> ReplicaFold {
-        ReplicaFold {
-            id: id("mdma-stage"),
-            synced_at: Some(secs(1_000)),
-            projection: project_lines(lines.iter().map(String::as_str)),
-        }
-    }
+    // --- the hint under --facts=node --------------------------------------------
 
     #[test]
-    fn the_replica_is_named_and_its_age_given_on_stderr() {
-        let fold = fold_of(&play_lines());
+    fn the_hint_names_the_replica_and_its_age_and_is_silent_without_one() {
+        let _lock = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _env = offline_env(dir.path());
+        let node = node_named("mdma-stage2.local");
+        assert_eq!(replica_hint(&node, secs(1)), None, "no replica yet");
 
-        let notes = replica_notes(&fold, secs(1_000 + 7_200));
+        let nodes_dir = nodes_dir(dir.path());
+        let failed = Replica::new(&nodes_dir, &id("untouched"));
+        std::fs::create_dir_all(failed.dir()).unwrap();
+        failed.note_failure(secs(2)).unwrap();
+        assert_eq!(
+            replica_hint(&node_named("untouched"), secs(3)),
+            None,
+            "a replica that never synced has no age to name"
+        );
 
-        assert_eq!(notes, ["replica of mdma-stage, synced 2 h ago"]);
-    }
-
-    #[test]
-    fn lines_this_mdma_cannot_read_are_reported_too() {
-        let mut lines = play_lines();
-        lines.push(r#"["from-a-newer-node"]"#.to_string());
-        lines.push("garbage".to_string());
-
-        let notes = replica_notes(&fold_of(&lines), secs(1_005));
+        replica_with_lines(&nodes_dir, "stage", "mdma-stage2.local", play_lines());
 
         assert_eq!(
-            notes,
-            [
-                "replica of mdma-stage, synced 5 s ago",
-                "2 lines this mdma cannot read; plays may be missing; upgrade mdma"
-            ]
+            replica_hint(&node, secs(1 + 7_200)),
+            Some("--facts=replica answers from the local replica (synced 2 h ago)".to_string())
         );
-    }
-
-    #[test]
-    fn a_replica_that_never_synced_says_never() {
-        let mut fold = fold_of(&[]);
-        fold.synced_at = None;
-
-        let notes = replica_notes(&fold, secs(5));
-
-        assert_eq!(notes, ["replica of mdma-stage, synced never"]);
     }
 }

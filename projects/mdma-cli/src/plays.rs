@@ -11,7 +11,7 @@ use std::str::FromStr;
 
 use bpaf::{construct, Parser};
 use chrono::{DateTime, Local, TimeZone, Utc};
-use client_facts::{fold_current, replica_notes, UnixSecs};
+use client_facts::{Facts, FactsChoice, UnixSecs};
 use color_eyre::Result;
 use hicli::Arg;
 use library_ipc_client::ContentHash;
@@ -75,18 +75,19 @@ impl Arg for PlaysOf {
 /// ```
 #[hicli::command]
 pub(crate) fn plays(of: PlaysOf, ctx: &Ctx) -> Result<hicli::Success> {
-    let fold = fold_current(ctx)?;
-    for note in replica_notes(&fold, UnixSecs::now()) {
+    let facts = Facts::open(ctx, FactsChoice::default())?;
+    if let Some(note) = facts.source_note(UnixSecs::now()) {
         eprintln!("{note}");
     }
+    let projection = facts.plays()?;
     match of {
         PlaysOf::Track(hash) => {
             let hashes = hashes_of_input(hash)?;
             // Resolved once, however many tracks are asked for.
-            let resolved = fold.projection.plays.resolved(&fold.projection.tracks);
+            let resolved = projection.plays.resolved(&projection.tracks);
             let mut first = true;
             each_track(hashes, |hash| {
-                let text = show_track(&fold.projection, &resolved, hash, &Local)?;
+                let text = show_track(projection, &resolved, hash, &Local)?;
                 if !std::mem::take(&mut first) {
                     println!();
                 }
@@ -95,7 +96,7 @@ pub(crate) fn plays(of: PlaysOf, ctx: &Ctx) -> Result<hicli::Success> {
             })
         }
         PlaysOf::Recent(RecentCount(n)) => {
-            println!("{}", show_recent(&fold.projection, n, &Local));
+            println!("{}", show_recent(projection, n, &Local));
             Ok(hicli::Success::OK)
         }
     }
