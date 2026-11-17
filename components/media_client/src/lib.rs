@@ -17,8 +17,10 @@ use std::path::PathBuf;
 /// carries command-level error messages.
 pub type ClientError = nng_transport::NngClientError;
 
+/// A clone shares the socket.
+#[derive(Clone)]
 pub struct MediaClient {
-    socket: nng::Socket,
+    socket: nng_transport::SharedSocket,
 }
 
 impl MediaClient {
@@ -37,7 +39,7 @@ impl MediaClient {
     /// # Ok::<(), media_client::ClientError>(())
     /// ```
     pub fn connect(url: &str) -> Result<Self, ClientError> {
-        let socket = nng_transport::connect(url)?;
+        let socket = nng_transport::SharedSocket::connect(url)?;
         Ok(Self { socket })
     }
 
@@ -195,7 +197,7 @@ impl MediaClient {
     fn send_command(&self, cmd: Command) -> Result<(), ClientError> {
         tracing::debug!("Serializing command: {:?}", cmd);
         tracing::debug!("Sending command to server");
-        let response: Response = nng_transport::request_response(&self.socket, &cmd)?;
+        let response: Response = self.socket.request_response(&cmd)?;
         tracing::debug!("Received response");
 
         match response {
@@ -209,7 +211,7 @@ impl MediaClient {
         cmd: Command,
         extract: fn(ResponseData) -> Option<T>,
     ) -> Result<T, ClientError> {
-        let response: Response = nng_transport::request_response(&self.socket, &cmd)?;
+        let response: Response = self.socket.request_response(&cmd)?;
 
         match response {
             Response::Err { message } => Err(ClientError::Service(message)),

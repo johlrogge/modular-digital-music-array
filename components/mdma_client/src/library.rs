@@ -16,6 +16,8 @@ use library_ipc_client::{
 use playlist_import::PlaylistWriteOps;
 
 /// Abstraction for library requests, works in both gateway and direct mode.
+/// A clone shares the connection.
+#[derive(Clone)]
 pub enum LibraryBackend {
     Direct(LibraryClient),
     Gateway(gateway_client::GatewayClient),

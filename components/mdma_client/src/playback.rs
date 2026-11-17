@@ -6,6 +6,8 @@ use media_client::{
 };
 
 /// Abstraction for playback commands, works in both gateway and direct mode.
+/// A clone shares the connection.
+#[derive(Clone)]
 pub enum PlaybackBackend {
     Direct(MediaClient),
     Gateway(gateway_client::GatewayClient),

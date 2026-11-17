@@ -357,6 +357,48 @@ where
     Ok(response)
 }
 
+/// A connected socket that clones share.
+///
+/// A Req0 socket has one request in flight: a second `send` cancels the first,
+/// so two threads on one socket can receive each other's replies. The lock is
+/// held from send to receive, so a clone is as safe to use from another thread
+/// as the original.
+#[derive(Clone)]
+pub struct SharedSocket(std::sync::Arc<std::sync::Mutex<nng::Socket>>);
+
+impl SharedSocket {
+    pub fn new(socket: nng::Socket) -> Self {
+        Self(std::sync::Arc::new(std::sync::Mutex::new(socket)))
+    }
+
+    /// [`connect`], shared.
+    pub fn connect(address: &str) -> Result<Self, ConnectionError> {
+        connect(address).map(Self::new)
+    }
+
+    /// [`connect_with_timeout`], shared.
+    pub fn connect_with_timeout(address: &str, timeout: Duration) -> Result<Self, ConnectionError> {
+        connect_with_timeout(address, timeout).map(Self::new)
+    }
+
+    /// [`request_response`] with the socket locked from send to receive.
+    pub fn request_response<Req, Resp>(&self, request: &Req) -> Result<Resp, NngClientError>
+    where
+        Req: serde::Serialize,
+        Resp: serde::de::DeserializeOwned,
+    {
+        // A panic while holding the lock leaves at most an unanswered request,
+        // which the next send cancels.
+        let socket = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        request_response(&socket, request)
+    }
+
+    /// Whether `other` is a clone of this socket.
+    pub fn is_same_socket(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
 /// Shared NNG client error type for use across all NNG-based clients.
 ///
 /// Covers the common error cases: failed connection, NNG transport errors,
@@ -391,6 +433,43 @@ mod tests {
     fn req_sockets_never_resend_requests() {
         let socket = new_req_socket(Duration::from_secs(60)).unwrap();
         assert_eq!(socket.get_opt::<ResendTime>().unwrap(), None);
+    }
+
+    #[test]
+    fn clones_of_a_shared_socket_get_their_own_replies() {
+        let addr = format!(
+            "ipc://{}/nng-transport-echo-{}",
+            std::env::temp_dir().display(),
+            std::process::id()
+        );
+        // Echoes each request after a delay that makes the replies overlap.
+        let server = nng::Socket::new(nng::Protocol::Rep0).unwrap();
+        server.listen(&addr).unwrap();
+        let echo = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let request = server.recv().unwrap();
+                std::thread::sleep(Duration::from_millis(150));
+                server.send(request).map_err(|(_, e)| e).unwrap();
+            }
+        });
+
+        let client = SharedSocket::connect(&addr).unwrap();
+        let askers: Vec<_> = ["first", "second"]
+            .into_iter()
+            .map(|word| {
+                let client = client.clone();
+                std::thread::spawn(move || {
+                    let reply: String = client.request_response(&word.to_string()).unwrap();
+                    (word, reply)
+                })
+            })
+            .collect();
+        for asker in askers {
+            let (word, reply) = asker.join().unwrap();
+            assert_eq!(reply, word);
+        }
+        echo.join().unwrap();
+        assert!(client.is_same_socket(&client.clone()));
     }
 
     #[test]
