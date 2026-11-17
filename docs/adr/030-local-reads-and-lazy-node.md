@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted, 2026-11-17 (Joakim decided)
+Accepted, 2026-11-17 (Joakim decided). Amended 2026-11-17 (#111)
 
 Amends ADR-022 §3 (the client-facts interface gains a runtime source), §1 (NodeError texts gain who needed the node) and §6 (staleness is labelled on every local read). Builds on ADR-021 (replica), ADR-014 §14 (split-point test), ADR-004 (one fold). Related: ADR-011, ADR-016, ADR-029 (one matcher, in Rust).
 
@@ -238,6 +238,18 @@ New: whether a checkpoint ADR is needed is decided by §6's measurement.
 ## Phasing
 
 P0a (read side into `library_projection`), P1 (`client_facts_replica` move) and P3 (lazy node) run in parallel. P0b (service consistency, equivalence test and the stub fold-in) follows P0a; P2 (`Facts`) follows P0a and P1; P4 (CLI) follows P2 and P3; P5 (TUI) follows P2 and P3 and depends on the reach cell (§4.4), which is part of the transport and `Node`; P6 (measure, record, and trigger a checkpoint ADR if needed) is last.
+
+## Amendment 2026-11-17 (issue #111): never trust nng's dialer to recover
+
+Where this conflicts with §4.1 ("connects and reconnects by itself"), the amendment wins.
+
+`dial_async` does not always reconnect. In the bundled nng 1.4.0-rc, a dialer stops redialling for good after a connect that ends in `NNG_ECLOSED`, which happens when the IPC header write gets `EPIPE` while the listener restarts. The socket then waits for a pipe that never comes.
+
+**Rule:** a connection-class failure (a send that fails, `Closed`, `ConnectionReset`) replaces the socket; the dialer is never trusted to recover.
+
+- **The gateway** keeps each backend (library, playback, ACID, admin, and every source) in a `BackendSlot`: a socket made on first use and forgotten on a connection failure (compare and drop, so a worker never drops a newer socket). A failed send is retried once on a fresh socket, because it never reached the service (nng 1.4 req0: a send completes on pipe assignment); a failed receive is never retried. The send timeout (1 s) is shorter than the clients' 5 s, so both send attempts fit inside one client request.
+- **Clients** follow the same rule (`Node::live` already drops a dead connection).
+- **Event subscribers** (SUB sockets, §4.1 and §4.5) are not covered yet: see the Sub0 bridges in the gateway, which have the same exposure.
 
 ## Related
 
