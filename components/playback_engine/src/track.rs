@@ -54,8 +54,10 @@ pub struct Track {
     input_complete: Arc<AtomicBool>,
 }
 
+/// Commands to the decoder thread. A track is never moved once it exists: a
+/// seek makes a new track that starts at the position (see `Track::new`), so
+/// nothing can reset its state behind the caller's back.
 pub enum TrackCommand {
-    FillFrom(usize),
     Shutdown,
 }
 
@@ -111,29 +113,10 @@ fn decoder_thread_fn<S: Source + Send + Sync + 'static>(
             return;
         }
 
-        // Handle commands (seek, shutdown) — checked every iteration
-        while let Ok(command) = command_rx.try_recv() {
-            match command {
-                TrackCommand::FillFrom(position) => {
-                    tracing::debug!("Seek to sample {position}");
-                    if let Err(e) = source.seek(position) {
-                        tracing::error!("Seek error: {e}");
-                    }
-                    pending.clear();
-                    eof = false;
-                    input_complete.store(false, Ordering::Release);
-                    // Seek resets to Stopped — caller must call play() again if desired
-                    state.store(TrackState::Stopped as u8, Ordering::Release);
-                    // Reset resampler state by recreating it
-                    if source_rate != target_rate {
-                        resampler = Resampler::new(source_rate, target_rate, channels).ok();
-                    }
-                }
-                TrackCommand::Shutdown => {
-                    tracing::debug!("Decoder thread shutting down");
-                    return;
-                }
-            }
+        // Handle commands (shutdown) — checked every iteration
+        if let Ok(TrackCommand::Shutdown) = command_rx.try_recv() {
+            tracing::debug!("Decoder thread shutting down");
+            return;
         }
 
         // Decode more audio when the pending buffer runs low
@@ -248,13 +231,6 @@ impl Track {
             duration_ms,
             input_complete,
         })
-    }
-
-    pub fn seek(&mut self, position: usize) -> Result<(), PlaybackError> {
-        if let Err(e) = self.command_tx.try_send(TrackCommand::FillFrom(position)) {
-            tracing::error!("Failed to send fill command after seek: {}", e);
-        }
-        Ok(())
     }
 
     pub fn play(&mut self) {
@@ -658,32 +634,32 @@ mod tests {
         assert_eq!(received, samples);
     }
 
+    /// A seek makes a track that starts at the position: the source is moved
+    /// before the decoder thread exists, so `play()` right after creation
+    /// cannot be undone by a late seek command, and the track keeps delivering.
     #[test]
-    fn seek_resets_input_complete() {
-        let (mut track, cons, samples) = playing_track_with_consumer(4096);
-        let complete = track.input_complete();
-        assert!(wait_until(std::time::Duration::from_secs(5), || complete
-            .load(Ordering::Acquire)));
-        assert_eq!(cons.len(), samples);
-        track.seek(0).expect("seek");
-        assert!(
-            wait_until(std::time::Duration::from_secs(5), || !complete
-                .load(Ordering::Acquire)),
-            "seek must reset input_complete"
-        );
-    }
+    fn a_track_created_at_a_position_plays_and_keeps_playing() {
+        let samples = 96_000usize;
+        let source = TestSource::new_from_samples(vec![0.25f32; samples]);
+        source.seek(48_000).expect("seek the source");
+        let (prod, mut cons) = HeapRb::new(4_096).split();
+        let mut track = Track::new(source, prod, 48_000, 48_000).expect("Track::new");
+        track.play();
 
-    #[test]
-    fn seek_after_finished_resets_to_stopped() {
-        let (mut track, mut cons, samples) = playing_track_with_consumer(4096);
-        assert!(wait_until(std::time::Duration::from_secs(5), || cons.len() == samples));
-        while cons.pop().is_some() {}
-        assert!(wait_until(std::time::Duration::from_secs(5), || track.is_finished()));
-        track.seek(0).expect("seek");
         assert!(
-            wait_until(std::time::Duration::from_secs(5), || !track.is_finished()
-                && !track.is_playing()),
-            "seek should reset state to Stopped"
+            wait_until(std::time::Duration::from_secs(2), || !cons.is_empty()),
+            "the track must deliver samples"
         );
+        // Keep consuming: it goes on delivering, and stays playing.
+        let mut received = 0usize;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(300);
+        while std::time::Instant::now() < deadline {
+            while cons.pop().is_some() {
+                received += 1;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(received > 4_096, "only {received} samples delivered");
+        assert!(track.is_playing() || track.is_finished());
     }
 }

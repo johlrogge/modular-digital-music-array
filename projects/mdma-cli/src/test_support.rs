@@ -141,6 +141,8 @@ pub(crate) struct Setup<'a> {
     pub(crate) transport: Option<mdma_client::TransportStatus>,
     /// What it answers `Seek` with: where the track is afterwards.
     pub(crate) seeked: Option<mdma_client::TransportStatus>,
+    /// The track it answers `EndPreview` with as audible afterwards.
+    pub(crate) resumed: Option<mdma_client::ContentHash>,
     /// The beat grid every track of the fake library has.
     pub(crate) grid: Option<library_ipc_client::BeatGridInfo>,
 }
@@ -167,6 +169,7 @@ impl FakeServices {
             queue,
             transport,
             seeked,
+            resumed,
             grid,
         } = setup;
         let dir = tempfile::tempdir().expect("temp dir");
@@ -239,6 +242,9 @@ impl FakeServices {
                         }
                         mdma_client::Command::Seek { .. } => {
                             seeked.clone().map(mdma_client::ResponseData::Transport)
+                        }
+                        mdma_client::Command::EndPreview { .. } => {
+                            Some(mdma_client::ResponseData::NowPlaying(resumed.clone()))
                         }
                         _ => None,
                     };

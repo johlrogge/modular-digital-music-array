@@ -9,7 +9,7 @@ use crate::queue_pane::QueuePane;
 use crate::search_pane::SearchPane;
 use crate::theme::ColorMode;
 use event_protocol::PlaybackEvent;
-use mdma_client::{ContentHash, PlaylistName};
+use mdma_client::{ContentHash, Deck, PlaylistName, TransportStatus};
 use std::process::Child;
 use std::sync::mpsc::{Receiver, TryRecvError};
 
@@ -336,6 +336,14 @@ impl App {
                         self.now_playing.set_track_metadata(title, artist);
                     }
                     self.now_playing.apply(&pe);
+                    // A preview starting or ending changes the audible track
+                    // without a TrackStarted: ask the node what is audible.
+                    if matches!(
+                        pe,
+                        PlaybackEvent::PreviewStarted { .. } | PlaybackEvent::PreviewEnded { .. }
+                    ) {
+                        self.reread_transport();
+                    }
                 }
                 // News for the status line; the subscription goes on.
                 AppEvent::Malformed(msg) => self.set_status(format!("Event error: {msg}")),
@@ -349,6 +357,26 @@ impl App {
         if ended {
             self.event_rx = None;
         }
+    }
+
+    /// Show what the node says is audible (`GetTransport`) with its title and
+    /// artist. Keeps what is shown when the node cannot be asked.
+    fn reread_transport(&mut self) {
+        let Ok(playback) = self.link.playback() else {
+            return;
+        };
+        let Ok(status) = playback.get_transport(Deck::A) else {
+            return;
+        };
+        let (title, artist) = match &status {
+            TransportStatus::Loaded { now, .. } => match self.link.node_track(now) {
+                Ok(t) => (t.title, t.artist),
+                Err(_) => (None, None),
+            },
+            TransportStatus::Idle => (None, None),
+        };
+        self.now_playing.set_track_metadata(title, artist);
+        self.now_playing.apply_transport(&status);
     }
 
     /// Subscribe to the node's events, once, as soon as the node is resolved. Nothing

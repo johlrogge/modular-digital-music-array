@@ -1,11 +1,13 @@
 use crate::error::ServerError;
-use crate::playback_state::{PlaybackEffect, PlaybackState, PlaybackStateMachine};
+use crate::playback_state::{
+    BackTo, Observed, PlaybackEffect, PlaybackState, PlaybackStateMachine, Refusal,
+};
 use acid_client::AcidClient;
 use color_eyre::Result;
 use event_protocol::{to_topic_message, PlaybackEvent};
 use media_protocol::{
-    require_canonical, CanonicalHash, Command, ContentHash, Response, ResponseData, SourceName,
-    Transport, TransportStatus,
+    require_canonical, CanonicalHash, Command, ContentHash, Held, PreviewStatus, Response,
+    ResponseData, SourceName, Transport, TransportStatus,
 };
 use music_facts::{FactSource, MusicValue};
 use nng::Socket;
@@ -116,9 +118,42 @@ impl Server {
         persist_and_publish(&self.queue_file, &self.event_pub, queue);
     }
 
-    /// Pop the queue front, persisting and announcing the change if it popped.
-    fn pop_next(&self, queue: &mut VecDeque<QueueEntry>) -> Option<QueueEntry> {
-        pop_front_and_publish(&self.queue_file, &self.event_pub, queue)
+    /// Offer the queue front to a transition of the state machine; see
+    /// [`offer_front`]. The state is locked before the queue, as the poll task
+    /// does. Persists and announces the queue if it lost its front.
+    async fn offer_front(
+        &self,
+        transition: impl FnOnce(
+            &mut PlaybackStateMachine,
+            Option<(CanonicalHash, SourceName)>,
+        ) -> Result<Vec<PlaybackEffect>, Refusal>,
+    ) -> Result<Vec<PlaybackEffect>, Refusal> {
+        let mut sm = self.state.lock().await;
+        let mut queue = self.queue.lock().await;
+        let (effects, popped) = offer_front(&mut sm, &mut queue, transition)?;
+        if popped.is_some() {
+            self.queue_changed(&queue);
+        }
+        Ok(effects)
+    }
+
+    /// Move playback along the queue with `transition` (skip, play the front)
+    /// and run its effects; a refusal answers the command and changes nothing.
+    async fn advance_queue(
+        &self,
+        transition: impl FnOnce(
+            &mut PlaybackStateMachine,
+            Option<(CanonicalHash, SourceName)>,
+        ) -> Result<Vec<PlaybackEffect>, Refusal>,
+    ) -> Response {
+        match self.offer_front(transition).await {
+            Err(refusal) => refusal_response(refusal),
+            Ok(effects) => {
+                let result =
+                    execute_effects(effects, &self.audio, &self.event_pub, &self.acid_client).await;
+                self.create_response(result, None)
+            }
+        }
     }
 
     /// Load the queue from disk. Returns an empty queue on first start or corruption.
@@ -240,17 +275,42 @@ impl Server {
             }
             Command::Play { deck: _ } => {
                 info!("Play command");
-                if let Some(effects) = self.try_resume().await {
-                    let result =
-                        execute_effects(effects, &self.audio, &self.event_pub, &self.acid_client)
-                            .await;
-                    return self.create_response(result, None);
+                // Resumes a paused track or preview; otherwise a no-op.
+                let (effects, idle) = {
+                    let mut sm = self.state.lock().await;
+                    (sm.resume(), matches!(sm.state(), PlaybackState::Idle))
+                };
+                if idle {
+                    warn!("Play command received while Idle: nothing to resume");
                 }
-                // Playing or Idle — no-op
-                if matches!(self.state.lock().await.state(), PlaybackState::Idle) {
-                    warn!("Play command received while Idle and no queue entry");
+                let result =
+                    execute_effects(effects, &self.audio, &self.event_pub, &self.acid_client).await;
+                self.create_response(result, None)
+            }
+            Command::Preview { deck: _, hash } => {
+                let hash = match require_canonical(hash) {
+                    Ok(hash) => hash,
+                    Err(refusal) => return refusal,
+                };
+                info!("Preview {}", hash);
+                self.preview(hash).await
+            }
+            Command::EndPreview { deck: _ } => {
+                info!("Ending preview");
+                let effects = self.state.lock().await.end_preview();
+                let response = self.run_preview_effects(effects).await;
+                // Say what is audible afterwards: the track that was held, or
+                // nothing.
+                match response {
+                    Response::Ok { .. } => {
+                        let now: Option<ContentHash> =
+                            self.state.lock().await.current_hash().map(Into::into);
+                        Response::Ok {
+                            data: Some(ResponseData::NowPlaying(now)),
+                        }
+                    }
+                    err => err,
                 }
-                self.create_response(Ok(()), None)
             }
             // ---------------------------------------------------------------
             // State-machine-backed commands
@@ -381,30 +441,7 @@ impl Server {
                     return self.create_response(result, None);
                 }
 
-                let entry = {
-                    let mut queue = self.queue.lock().await;
-                    self.pop_next(&mut queue)
-                };
-                match entry {
-                    None => Response::Err {
-                        message: "Queue is empty".to_string(),
-                    },
-                    Some(e) => {
-                        let effects = self
-                            .state
-                            .lock()
-                            .await
-                            .play_queue(e.hash.clone(), e.source.clone());
-                        let result = execute_effects(
-                            effects,
-                            &self.audio,
-                            &self.event_pub,
-                            &self.acid_client,
-                        )
-                        .await;
-                        self.create_response(result, None)
-                    }
-                }
+                self.advance_queue(|sm, next| sm.play_queue(next)).await
             }
             Command::NowPlaying => {
                 let hash: Option<ContentHash> =
@@ -416,15 +453,7 @@ impl Server {
             }
             Command::Skip => {
                 info!("Skip: stopping current track and advancing queue");
-                let next = {
-                    let mut queue = self.queue.lock().await;
-                    self.pop_next(&mut queue)
-                        .map(|entry| (entry.hash, entry.source))
-                };
-                let effects = self.state.lock().await.skip(next);
-                let result =
-                    execute_effects(effects, &self.audio, &self.event_pub, &self.acid_client).await;
-                self.create_response(result, None)
+                self.advance_queue(|sm, next| sm.skip(next)).await
             }
             Command::GetSession => {
                 let session_id = self
@@ -514,6 +543,36 @@ impl Server {
         }
     }
 
+    /// Preview `hash` over what is audible. The track and position to come
+    /// back to are asked of the source now: the state machine does not track
+    /// them, and refuses the preview when they are missing or are not the
+    /// track it has as audible (a gapless switch in between, an unreadable
+    /// position, a source that could not be asked).
+    async fn preview(&self, hash: CanonicalHash) -> Response {
+        let state = self.state.lock().await.state().clone();
+        let observed = self
+            .ask_source(&state)
+            .await
+            .as_ref()
+            .and_then(observed_position);
+        match self.state.lock().await.preview(hash, observed) {
+            Err(refusal) => refusal_response(refusal),
+            Ok(effects) => self.run_preview_effects(effects).await,
+        }
+    }
+
+    /// Run what a preview transition asked for. Loading drops the source's
+    /// preload, which the poll loop is told like after a seek (see
+    /// [`SeekEpoch`]), after the source has done it. The bump is
+    /// unconditional on purpose: after a no-op `EndPreview` it costs one
+    /// preload that the source treats as already held.
+    async fn run_preview_effects(&self, effects: Vec<PlaybackEffect>) -> Response {
+        let result =
+            execute_effects(effects, &self.audio, &self.event_pub, &self.acid_client).await;
+        self.seek_epoch.bump();
+        self.create_response(result, None)
+    }
+
     /// What the source says about its track; nothing while `state` is idle
     /// (there is nobody to ask) or when it cannot be asked.
     async fn ask_source(&self, state: &PlaybackState) -> Option<StreamTrackInfo> {
@@ -595,6 +654,22 @@ async fn execute_effects(
                     warn!("Failed to play after load: {}", e);
                 })?;
             }
+            PlaybackEffect::LoadAt { hash, at, then } => {
+                // Load, seek, then play if it was playing: the same seek as
+                // `Command::Seek`, which leaves the play state as it was.
+                let client = audio.lock().await;
+                client.load(hash.clone().into()).inspect_err(|e| {
+                    warn!("Failed to load {}: {}", hash, e);
+                })?;
+                client.seek(at).inspect_err(|e| {
+                    warn!("Failed to seek {} to {}: {}", hash, at, e);
+                })?;
+                if then == Transport::Playing {
+                    client.play().inspect_err(|e| {
+                        warn!("Failed to play after load: {}", e);
+                    })?;
+                }
+            }
             PlaybackEffect::EmitEvent(event) => {
                 publish_event_on_socket(event_pub, &event);
             }
@@ -652,21 +727,9 @@ fn persist_and_publish(queue_file: &Path, event_pub: &Socket, queue: &VecDeque<Q
     );
 }
 
-/// Pop the queue front; if something was popped, persist and publish.
-fn pop_front_and_publish(
-    queue_file: &Path,
-    event_pub: &Socket,
-    queue: &mut VecDeque<QueueEntry>,
-) -> Option<QueueEntry> {
-    let entry = queue.pop_front();
-    if entry.is_some() {
-        persist_and_publish(queue_file, event_pub, queue);
-    }
-    entry
-}
-
 /// The track the audio source should have preloaded: the front of the queue
-/// while a track is Playing or Paused, nothing otherwise.
+/// while a track is Playing or Paused, nothing otherwise (a preview is not
+/// followed by the queue: playback goes back to what it held).
 ///
 /// The same track twice in a row is not preloaded: a gapless switch from `a`
 /// to `a` is invisible to the poll (audible == current), so that case goes
@@ -677,7 +740,7 @@ fn desired_preload(state: &PlaybackState, queue: &VecDeque<QueueEntry>) -> Optio
             .front()
             .filter(|e| e.hash != *hash)
             .map(|e| e.hash.clone()),
-        PlaybackState::Idle => None,
+        PlaybackState::Idle | PlaybackState::Previewing { .. } => None,
     }
 }
 
@@ -822,20 +885,44 @@ fn advance_and_dequeue(
     (effects, removed)
 }
 
+/// Offer the queue front to a transition of the state machine and pop it only
+/// if the transition took it: one that did nothing (a stale observation, no
+/// effects) or refused (`Err`, while previewing) leaves the queue as it was.
+/// Returns the effects and the popped entry, if any.
+fn offer_front<E>(
+    sm: &mut PlaybackStateMachine,
+    queue: &mut VecDeque<QueueEntry>,
+    transition: impl FnOnce(
+        &mut PlaybackStateMachine,
+        Option<(CanonicalHash, SourceName)>,
+    ) -> Result<Vec<PlaybackEffect>, E>,
+) -> Result<(Vec<PlaybackEffect>, Option<QueueEntry>), E> {
+    let next = queue.front().map(|e| (e.hash.clone(), e.source.clone()));
+    let effects = transition(sm, next)?;
+    if effects.is_empty() {
+        return Ok((effects, None));
+    }
+    Ok((effects, queue.pop_front()))
+}
+
 /// Track finished without a switch: offer the queue front to the state machine
-/// and pop it only if the state machine transitioned. Returns the effects and
-/// the popped entry, if any.
+/// and pop it only if the state machine transitioned.
 fn finish_and_dequeue(
     sm: &mut PlaybackStateMachine,
     queue: &mut VecDeque<QueueEntry>,
     finished: &CanonicalHash,
 ) -> (Vec<PlaybackEffect>, Option<QueueEntry>) {
-    let next = queue.front().map(|e| (e.hash.clone(), e.source.clone()));
-    let effects = sm.track_ended(finished, next);
-    if effects.is_empty() {
-        return (effects, None);
+    let Ok(taken) = offer_front::<std::convert::Infallible>(sm, queue, |sm, next| {
+        Ok(sm.track_ended(finished, next))
+    });
+    taken
+}
+
+/// The answer to a command the state machine refused.
+fn refusal_response(refusal: Refusal) -> Response {
+    Response::Err {
+        message: refusal.to_string(),
     }
-    (effects, queue.pop_front())
 }
 
 /// Send Preload/ClearPreload if the queue front differs from the last value sent.
@@ -939,8 +1026,44 @@ impl PreloadBook {
 fn state_hash(state: &PlaybackState) -> Option<&CanonicalHash> {
     match state {
         PlaybackState::Idle => None,
-        PlaybackState::Playing { hash } | PlaybackState::Paused { hash } => Some(hash),
+        PlaybackState::Playing { hash }
+        | PlaybackState::Paused { hash }
+        | PlaybackState::Previewing { hash, .. } => Some(hash),
     }
+}
+
+/// The audible track while it plays, a preview too; none when paused or idle.
+fn playing_hash(state: &PlaybackState) -> Option<&CanonicalHash> {
+    match state {
+        PlaybackState::Playing { hash }
+        | PlaybackState::Previewing {
+            hash,
+            transport: Transport::Playing,
+            ..
+        } => Some(hash),
+        PlaybackState::Idle | PlaybackState::Paused { .. } | PlaybackState::Previewing { .. } => {
+            None
+        }
+    }
+}
+
+/// Which track the source says is audible and where, when it says both.
+fn observed_position(info: &StreamTrackInfo) -> Option<Observed> {
+    Some(Observed {
+        hash: CanonicalHash::try_from(info.content_hash.clone()?).ok()?,
+        at: PositionMs::new(info.position_ms?),
+    })
+}
+
+/// Whether a poll's `Finished` is about `current`: only the track the state
+/// machine has as audible can have finished. A late `Finished` for the track
+/// that was audible before (a preview that just ended) is not this one's.
+fn finished_current(
+    finished: bool,
+    heard: Option<&CanonicalHash>,
+    current: &CanonicalHash,
+) -> bool {
+    finished && heard == Some(current)
 }
 
 /// The `PositionUpdate` for `hash` from what the source reported, if it
@@ -970,17 +1093,39 @@ async fn publish_position(
 /// what the source reported (`None` when idle, or when the source could not be
 /// asked).
 fn transport_status(state: &PlaybackState, info: Option<&StreamTrackInfo>) -> TransportStatus {
-    let (transport, hash) = match state {
+    let (transport, hash, preview) = match state {
         PlaybackState::Idle => return TransportStatus::Idle,
-        PlaybackState::Playing { hash } => (Transport::Playing, hash),
-        PlaybackState::Paused { hash } => (Transport::Paused, hash),
+        PlaybackState::Playing { hash } => (Transport::Playing, hash, None),
+        PlaybackState::Paused { hash } => (Transport::Paused, hash, None),
+        PlaybackState::Previewing {
+            hash,
+            transport,
+            back_to,
+        } => (
+            *transport,
+            hash,
+            Some(PreviewStatus {
+                back_to: match back_to {
+                    BackTo::Nothing => None,
+                    BackTo::Track {
+                        hash,
+                        at,
+                        transport,
+                    } => Some(Held {
+                        hash: hash.into(),
+                        at: *at,
+                        transport: *transport,
+                    }),
+                },
+            }),
+        ),
     };
     TransportStatus::Loaded {
         transport,
         now: hash.clone().into(),
         position_ms: info.and_then(|i| i.position_ms).map(PositionMs::new),
         duration_ms: info.and_then(|i| i.duration_ms).map(PositionMs::new),
-        preview: None,
+        preview,
     }
 }
 
@@ -1059,31 +1204,28 @@ async fn poll_once(task: &PollTask, poll: &mut PollState) {
     } = poll;
     *tick = tick.wrapping_add(1);
 
-    // Every 5th tick (~1 s) broadcast a position update while playing.
+    // Every 5th tick (~1 s) broadcast a position update while playing, a
+    // preview too.
     if tick.is_multiple_of(5) {
         let current_state = state.lock().await;
-        if let PlaybackState::Playing { hash } = current_state.state() {
-            let h = hash.clone();
+        if let Some(h) = playing_hash(current_state.state()).cloned() {
             drop(current_state);
             publish_position(audio, event_pub, &h).await;
         }
     }
 
     let snapshot = state.lock().await.state().clone();
-    let (current_hash, is_playing) = match &snapshot {
-        PlaybackState::Playing { hash } => (hash.clone(), true),
-        PlaybackState::Paused { hash } => (hash.clone(), false),
-        PlaybackState::Idle => {
-            // Stopped: the source dropped its preload; make sure we re-send later.
-            book.idle();
-            // The output keeps running while Idle, so its health stays
-            // meaningful: keep watching it (~1 s).
-            if tick.is_multiple_of(5) {
-                let _ = refresh_output(audio, event_pub, output_cache, last_output).await;
-            }
-            return;
+    let Some(current_hash) = state_hash(&snapshot).cloned() else {
+        // Stopped: the source dropped its preload; make sure we re-send later.
+        book.idle();
+        // The output keeps running while Idle, so its health stays
+        // meaningful: keep watching it (~1 s).
+        if tick.is_multiple_of(5) {
+            let _ = refresh_output(audio, event_pub, output_cache, last_output).await;
         }
+        return;
     };
+    let is_playing = playing_hash(&snapshot).is_some();
     // A new track (manual load, skip, advance) or a seek: the source's
     // preload is gone, so re-send it.
     book.observe(&current_hash, seek_epoch.current());
@@ -1111,6 +1253,8 @@ async fn poll_once(task: &PollTask, poll: &mut PollState) {
             }
         };
     remember_next(&mut book.known, reported_next.as_ref());
+    // Both branches below act on `finished` for the audible track only.
+    let finished = finished_current(finished, heard.as_ref(), &current_hash);
 
     if !is_playing {
         // Paused: no advancing, but keep the preload in sync.
@@ -1121,6 +1265,25 @@ async fn poll_once(task: &PollTask, poll: &mut PollState) {
     // The snapshot predates the poll; a command (e.g. Skip) may have moved
     // the state since. Drop this observation rather than act on it.
     if state.lock().await.current_hash() != Some(&current_hash) {
+        return;
+    }
+
+    if matches!(snapshot, PlaybackState::Previewing { .. }) {
+        // No preload while previewing (`desired_preload` is none). The preview
+        // ended by itself: go back, whatever the queue holds.
+        reconcile_preload(audio, queue, &snapshot, book).await;
+        if finished {
+            let effects = state.lock().await.preview_finished(&current_hash);
+            if effects.is_empty() {
+                return;
+            }
+            info!("Preview finished: {:?}", current_hash);
+            if let Err(e) = execute_effects(effects, audio, event_pub, acid_client).await {
+                warn!("Going back after a preview failed: {}", e);
+            }
+            // The source dropped its preload when it loaded the held track.
+            seek_epoch.bump();
+        }
         return;
     }
 
@@ -1302,7 +1465,8 @@ mod tests {
         // Drive state machine to Paused.
         {
             let mut sm = server.state.lock().await;
-            sm.play_queue(h("paused_track"), SourceName::audio());
+            sm.play_queue(Some((h("paused_track"), SourceName::audio())))
+                .unwrap();
             sm.pause();
         }
 
@@ -1352,7 +1516,8 @@ mod tests {
         // Drive the state machine directly into Paused.
         {
             let mut sm = server.state.lock().await;
-            sm.play_queue(h("test"), SourceName::audio());
+            sm.play_queue(Some((h("test"), SourceName::audio())))
+                .unwrap();
             sm.pause();
         }
 
@@ -1367,7 +1532,7 @@ mod tests {
         // Issue Skip directly on the state machine.
         // We skip effects execution entirely — the audio stub doesn't respond,
         // and we only care about the state transition here.
-        let _effects = server.state.lock().await.skip(None);
+        let _effects = server.state.lock().await.skip(None).unwrap();
 
         assert!(
             matches!(server.state.lock().await.state(), PlaybackState::Idle),
@@ -1791,7 +1956,7 @@ mod tests {
     fn scenario_queue_edited_inside_commit_window_records_heard_and_keeps_edit() {
         // Playing a; queue [b, c]; b sent and committed; user does QueueNext x.
         let mut sm = PlaybackStateMachine::new();
-        sm.play_queue(h("a"), SourceName::audio());
+        sm.play_queue(Some((h("a"), SourceName::audio()))).unwrap();
         let mut q: VecDeque<_> = [entry("x"), entry("b"), entry("c")].into();
         let known = vec![h("b"), h("x")];
 
@@ -1813,7 +1978,7 @@ mod tests {
     fn advance_rejected_by_state_machine_leaves_queue_untouched() {
         // A Pause landed between the poll and the advance: the guard rejects.
         let mut sm = PlaybackStateMachine::new();
-        sm.play_queue(h("a"), SourceName::audio());
+        sm.play_queue(Some((h("a"), SourceName::audio()))).unwrap();
         sm.pause();
         let mut q: VecDeque<_> = [entry("b"), entry("c")].into();
 
@@ -1827,7 +1992,7 @@ mod tests {
     #[test]
     fn finish_rejected_by_state_machine_leaves_queue_untouched() {
         let mut sm = PlaybackStateMachine::new();
-        sm.play_queue(h("a"), SourceName::audio());
+        sm.play_queue(Some((h("a"), SourceName::audio()))).unwrap();
         sm.pause();
         let mut q: VecDeque<_> = [entry("b")].into();
 
@@ -1840,7 +2005,7 @@ mod tests {
     #[test]
     fn finish_pops_front_when_state_machine_transitions() {
         let mut sm = PlaybackStateMachine::new();
-        sm.play_queue(h("a"), SourceName::audio());
+        sm.play_queue(Some((h("a"), SourceName::audio()))).unwrap();
         let mut q: VecDeque<_> = [entry("b"), entry("c")].into();
 
         let (effects, popped) = finish_and_dequeue(&mut sm, &mut q, &h("a"));
@@ -1853,7 +2018,7 @@ mod tests {
     #[test]
     fn finish_with_empty_queue_goes_idle() {
         let mut sm = PlaybackStateMachine::new();
-        sm.play_queue(h("a"), SourceName::audio());
+        sm.play_queue(Some((h("a"), SourceName::audio()))).unwrap();
         let mut q: VecDeque<QueueEntry> = VecDeque::new();
 
         let (effects, popped) = finish_and_dequeue(&mut sm, &mut q, &h("a"));
@@ -1867,7 +2032,7 @@ mod tests {
         // The source parked the preload (sample-rate change): a finishes with
         // no switch, so the queue front is popped and loaded explicitly.
         let mut sm = PlaybackStateMachine::new();
-        sm.play_queue(h("a"), SourceName::audio());
+        sm.play_queue(Some((h("a"), SourceName::audio()))).unwrap();
         let mut q: VecDeque<_> = [entry("b")].into();
 
         let action = classify_poll(true, Some(&h("a")), &[h("b")], &h("a"));
@@ -1883,7 +2048,7 @@ mod tests {
     #[test]
     fn scenario_end_of_queue_goes_idle() {
         let mut sm = PlaybackStateMachine::new();
-        sm.play_queue(h("a"), SourceName::audio());
+        sm.play_queue(Some((h("a"), SourceName::audio()))).unwrap();
         let q: VecDeque<QueueEntry> = VecDeque::new();
 
         assert_eq!(
@@ -1902,7 +2067,7 @@ mod tests {
     #[test]
     fn scenario_same_track_twice_plays_twice() {
         let mut sm = PlaybackStateMachine::new();
-        sm.play_queue(h("a"), SourceName::audio());
+        sm.play_queue(Some((h("a"), SourceName::audio()))).unwrap();
         let mut q: VecDeque<_> = [entry("a")].into();
 
         // No preload for a duplicate of the current track.
@@ -1968,7 +2133,8 @@ mod tests {
             .state
             .lock()
             .await
-            .play_queue(h(label), SourceName::audio());
+            .play_queue(Some((h(label), SourceName::audio())))
+            .unwrap();
     }
 
     #[tokio::test]
@@ -2145,6 +2311,624 @@ mod tests {
             deck: media_protocol::Deck::A
         }));
         assert!(!is_read_only(&seek_to(0)));
+    }
+
+    // -------------------------------------------------------------------------
+    // Preview hold (ADR-031)
+    // -------------------------------------------------------------------------
+
+    fn preview_command(label: &str) -> Command {
+        Command::Preview {
+            deck: media_protocol::Deck::A,
+            hash: full(label),
+        }
+    }
+
+    fn end_preview_command() -> Command {
+        Command::EndPreview {
+            deck: media_protocol::Deck::A,
+        }
+    }
+
+    fn get_transport_command() -> Command {
+        Command::GetTransport {
+            deck: media_protocol::Deck::A,
+        }
+    }
+
+    fn load_of(label: &str) -> StreamCommand {
+        StreamCommand::Load {
+            content_hash: full(label),
+        }
+    }
+
+    fn assert_ok(response: Response) {
+        assert!(matches!(response, Response::Ok { .. }), "{response:?}");
+    }
+
+    fn held_a_at_1_30(transport: Transport) -> crate::playback_state::BackTo {
+        crate::playback_state::BackTo::Track {
+            hash: h("a"),
+            at: PositionMs::new(90_000),
+            transport,
+        }
+    }
+
+    /// `a` plays at 1:30 and `b` is previewed over it.
+    async fn previewing_b_over_a(harness: &Harness) {
+        start(&harness.server, "a").await;
+        assert_ok(harness.server.handle_command(preview_command("b")).await);
+    }
+
+    #[tokio::test]
+    async fn a_preview_holds_where_the_source_says_the_audible_track_is() {
+        let harness = make_harness(source_playing_a);
+        start(&harness.server, "a").await;
+
+        assert_ok(harness.server.handle_command(preview_command("b")).await);
+
+        assert_eq!(
+            harness.server.state.lock().await.state(),
+            &PlaybackState::Previewing {
+                hash: h("b"),
+                transport: Transport::Playing,
+                back_to: held_a_at_1_30(Transport::Playing),
+            }
+        );
+        assert_eq!(
+            harness.sent(),
+            vec![StreamCommand::Loaded, load_of("b"), StreamCommand::Play]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_preview_from_idle_asks_no_one_and_holds_nothing() {
+        let harness = make_harness(source_playing_a);
+
+        assert_ok(harness.server.handle_command(preview_command("b")).await);
+
+        assert_eq!(
+            harness.server.state.lock().await.state(),
+            &PlaybackState::Previewing {
+                hash: h("b"),
+                transport: Transport::Playing,
+                back_to: crate::playback_state::BackTo::Nothing,
+            }
+        );
+        assert_eq!(harness.sent(), vec![load_of("b"), StreamCommand::Play]);
+    }
+
+    #[tokio::test]
+    async fn a_preview_refuses_a_prefix_and_changes_nothing() {
+        let harness = make_harness(source_playing_a);
+
+        let response = harness
+            .server
+            .handle_command(Command::Preview {
+                deck: media_protocol::Deck::A,
+                hash: short(),
+            })
+            .await;
+
+        assert_refused(response);
+        assert!(harness.sent().is_empty());
+        assert_eq!(
+            harness.server.state.lock().await.state(),
+            &PlaybackState::Idle
+        );
+    }
+
+    /// A preview over a playing `a` whose source answers `Loaded` with `reply`
+    /// is refused, and nothing is loaded or changed.
+    async fn assert_preview_refused_when_source_says(reply: StreamResponse) {
+        let harness = make_harness(move |command| match command {
+            StreamCommand::Loaded => reply.clone(),
+            _ => StreamResponse::Ok,
+        });
+        start(&harness.server, "a").await;
+
+        let response = harness.server.handle_command(preview_command("b")).await;
+
+        let Response::Err { message } = response else {
+            panic!("expected a refusal, got {response:?}");
+        };
+        assert_eq!(
+            message,
+            "Cannot preview: the source does not say where the playing track is"
+        );
+        assert_eq!(harness.sent(), vec![StreamCommand::Loaded]);
+        assert_eq!(
+            harness.server.state.lock().await.state(),
+            &PlaybackState::Playing { hash: h("a") }
+        );
+        assert_eq!(harness.server.seek_epoch.current(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_preview_is_refused_when_the_source_does_not_say_the_position() {
+        assert_preview_refused_when_source_says(StreamResponse::Loaded {
+            info: Some(StreamTrackInfo {
+                state: StreamPlaybackState::Playing,
+                content_hash: Some(full("a")),
+                title: None,
+                artist: None,
+                album: None,
+                position_ms: None,
+                duration_ms: None,
+                preloaded: None,
+            }),
+            output: None,
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_preview_is_refused_when_the_source_cannot_be_asked() {
+        assert_preview_refused_when_source_says(StreamResponse::Error {
+            message: "busy".to_string(),
+        })
+        .await;
+    }
+
+    /// A gapless switch landed: the source says `x`, playback still has `a`.
+    #[tokio::test]
+    async fn a_preview_is_refused_when_the_source_speaks_of_another_track() {
+        assert_preview_refused_when_source_says(loaded("x", StreamPlaybackState::Playing)).await;
+    }
+
+    #[tokio::test]
+    async fn play_queue_while_previewing_is_refused_even_with_an_empty_queue() {
+        let harness = make_harness(source_playing_a);
+        previewing_b_over_a(&harness).await;
+
+        let response = harness.server.handle_command(Command::PlayQueue).await;
+
+        let Response::Err { message } = response else {
+            panic!("expected a refusal, got {response:?}");
+        };
+        assert_eq!(message, "Previewing: go back first");
+    }
+
+    #[tokio::test]
+    async fn play_queue_with_an_empty_queue_says_so() {
+        let harness = make_harness(source_playing_a);
+
+        let response = harness.server.handle_command(Command::PlayQueue).await;
+
+        let Response::Err { message } = response else {
+            panic!("expected an error, got {response:?}");
+        };
+        assert_eq!(message, "Queue is empty");
+    }
+
+    #[tokio::test]
+    async fn play_queue_on_a_paused_track_resumes_it_and_keeps_the_queue() {
+        let harness = make_harness(source_playing_a);
+        start(&harness.server, "a").await;
+        harness.server.state.lock().await.pause();
+        harness.server.queue.lock().await.push_back(entry("c"));
+
+        assert_ok(harness.server.handle_command(Command::PlayQueue).await);
+
+        assert_eq!(queued(&harness.server).await, vec![full("c")]);
+        assert_eq!(harness.sent(), vec![StreamCommand::Play]);
+    }
+
+    #[tokio::test]
+    async fn play_resumes_a_paused_preview() {
+        let harness = make_harness(source_playing_a);
+        previewing_b_over_a(&harness).await;
+        harness.server.state.lock().await.pause();
+        let before = harness.sent().len();
+
+        assert_ok(
+            harness
+                .server
+                .handle_command(Command::Play {
+                    deck: media_protocol::Deck::A,
+                })
+                .await,
+        );
+
+        assert_eq!(harness.sent()[before..], [StreamCommand::Play]);
+    }
+
+    #[tokio::test]
+    async fn end_preview_says_which_track_is_audible_afterwards() {
+        let harness = make_harness(source_playing_a);
+        previewing_b_over_a(&harness).await;
+
+        let response = harness.server.handle_command(end_preview_command()).await;
+
+        assert!(matches!(
+            response,
+            Response::Ok { data: Some(ResponseData::NowPlaying(Some(now))) } if now == full("a")
+        ));
+    }
+
+    #[tokio::test]
+    async fn back_to_nothing_says_nothing_is_audible() {
+        let harness = make_harness(source_playing_a);
+        assert_ok(harness.server.handle_command(preview_command("b")).await);
+
+        let response = harness.server.handle_command(end_preview_command()).await;
+
+        assert!(matches!(
+            response,
+            Response::Ok {
+                data: Some(ResponseData::NowPlaying(None))
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn back_loads_the_held_track_seeks_to_where_it_was_and_plays() {
+        let harness = make_harness(source_playing_a);
+        previewing_b_over_a(&harness).await;
+        let before = harness.sent().len();
+
+        assert_ok(harness.server.handle_command(end_preview_command()).await);
+
+        assert_eq!(
+            harness.sent()[before..],
+            [
+                load_of("a"),
+                StreamCommand::Seek {
+                    position_ms: PositionMs::new(90_000)
+                },
+                StreamCommand::Play
+            ]
+        );
+        assert_eq!(
+            harness.server.state.lock().await.state(),
+            &PlaybackState::Playing { hash: h("a") }
+        );
+    }
+
+    #[tokio::test]
+    async fn back_to_a_paused_track_does_not_play() {
+        let harness = make_harness(source_playing_a);
+        start(&harness.server, "a").await;
+        harness.server.state.lock().await.pause();
+        assert_ok(harness.server.handle_command(preview_command("b")).await);
+        let before = harness.sent().len();
+
+        assert_ok(harness.server.handle_command(end_preview_command()).await);
+
+        assert_eq!(
+            harness.sent()[before..],
+            [
+                load_of("a"),
+                StreamCommand::Seek {
+                    position_ms: PositionMs::new(90_000)
+                }
+            ]
+        );
+        assert_eq!(
+            harness.server.state.lock().await.state(),
+            &PlaybackState::Paused { hash: h("a") }
+        );
+    }
+
+    #[tokio::test]
+    async fn end_preview_with_no_preview_is_ok_and_asks_no_one() {
+        let harness = make_harness(source_playing_a);
+        start(&harness.server, "a").await;
+
+        assert_ok(harness.server.handle_command(end_preview_command()).await);
+
+        assert!(harness.sent().is_empty());
+        assert_eq!(
+            harness.server.state.lock().await.state(),
+            &PlaybackState::Playing { hash: h("a") }
+        );
+    }
+
+    #[tokio::test]
+    async fn skip_and_play_queue_are_refused_while_previewing_and_the_queue_is_kept() {
+        let harness = make_harness(source_playing_a);
+        previewing_b_over_a(&harness).await;
+        harness.server.queue.lock().await.push_back(entry("c"));
+        let before = harness.sent().len();
+
+        for command in [Command::Skip, Command::PlayQueue] {
+            let Response::Err { message } = harness.server.handle_command(command).await else {
+                panic!("expected a refusal");
+            };
+            assert_eq!(message, "Previewing: go back first");
+        }
+
+        assert_eq!(queued(&harness.server).await, vec![full("c")]);
+        assert_eq!(harness.sent().len(), before, "the source is not touched");
+        assert!(matches!(
+            harness.server.state.lock().await.state(),
+            PlaybackState::Previewing { hash, .. } if *hash == h("b")
+        ));
+    }
+
+    #[tokio::test]
+    async fn queue_edits_are_allowed_while_previewing() {
+        let harness = make_harness(source_playing_a);
+        previewing_b_over_a(&harness).await;
+
+        assert_ok(
+            harness
+                .server
+                .handle_command(Command::QueueAppend {
+                    hash: full("c"),
+                    source: SourceName::audio(),
+                })
+                .await,
+        );
+
+        assert_eq!(queued(&harness.server).await, vec![full("c")]);
+    }
+
+    #[tokio::test]
+    async fn stop_while_previewing_ends_everything() {
+        let harness = make_harness(source_playing_a);
+        previewing_b_over_a(&harness).await;
+
+        let response = harness
+            .server
+            .handle_command(Command::Stop {
+                deck: media_protocol::Deck::A,
+            })
+            .await;
+
+        assert_ok(response);
+        assert_eq!(
+            harness.server.state.lock().await.state(),
+            &PlaybackState::Idle
+        );
+        assert_eq!(harness.sent().last(), Some(&StreamCommand::Stop));
+    }
+
+    #[tokio::test]
+    async fn pause_resume_and_seek_act_on_the_preview() {
+        let harness = make_harness(source_playing_a);
+        previewing_b_over_a(&harness).await;
+        let before = harness.sent().len();
+
+        assert_ok(
+            harness
+                .server
+                .handle_command(Command::Pause {
+                    deck: media_protocol::Deck::A,
+                })
+                .await,
+        );
+        let seeked = transport_of(harness.server.handle_command(seek_to(5_000)).await);
+        assert_ok(
+            harness
+                .server
+                .handle_command(Command::Resume {
+                    deck: media_protocol::Deck::A,
+                })
+                .await,
+        );
+
+        let sent = harness.sent();
+        assert_eq!(sent[before], StreamCommand::Pause);
+        assert_eq!(
+            sent[before + 1],
+            StreamCommand::Seek {
+                position_ms: PositionMs::new(5_000)
+            }
+        );
+        assert_eq!(sent.last(), Some(&StreamCommand::Play));
+        // The seek answers about the preview, not the held track.
+        assert!(matches!(
+            seeked,
+            TransportStatus::Loaded { transport: Transport::Paused, now, .. } if now == full("b")
+        ));
+        assert!(matches!(
+            harness.server.state.lock().await.state(),
+            PlaybackState::Previewing { transport: Transport::Playing, back_to, .. }
+                if *back_to == held_a_at_1_30(Transport::Playing)
+        ));
+    }
+
+    #[tokio::test]
+    async fn get_transport_shows_the_preview_and_where_it_goes_back_to() {
+        let harness = make_harness(source_playing_a);
+        previewing_b_over_a(&harness).await;
+
+        let status = transport_of(harness.server.handle_command(get_transport_command()).await);
+
+        assert_eq!(
+            status,
+            TransportStatus::Loaded {
+                transport: Transport::Playing,
+                now: full("b"),
+                position_ms: Some(PositionMs::new(90_000)),
+                duration_ms: Some(PositionMs::new(240_000)),
+                preview: Some(media_protocol::PreviewStatus {
+                    back_to: Some(Held {
+                        hash: full("a"),
+                        at: PositionMs::new(90_000),
+                        transport: Transport::Playing,
+                    }),
+                }),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn get_transport_of_a_preview_over_nothing_goes_back_to_nothing() {
+        let harness = make_harness(source_playing_a);
+        assert_ok(harness.server.handle_command(preview_command("b")).await);
+
+        let status = transport_of(harness.server.handle_command(get_transport_command()).await);
+
+        assert!(matches!(
+            status,
+            TransportStatus::Loaded {
+                preview: Some(media_protocol::PreviewStatus { back_to: None }),
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn now_playing_names_the_preview_while_it_runs() {
+        let harness = make_harness(source_playing_a);
+        previewing_b_over_a(&harness).await;
+
+        let response = harness.server.handle_command(Command::NowPlaying).await;
+
+        assert!(matches!(
+            response,
+            Response::Ok { data: Some(ResponseData::NowPlaying(Some(now))) } if now == full("b")
+        ));
+    }
+
+    /// The source dropped its preload when it loaded the preview, and the
+    /// poll loop must neither send one nor believe it still has one.
+    #[tokio::test]
+    async fn no_preload_while_previewing_and_it_comes_back_after_the_pop() {
+        let harness = make_harness(source_playing_a);
+        start(&harness.server, "a").await;
+        harness.server.queue.lock().await.push_back(entry("c"));
+        let task = harness.server.poll_task();
+        let mut poll = PollState::default();
+        poll_once(&task, &mut poll).await;
+        assert_eq!(harness.sent_preloads(), vec![full("c")]);
+
+        assert_ok(harness.server.handle_command(preview_command("b")).await);
+        for _ in 0..3 {
+            poll_once(&task, &mut poll).await;
+        }
+        assert_eq!(
+            harness.sent_preloads(),
+            vec![full("c")],
+            "nothing is preloaded while previewing"
+        );
+
+        assert_ok(harness.server.handle_command(end_preview_command()).await);
+        poll_once(&task, &mut poll).await;
+        assert_eq!(harness.sent_preloads(), vec![full("c"), full("c")]);
+    }
+
+    #[tokio::test]
+    async fn position_updates_name_the_preview_while_it_plays() {
+        let harness = make_harness(source_playing_a);
+        let events = harness.subscribe();
+        previewing_b_over_a(&harness).await;
+        let task = harness.server.poll_task();
+        let mut poll = PollState::default();
+
+        for _ in 0..5 {
+            poll_once(&task, &mut poll).await;
+        }
+
+        let mut seen = Vec::new();
+        while let Ok(msg) = events.recv() {
+            let (_, event) = event_protocol::from_topic_message(msg.as_slice()).unwrap();
+            if let PlaybackEvent::PositionUpdate { hash, .. } = event {
+                assert_eq!(hash, full("b"));
+                return;
+            }
+            seen.push(event);
+        }
+        panic!("no PositionUpdate, saw {seen:?}");
+    }
+
+    /// A source that reports `a` playing until it is told to load anything,
+    /// and from then on `b` as finished, whatever it loaded: a preview of `b`
+    /// that ended, and a source that is late to report what is audible.
+    fn source_whose_preview_b_finishes(
+    ) -> impl Fn(&StreamCommand) -> StreamResponse + Send + 'static {
+        let loaded_any = std::sync::atomic::AtomicBool::new(false);
+        move |command| match command {
+            StreamCommand::Load { .. } => {
+                loaded_any.store(true, Ordering::SeqCst);
+                StreamResponse::Ok
+            }
+            StreamCommand::Loaded if loaded_any.load(Ordering::SeqCst) => {
+                loaded("b", StreamPlaybackState::Finished)
+            }
+            other => source_playing_a(other),
+        }
+    }
+
+    /// A late `Finished` for the preview, after Back, is not the end of the
+    /// restored track.
+    #[tokio::test]
+    async fn a_late_finished_for_the_old_preview_does_not_end_the_restored_track() {
+        let harness = make_harness(source_whose_preview_b_finishes());
+        start(&harness.server, "a").await;
+        harness.server.queue.lock().await.push_back(entry("c"));
+        assert_ok(harness.server.handle_command(preview_command("b")).await);
+        let task = harness.server.poll_task();
+        let mut poll = PollState::default();
+        poll_once(&task, &mut poll).await;
+        assert_eq!(
+            harness.server.state.lock().await.state(),
+            &PlaybackState::Playing { hash: h("a") }
+        );
+        let before = harness.sent().len();
+
+        // The source still says `b` finished.
+        poll_once(&task, &mut poll).await;
+
+        assert_eq!(
+            harness.server.state.lock().await.state(),
+            &PlaybackState::Playing { hash: h("a") }
+        );
+        assert_eq!(queued(&harness.server).await, vec![full("c")]);
+        assert!(
+            harness.sent()[before..]
+                .iter()
+                .all(|c| !matches!(c, StreamCommand::Load { .. })),
+            "nothing is loaded over the restored track"
+        );
+    }
+
+    /// The preview played to its end: the poll loop sends playback back by
+    /// itself, and the queue is not advanced.
+    #[tokio::test]
+    async fn a_preview_that_finishes_goes_back_and_does_not_pop_the_queue() {
+        let harness = make_harness(source_whose_preview_b_finishes());
+        let events = harness.subscribe();
+        start(&harness.server, "a").await;
+        harness.server.queue.lock().await.push_back(entry("c"));
+        assert_ok(harness.server.handle_command(preview_command("b")).await);
+        let before = harness.sent().len();
+        let task = harness.server.poll_task();
+        let mut poll = PollState::default();
+
+        poll_once(&task, &mut poll).await;
+
+        assert_eq!(
+            harness.server.state.lock().await.state(),
+            &PlaybackState::Playing { hash: h("a") }
+        );
+        assert_eq!(
+            harness.sent()[before..]
+                .iter()
+                .filter(|c| !matches!(c, StreamCommand::Loaded))
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![
+                load_of("a"),
+                StreamCommand::Seek {
+                    position_ms: PositionMs::new(90_000)
+                },
+                StreamCommand::Play
+            ]
+        );
+        assert_eq!(queued(&harness.server).await, vec![full("c")]);
+        let mut seen = Vec::new();
+        while let Ok(msg) = events.recv() {
+            let (_, event) = event_protocol::from_topic_message(msg.as_slice()).unwrap();
+            if let PlaybackEvent::PreviewEnded { hash, resumed } = event {
+                assert_eq!((hash, resumed), (full("b"), Some(full("a"))));
+                return;
+            }
+            seen.push(event);
+        }
+        panic!("no PreviewEnded, saw {seen:?}");
     }
 
     // -------------------------------------------------------------------------

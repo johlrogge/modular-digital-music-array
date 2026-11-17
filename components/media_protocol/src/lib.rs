@@ -5,5 +5,6 @@ pub use playback_primitives::{
     PositionMs, SourceName,
 };
 pub use protocol::{
-    require_canonical, Command, PreviewStatus, Response, ResponseData, Transport, TransportStatus,
+    require_canonical, Command, Held, PreviewStatus, Response, ResponseData, Transport,
+    TransportStatus,
 };

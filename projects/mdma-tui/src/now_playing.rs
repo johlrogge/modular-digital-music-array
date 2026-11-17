@@ -1,5 +1,5 @@
 use event_protocol::PlaybackEvent;
-use mdma_client::ContentHash;
+use mdma_client::{ContentHash, PositionMs, Transport, TransportStatus};
 
 /// Represents the current playback state as a proper enum,
 /// eliminating the illegal state of (None, is_paused=true).
@@ -16,6 +16,18 @@ pub enum PlaybackStatus {
         position_ms: u64,
         duration_ms: u64,
     },
+}
+
+impl PlaybackStatus {
+    /// The track shown, if any.
+    fn track(&self) -> Option<&ContentHash> {
+        match self {
+            PlaybackStatus::Stopped => None,
+            PlaybackStatus::Playing { track, .. } | PlaybackStatus::Paused { track, .. } => {
+                Some(track)
+            }
+        }
+    }
 }
 
 /// State reducer over PlaybackEvents.
@@ -50,9 +62,58 @@ impl NowPlaying {
         self.artist = artist;
     }
 
+    /// Take the state from what the node says it is (`GetTransport`): the
+    /// source of truth when the audible track changes without a `TrackStarted`
+    /// (a preview starting or ending, ADR-031). Returns `true`: redraw.
+    pub fn apply_transport(&mut self, status: &TransportStatus) -> bool {
+        self.status = match status {
+            TransportStatus::Idle => PlaybackStatus::Stopped,
+            TransportStatus::Loaded {
+                transport,
+                now,
+                position_ms,
+                duration_ms,
+                ..
+            } => {
+                let track = now.clone();
+                let position_ms = position_ms.map_or(0, PositionMs::as_millis);
+                let duration_ms = duration_ms.map_or(0, PositionMs::as_millis);
+                match transport {
+                    Transport::Playing => PlaybackStatus::Playing {
+                        track,
+                        position_ms,
+                        duration_ms,
+                    },
+                    Transport::Paused => PlaybackStatus::Paused {
+                        track,
+                        position_ms,
+                        duration_ms,
+                    },
+                }
+            }
+        };
+        true
+    }
+
+    /// Whether an event names a track other than the one shown. Such an
+    /// event is about something that is not audible (the held track while a
+    /// preview plays), so it must not change what is shown.
+    fn names_other_track(&self, hash: &ContentHash) -> bool {
+        self.status.track().is_some_and(|shown| shown != hash)
+    }
+
     /// Apply a playback event, returning `true` if a redraw is warranted.
     pub fn apply(&mut self, event: &PlaybackEvent) -> bool {
         match event {
+            PlaybackEvent::TrackEnded { hash }
+            | PlaybackEvent::TrackStopped { hash }
+            | PlaybackEvent::TrackPaused { hash }
+            | PlaybackEvent::TrackResumed { hash }
+            | PlaybackEvent::PositionUpdate { hash, .. }
+                if self.names_other_track(hash) =>
+            {
+                false
+            }
             PlaybackEvent::TrackStarted { hash } => {
                 self.status = PlaybackStatus::Playing {
                     track: hash.clone(),
@@ -128,6 +189,10 @@ impl NowPlaying {
             PlaybackEvent::SessionStarted { .. }
             | PlaybackEvent::SessionEnded { .. }
             | PlaybackEvent::OutputChanged { .. } => false,
+            // The audible track changes without a TrackStarted: the caller
+            // re-reads the transport (`apply_transport`), which says what is
+            // audible and whether it plays, as these events do not.
+            PlaybackEvent::PreviewStarted { .. } | PlaybackEvent::PreviewEnded { .. } => false,
         }
     }
 
@@ -238,6 +303,61 @@ mod tests {
             }
         ));
         assert!(!redraw);
+    }
+
+    #[test]
+    fn events_about_another_track_do_not_change_what_is_shown() {
+        let mut np = NowPlaying::new();
+        let shown = make_hash("sha256:preview");
+        let held = make_hash("sha256:held");
+        np.apply(&PlaybackEvent::TrackStarted {
+            hash: shown.clone(),
+        });
+
+        assert!(!np.apply(&PlaybackEvent::TrackPaused { hash: held.clone() }));
+        assert!(!np.apply(&PlaybackEvent::TrackResumed { hash: held.clone() }));
+        assert!(!np.apply(&PlaybackEvent::TrackStopped { hash: held.clone() }));
+        assert!(!np.apply(&PlaybackEvent::TrackEnded { hash: held.clone() }));
+        np.apply(&PlaybackEvent::PositionUpdate {
+            hash: held,
+            position_ms: 9,
+            duration_ms: 99,
+        });
+
+        assert_eq!(
+            np.status,
+            PlaybackStatus::Playing {
+                track: shown,
+                position_ms: 0,
+                duration_ms: 0
+            }
+        );
+    }
+
+    #[test]
+    fn the_transport_the_node_reports_is_what_is_shown() {
+        let mut np = NowPlaying::new();
+        let loaded = |transport| TransportStatus::Loaded {
+            transport,
+            now: make_hash("sha256:abc"),
+            position_ms: Some(PositionMs::new(1_500)),
+            duration_ms: None,
+            preview: None,
+        };
+
+        assert!(np.apply_transport(&loaded(Transport::Paused)));
+        assert_eq!(
+            np.status,
+            PlaybackStatus::Paused {
+                track: make_hash("sha256:abc"),
+                position_ms: 1_500,
+                duration_ms: 0
+            }
+        );
+        np.apply_transport(&loaded(Transport::Playing));
+        assert!(matches!(np.status, PlaybackStatus::Playing { .. }));
+        np.apply_transport(&TransportStatus::Idle);
+        assert_eq!(np.status, PlaybackStatus::Stopped);
     }
 
     #[test]
