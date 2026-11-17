@@ -534,11 +534,26 @@ export function startRouter() {
 // Nothing here may call the raw /player/play-queue: playNow and start go through the server's
 // idle guard. Each action resolves true when the server did what was asked, false otherwise.
 
-const count = (hashes) => (hashes.length === 1 ? "1 track" : hashes.length + " tracks");
-const text = (subject, hashes) => subject || count(hashes);
+const count = (n) => (n === 1 ? "1 track" : n + " tracks");
 
-/** Run a queue mutation. Returns the body of a 2xx answer, or null after toasting the failure. */
-async function queueCall(path, body) {
+// What a queue action acts on is a "set": a function from the action ("next", "last", "replace",
+// "now") to the request that does it. The server holds every rule about which tracks can play.
+/** The set of tracks with these hashes. */
+export const ofHashes = (hashes) => (action) => ["/api/queue", { action, hashes }];
+/** The set of a playlist's lines: the server reads the playlist and leaves out the lines that cannot play. */
+export const ofPlaylist = (name) => (action) => ["/api/playlists/" + enc(name) + "/queue", { action }];
+/**
+ * Tracks as a set. Every track must carry a hash: a narrowed playlist page passes the rows it
+ * shows, and a narrowed list never holds an unavailable line (it has no hash, so no search matches
+ * it). Queueing a subset through the playlist route is not supported.
+ */
+export const setOf = (tracks) => {
+  if (tracks.some((t) => !t.hash)) throw new Error("a track without a hash cannot be queued");
+  return ofHashes(tracks.map((t) => t.hash));
+};
+
+/** Run a queue mutation. Returns the body of a 2xx answer, or null after toasting the failure; `stale` is the toast for a 409 that is not "busy". */
+async function queueCall(path, body, stale = "Up next changed, try again") {
   try {
     return await api(path, { body });
   } catch (e) {
@@ -555,7 +570,7 @@ async function queueCall(path, body) {
       toast("Something is already playing. Use Queue next or Queue last.");
       refreshPlayer();
     } else if (e instanceof ApiError && e.status === 409) {
-      toast("Up next changed, try again");
+      toast(stale);
     } else {
       toast("Couldn't change Up next: " + (e.message || "error"));
       refreshPlayer();
@@ -564,20 +579,42 @@ async function queueCall(path, body) {
   }
 }
 
-/** Apply a successful { queue, queued, error? } body. Returns true unless it was a partial (207). */
-function settle(body, hashes, done) {
+/** Apply a successful { queue, queued, error?, skipped? } body. Returns true unless it was a partial (207). */
+function settle(body, done) {
   if (Array.isArray(body.queue)) applyQueue(body.queue);
   if (body.error) {
-    if (body.stage === "start") toast("Queued, but couldn't start: " + body.error);
-    else toast("Queued " + body.queued + " of " + hashes.length + ": " + body.error);
+    toast(body.stage === "start" ? "Queued, but couldn't start: " + body.error : "Queued " + body.queued + ", then stopped: " + body.error);
     return false;
   }
   return done();
 }
 
-/** Toast with an Undo that puts back the queue as it was, but only if it is still as the server returned it. */
+/**
+ * The sentence for a successful body: `done(what, n)` says what happened to `n` queued tracks
+ * (`what`: the subject, or "N tracks"), then the playlist lines the server left out. The server
+ * counts positions from 0; people count from 1. Nothing queued means nothing changed.
+ */
+function said(body, subject, done) {
+  const skipped = (body.skipped || []).map((s) => s.position + 1);
+  const note = skipped.length ? " (unavailable skipped: " + skipped.join(", ") + ")" : "";
+  return (body.queued ? done(subject || count(body.queued), body.queued) : "Nothing to queue") + note;
+}
+
+/** Toast with an Undo that puts back `before`, the queue the server replaced, but only if it is still as the server returned it (`after`). */
 function toastUndo(msg, before, after) {
   toast(msg, () => editQueue(after, before, "undo"));
+}
+
+/** Run a queue action on a set and toast `done`'s sentence (see `said`), with Undo when the server says the change can be undone (`previous`). */
+async function queueAction(action, set, subject, done) {
+  const body = await queueCall(...set(action));
+  if (!body) return false;
+  return settle(body, () => {
+    const msg = said(body, subject, done);
+    if (body.previous) toastUndo(msg, body.previous, body.queue);
+    else toast(msg);
+    return true;
+  });
 }
 
 /**
@@ -588,7 +625,7 @@ function toastUndo(msg, before, after) {
  * Undo toast (e.g. 'Removed "Song"'); the message "undo" shows a plain confirmation instead.
  */
 async function editQueue(expect, next, message) {
-  const body = await queueCall("/api/queue/edit", { expect, queue: next });
+  const body = await queueCall("/api/queue/edit", { expect, queue: next }, message === "undo" ? "Up next changed since; can't undo" : undefined);
   if (!body) return false;
   applyQueue(body.queue);
   if (message === "undo") toast("Undone");
@@ -596,37 +633,18 @@ async function editQueue(expect, next, message) {
   return true;
 }
 
-// `subject` below is a noun phrase naming what was acted on ("Song title", "12 tracks"); the
-// action adds the verb. Defaults to "N tracks".
+// `set` below is what to act on (ofHashes, ofPlaylist). `subject` is a noun phrase naming it
+// ("Song title", "12 tracks"); the action adds the verb. Defaults to "N tracks".
 export const actions = {
-  /** Insert hashes at the front of Up next, order kept. subject: noun phrase, toast says "<subject> plays next". */
-  async queueNext(hashes, subject) {
-    const before = store.player.queue.slice();
-    const body = await queueCall("/api/queue/next", { hashes });
-    if (!body) return false;
-    return settle(body, hashes, () => {
-      toastUndo(text(subject, hashes) + (hashes.length === 1 ? " plays next" : " play next"), before, body.queue);
-      return true;
-    });
-  },
-  /** Append hashes to Up next. subject: noun phrase, toast says "<subject> added to Up next". */
-  async queueLast(hashes, subject) {
-    const before = store.player.queue.slice();
-    const body = await queueCall("/api/queue/last", { hashes });
-    if (!body) return false;
-    return settle(body, hashes, () => {
-      toastUndo(text(subject, hashes) + " added to Up next", before, body.queue);
-      return true;
-    });
-  },
-  /** Idle only: queue the hashes and start. The server answers 409 when something is loaded. subject: noun phrase, toast says "Playing <subject>". */
-  async playNow(hashes, subject) {
-    const body = await queueCall("/api/play-now", { hashes });
-    if (!body) return false;
-    const ok = settle(body, hashes, () => {
-      toast("Playing " + text(subject, hashes));
-      return true;
-    });
+  /** Insert the set at the front of Up next, order kept. Toast says "<subject> plays next". */
+  queueNext: (set, subject) => queueAction("next", set, subject, (what, n) => what + (n === 1 ? " plays next" : " play next")),
+  /** Append the set to Up next. Toast says "<subject> added to Up next". */
+  queueLast: (set, subject) => queueAction("last", set, subject, (what) => what + " added to Up next"),
+  /** Make the set the whole of Up next; what plays keeps playing. Toast says "Up next replaced with <subject>". */
+  replaceQueue: (set, subject) => queueAction("replace", set, subject, (what) => "Up next replaced with " + what),
+  /** Idle only: queue the set and start. The server answers 409 when something is loaded. Toast says "Playing <subject>"; no Undo (it would not stop the track). */
+  async playNow(set, subject) {
+    const ok = await queueAction("now", set, subject, (what) => "Playing " + what);
     refreshPlayer();
     return ok;
   },
@@ -637,10 +655,6 @@ export const actions = {
     if (Array.isArray(body.queue)) applyQueue(body.queue);
     refreshPlayer();
     return true;
-  },
-  /** Replace Up next with `hashes` (caller confirms first). `snapshot` is the queue the user saw. message: full sentence for the Undo toast. */
-  replaceQueue(snapshot, hashes, message) {
-    return editQueue(snapshot, hashes, message);
   },
   editQueue,
 };

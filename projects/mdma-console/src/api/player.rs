@@ -6,22 +6,26 @@
 //! Every playback command sent here is queue-level, which the protocol routes to deck A and
 //! which carries no `deck` field yet (ADR-017 phase 1); nothing here targets another deck.
 
+use super::library::playlist_name;
 use super::{
-    error_reply, fail, gw, json_or_failure, playback_failed, playback_failure_status,
-    queue_entries, resolve_for_playback, resolve_for_queue_replace, respond, send, PlaybackFailure,
-    Reply,
+    error_reply, fail, gw, json_or_failure, library, library_failed, playback_failed,
+    playback_failure_status, queue_entries, resolve_for_playback, resolve_for_queue_replace,
+    respond, send, PlaybackFailure, Reply,
 };
 use crate::play_now::{
     queue_last_commands, queue_next_commands, require_idle, start_command, Busy,
 };
 use crate::AppState;
 use axum::{
-    extract::State,
+    extract::{Path, State},
     http::StatusCode,
     response::{Json, Response},
 };
 use event_protocol::PlaybackEvent;
-use gateway_client::{Command, GatewayClient};
+use gateway_client::{Command, GatewayClient, LibraryRequest};
+use library_ipc_client::{
+    entries_for_playback, interpret_playlist_entries, CanonicalHash, PlayableEntries, PlaylistName,
+};
 use media_protocol::{ContentHash, Deck, OutputHealth, ResponseData};
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
@@ -216,11 +220,6 @@ fn snapshot(client: &GatewayClient) -> Result<Snapshot, PlaybackFailure> {
     })
 }
 
-#[derive(Debug, Deserialize)]
-pub struct HashesRequest {
-    hashes: Vec<String>,
-}
-
 #[allow(clippy::result_large_err)]
 fn parse_hashes(hashes: Vec<String>) -> Result<Vec<ContentHash>, Response> {
     if hashes.is_empty() {
@@ -268,109 +267,251 @@ pub async fn resume(State(state): State<Arc<AppState>>) -> Response {
     }))
 }
 
-/// `POST /api/queue/next {hashes}`: the set goes to the front of Up next, in the order given.
-/// 422/503 when a hash can't be resolved (nothing sent).
-pub async fn queue_next(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<HashesRequest>,
-) -> Response {
-    let hashes = match parse_hashes(req.hashes) {
-        Ok(h) => h,
-        Err(response) => return response,
-    };
-    let resolver = Arc::clone(&state);
-    respond(
-        gw(&state, move |client| {
-            match resolve_for_playback(&resolver, &hashes) {
-                Ok(full) => run_batch(client, &queue_next_commands(&full)),
-                Err(reply) => reply,
-            }
-        })
-        .await,
-    )
-}
-
-/// `POST /api/queue/last {hashes}`: the set goes to the end of Up next, in the order given.
-/// 422/503 when a hash can't be resolved (nothing sent).
-pub async fn queue_last(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<HashesRequest>,
-) -> Response {
-    let hashes = match parse_hashes(req.hashes) {
-        Ok(h) => h,
-        Err(response) => return response,
-    };
-    let resolver = Arc::clone(&state);
-    respond(
-        gw(&state, move |client| {
-            match resolve_for_playback(&resolver, &hashes) {
-                Ok(full) => run_batch(client, &queue_last_commands(&full)),
-                Err(reply) => reply,
-            }
-        })
-        .await,
-    )
-}
-
 fn busy_reply() -> Reply {
     error_reply(StatusCode::CONFLICT, "busy")
 }
 
-/// `POST /api/play-now {hashes}`: queue the set at the front, then start it, but only while
-/// nothing is loaded; the guard is checked before queueing and again before `PlayQueue`
-/// (something may have started in between).
+/// The full hashes of the tracks a queue request names: never empty, so no queue action can run
+/// on nothing (an empty set never changes Up next).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrackSet(Vec<CanonicalHash>);
+
+impl TrackSet {
+    /// The set of `hashes`, or `None` when there are none.
+    pub fn new(hashes: Vec<CanonicalHash>) -> Option<Self> {
+        (!hashes.is_empty()).then_some(Self(hashes))
+    }
+
+    pub fn as_slice(&self) -> &[CanonicalHash] {
+        &self.0
+    }
+}
+
+/// The tracks a queue request names, resolved, or the reply that says why not.
+type Resolved = Result<TrackSet, Reply>;
+
+/// The set of `hashes`, which resolution made from a non-empty list ([`parse_hashes`], the one
+/// 400 for an empty request, which comes before any player check): one full hash per hash asked
+/// for, so it cannot be empty.
+fn resolved_set(hashes: Vec<CanonicalHash>) -> TrackSet {
+    debug_assert!(!hashes.is_empty());
+    TrackSet(hashes)
+}
+
+/// Run `then` on the resolved set, or answer with why it did not resolve (nothing sent).
+fn resolved(resolve: impl FnOnce() -> Resolved, then: impl FnOnce(&TrackSet) -> Reply) -> Reply {
+    match resolve() {
+        Ok(set) => then(&set),
+        Err(reply) => reply,
+    }
+}
+
+/// `reply` with `key` set to `value` in its body (every reply body is an object).
+fn with_field((status, mut body): Reply, key: &str, value: impl serde::Serialize) -> Reply {
+    body[key] = serde_json::to_value(value).unwrap_or_default();
+    (status, body)
+}
+
+/// Run `then`, which changes Up next, and add `previous` to its reply: Up next as it was just
+/// before (read here, so it is the queue `then` replaced, not what the browser last saw). It is
+/// what Undo puts back. Between the read and the change the queue can still move: a change by
+/// someone else in that window is not in `previous` (ADR-027, amendment 2026-11-17).
+fn changing(client: &GatewayClient, then: impl FnOnce() -> Reply) -> Reply {
+    match queue_of(client) {
+        Ok(previous) => with_field(then(), "previous", strings(&previous)),
+        Err(failure) => playback_failed(&failure),
+    }
+}
+
+/// `QueueReplace` with `hashes`: one atomic command, so a refusal leaves Up next as it was. What
+/// plays is not touched: the playback service replaces its queue only, and nothing here stops or
+/// starts a track.
+fn replace_reply(client: &GatewayClient, set: &TrackSet) -> Reply {
+    let command = Command::QueueReplace {
+        entries: queue_entries(set.as_slice().to_vec()),
+    };
+    match send(client, &command) {
+        Ok(_) => batch_reply(client, set.as_slice().len(), None),
+        Err(failure) => batch_reply(client, 0, Some(failure)),
+    }
+}
+
+/// Queue the set at the front, then start it, but only while nothing is loaded; the guard is
+/// checked before resolving and queueing and again before `PlayQueue` (something may have
+/// started in between). See [`queue`] for the replies.
+fn play_now_reply(client: &GatewayClient, resolve: impl FnOnce() -> Resolved) -> Reply {
+    let now = match now_of(client) {
+        Ok(now) => now,
+        Err(failure) => return playback_failed(&failure),
+    };
+    if require_idle(now).is_err() {
+        return busy_reply();
+    }
+    // No `previous`: an Undo could put the queue back but not stop the track this starts.
+    resolved(resolve, |set| {
+        let (queued, failure) = send_all(client, &queue_next_commands(set.as_slice()));
+        if failure.is_some() {
+            return batch_reply(client, queued, failure);
+        }
+        let again = match now_of(client) {
+            Ok(now) => now,
+            Err(failure) => return start_failed_reply(client, queued, failure),
+        };
+        match require_idle(again) {
+            Ok(idle) => match send(client, &start_command(idle)) {
+                Ok(_) => batch_reply(client, queued, None),
+                Err(failure) => start_failed_reply(client, queued, failure),
+            },
+            Err(Busy::Loaded(_)) => {
+                let queue = queue_of(client).map(|q| strings(&q)).unwrap_or_default();
+                (
+                    StatusCode::CONFLICT,
+                    serde_json::json!({ "error": "busy", "queued": queued, "queue": queue }),
+                )
+            }
+        }
+    })
+}
+
+/// What a queue request does with the tracks it names: the one list of queue actions, whether
+/// the tracks come as hashes or as a playlist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum QueueAction {
+    /// The set goes to the front of Up next, in the order given.
+    Next,
+    /// The set goes to the end of Up next, in the order given.
+    Last,
+    /// The set becomes the whole of Up next; what plays keeps playing.
+    Replace,
+    /// The set goes to the front and starts, but only while nothing is loaded.
+    Now,
+}
+
+impl QueueAction {
+    /// Do the action to the tracks `resolve` gives, over `client`. A set that does not resolve is
+    /// answered, and nothing is sent. The set is never empty ([`TrackSet`]), so Up next is never
+    /// changed by nothing. A change that can be undone (not `now`) answers with `previous`
+    /// ([`changing`]).
+    fn run(self, client: &GatewayClient, resolve: impl FnOnce() -> Resolved) -> Reply {
+        match self {
+            QueueAction::Next => resolved(resolve, |set| {
+                changing(client, || {
+                    run_batch(client, &queue_next_commands(set.as_slice()))
+                })
+            }),
+            QueueAction::Last => resolved(resolve, |set| {
+                changing(client, || {
+                    run_batch(client, &queue_last_commands(set.as_slice()))
+                })
+            }),
+            QueueAction::Replace => resolved(resolve, |set| {
+                changing(client, || replace_reply(client, set))
+            }),
+            QueueAction::Now => play_now_reply(client, resolve),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct QueueRequest {
+    action: QueueAction,
+    hashes: Vec<String>,
+}
+
+/// `POST /api/queue {action: "next"|"last"|"replace"|"now", hashes}`: the one route of every queue
+/// action on a list of tracks. Every hash is resolved against the library's add set (any track the
+/// library has, ADR-027 amendment 2026-11-17) before anything is sent.
+/// - next: the set goes to the front of Up next, in the order given;
+/// - last: the set goes to the end of Up next, in the order given;
+/// - replace: the set becomes the whole of Up next, unconditionally (`/api/queue/edit` is the
+///   guarded edit), in one atomic `QueueReplace`; the track that plays keeps playing;
+/// - now: the set goes to the front and starts, but only while nothing is loaded; the guard is
+///   checked before resolving and queueing and again before `PlayQueue` (something may have
+///   started in between).
 ///
-/// Replies: 200 `{queued, queue}`; 409 `{error: "busy"}` (nothing sent) or 409
-/// `{error: "busy", queued, queue}` (became busy after queueing, so not started); 207/500 as
-/// for `/api/queue/next` when queueing fails; 500 `{error, queued, stage: "start", queue}` when
-/// everything was queued but the start failed; 422/503 when a hash can't be resolved (nothing
-/// sent). The busy check comes first, so a busy player answers 409 before any lookup.
-pub async fn play_now(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<HashesRequest>,
-) -> Response {
+/// Replies: 200 `{queued, queue}`, with `previous` (Up next as it was just before, for Undo) for
+/// next, last and replace, and none for `now`: an Undo cannot stop the track it started; 207
+/// `{queued, error, queue}` when queueing stopped partway; 409
+/// `{error: "busy"}` (nothing sent) or `{error: "busy", queued, queue}` (became busy
+/// after queueing, so not started); `{error, queued, stage: "start", queue}` with the
+/// failure's status (502/503) when everything was queued but the start failed; the failure's
+/// status (502/503) with `{error, queued: 0}` when playback refuses or cannot be reached; 422/503
+/// when a hash can't be resolved (nothing sent); 400 without hashes; 422 for an unknown action.
+/// A busy player answers `now` with 409 before any lookup.
+pub async fn queue(State(state): State<Arc<AppState>>, Json(req): Json<QueueRequest>) -> Response {
     let hashes = match parse_hashes(req.hashes) {
         Ok(h) => h,
         Err(response) => return response,
     };
+    let action = req.action;
     let resolver = Arc::clone(&state);
     respond(
         gw(&state, move |client| {
-            let now = match now_of(client) {
-                Ok(now) => now,
-                Err(failure) => return playback_failed(&failure),
-            };
-            if require_idle(now).is_err() {
-                return busy_reply();
-            }
-            let hashes = match resolve_for_playback(&resolver, &hashes) {
-                Ok(full) => full,
-                Err(reply) => return reply,
-            };
-            let (queued, failure) = send_all(client, &queue_next_commands(&hashes));
-            if failure.is_some() {
-                return batch_reply(client, queued, failure);
-            }
-            let again = match now_of(client) {
-                Ok(now) => now,
-                Err(failure) => return start_failed_reply(client, queued, failure),
-            };
-            match require_idle(again) {
-                Ok(idle) => match send(client, &start_command(idle)) {
-                    Ok(_) => batch_reply(client, queued, None),
-                    Err(failure) => start_failed_reply(client, queued, failure),
-                },
-                Err(Busy::Loaded(_)) => {
-                    let queue = queue_of(client).map(|q| strings(&q)).unwrap_or_default();
-                    (
-                        StatusCode::CONFLICT,
-                        serde_json::json!({ "error": "busy", "queued": queued, "queue": queue }),
-                    )
-                }
-            }
+            action.run(client, || {
+                resolve_for_playback(&resolver, &hashes).map(resolved_set)
+            })
         })
         .await,
     )
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PlaylistQueueRequest {
+    action: QueueAction,
+}
+
+/// 200 `{queued: 0, queue}`: there was nothing to queue, so Up next is as it was.
+fn nothing_queued(client: &GatewayClient) -> Reply {
+    batch_reply(client, 0, None)
+}
+
+/// The playlist `name` queued by `action` ([`entries_for_playback`], ADR-027 §10): its playable
+/// entries get the action's treatment, as for a list of hashes; its unavailable entries are
+/// skipped and reported (`skipped: [{position, error}]`, positions 0-based among the playlist's
+/// entries; the browser adds 1 to show one), never failed on. With nothing playable nothing is
+/// sent and the answer is 200 `{queued: 0, queue, skipped}`, whatever the action.
+pub fn queue_playlist(client: &GatewayClient, name: &PlaylistName, action: QueueAction) -> Reply {
+    let entries = match library(
+        client,
+        &LibraryRequest::PlaylistEntries { name: name.clone() },
+    )
+    .and_then(interpret_playlist_entries)
+    {
+        Ok(entries) => entries,
+        Err(e) => return library_failed(&e),
+    };
+    let PlayableEntries { hashes, skipped } = entries_for_playback(&entries);
+    let reply = match TrackSet::new(hashes) {
+        Some(set) => action.run(client, || Ok(set)),
+        None => nothing_queued(client),
+    };
+    with_field(reply, "skipped", skipped)
+}
+
+/// `POST /api/playlists/{name}/queue {action}`: [`queue_playlist`]. Replies are `POST /api/queue`'s
+/// with `skipped` added. 404 for a missing playlist; 400 for a name no playlist can have (nothing
+/// is sent); 422 for an unknown action.
+pub async fn playlist_queue(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Json(req): Json<PlaylistQueueRequest>,
+) -> Response {
+    queue_named_playlist(&state, &name, req.action).await
+}
+
+/// `action` on the playlist called `name` (from a path), over a blocking gateway connection:
+/// what every route that queues a playlist answers with.
+pub async fn queue_named_playlist(
+    state: &Arc<AppState>,
+    name: &str,
+    action: QueueAction,
+) -> Response {
+    let name = match playlist_name(name) {
+        Ok(n) => n,
+        Err(response) => return response,
+    };
+    respond(gw(state, move |client| queue_playlist(client, &name, action)).await)
 }
 
 /// `POST /api/start`: start the queue, only when nothing is loaded; 409 otherwise.
@@ -532,11 +673,26 @@ mod tests {
     // ---- handlers, against a fake gateway ----
 
     use crate::test_support::{
-        body_json, described, playback_err, playback_ok, send_get, send_post_json, test_app_with,
-        track_not_found, track_ok, FakeGateway,
+        body_json, described, library_ok, playback_err, playback_ok, send_get, send_post_json,
+        test_app_with, track_not_found, track_ok, FakeGateway,
     };
-    use gateway_client::{GatewayRequest, GatewayResponse, LibraryRequest};
+    use gateway_client::{GatewayRequest, GatewayResponse, LibraryRequest, LibraryResponse};
+    use library_ipc_client::{CanonicalHash, EntryError, PlaylistEntry};
     use serde_json::json;
+
+    fn track_entry(full: &str) -> PlaylistEntry {
+        PlaylistEntry::Track {
+            hash: CanonicalHash::try_from(ContentHash::new(full)).unwrap(),
+        }
+    }
+
+    fn unresolved_entry(token: &str) -> PlaylistEntry {
+        PlaylistEntry::Unresolved {
+            error: EntryError::Unknown {
+                hash: ContentHash::new(token),
+            },
+        }
+    }
 
     // Playback holds only full hashes, so the handlers are given full ones.
     const A: &str = concat!(
@@ -602,6 +758,27 @@ mod tests {
             } => playback_ok(Some(ResponseData::OutputStatus(output))),
             GatewayRequest::Playback { .. } => playback_ok(None),
             GatewayRequest::Library {
+                request: LibraryRequest::PlaylistEntries { name },
+            } => library_ok(match name.as_str() {
+                "set" => LibraryResponse::PlaylistEntries(vec![
+                    track_entry(A),
+                    unresolved_entry("dead"),
+                    track_entry(B),
+                ]),
+                "holes" => LibraryResponse::PlaylistEntries(vec![
+                    unresolved_entry("dead"),
+                    track_entry(A),
+                    unresolved_entry("beef"),
+                    track_entry(B),
+                ]),
+                "gone" => LibraryResponse::PlaylistEntries(vec![unresolved_entry("dead")]),
+                other => {
+                    LibraryResponse::Error(library_ipc_client::ProtocolError::PlaylistNotFound {
+                        name: other.to_owned(),
+                    })
+                }
+            }),
+            GatewayRequest::Library {
                 request: LibraryRequest::GetTrack { hash },
             } if hash.as_str() == SHORT_A => track_ok(A),
             GatewayRequest::Library {
@@ -620,15 +797,24 @@ mod tests {
         false
     }
 
+    /// `action` ("next", "last", "replace" or "now") on `hashes`, through `POST /api/queue`.
+    async fn queue_call(
+        gw: &FakeGateway,
+        action: &str,
+        hashes: serde_json::Value,
+    ) -> axum::response::Response {
+        send_post_json(
+            test_app_with(gw.addr()),
+            "/api/queue",
+            &json!({"action": action, "hashes": hashes}),
+        )
+        .await
+    }
+
     #[tokio::test]
     async fn play_now_while_something_is_loaded_is_409_and_sends_nothing_else() {
         let gw = playback_script(Some(X), &[], never);
-        let res = crate::test_support::send_post_json(
-            test_app_with(gw.addr()),
-            "/api/play-now",
-            &json!({"hashes": [A, B]}),
-        )
-        .await;
+        let res = queue_call(&gw, "now", json!([A, B])).await;
         assert_eq!(res.status(), StatusCode::CONFLICT);
         assert_eq!(body_json(res).await, json!({"error": "busy"}));
         assert_eq!(described(&gw), ["now"]);
@@ -654,15 +840,12 @@ mod tests {
     #[tokio::test]
     async fn play_now_when_idle_queues_the_set_in_order_then_plays() {
         let gw = playback_script(None, &[A, B, C], never);
-        let res = send_post_json(
-            test_app_with(gw.addr()),
-            "/api/play-now",
-            &json!({"hashes": [A, B, C]}),
-        )
-        .await;
+        let res = queue_call(&gw, "now", json!([A, B, C])).await;
         assert_eq!(res.status(), StatusCode::OK);
         let body = body_json(res).await;
         assert_eq!(body["queue"], json!([A, B, C]));
+        // An Undo cannot stop the track `now` starts, so there is nothing to undo to.
+        assert!(body.get("previous").is_none());
         assert_eq!(body["queued"], 3);
         assert_eq!(
             described(&gw),
@@ -697,12 +880,7 @@ mod tests {
             } => track_ok(hash.as_str()),
             _ => playback_ok(None),
         });
-        let res = send_post_json(
-            test_app_with(gw.addr()),
-            "/api/play-now",
-            &json!({"hashes": [A]}),
-        )
-        .await;
+        let res = queue_call(&gw, "now", json!([A])).await;
         assert_eq!(res.status(), StatusCode::CONFLICT);
         assert_eq!(
             body_json(res).await,
@@ -714,12 +892,7 @@ mod tests {
     #[tokio::test]
     async fn play_now_whose_start_fails_says_so_with_what_was_queued() {
         let gw = playback_script(None, &[A], |c| matches!(c, Command::PlayQueue));
-        let res = send_post_json(
-            test_app_with(gw.addr()),
-            "/api/play-now",
-            &json!({"hashes": [A]}),
-        )
-        .await;
+        let res = queue_call(&gw, "now", json!([A])).await;
         assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
         assert_eq!(
             body_json(res).await,
@@ -800,18 +973,13 @@ mod tests {
     #[tokio::test]
     async fn queue_next_sends_the_set_in_reverse() {
         let gw = playback_script(Some(X), &[A, B], never);
-        let res = send_post_json(
-            test_app_with(gw.addr()),
-            "/api/queue/next",
-            &json!({"hashes": [A, B]}),
-        )
-        .await;
+        let res = queue_call(&gw, "next", json!([A, B])).await;
         assert_eq!(res.status(), StatusCode::OK);
         let body = body_json(res).await;
         assert_eq!(body["queue"], json!([A, B]));
         assert_eq!(
             described(&gw),
-            [&format!("next {B}"), &format!("next {A}"), "list"]
+            ["list", &format!("next {B}"), &format!("next {A}"), "list"]
         );
         // Every hash is resolved by the library, full ones too (no pass-through).
         let looked_up: Vec<String> = gw
@@ -831,12 +999,7 @@ mod tests {
     async fn a_full_hash_the_library_does_not_know_is_422_and_nothing_is_sent() {
         // X is a well-formed full hash, but the library has no such track.
         let gw = playback_script(Some(X), &[], never);
-        let res = send_post_json(
-            test_app_with(gw.addr()),
-            "/api/queue/next",
-            &json!({"hashes": [A, X]}),
-        )
-        .await;
+        let res = queue_call(&gw, "next", json!([A, X])).await;
         assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
         assert!(body_json(res).await["error"].as_str().unwrap().contains(X));
         assert!(gw.commands().is_empty());
@@ -845,64 +1008,56 @@ mod tests {
     #[tokio::test]
     async fn queue_next_resolves_a_short_hash_and_sends_the_full_one() {
         let gw = playback_script(Some(X), &[A], never);
-        let res = send_post_json(
-            test_app_with(gw.addr()),
-            "/api/queue/next",
-            &json!({"hashes": [SHORT_A]}),
-        )
-        .await;
+        let res = queue_call(&gw, "next", json!([SHORT_A])).await;
         assert_eq!(res.status(), StatusCode::OK);
-        assert_eq!(described(&gw), [&format!("next {A}"), "list"]);
+        assert_eq!(described(&gw), ["list", &format!("next {A}"), "list"]);
     }
 
     #[tokio::test]
-    async fn queue_last_and_play_now_resolve_short_hashes_too() {
+    async fn every_action_resolves_short_hashes() {
         let gw = playback_script(None, &[A], never);
-        let res = send_post_json(
-            test_app_with(gw.addr()),
-            "/api/queue/last",
-            &json!({"hashes": [SHORT_A]}),
-        )
-        .await;
-        assert_eq!(res.status(), StatusCode::OK);
-        let res = send_post_json(
-            test_app_with(gw.addr()),
-            "/api/play-now",
-            &json!({"hashes": [SHORT_A]}),
-        )
-        .await;
-        assert_eq!(res.status(), StatusCode::OK);
+        for action in ["last", "now", "replace"] {
+            let res = queue_call(&gw, action, json!([SHORT_A])).await;
+            assert_eq!(res.status(), StatusCode::OK, "{action}");
+        }
         let sent: Vec<String> = described(&gw)
             .into_iter()
-            .filter(|c| c.starts_with("append") || c.starts_with("next"))
+            .filter(|c| {
+                ["append", "next", "replace"]
+                    .iter()
+                    .any(|verb| c.starts_with(verb))
+            })
             .collect();
-        assert_eq!(sent, [format!("append {A}"), format!("next {A}")]);
+        assert_eq!(
+            sent,
+            [
+                format!("append {A}"),
+                format!("next {A}"),
+                format!("replace {A}")
+            ]
+        );
     }
 
     #[tokio::test]
     async fn an_unknown_hash_is_422_naming_it_and_nothing_is_sent() {
         // The unknown hash sits in the middle, so every route (including the reversed ones)
         // would have sent a resolved neighbour before reaching it if it did not resolve first.
-        for (path, playback) in [
-            ("/api/queue/next", vec![]),
-            ("/api/queue/last", vec![]),
+        for (action, playback) in [
+            ("next", vec![]),
+            ("last", vec![]),
+            ("replace", vec![]),
             // Play-now's idle guard is the only playback command.
-            ("/api/play-now", vec!["now"]),
+            ("now", vec!["now"]),
         ] {
             let gw = playback_script(None, &[], never);
-            let res = send_post_json(
-                test_app_with(gw.addr()),
-                path,
-                &json!({"hashes": [A, "sha256:dead", B]}),
-            )
-            .await;
-            assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY, "{path}");
+            let res = queue_call(&gw, action, json!([A, "sha256:dead", B])).await;
+            assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY, "{action}");
             let body = body_json(res).await;
             assert!(
                 body["error"].as_str().unwrap().contains("sha256:dead"),
-                "{path}: {body}"
+                "{action}: {body}"
             );
-            assert_eq!(described(&gw), playback, "{path}");
+            assert_eq!(described(&gw), playback, "{action}");
         }
     }
 
@@ -916,12 +1071,7 @@ mod tests {
             },
             _ => playback_ok(None),
         });
-        let res = send_post_json(
-            test_app_with(gw.addr()),
-            "/api/queue/next",
-            &json!({"hashes": [SHORT_A]}),
-        )
-        .await;
+        let res = queue_call(&gw, "next", json!([SHORT_A])).await;
         assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
         assert!(gw.commands().is_empty());
     }
@@ -932,12 +1082,7 @@ mod tests {
             |req| matches!(req, GatewayRequest::Library { .. }),
             |_| playback_ok(None),
         );
-        let res = send_post_json(
-            test_app_with(gw.addr()),
-            "/api/queue/next",
-            &json!({"hashes": [SHORT_A]}),
-        )
-        .await;
+        let res = queue_call(&gw, "next", json!([SHORT_A])).await;
         assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert!(gw.commands().is_empty());
     }
@@ -945,12 +1090,7 @@ mod tests {
     #[tokio::test]
     async fn play_now_on_a_busy_player_is_409_before_any_hash_is_resolved() {
         let gw = playback_script(Some(X), &[], never);
-        let res = send_post_json(
-            test_app_with(gw.addr()),
-            "/api/play-now",
-            &json!({"hashes": [SHORT_A]}),
-        )
-        .await;
+        let res = queue_call(&gw, "now", json!([SHORT_A])).await;
         assert_eq!(res.status(), StatusCode::CONFLICT);
         assert!(gw
             .requests()
@@ -966,12 +1106,7 @@ mod tests {
             &[C],
             |c| matches!(c, Command::QueueNext { hash, .. } if hash.as_str() == B),
         );
-        let res = send_post_json(
-            test_app_with(gw.addr()),
-            "/api/queue/next",
-            &json!({"hashes": [A, B, C]}),
-        )
-        .await;
+        let res = queue_call(&gw, "next", json!([A, B, C])).await;
         assert_eq!(res.status(), StatusCode::MULTI_STATUS);
         let body = body_json(res).await;
         assert_eq!(body["queued"], 1);
@@ -979,19 +1114,14 @@ mod tests {
         assert_eq!(body["queue"], json!([C]));
         assert_eq!(
             described(&gw),
-            [&format!("next {C}"), &format!("next {B}"), "list"]
+            ["list", &format!("next {C}"), &format!("next {B}"), "list"]
         );
     }
 
     #[tokio::test]
     async fn queue_next_total_refusal_is_502() {
         let gw = playback_script(None, &[], |c| matches!(c, Command::QueueNext { .. }));
-        let res = send_post_json(
-            test_app_with(gw.addr()),
-            "/api/queue/next",
-            &json!({"hashes": [A]}),
-        )
-        .await;
+        let res = queue_call(&gw, "next", json!([A])).await;
         assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
         assert_eq!(body_json(res).await["queued"], 0);
     }
@@ -999,27 +1129,60 @@ mod tests {
     #[tokio::test]
     async fn queue_last_appends_in_order() {
         let gw = playback_script(Some(X), &[A, B], never);
-        let res = send_post_json(
-            test_app_with(gw.addr()),
-            "/api/queue/last",
-            &json!({"hashes": [A, B]}),
-        )
-        .await;
+        let res = queue_call(&gw, "last", json!([A, B])).await;
         assert_eq!(res.status(), StatusCode::OK);
         assert_eq!(
             described(&gw),
-            [&format!("append {A}"), &format!("append {B}"), "list"]
+            [
+                "list",
+                &format!("append {A}"),
+                &format!("append {B}"),
+                "list"
+            ]
         );
     }
 
     #[tokio::test]
     async fn an_empty_set_is_a_400_and_sends_nothing() {
-        let gw = playback_script(None, &[], never);
-        for path in ["/api/queue/next", "/api/queue/last", "/api/play-now"] {
-            let res = send_post_json(test_app_with(gw.addr()), path, &json!({"hashes": []})).await;
-            assert_eq!(res.status(), StatusCode::BAD_REQUEST, "{path}");
+        // Also on a busy player: the 400 comes before the 409 of `now`.
+        for now in [None, Some(X)] {
+            let gw = playback_script(now, &[], never);
+            for action in ["next", "last", "replace", "now"] {
+                let res = queue_call(&gw, action, json!([])).await;
+                assert_eq!(res.status(), StatusCode::BAD_REQUEST, "{action} {now:?}");
+            }
+            assert!(gw.commands().is_empty(), "{now:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn an_unknown_action_is_422_and_sends_nothing() {
+        let gw = playback_script(None, &[], never);
+        let res = queue_call(&gw, "explode", json!([A])).await;
+        assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
         assert!(gw.commands().is_empty());
+    }
+
+    #[tokio::test]
+    async fn undo_gets_the_queue_read_just_before_the_change() {
+        // The queue the console reads is the queue the change replaced, whatever the browser held.
+        // (`now` has none: see `play_now_when_idle_queues_the_set_in_order_then_plays`.)
+        for action in ["next", "last", "replace"] {
+            let gw = playback_script(None, &[C], never);
+            let res = queue_call(&gw, action, json!([A])).await;
+            assert_eq!(res.status(), StatusCode::OK, "{action}");
+            assert_eq!(body_json(res).await["previous"], json!([C]), "{action}");
+            let sent = described(&gw);
+            let first_change = sent
+                .iter()
+                .position(|c| {
+                    ["next", "append", "replace"]
+                        .iter()
+                        .any(|v| c.starts_with(v))
+                })
+                .unwrap();
+            assert_eq!(sent[first_change - 1], "list", "{action}: {sent:?}");
+        }
     }
 
     #[tokio::test]
@@ -1047,7 +1210,8 @@ mod tests {
         .await;
         assert_eq!(res.status(), StatusCode::OK);
         assert_eq!(described(&gw), ["list", &format!("replace {B}"), "list"]);
-        assert!(body_json(res).await["queue"].is_array());
+        // The fake playback lists the same scripted queue after the replace.
+        assert_eq!(body_json(res).await, json!({"queue": [A, B]}));
     }
 
     #[tokio::test]
@@ -1207,6 +1371,254 @@ mod tests {
     #[tokio::test]
     async fn player_without_a_gateway_is_503() {
         let res = send_get(crate::test_support::test_app(), "/api/player", None).await;
+        assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    // ---- replace ----
+
+    #[tokio::test]
+    async fn queue_replace_replaces_up_next_without_touching_what_plays() {
+        let gw = playback_script(Some(X), &[C], never);
+        let res = queue_call(&gw, "replace", json!([A, B])).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = body_json(res).await;
+        assert_eq!(body["queued"], 2);
+        assert_eq!(body["previous"], json!([C]));
+        // The read for `previous`, one atomic replace and the read of the result: no stop, no
+        // play, no idle check.
+        assert_eq!(
+            described(&gw),
+            [
+                "list".to_string(),
+                format!("replace {A},{B}"),
+                "list".into()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn queue_replace_that_playback_refuses_is_502_and_queued_nothing() {
+        let gw = playback_script(Some(X), &[C], |c| matches!(c, Command::QueueReplace { .. }));
+        let res = queue_call(&gw, "replace", json!([A])).await;
+        assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            body_json(res).await,
+            json!({"error": "boom", "queued": 0, "previous": [C]})
+        );
+    }
+
+    // ---- /api/playlists/:name/queue ----
+
+    async fn queue_playlist(
+        gw: &FakeGateway,
+        name: &str,
+        action: &str,
+    ) -> axum::response::Response {
+        send_post_json(
+            test_app_with(gw.addr()),
+            &format!("/api/playlists/{name}/queue"),
+            &json!({ "action": action }),
+        )
+        .await
+    }
+
+    /// The `skipped` of "set": its one unavailable line, the second (0-based position 1).
+    fn set_skipped() -> serde_json::Value {
+        json!([{"position": 1, "error": {"Unknown": {"hash": "dead"}}}])
+    }
+
+    #[tokio::test]
+    async fn queueing_a_playlist_next_sends_its_playable_entries_in_reverse_and_reports_the_rest() {
+        let gw = playback_script(Some(X), &[A, B], never);
+        let res = queue_playlist(&gw, "set", "next").await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = body_json(res).await;
+        assert_eq!(body["queued"], 2);
+        assert_eq!(body["skipped"], set_skipped());
+        assert_eq!(body["queue"], json!([A, B]));
+        assert_eq!(body["previous"], json!([A, B]));
+        assert_eq!(
+            described(&gw),
+            [
+                "list".to_string(),
+                format!("next {B}"),
+                format!("next {A}"),
+                "list".into()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn queueing_a_playlist_last_appends_after_what_is_queued_and_never_clears() {
+        let gw = playback_script(Some(X), &[C], never);
+        let res = queue_playlist(&gw, "set", "last").await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = body_json(res).await;
+        assert_eq!(body["queued"], 2);
+        assert_eq!(body["skipped"], set_skipped());
+        assert_eq!(body["previous"], json!([C]));
+        assert_eq!(
+            described(&gw),
+            [
+                "list".to_string(),
+                format!("append {A}"),
+                format!("append {B}"),
+                "list".into()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn replacing_the_queue_with_a_playlist_is_one_atomic_replace_that_leaves_playback_alone()
+    {
+        let gw = playback_script(Some(X), &[C], never);
+        let res = queue_playlist(&gw, "set", "replace").await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = body_json(res).await;
+        assert_eq!(body["queued"], 2);
+        assert_eq!(body["skipped"], set_skipped());
+        assert_eq!(
+            described(&gw),
+            [
+                "list".to_string(),
+                format!("replace {A},{B}"),
+                "list".into()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_playlist_replace_that_playback_refuses_queued_nothing() {
+        let gw = playback_script(Some(X), &[C], |c| matches!(c, Command::QueueReplace { .. }));
+        let res = queue_playlist(&gw, "set", "replace").await;
+        assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
+        let body = body_json(res).await;
+        assert_eq!(body["queued"], 0);
+        assert_eq!(body["skipped"], set_skipped());
+        assert_eq!(
+            described(&gw),
+            ["list".to_string(), format!("replace {A},{B}")]
+        );
+    }
+
+    #[tokio::test]
+    async fn playing_a_playlist_now_queues_the_playable_entries_at_the_front_then_starts() {
+        let gw = playback_script(None, &[A, B], never);
+        let res = queue_playlist(&gw, "set", "now").await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = body_json(res).await;
+        assert_eq!(body["queued"], 2);
+        assert_eq!(body["skipped"], set_skipped());
+        assert_eq!(
+            described(&gw),
+            [
+                "now".to_string(),
+                format!("next {B}"),
+                format!("next {A}"),
+                "now".into(),
+                "play".into(),
+                "list".into()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn playing_a_playlist_now_while_something_plays_is_409_and_changes_nothing() {
+        let gw = playback_script(Some(X), &[C], never);
+        let res = queue_playlist(&gw, "set", "now").await;
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+        assert_eq!(body_json(res).await["error"], "busy");
+        assert_eq!(described(&gw), ["now"]);
+    }
+
+    #[tokio::test]
+    async fn skipped_positions_are_zero_based_among_all_the_playlists_entries() {
+        let gw = playback_script(Some(X), &[], never);
+        let res = queue_playlist(&gw, "holes", "last").await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = body_json(res).await;
+        assert_eq!(body["queued"], 2);
+        assert_eq!(
+            body["skipped"],
+            json!([
+                {"position": 0, "error": {"Unknown": {"hash": "dead"}}},
+                {"position": 2, "error": {"Unknown": {"hash": "beef"}}},
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_set_never_changes_up_next_whatever_the_action_or_the_player() {
+        // Idle and busy: a `now` on nothing must not start what is already queued either.
+        for now in [None, Some(X)] {
+            for action in ["next", "last", "replace", "now"] {
+                let gw = playback_script(now, &[C], never);
+                let res = queue_playlist(&gw, "gone", action).await;
+                assert_eq!(res.status(), StatusCode::OK, "{action} {now:?}");
+                assert_eq!(
+                    body_json(res).await,
+                    json!({
+                        "queued": 0,
+                        "queue": [C],
+                        "skipped": [{"position": 0, "error": {"Unknown": {"hash": "dead"}}}],
+                    }),
+                    "{action} {now:?}"
+                );
+                // Only the read that says what Up next is: nothing changed, nothing started.
+                assert_eq!(described(&gw), ["list"], "{action} {now:?}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn queueing_a_missing_playlist_is_404_and_sends_nothing() {
+        let gw = playback_script(Some(X), &[], never);
+        let res = queue_playlist(&gw, "nope", "last").await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        assert!(gw.commands().is_empty());
+    }
+
+    #[tokio::test]
+    async fn queueing_with_an_unknown_action_or_a_bad_name_is_refused_and_sends_nothing() {
+        let gw = playback_script(Some(X), &[], never);
+        let res = queue_playlist(&gw, "set", "explode").await;
+        assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let res = queue_playlist(&gw, "bad%20name", "last").await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert!(gw.requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn queueing_a_playlist_with_the_library_down_sends_nothing() {
+        let refusing = FakeGateway::start(|req| match req {
+            GatewayRequest::Library { .. } => GatewayResponse::Error {
+                message: "library unavailable".into(),
+            },
+            _ => playback_ok(None),
+        });
+        for action in ["next", "last", "replace", "now"] {
+            let res = queue_playlist(&refusing, "set", action).await;
+            assert_eq!(res.status(), StatusCode::BAD_GATEWAY, "{action}");
+        }
+        assert!(refusing.commands().is_empty());
+
+        let unreadable = FakeGateway::start_unreadable_when(
+            |req| matches!(req, GatewayRequest::Library { .. }),
+            |_| playback_ok(None),
+        );
+        let res = queue_playlist(&unreadable, "set", "replace").await;
+        assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(unreadable.commands().is_empty());
+    }
+
+    #[tokio::test]
+    async fn queueing_a_playlist_with_no_gateway_is_503() {
+        let res = send_post_json(
+            crate::test_support::test_app(),
+            "/api/playlists/set/queue",
+            &json!({"action": "last"}),
+        )
+        .await;
         assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 }

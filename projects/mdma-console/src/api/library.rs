@@ -12,8 +12,8 @@ use axum::{
 };
 use gateway_client::{GatewayClient, LibraryRequest, LibraryResponse};
 use library_ipc_client::{
-    track_hashes, unresolved_entries, ClientError, PlaylistEntry, PlaylistName, StringQuery,
-    TrackInfo, TrackQuery,
+    track_hashes, unresolved_entries, ClientError, PlaylistEntry, PlaylistName, PlaylistSnapshot,
+    PlaylistVersion, StringQuery, TrackInfo, TrackQuery,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -118,11 +118,36 @@ impl From<&PlaylistEntry> for ApiEntry {
     }
 }
 
+/// A playlist's lines with the version they were read at: the one shape every playlist read and
+/// edit answer carries (`snapshot`, `current`), so the browser redraws from any of them.
+#[derive(Debug, Serialize)]
+pub struct ApiSnapshot {
+    version: PlaylistVersion,
+    entries: Vec<ApiEntry>,
+}
+
+impl From<&PlaylistSnapshot> for ApiSnapshot {
+    fn from(snapshot: &PlaylistSnapshot) -> Self {
+        Self {
+            version: snapshot.version.clone(),
+            entries: snapshot.entries.iter().map(ApiEntry::from).collect(),
+        }
+    }
+}
+
 /// The body of `GET /api/playlists/{name}`.
 #[derive(Debug, Serialize)]
 struct ApiPlaylistPage {
     name: String,
-    entries: Vec<ApiEntry>,
+    #[serde(flatten)]
+    snapshot: ApiSnapshot,
+}
+
+/// The playlist `name` from a path, or the 400 response for a name no playlist can have (the
+/// library is not asked). A bad name in a create body is planned as 422 instead (slice 3).
+#[allow(clippy::result_large_err)]
+pub fn playlist_name(name: &str) -> Result<PlaylistName, Response> {
+    PlaylistName::new(name).map_err(|e| fail(StatusCode::BAD_REQUEST, e.to_string()))
 }
 
 /// `GET /api/playlists`: every playlist with the full hashes of its resolved entries and the
@@ -141,22 +166,26 @@ pub async fn playlists(State(state): State<Arc<AppState>>) -> Response {
 }
 
 /// `GET /api/playlists/{name}`: every line of the playlist in file order, duplicates kept, an
-/// unresolved line in its place. 404 for a playlist that does not exist.
-///
-/// A name no playlist can have is 400 here, where the name is in the path (the library is not
-/// asked). A bad name in a create body is planned as 422 instead (slice 3).
+/// unresolved line in its place, and the version they were read at (ADR-027 §9). 404 for a
+/// playlist that does not exist. A name no playlist can have is 400 ([`playlist_name`]). A library
+/// that does not know `PlaylistSnapshot` (an old node) is a 502: there is no fallback.
 pub async fn playlist(State(state): State<Arc<AppState>>, Path(name): Path<String>) -> Response {
-    let playlist_name = match PlaylistName::new(&name) {
+    let name = match playlist_name(&name) {
         Ok(n) => n,
-        Err(e) => return fail(StatusCode::BAD_REQUEST, e.to_string()),
+        Err(response) => return response,
     };
     json_or_failure(
-        lib(&state, move |library| {
-            let entries = library.playlist_entries(&playlist_name)?;
-            Ok::<_, ClientError>(ApiPlaylistPage {
-                name: playlist_name.as_str().to_owned(),
-                entries: entries.iter().map(ApiEntry::from).collect(),
-            })
+        gw(&state, move |client| {
+            match library(
+                client,
+                &LibraryRequest::PlaylistSnapshot { name: name.clone() },
+            )? {
+                LibraryResponse::PlaylistSnapshot(snapshot) => Ok(ApiPlaylistPage {
+                    name: name.as_str().to_owned(),
+                    snapshot: ApiSnapshot::from(&snapshot),
+                }),
+                _ => Err(unexpected_library_response()),
+            }
         })
         .await,
     )
@@ -442,7 +471,8 @@ mod tests {
     };
     use gateway_client::{GatewayRequest, GatewayResponse, LibraryRequest, LibraryResponse};
     use library_ipc_client::{
-        CanonicalHash, ContentHash, EntryError, PlaylistEntry, PlaylistName, ProtocolError,
+        CanonicalHash, ContentHash, EntryError, PlaylistEntry, PlaylistName, PlaylistSnapshot,
+        PlaylistVersion, ProtocolError,
     };
     use serde_json::json;
 
@@ -530,6 +560,17 @@ mod tests {
                     name: name.as_str().to_owned(),
                 }),
             }),
+            GatewayRequest::Library {
+                request: LibraryRequest::PlaylistSnapshot { name },
+            } => library_ok(match playlists.iter().find(|(n, _)| *n == name.as_str()) {
+                Some((n, entries)) => LibraryResponse::PlaylistSnapshot(PlaylistSnapshot {
+                    version: PlaylistVersion::of(n.as_bytes()),
+                    entries: entries.clone(),
+                }),
+                None => LibraryResponse::Error(ProtocolError::PlaylistNotFound {
+                    name: name.as_str().to_owned(),
+                }),
+            }),
             other => GatewayResponse::Error {
                 message: format!("unexpected {other:?}"),
             },
@@ -601,6 +642,7 @@ mod tests {
             body_json(res).await,
             json!({
                 "name": "set",
+                "version": PlaylistVersion::of(b"set").as_str(),
                 "entries": [
                     {"status": "Track", "hash": full('a')},
                     {"status": "Unresolved", "token": "0badc0de",
@@ -618,6 +660,24 @@ mod tests {
         let res = send_get(test_app_with(gw.addr()), "/api/playlists/nope", None).await;
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
         assert!(body_json(res).await["error"].is_string());
+    }
+
+    #[tokio::test]
+    async fn api_playlist_from_a_library_that_refuses_is_502_and_never_falls_back() {
+        // An old node does not know PlaylistSnapshot; there is no fallback to PlaylistEntries.
+        let gw = FakeGateway::start(|req| match req {
+            GatewayRequest::Library {
+                request: LibraryRequest::PlaylistSnapshot { .. },
+            } => GatewayResponse::Error {
+                message: "Invalid request: unknown variant `playlist_snapshot`".into(),
+            },
+            other => GatewayResponse::Error {
+                message: format!("unexpected {other:?}"),
+            },
+        });
+        let res = send_get(test_app_with(gw.addr()), "/api/playlists/set", None).await;
+        assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(gw.requests().len(), 1);
     }
 
     #[tokio::test]

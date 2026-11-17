@@ -2187,9 +2187,14 @@
 
         function queuePlaylist(name) {
             fetch('/library/playlists/' + encodeURIComponent(name) + '/queue', { method: 'POST' })
-                .then(function(r) { return r.json(); })
-                .then(function(data) {
-                    if (data.success) {
+                .then(function(r) { return r.json().then(function(data) { return { ok: r.ok, data: data }; }); })
+                .then(function(res) {
+                    var data = res.data;
+                    if (data.error && data.queued) {
+                        // 207: some were queued before playback failed.
+                        showStatus('Queued ' + data.queued + ' from ' + name + ', then failed: ' + data.error, true);
+                        refreshQueue();
+                    } else if (res.ok) {
                         showStatus('Queued ' + data.queued + ' from ' + name + ' (' + data.skipped.length + ' unavailable)', false);
                         refreshQueue();
                     } else {

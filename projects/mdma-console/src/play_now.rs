@@ -66,14 +66,7 @@ mod tests {
         CanonicalHash::try_from(h(&format!("sha256:{}", c.to_string().repeat(64)))).unwrap()
     }
 
-    fn describe(c: &Command) -> String {
-        match c {
-            Command::QueueNext { hash, .. } => format!("next {}", hash.as_str()),
-            Command::QueueAppend { hash, .. } => format!("append {}", hash.as_str()),
-            Command::PlayQueue => "play".into(),
-            other => format!("{other:?}"),
-        }
-    }
+    use crate::test_support::describe;
 
     #[test]
     fn a_loaded_track_is_busy() {

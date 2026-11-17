@@ -46,13 +46,26 @@ pub async fn send_get(app: Router, path: &str, accept_encoding: Option<&str>) ->
     app.oneshot(req.body(Body::empty()).unwrap()).await.unwrap()
 }
 
+/// Send `method` to `path` on `app`, with `json` as the body when given.
+pub async fn send_json(
+    app: Router,
+    method: &str,
+    path: &str,
+    json: Option<&serde_json::Value>,
+) -> Response {
+    let req = Request::builder().method(method).uri(path);
+    let req = match json {
+        Some(json) => req
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(json).unwrap())),
+        None => req.body(Body::empty()),
+    };
+    app.oneshot(req.unwrap()).await.unwrap()
+}
+
 /// POST a JSON body to `path` on `app`.
 pub async fn send_post_json(app: Router, path: &str, json: &serde_json::Value) -> Response {
-    let req = Request::post(path)
-        .header("content-type", "application/json")
-        .body(Body::from(serde_json::to_vec(json).unwrap()))
-        .unwrap();
-    app.oneshot(req).await.unwrap()
+    send_json(app, "POST", path, Some(json)).await
 }
 
 /// Parsed JSON body of a response.

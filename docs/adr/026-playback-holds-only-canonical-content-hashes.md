@@ -87,7 +87,7 @@ Supersedes §1.2's "Decided: canonical input returned unchanged" and the Consequ
 
 The first unresolved entry fails the whole batch with its 1-based position (`UnplayableEntry`, "entry N: ..."). The console answers 422 and sends nothing.
 
-**Amended 2026-11-17 (Joakim, ADR-027 §10):** this fail-on-first rule is superseded. `entries_for_playback` returns the playable canonical hashes in order (duplicates kept) and the skipped entries (`UnplayableEntry`). Queueing a playlist appends the playable ones after what is already in the queue and reports the skipped ones (0-based positions) instead of failing the batch. It never replaces or clears the queue; with nothing playable the queue stays as it is.
+**Amended 2026-11-17 (Joakim, ADR-027 §10):** this fail-on-first rule is superseded. `entries_for_playback` returns the playable canonical hashes in order (duplicates kept) and the skipped entries (`UnplayableEntry`). Queueing a playlist appends the playable ones after what is already in the queue and reports the skipped ones (0-based positions) instead of failing the batch. It never replaces or clears the queue; with nothing playable the queue stays as it is. The actions a console user can ask for (next, last, replace, now) and the rule that an empty set never changes Up next are in ADR-027, "Amendment 2026-11-17".
 
 ### A5. Unresolved rows stay in place in every client
 

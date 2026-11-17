@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 pub mod library;
 pub mod player;
+pub mod playlists;
 
 /// All `/api/...` routes.
 pub fn routes() -> Router<Arc<AppState>> {
@@ -25,14 +26,18 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/api/tracks/match", get(library::tracks_match))
         .route("/api/library/match", get(library::library_match))
         .route("/api/playlists", get(library::playlists))
-        .route("/api/playlists/:name", get(library::playlist))
+        .route(
+            "/api/playlists/:name",
+            get(library::playlist).delete(playlists::delete),
+        )
+        .route("/api/playlists/:name/edit", post(playlists::edit))
+        .route("/api/playlists/:name/revert", post(playlists::revert))
+        .route("/api/playlists/:name/queue", post(player::playlist_queue))
         .route("/api/player", get(player::player))
         .route("/api/pause", post(player::pause))
         .route("/api/resume", post(player::resume))
-        .route("/api/queue/next", post(player::queue_next))
-        .route("/api/queue/last", post(player::queue_last))
+        .route("/api/queue", post(player::queue))
         .route("/api/queue/edit", post(player::queue_edit))
-        .route("/api/play-now", post(player::play_now))
         .route("/api/start", post(player::start))
 }
 

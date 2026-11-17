@@ -4,44 +4,26 @@
 // configurations of it, and so is the playlist page (playlist.js). Clicks never interrupt playback:
 // the buttons come from lists.js queueButtons, where Play now exists only while idle. NO_MUSIC and
 // missing() are the notes shared by every page that needs the catalogue (playlist.js too).
-import { h, icon, route, store, enc, plural, fmtTotal, actions, confirmDlg, openMenu } from "./core.js";
+import { h, icon, route, store, enc, plural, fmtTotal, setOf } from "./core.js";
 import { art } from "./art.js";
-import { albumOrder, groupAlbums, isIdle, playable, skippedNote, coverOf } from "./logic.js";
+import { albumOrder, groupAlbums, isIdle, coverOf } from "./logic.js";
 import { queueButtons, narrowedTracks, albumCard } from "./lists.js";
 
 const catalogue = () => store.order.map((hash) => store.tracks.get(hash)).filter(Boolean);
 export const LIBRARY_LINK = { href: "#/library", text: "Back to Library" };
 
-/** Replace Up next with `tracks` ({ tracks, skipped } from logic.playable): asks first, and the toast offers Undo. */
-function replaceUpNext({ tracks, skipped }, subject) {
-  const hashes = tracks.map((t) => t.hash);
-  const what = subject + skippedNote(skipped);
-  confirmDlg("Replace Up next?", "Up next will be replaced by " + what + " (" + plural(hashes.length, "song") + "). You can undo it.", "Replace", () =>
-    actions.replaceQueue(store.player.queue.slice(), hashes, "Replaced Up next with " + what),
-  );
-}
-
 /**
  * Header of a collection page.
  * cfg: { label (kicker), name, art: { round, cover(all) -> hash|null }, byline(all) -> node|text|null,
- * stats(all) -> text }. `all`: every track of the collection (for the facts). `rows`: the tracks
- * displayed, in displayed order: the buttons act on exactly these. `narrowed`: rows are a subset.
+ * stats(all) -> text, queueSet(rows, narrowed) -> set }. `all`: every track of the collection (for
+ * the facts). `rows`: the tracks displayed, in displayed order. `narrowed`: rows are a subset.
+ * The buttons act on `queueSet(rows, narrowed)`, by default exactly the displayed rows.
  */
 export function collectionHeader(cfg, all, rows, narrowed) {
   const idle = isIdle(store.player);
-  const set = playable(rows);
-  const { tracks } = set;
-  const subject = narrowed ? plural(tracks.length, "song") + " from " + cfg.name : cfg.name;
-  let btns = h("div", { class: "btn-row" });
-  if (tracks.length) {
-    btns = queueButtons(set, subject, { suffix: narrowed ? " · " + tracks.length : "" });
-    const more = h("button", { class: "icon-btn", "aria-label": "More actions", "aria-haspopup": "menu" }, [icon("more", "sm")]);
-    more.addEventListener("click", (e) => {
-      e.stopPropagation();
-      openMenu(more, [["queue", "Replace Up next…", () => replaceUpNext(set, subject)]], [cfg.name, plural(tracks.length, "song") + " · " + fmtTotal(tracks)]);
-    });
-    btns.appendChild(more);
-  }
+  const subject = narrowed ? plural(rows.length, "song") + " from " + cfg.name : cfg.name;
+  const set = (cfg.queueSet || setOf)(rows, narrowed);
+  const btns = rows.length ? queueButtons(set, subject, { suffix: narrowed ? " · " + rows.length : "" }) : h("div", { class: "btn-row" });
   const byline = cfg.byline ? cfg.byline(all) : null;
   return h("div", { class: "coll" }, [
     art(cfg.name, { round: cfg.art && cfg.art.round, cover: cfg.art && cfg.art.cover ? cfg.art.cover(all) : null }),
@@ -50,7 +32,7 @@ export function collectionHeader(cfg, all, rows, narrowed) {
       h("h1", { text: cfg.name }),
       h("div", { class: "sub" }, [byline, byline ? " · " : null, cfg.stats(all)]),
       btns,
-      tracks.length && !idle ? h("div", { class: "idle-note", text: "Something is playing, so these add to Up next" }) : null,
+      rows.length && !idle ? h("div", { class: "idle-note", text: "Something is playing, so these add to Up next" }) : null,
     ]),
   ]);
 }

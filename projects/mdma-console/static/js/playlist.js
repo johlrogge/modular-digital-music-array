@@ -1,10 +1,13 @@
 // The playlist page: a collectionPage (collections.js) whose rows are the playlist's lines in file
 // order, duplicates kept. The library resolves every line (GET /api/playlists/{name}); a line it
-// could not resolve shows dimmed in its place (lists.js trackRow) and is left out of anything
-// queued (logic.js playable). A line the library resolved but the console's catalogue lacks is a
-// placeholder track (logic.js placeholderTrack). Read-only: editing comes later.
-import { route, store, api, enc } from "./core.js";
-import { playlistRows, playable, coverOf } from "./logic.js";
+// could not resolve shows dimmed in its place (lists.js trackRow). The queue buttons act on the
+// whole playlist through the server (core.js ofPlaylist), which leaves out the lines that cannot
+// play and says which; narrowed to a subset, they act on exactly the rows shown, which all have
+// a track. A line the library resolved but the console's catalogue lacks is a placeholder track
+// (logic.js placeholderTrack). The server has the edit routes (ADR-027 §9: edit, revert, delete),
+// but this page does not use them yet: it is read-only.
+import { route, store, api, enc, ofPlaylist, setOf } from "./core.js";
+import { playlistRows, coverOf } from "./logic.js";
 import { songCounts } from "./lists.js";
 import { collectionPage, missing, LIBRARY_LINK, NO_MUSIC, NONE } from "./collections.js";
 
@@ -39,9 +42,12 @@ function drawPlaylist(root, name, state) {
       name,
       art: { round: false, cover: coverOf },
       stats: (all) => {
-        const { tracks, skipped } = playable(all);
-        return songCounts(tracks.length, skipped);
+        const unavailable = all.filter((r) => r.kind === "unresolved").length;
+        return songCounts(all.length - unavailable, unavailable);
       },
+      // Narrowed rows always carry a hash (setOf checks): an unavailable line has none, so no
+      // search matches it. The playlist route cannot queue a subset, so the shown rows go as hashes.
+      queueSet: (rows, narrowed) => (narrowed ? setOf(rows) : ofPlaylist(name)),
     },
     pane: {
       key: "playlist",

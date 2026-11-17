@@ -2,9 +2,9 @@
 // Every click that can change what is heard goes through core's `actions`; nothing here calls a
 // playback route. A plain tap on a row or card opens a menu or a page and NEVER plays.
 // Play now is offered only when logic.isIdle(store.player) (paused counts as playing).
-import { h, icon, store, actions, enc, fmt, fmtTotal, plural, openMenu, onView } from "./core.js";
+import { h, icon, store, actions, setOf, enc, fmt, fmtTotal, plural, openMenu, onView } from "./core.js";
 import { art } from "./art.js";
-import { isIdle, groupAlbums, trackTitle, sortTracks, skippedNote, placeholderTrack, coverOf } from "./logic.js";
+import { isIdle, groupAlbums, trackTitle, sortTracks, placeholderTrack, coverOf } from "./logic.js";
 import { narrowedView, matchSet, setSort, SEARCH_FAILED_NOTE, FILTERS_EMPTY_NOTE } from "./narrow.js";
 
 const PAGE = 60;
@@ -65,9 +65,6 @@ export function swipe(el, { dir = "right", threshold, max = 160, onMove, onEnd, 
 
 /* ============================================================ track menu */
 
-/** Hashes of tracks, for the queue actions. */
-const hashesOf = (tracks) => tracks.map((t) => t.hash);
-
 /**
  * Menu for one track. `extra` is spliced in after Queue last (items in openMenu's format);
  * `opts` goes to openMenu (opts.onClose).
@@ -75,9 +72,11 @@ const hashesOf = (tracks) => tracks.map((t) => t.hash);
 export function trackMenu(anchor, track, extra, opts) {
   const items = [];
   const label = trackTitle(track);
-  if (isIdle(store.player)) items.push(["play", "Play now", () => actions.playNow([track.hash], label), "primary"]);
-  items.push(["next-up", "Queue next", () => actions.queueNext([track.hash], label)]);
-  items.push(["plus", "Queue last", () => actions.queueLast([track.hash], label)]);
+  const set = setOf([track]);
+  if (isIdle(store.player)) items.push(["play", "Play now", () => actions.playNow(set, label), "primary"]);
+  items.push(["next-up", "Queue next", () => actions.queueNext(set, label)]);
+  items.push(["plus", "Queue last", () => actions.queueLast(set, label)]);
+  items.push(["queue", "Replace queue", () => actions.replaceQueue(set, label)]);
   if (extra) items.push(...extra);
   const nav = [];
   if (track.album) nav.push(["disc", "Go to album", () => (location.hash = "#/album/" + enc(track.album))]);
@@ -87,12 +86,14 @@ export function trackMenu(anchor, track, extra, opts) {
   openMenu(anchor, items, [label, tech.join(" · ")], opts);
 }
 
-/** Menu for a set of tracks (a card or a collection): Play now only when idle, Queue next, Queue last. */
+/** Menu for a set of tracks (a card or a collection): Play now only when idle, Queue next, Queue last, Replace queue. */
 export function collMenu(anchor, tracks, label) {
   const items = [];
-  if (isIdle(store.player)) items.push(["play", "Play now", () => actions.playNow(hashesOf(tracks), label), "primary"]);
-  items.push(["next-up", "Queue next", () => actions.queueNext(hashesOf(tracks), label)]);
-  items.push(["plus", "Queue last", () => actions.queueLast(hashesOf(tracks), label)]);
+  const set = setOf(tracks);
+  if (isIdle(store.player)) items.push(["play", "Play now", () => actions.playNow(set, label), "primary"]);
+  items.push(["next-up", "Queue next", () => actions.queueNext(set, label)]);
+  items.push(["plus", "Queue last", () => actions.queueLast(set, label)]);
+  items.push(["queue", "Replace queue", () => actions.replaceQueue(set, label)]);
   openMenu(anchor, items, [label, plural(tracks.length, "song") + " · " + fmtTotal(tracks)]);
 }
 
@@ -166,8 +167,8 @@ export function trackRow(t, opts = {}, index = 0) {
       h("div", { class: "end" }, [qn, ql, more]),
     ],
   );
-  const queueNext = () => actions.queueNext([t.hash], title);
-  const queueLast = () => actions.queueLast([t.hash], title);
+  const queueNext = () => actions.queueNext(setOf([t]), title);
+  const queueLast = () => actions.queueLast(setOf([t]), title);
   qn.addEventListener("click", (e) => {
     e.stopPropagation();
     queueNext();
@@ -310,22 +311,21 @@ export function pagedList(container, tracks, opts = {}) {
 /* ============================================================ bulk bar */
 
 /**
- * The one set of buttons that act on a list of tracks: Play now ONLY while idle (a click never
- * interrupts playback), Queue next, Queue last (primary while something plays). `subject` names
- * the set in the toasts; opts.suffix is appended to the labels (e.g. " · 5").
- * `{ tracks, skipped }` is logic.playable's answer (the one home of the skip rule); the toasts
- * add how many were skipped.
+ * The one set of buttons that act on a set of tracks (setOf, or core's ofPlaylist): Play now ONLY
+ * while idle (a click never interrupts playback), Queue next, Queue last (primary while something
+ * plays) and Replace queue (Up next only; what plays keeps playing). `subject` names the set in
+ * the toasts; opts.suffix is appended to the labels (e.g. " · 5"). Which entries can play, and
+ * how many were skipped, is the server's answer.
  */
-export function queueButtons({ tracks, skipped }, subject, { suffix = "" } = {}) {
+export function queueButtons(set, subject, { suffix = "" } = {}) {
   const idle = isIdle(store.player);
-  const hashes = hashesOf(tracks);
-  const what = subject + skippedNote(skipped);
   const row = h("div", { class: "btn-row" });
   if (idle) {
-    row.appendChild(h("button", { class: "btn primary", onclick: () => actions.playNow(hashes, what) }, [icon("play", "fill sm"), "Play now" + suffix]));
+    row.appendChild(h("button", { class: "btn primary", onclick: () => actions.playNow(set, subject) }, [icon("play", "fill sm"), "Play now" + suffix]));
   }
-  row.appendChild(h("button", { class: "btn" + (idle ? "" : " primary"), onclick: () => actions.queueNext(hashes, what) }, [icon("next-up", "sm"), "Queue next" + suffix]));
-  row.appendChild(h("button", { class: "btn", onclick: () => actions.queueLast(hashes, what) }, [icon("plus", "sm"), "Queue last" + suffix]));
+  row.appendChild(h("button", { class: "btn" + (idle ? "" : " primary"), onclick: () => actions.queueNext(set, subject) }, [icon("next-up", "sm"), "Queue next" + suffix]));
+  row.appendChild(h("button", { class: "btn", onclick: () => actions.queueLast(set, subject) }, [icon("plus", "sm"), "Queue last" + suffix]));
+  row.appendChild(h("button", { class: "btn", onclick: () => actions.replaceQueue(set, subject) }, [icon("queue", "sm"), "Replace queue" + suffix]));
   return row;
 }
 
@@ -333,7 +333,7 @@ export function queueButtons({ tracks, skipped }, subject, { suffix = "" } = {})
 export function bulkBar(tracks) {
   if (!tracks.length) return null;
   const what = plural(tracks.length, "track");
-  return h("div", { class: "bulk" }, [h("span", { class: "kicker", text: what + " match" }), queueButtons({ tracks, skipped: 0 }, what)]);
+  return h("div", { class: "bulk" }, [h("span", { class: "kicker", text: what + " match" }), queueButtons(setOf(tracks), what)]);
 }
 
 /** A note in place of rows. link: { href, text } adds a link after the text. */
@@ -464,7 +464,7 @@ export function card(name, meta, artOpts, tracksFn, href, subject = name) {
   fab.addEventListener("click", (e) => {
     e.stopPropagation();
     e.preventDefault(); // the card is a link
-    if (idle) actions.playNow(hashesOf(tracksFn()), subject);
+    if (idle) actions.playNow(setOf(tracksFn()), subject);
     else collMenu(fab, tracksFn(), subject);
   });
   return h("a", { class: "card", href, style: "text-decoration:none;color:inherit" }, [
@@ -492,14 +492,7 @@ export function albumCard(a) {
 /** Card for a playlist ({ name, hashes, unavailable }). */
 export function playlistCard(pl) {
   const tracks = playlistTracks(pl);
-  return card(
-    pl.name,
-    songCounts(pl.hashes.length, pl.unavailable),
-    { cover: coverOf(tracks) },
-    () => playlistTracks(pl),
-    "#/playlist/" + enc(pl.name),
-    pl.name + skippedNote(pl.unavailable),
-  );
+  return card(pl.name, songCounts(pl.hashes.length, pl.unavailable), { cover: coverOf(tracks) }, () => playlistTracks(pl), "#/playlist/" + enc(pl.name));
 }
 
 /** Card for an artist as grouped by logic.groupArtists. */

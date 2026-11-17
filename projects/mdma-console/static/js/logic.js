@@ -203,20 +203,6 @@ export function playlistRows(entries, trackOf) {
 }
 
 /**
- * The rows that have a track, and how many were left out: { tracks, skipped }.
- * PROVISIONAL (pending Joakim, versus ADR-026 A4's fail-the-batch): unresolved playlist lines are
- * skipped, and the toasts say how many (skippedNote). This is the one home of that rule; every
- * queue action takes its tracks from here.
- */
-export function playable(rows) {
-  const tracks = rows.filter((r) => r.kind !== "unresolved");
-  return { tracks, skipped: rows.length - tracks.length };
-}
-
-/** What a toast adds to its subject when `skipped` unavailable rows were left out of a queue action. */
-export const skippedNote = (skipped) => (skipped > 0 ? " (" + skipped + " unavailable skipped)" : "");
-
-/**
  * Number of active filter groups in `f` ({ bmin, bmax, key, compat, added }, all fields present):
  * tempo, key and added each count once.
  */
