@@ -10,6 +10,7 @@ use crate::transfer::{
     export_extension, path_cost, DownloadOutcome, ExportFormat, MAX_LOCATION_URI_BYTES,
 };
 use bpaf::{construct, Parser};
+use client_facts::Facts;
 use color_eyre::eyre::{bail, eyre};
 use color_eyre::Result;
 use hicli::Arg;
@@ -230,14 +231,14 @@ pub(crate) fn export(args: RekordboxExportArgs, ctx: &Ctx) -> Result<()> {
         ExportSource::Playlists(playlists) => playlists,
         ExportSource::Stdin => Vec::new(),
     };
-    let library = ctx.library()?;
+    let library = ctx.node().library()?;
     let output = output.unwrap_or_else(|| {
         dirs::audio_dir()
             .map(|p| p.join("mdma_rekordbox"))
             .unwrap_or_else(|| std::path::PathBuf::from("./rekordbox-export/"))
     });
 
-    let (node, node_ip) = ctx.require_node()?;
+    let (node, node_ip) = ctx.node().require_node()?;
 
     // Collect hashes per playlist, or from stdin when no playlists given.
     //
@@ -600,7 +601,6 @@ pub(crate) fn import(args: RekordboxImportArgs, ctx: &Ctx) -> Result<()> {
         dry_run: DryRun(dry_run),
         path,
     } = args;
-    let library = ctx.library()?;
 
     // 1. Read and parse XML file
     let ExistingFileArg(path) = path;
@@ -614,8 +614,12 @@ pub(crate) fn import(args: RekordboxImportArgs, ctx: &Ctx) -> Result<()> {
         return Ok(());
     }
 
-    // 2. Create lookup and match tracks
-    let lookup = LibraryTrackLookup::new(|q| library.search(q));
+    // 2. Create lookup and match tracks. The matches become writes to the node, so
+    // they are asked of the node whatever --facts says (ADR-030 §5): a stale replica
+    // would give fewer matches and the import would replace a good playlist with a
+    // partial one.
+    let facts = Facts::Node(ctx.node());
+    let lookup = LibraryTrackLookup::new(|q| facts.search(q));
 
     let mut matched: Vec<(&RekordboxTrack, ContentHash)> = Vec::new();
     let mut ambiguous: Vec<(&RekordboxTrack, Vec<ContentHash>)> = Vec::new();
@@ -656,6 +660,9 @@ pub(crate) fn import(args: RekordboxImportArgs, ctx: &Ctx) -> Result<()> {
 
     // A failed library search must not look like "not in library"
     lookup.check()?;
+
+    // The writes (playlists, enrichment) go through the node too.
+    let library = ctx.node().library()?;
 
     // 3. Print summary
     println!("Matched:   {:3} tracks", matched.len());

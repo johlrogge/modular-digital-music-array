@@ -16,6 +16,7 @@ members = [
     "components/audio_types",
     "components/bandcamp_api",
     "components/boot_health",
+    "components/client_facts_replica",
     "components/date_expression",
     "components/event_protocol",
     "components/fact_replica",
@@ -94,6 +95,7 @@ audio-transcoder = { path = "components/audio_transcoder" }
 audio-types = { path = "components/audio_types" }
 bandcamp-api = { path = "components/bandcamp_api" }
 boot-health = { path = "components/boot_health" }
+client-facts = { path = "components/client_facts_replica" }
 date-expression = { path = "components/date_expression" }
 event-protocol = { path = "components/event_protocol" }
 fact-replica = { path = "components/fact_replica" }

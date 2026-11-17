@@ -220,11 +220,29 @@ pub fn interpret_library<T>(
 pub enum TrackFailure {
     Client(ClientError),
     Said(String),
+    /// The facts cannot be read at all (no replica, an unreachable node): it ends the
+    /// run, and is reported once, as it is.
+    Fatal(client_facts::FactsError),
 }
 
 impl From<ClientError> for TrackFailure {
     fn from(e: ClientError) -> Self {
         Self::Client(e)
+    }
+}
+
+impl From<client_facts::FactsError> for TrackFailure {
+    /// A refusal of the library or of the facts (not found, ambiguous) is about this
+    /// track alone; a transport failure may be the node being too old; anything else
+    /// is about every track.
+    fn from(e: client_facts::FactsError) -> Self {
+        use client_facts::FactsError;
+        match e {
+            FactsError::Library(refusal) => Self::Said(refusal.to_string()),
+            FactsError::Refused(text) => Self::Said(text),
+            FactsError::Transport(e) => Self::Client(e),
+            other => Self::Fatal(other),
+        }
     }
 }
 
@@ -237,20 +255,19 @@ pub fn each_track<E: Into<TrackFailure>>(
     mut act: impl FnMut(&library_ipc_client::ContentHash) -> Result<(), E>,
 ) -> color_eyre::Result<hicli::Success> {
     let mut failed = false;
+    let mut report = |hash: &library_ipc_client::ContentHash, text: String| {
+        failed = true;
+        eprintln!("{}  {}", track_formatter::short_hash(hash), text);
+    };
     for hash in hashes {
         match act(&hash).map_err(Into::into) {
             Ok(()) => {}
             Err(TrackFailure::Client(e)) if e.is_unsupported_request() => {
                 return Err(library_error(e))
             }
-            Err(failure) => {
-                failed = true;
-                let text = match failure {
-                    TrackFailure::Client(e) => library_error(e).to_string(),
-                    TrackFailure::Said(text) => text,
-                };
-                eprintln!("{}  {}", track_formatter::short_hash(&hash), text);
-            }
+            Err(TrackFailure::Fatal(e)) => return Err(e.into()),
+            Err(TrackFailure::Client(e)) => report(&hash, library_error(e).to_string()),
+            Err(TrackFailure::Said(text)) => report(&hash, text),
         }
     }
     Ok(success_unless(failed))

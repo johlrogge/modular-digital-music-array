@@ -817,42 +817,25 @@ impl LibraryService {
         }
     }
 
-    /// Whether a live track shows the cover art `rel`: as its own, or through
-    /// `album_cover_cache`, which hands it to the album's tracks that have none. A
-    /// cache entry that points at `rel` but is not needed is repointed at another
-    /// cover of the album, or evicted, so it never names an archived file.
+    /// Whether a live track holds the cover art `rel`: as its own cover or as the one
+    /// it inherits along `Replaces` (ADR-013, amendment 2026-11-17), so the file of the
+    /// nearest ancestor is not archived while it is a fallback of the track that
+    /// replaced it. An album's cover is always the effective cover of one of its
+    /// tracks, and `album_cover_cache` is rebuilt from the live tracks every time the
+    /// projection catches up or the lineage is refreshed, so it never names a cover
+    /// that no live track shows.
+    ///
+    /// A pure read. It needs the lineage refreshed after the facts that retired the
+    /// file (`merge_into` does, `cleanup_merge_orphans` does first), and when the last
+    /// refresh could not read the whole stream the lineage is not known to be
+    /// current, so every cover counts as in use and nothing is archived.
     fn cover_art_in_use(&self, rel: &Path) -> bool {
         let tracks = self.tracks.lock().unwrap();
-        if tracks
-            .iter()
-            .any(|t| t.cover_art_path.as_deref() == Some(rel))
-        {
-            return true;
-        }
-        let rel_str = rel.to_string_lossy();
-        let mut cache = self.album_cover_cache.lock().unwrap();
-        let albums: Vec<String> = cache
-            .iter()
-            .filter(|(_, path)| path.as_str() == rel_str)
-            .map(|(album, _)| album.clone())
-            .collect();
-        let mut serving = false;
-        for album in albums {
-            let of_album = || {
-                tracks
-                    .iter()
-                    .filter(|t| t.album.as_deref() == Some(album.as_str()))
-            };
-            if let Some(other) = of_album().find_map(|t| t.cover_art_path.as_ref()) {
-                cache.insert(album, other.to_string_lossy().into_owned());
-            } else if of_album().next().is_some() {
-                // Tracks of the album without a cover of their own show this one.
-                serving = true;
-            } else {
-                cache.remove(&album);
-            }
-        }
-        serving
+        !self.lineage_current.load(Ordering::Relaxed)
+            || tracks.iter().any(|t| {
+                t.cover_art_path.as_deref() == Some(rel)
+                    || t.inherited_cover_art_path.as_deref() == Some(rel)
+            })
     }
 
     /// Archive cover art that no live track references any more.
@@ -1125,6 +1108,8 @@ impl LibraryService {
     /// ever touches hashes named by a live `Replaces` from `mdma-dedup`: other
     /// `NoLiveFacts` orphans (ADR-004 replace leftovers) are not its business.
     pub(super) fn cleanup_merge_orphans(&self, report: &mut DedupApplyReport) {
+        // The covers an orphan's files may still be shown as are read from the lineage.
+        self.refresh_lineage();
         for key in self.merge_orphan_candidates() {
             // Liveness is re-checked under the retire gate right before the files
             // move, so a track that came back since the candidate list was made

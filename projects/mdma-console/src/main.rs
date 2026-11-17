@@ -3017,6 +3017,9 @@ mod tests {
             beat_grid: None,
             role: None,
             energy: None,
+            genre: None,
+            label: None,
+            styles: vec![],
         };
         let json = TrackInfoJson::from_track_info(&track);
         assert_eq!(json.content_hash, "sha256:abc123");
@@ -3051,6 +3054,9 @@ mod tests {
             beat_grid: None,
             role: None,
             energy: None,
+            genre: None,
+            label: None,
+            styles: vec![],
         };
         let json = TrackInfoJson::from_track_info(&track);
         assert_eq!(json.content_hash, "sha256:deadbeef");
@@ -3085,6 +3091,9 @@ mod tests {
             beat_grid: None,
             role: None,
             energy: None,
+            genre: None,
+            label: None,
+            styles: vec![],
         };
         let json = TrackInfoJson::from_track_info(&track);
         assert_eq!(json.disc_number, Some(2));

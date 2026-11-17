@@ -155,7 +155,7 @@ pub(crate) fn forget(_ctx: &Ctx) -> color_eyre::Result<()> {
 #[hicli::command]
 pub(crate) fn show(ctx: &Ctx) -> color_eyre::Result<()> {
     let resolution = resolve(
-        request(ctx.node_flag(), ctx.local_ipc())?,
+        request(ctx.node().node_flag(), ctx.node().local_ipc())?,
         &mut real_effects(),
     )
     .map_err(|e| eyre!("{}", resolve_error_message(&e)))?;

@@ -116,9 +116,10 @@ const SOURCE_LONG_OP_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 /// List available music sources
 #[hicli::command]
 pub(crate) fn list(ctx: &Ctx) -> Result<()> {
-    let gateway = ctx.gateway()?;
-    let sources = mdma_client::list_available_sources(gateway.as_deref(), ctx.sources_dir()?)
-        .map_err(display_error)?;
+    let gateway = ctx.node().gateway()?;
+    let sources =
+        mdma_client::list_available_sources(gateway.as_deref(), ctx.node().sources_dir()?)
+            .map_err(display_error)?;
     if sources.is_empty() {
         println!("No sources available");
     } else {
@@ -172,7 +173,7 @@ fn item_error(source: &str, err: SourceError) -> color_eyre::Report {
 #[hicli::command(curried)]
 pub(crate) fn sync(source: SourceArg, ctx: &Ctx) -> Result<()> {
     let name = source.as_str();
-    let source = ctx.source(name, Some(SOURCE_LONG_OP_TIMEOUT))?;
+    let source = ctx.node().source(name, Some(SOURCE_LONG_OP_TIMEOUT))?;
     println!("Syncing {}...", name);
     let (total_items, new_items) =
         source_call(
@@ -196,7 +197,7 @@ pub(crate) fn sync(source: SourceArg, ctx: &Ctx) -> Result<()> {
 #[hicli::command(curried)]
 pub(crate) fn status(source: SourceArg, ctx: &Ctx) -> Result<()> {
     let name = source.as_str();
-    let source = ctx.source(name, None)?;
+    let source = ctx.node().source(name, None)?;
     let status = source_call(
         &source,
         name,
@@ -236,7 +237,7 @@ pub(crate) fn status(source: SourceArg, ctx: &Ctx) -> Result<()> {
 #[hicli::command(curried)]
 pub(crate) fn downloads(source: SourceArg, ctx: &Ctx) -> Result<()> {
     let name = source.as_str();
-    let source = ctx.source(name, None)?;
+    let source = ctx.node().source(name, None)?;
     let downloads =
         source_call(
             &source,
@@ -286,7 +287,7 @@ pub(crate) fn downloads(source: SourceArg, ctx: &Ctx) -> Result<()> {
 pub(crate) fn cancel(source: SourceArg, id: DownloadArg, ctx: &Ctx) -> Result<()> {
     let DownloadArg(id) = id;
     let name = source.as_str();
-    let source = ctx.source(name, None)?;
+    let source = ctx.node().source(name, None)?;
     let request = SourceRequest::CancelDownload { id: id.clone() };
     source_call(&source, name, &request, |response| match response {
         SourceResponse::Cancelled { .. } => Some(()),
@@ -300,7 +301,7 @@ pub(crate) fn cancel(source: SourceArg, id: DownloadArg, ctx: &Ctx) -> Result<()
 #[hicli::command(curried)]
 pub(crate) fn pause(source: SourceArg, ctx: &Ctx) -> Result<()> {
     let name = source.as_str();
-    let source = ctx.source(name, None)?;
+    let source = ctx.node().source(name, None)?;
     source_call(
         &source,
         name,
@@ -318,7 +319,7 @@ pub(crate) fn pause(source: SourceArg, ctx: &Ctx) -> Result<()> {
 #[hicli::command(curried)]
 pub(crate) fn resume(source: SourceArg, ctx: &Ctx) -> Result<()> {
     let name = source.as_str();
-    let source = ctx.source(name, None)?;
+    let source = ctx.node().source(name, None)?;
     source_call(
         &source,
         name,
@@ -337,7 +338,7 @@ pub(crate) fn resume(source: SourceArg, ctx: &Ctx) -> Result<()> {
 pub(crate) fn resync(source: SourceArg, identifier: ItemIdArg, ctx: &Ctx) -> Result<()> {
     let ItemIdArg(identifier) = identifier;
     let name = source.as_str();
-    let source = ctx.source(name, Some(SOURCE_LONG_OP_TIMEOUT))?;
+    let source = ctx.node().source(name, Some(SOURCE_LONG_OP_TIMEOUT))?;
     println!("Requesting resync of {} from {}...", identifier, name);
     let request = SourceRequest::ResyncItem { identifier };
     let (identifier, tracks_queued) = source_call_with(
@@ -365,7 +366,7 @@ pub(crate) fn resync(source: SourceArg, identifier: ItemIdArg, ctx: &Ctx) -> Res
 pub(crate) fn check_item(source: SourceArg, identifier: ItemIdArg, ctx: &Ctx) -> Result<()> {
     let ItemIdArg(identifier) = identifier;
     let name = source.as_str();
-    let source = ctx.source(name, Some(SOURCE_LONG_OP_TIMEOUT))?;
+    let source = ctx.node().source(name, Some(SOURCE_LONG_OP_TIMEOUT))?;
     let request = SourceRequest::CheckItem { identifier };
     let (identifier, live_track_count, stored_track_count, stale) = source_call_with(
         &source,
@@ -445,10 +446,10 @@ pub(crate) fn check_updates(source: SourceArg, apply: Apply, ctx: &Ctx) -> Resul
     let name = source.as_str();
     let apply = apply.0;
     // Start and polls are short requests: the default timeout is enough.
-    let source = ctx.source(name, None)?;
+    let source = ctx.node().source(name, None)?;
     // Fetch all ItemId values from the library for this source.
     // We use GetFactValues("ItemId") — returns all ItemId values the library knows about.
-    let library = ctx.library()?;
+    let library = ctx.node().library()?;
     let all_item_ids = interpret_library(
         library.request(&library_ipc_client::LibraryRequest::GetFactValues {
             fact_type: library_ipc_client::FactType::new("ItemId"),
@@ -569,7 +570,7 @@ pub(crate) fn check_updates(source: SourceArg, apply: Apply, ctx: &Ctx) -> Resul
 
     if apply {
         // A resync fetches the whole upstream collection before it answers.
-        let source = ctx.source(name, Some(SOURCE_LONG_OP_TIMEOUT))?;
+        let source = ctx.node().source(name, Some(SOURCE_LONG_OP_TIMEOUT))?;
         for id in &stale_ids {
             match source.request(
                 name,
@@ -620,7 +621,7 @@ fn playlist_source_error(source: &str, feature: &str, err: &SourceError) -> colo
 #[hicli::command(curried)]
 pub(crate) fn playlists(source: SourceArg, ctx: &Ctx) -> Result<()> {
     let name = source.as_str();
-    let source = ctx.source(name, Some(SOURCE_LISTING_TIMEOUT))?;
+    let source = ctx.node().source(name, Some(SOURCE_LISTING_TIMEOUT))?;
     let playlists = source_call_with(
         &source,
         name,
@@ -694,7 +695,7 @@ pub(crate) fn import_playlist(
     ctx: &Ctx,
 ) -> Result<Success> {
     let name = source.as_str();
-    let source = ctx.source(name, None)?;
+    let source = ctx.node().source(name, None)?;
     let ImportPlaylistArgs {
         name: ImportName(playlist_name),
         dry_run: DryRun(dry_run),
@@ -747,7 +748,7 @@ pub(crate) fn import_playlist(
 #[hicli::command(curried)]
 pub(crate) fn import_status(source: SourceArg, ctx: &Ctx) -> Result<Success> {
     let name = source.as_str();
-    let source = ctx.source(name, None)?;
+    let source = ctx.node().source(name, None)?;
     let status = source_call_with(
         &source,
         name,

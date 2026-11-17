@@ -16,6 +16,8 @@ use library_ipc_client::{
 use playlist_import::PlaylistWriteOps;
 
 /// Abstraction for library requests, works in both gateway and direct mode.
+/// A clone shares the connection.
+#[derive(Clone)]
 pub enum LibraryBackend {
     Direct(LibraryClient),
     Gateway(gateway_client::GatewayClient),
@@ -39,6 +41,15 @@ impl LibraryBackend {
         match gateway {
             Some(gw) => Self::connect_gateway(gw),
             None => Self::connect_direct(socket),
+        }
+    }
+
+    /// Why a request on this connection found the node unreachable since this was
+    /// last asked, if one did. The `Node` asks, and drops a connection that went dead.
+    pub fn take_unreachable(&self) -> Option<String> {
+        match self {
+            LibraryBackend::Direct(c) => c.take_unreachable(),
+            LibraryBackend::Gateway(gw) => gw.take_unreachable(),
         }
     }
 

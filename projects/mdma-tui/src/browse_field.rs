@@ -26,8 +26,7 @@ impl BrowseField {
         match self {
             Self::Artist => track.artist.clone(),
             Self::Album => track.album.clone(),
-            // Genre is not directly in TrackInfo — handled via get_fact_values
-            Self::Genre => None,
+            Self::Genre => track.genre.clone(),
             Self::Title => track.title.clone(),
         }
     }
@@ -71,6 +70,9 @@ mod tests {
             beat_grid: None,
             role: None,
             energy: None,
+            genre: None,
+            label: None,
+            styles: vec![],
         }
     }
 
@@ -120,10 +122,15 @@ mod tests {
     }
 
     #[test]
-    fn browse_field_extract_genre_returns_none() {
-        // Genre is not in TrackInfo directly; always returns None
-        let track = make_track(Some("CBL"), Some("Twentythree"), Some("Abiogenesis"));
+    fn browse_field_extract_genre_returns_the_genre_of_the_track() {
+        let mut track = make_track(Some("CBL"), Some("Twentythree"), Some("Abiogenesis"));
         assert_eq!(BrowseField::Genre.extract(&track), None);
+
+        track.genre = Some("Ambient".to_string());
+        assert_eq!(
+            BrowseField::Genre.extract(&track),
+            Some("Ambient".to_string())
+        );
     }
 
     #[test]

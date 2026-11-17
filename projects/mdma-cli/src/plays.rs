@@ -1,9 +1,9 @@
 //! `mdma plays`: play history, read from the local fact replica (#99, ADR-021).
 //!
-//! Nothing here counts or resolves anything. `library_projection` folds the plays
-//! ([`PlayLog`](library_projection::PlayLog)) and resolves a partial hash
-//! ([`resolve_prefix`]), with the same functions the library service uses; this module
-//! parses the command line and lays the answer out.
+//! Nothing here counts or resolves anything. `client-facts` folds the plays and
+//! resolves a partial hash ([`Facts::play_histories`](client_facts::Facts)), with the
+//! same functions the library service uses; this module parses the command line and
+//! lays the answer out.
 
 use std::fmt::Display;
 use std::num::NonZeroUsize;
@@ -11,20 +11,15 @@ use std::str::FromStr;
 
 use bpaf::{construct, Parser};
 use chrono::{DateTime, Local, TimeZone, Utc};
+use client_facts::{Play, PlayHistory, RecentPlay, TrackPlays};
 use color_eyre::Result;
-use fact_replica::UnixSecs;
 use hicli::Arg;
 use library_ipc_client::ContentHash;
-use library_projection::{
-    ambiguity_message, resolve_prefix, IndexedTrackInfo, Play, PlayHistory, Projection,
-    ResolvedPlays, Unresolved,
-};
 use music_facts::{StartReason, StopReason};
 
 use crate::args::{parse_count, HashInput};
 use crate::ctx::Ctx;
-use crate::output::{each_track, TrackFailure};
-use crate::replica::{ago, fold_current, ReplicaFold};
+use crate::output::each_track;
 use crate::stdin::hashes_of_input;
 
 /// List the N latest plays of any track, instead of one track's history
@@ -76,75 +71,28 @@ impl Arg for PlaysOf {
 /// ```
 #[hicli::command]
 pub(crate) fn plays(of: PlaysOf, ctx: &Ctx) -> Result<hicli::Success> {
-    let fold = fold_current(ctx)?;
-    for note in replica_notes(&fold, UnixSecs::now()) {
-        eprintln!("{note}");
-    }
-    match of {
+    ctx.read(|facts| match of {
         PlaysOf::Track(hash) => {
             let hashes = hashes_of_input(hash)?;
-            // Resolved once, however many tracks are asked for.
-            let resolved = fold.projection.plays.resolved(&fold.projection.tracks);
+            // Resolved once, however many tracks are asked for; each answered or
+            // refused on its own.
+            let mut histories = facts.play_histories(&hashes)?.into_iter();
             let mut first = true;
-            each_track(hashes, |hash| {
-                let text = show_track(&fold.projection, &resolved, hash, &Local)?;
+            each_track(hashes, |_| {
+                let plays = histories.next().expect("one answer per hash")?;
                 if !std::mem::take(&mut first) {
                     println!();
                 }
-                println!("{text}");
-                Ok::<(), TrackFailure>(())
+                println!("{}", render_track(&plays, &Local));
+                Ok::<(), client_facts::FactsError>(())
             })
         }
         PlaysOf::Recent(RecentCount(n)) => {
-            println!("{}", show_recent(&fold.projection, n, &Local));
+            let recent = facts.recent_plays(n.get())?;
+            println!("{}", render_recent(&recent, &Local));
             Ok(hicli::Success::OK)
         }
-    }
-}
-
-/// What to say on stderr about the replica the answer comes from: which node, how old,
-/// and any lines it could not read.
-fn replica_notes(fold: &ReplicaFold, now: UnixSecs) -> Vec<String> {
-    let synced = ago(now, fold.synced_at);
-    let mut notes = vec![format!("replica of {}, synced {synced}", fold.id)];
-    let unreadable = fold.projection.unparseable_lines;
-    if unreadable > 0 {
-        let unread =
-            format!("{unreadable} lines this mdma cannot read; plays may be missing; upgrade mdma");
-        notes.push(unread);
-    }
-    notes
-}
-
-/// The history of the track `hash` names, laid out; or why it cannot be shown.
-/// `resolved` is the projection's plays, resolved once for all the tracks asked for.
-fn show_track<Tz: TimeZone>(
-    projection: &Projection,
-    resolved: &ResolvedPlays,
-    hash: &ContentHash,
-    tz: &Tz,
-) -> Result<String, TrackFailure>
-where
-    Tz::Offset: Display,
-{
-    let found = resolve_prefix(&projection.tracks, hash.as_str());
-    let track = found.map_err(|unresolved| match unresolved {
-        Unresolved::NotFound => TrackFailure::Said("not in the replica".to_string()),
-        Unresolved::Ambiguous(tracks) => {
-            TrackFailure::Said(ambiguity_message(hash.as_str(), &tracks))
-        }
-    })?;
-    Ok(render_track(track, &resolved.history(track), tz))
-}
-
-/// The `n` latest plays of any track, laid out.
-fn show_recent<Tz: TimeZone>(projection: &Projection, n: NonZeroUsize, tz: &Tz) -> String
-where
-    Tz::Offset: Display,
-{
-    let tracks = &projection.tracks;
-    let recent = projection.plays.recent(tracks, n.get());
-    render_recent(tracks, &recent, tz)
+    })
 }
 
 /// How a missing value is written.
@@ -159,12 +107,12 @@ where
 }
 
 /// `{short}  {artist} - {title}`.
-fn label(track: &IndexedTrackInfo) -> String {
+fn label(hash: &ContentHash, artist: Option<&str>, title: Option<&str>) -> String {
     format!(
         "{}  {} - {}",
-        track_formatter::short_hash(&track.content_hash),
-        track.artist.as_deref().unwrap_or(MISSING),
-        track.title.as_deref().unwrap_or(MISSING)
+        track_formatter::short_hash(hash),
+        artist.unwrap_or(MISSING),
+        title.unwrap_or(MISSING)
     )
 }
 
@@ -207,15 +155,20 @@ impl Columns {
 
 /// One track's history: its label, how many plays and the latest, then a row per play,
 /// newest first: `start stop start-reason stop-reason`.
-fn render_track<Tz: TimeZone>(track: &IndexedTrackInfo, history: &PlayHistory, tz: &Tz) -> String
+fn render_track<Tz: TimeZone>(track: &TrackPlays, tz: &Tz) -> String
 where
     Tz::Offset: Display,
 {
+    let history: &PlayHistory = &track.history;
     let time = |at: Option<DateTime<Utc>>| at.map_or(MISSING.to_string(), |at| when(at, tz));
     let count = history.count();
     let plural = if count == 1 { "play" } else { "plays" };
     let mut lines = vec![
-        label(track),
+        label(
+            &track.content_hash,
+            track.artist.as_deref(),
+            track.title.as_deref(),
+        ),
         format!("{count} {plural}, last {}", time(history.last_played())),
     ];
     for play in history.plays.iter().rev() {
@@ -233,23 +186,23 @@ where
 }
 
 /// The latest plays, one row each: `time short artist - title start-reason/stop-reason`.
-/// `recent` pairs a play with the index of its track in `tracks`.
-fn render_recent<Tz: TimeZone>(
-    tracks: &[IndexedTrackInfo],
-    recent: &[(usize, Play)],
-    tz: &Tz,
-) -> String
+fn render_recent<Tz: TimeZone>(recent: &[RecentPlay], tz: &Tz) -> String
 where
     Tz::Offset: Display,
 {
     recent
         .iter()
-        .map(|(i, play)| {
+        .map(|recent| {
+            let play = &recent.play;
             let columns = Columns::of(play);
             format!(
                 "{}  {}  {}/{}",
                 when(play.at(), tz),
-                label(&tracks[*i]),
+                label(
+                    &recent.content_hash,
+                    recent.artist.as_deref(),
+                    recent.title.as_deref()
+                ),
                 columns.start_reason(),
                 columns.stop_reason()
             )
@@ -261,10 +214,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{asserted, help, parses, usage_error};
+    use crate::test_support::{help, parses, usage_error};
     use chrono::FixedOffset;
-    use fact_replica::NodeId;
-    use library_projection::project_lines;
+    use client_facts::Stop;
     use pretty_assertions::assert_eq;
 
     // --- the command line ----------------------------------------------------
@@ -316,88 +268,56 @@ mod tests {
         assert!(!text.contains("```"), "{text}");
     }
 
-    // --- a replica to read ---------------------------------------------------
+    // --- the layout ----------------------------------------------------------
+    //
+    // What the plays are (the lineage of a merge, the pairing of starts and stops,
+    // the resolution of a hash) is `client-facts`' and tested there.
 
     const WINNER: &str = "sha256:aabbccddeeff00112233445566778899";
-    const LOSER: &str = "sha256:99887766554433221100ffeeddccbbaa";
     const OTHER: &str = "sha256:cc00cc00cc00cc00";
 
-    /// A time in January 2026, as the log writes it.
-    fn t(day: u32, hour: u32, min: u32) -> String {
-        format!("2026-01-{day:02}T{hour:02}:{min:02}:00Z")
+    /// A time in January 2026.
+    fn t(day: u32, hour: u32, min: u32) -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 1, day, hour, min, 0).unwrap()
     }
 
-    fn field(entity: &str, name: &str, value: &str, time: &str) -> String {
-        let json = format!(r#"{{"t":"{name}","v":"{value}"}}"#);
-        asserted(entity, &json, time)
+    fn stop(at: DateTime<Utc>, reason: StopReason) -> Stop {
+        Stop { at, reason }
     }
 
-    fn started(entity: &str, reason: &str, time: &str) -> String {
-        field(entity, "TrackStarted", reason, time)
+    /// Three plays: a stop-only one, a start another start cut off, and a complete one.
+    fn blue_monday(plays: Vec<Play>) -> TrackPlays {
+        TrackPlays {
+            content_hash: ContentHash::new(WINNER),
+            artist: Some("New Order".to_string()),
+            title: Some("Blue Monday".to_string()),
+            history: PlayHistory { plays },
+        }
     }
 
-    fn stopped(entity: &str, reason: &str, time: &str) -> String {
-        field(entity, "TrackStopped", reason, time)
-    }
-
-    /// Two tracks. The winner replaced the loser, which is gone, and carries its play:
-    /// three plays in all (a stop-only one, a start another start cut off, and a
-    /// complete one). The other track was played once.
-    fn log() -> Vec<String> {
-        let replaces = format!(r#"{{"t":"Replaces","v":"{LOSER}"}}"#);
+    fn three_plays() -> Vec<Play> {
         vec![
-            field(WINNER, "Artist", "New Order", &t(1, 10, 0)),
-            field(WINNER, "Title", "Blue Monday", &t(1, 10, 0)),
-            field(OTHER, "Artist", "deadmau5", &t(1, 10, 0)),
-            field(OTHER, "Title", "Strobe", &t(1, 10, 0)),
-            stopped(LOSER, "OnSkip", &t(3, 11, 0)),
-            asserted(WINNER, &replaces, &t(2, 10, 0)),
-            started(WINNER, "OnRequest", &t(5, 12, 0)),
-            started(WINNER, "ByQueue", &t(9, 13, 0)),
-            stopped(WINNER, "OnCompletion", &t(9, 13, 30)),
-            started(OTHER, "ByQueue", &t(7, 9, 15)),
-            stopped(OTHER, "OnSkip", &t(7, 9, 20)),
+            Play::StopOnly(stop(t(3, 11, 0), StopReason::OnSkip)),
+            Play::Started {
+                at: t(5, 12, 0),
+                reason: StartReason::OnRequest,
+                stop: None,
+            },
+            Play::Started {
+                at: t(9, 13, 0),
+                reason: StartReason::ByQueue,
+                stop: Some(stop(t(9, 13, 30), StopReason::OnCompletion)),
+            },
         ]
-    }
-
-    fn project(lines: &[String]) -> Projection {
-        project_lines(lines.iter().map(String::as_str))
-    }
-
-    fn projection() -> Projection {
-        let projection = project(&log());
-        assert_eq!(projection.unparseable_lines, 0, "the fixture lines parse");
-        projection
-    }
-
-    /// `show_track`, with the plays resolved for this one track.
-    fn track_text(
-        projection: &Projection,
-        hash: &ContentHash,
-        tz: &FixedOffset,
-    ) -> Result<String, TrackFailure> {
-        let resolved = projection.plays.resolved(&projection.tracks);
-        show_track(projection, &resolved, hash, tz)
     }
 
     fn utc() -> FixedOffset {
         FixedOffset::east_opt(0).unwrap()
     }
 
-    fn said(result: Result<String, TrackFailure>) -> String {
-        match result {
-            Err(TrackFailure::Said(text)) => text,
-            other => panic!("expected a failure with a text, got {other:?}"),
-        }
-    }
-
-    // --- one track -----------------------------------------------------------
-
     #[test]
-    fn a_track_shows_its_plays_newest_first_with_those_inherited_from_a_merge() {
-        let hash = ContentHash::new("aabbccdd");
-
-        let shown = track_text(&projection(), &hash, &utc()).unwrap();
+    fn a_track_shows_its_plays_newest_first() {
+        let shown = render_track(&blue_monday(three_plays()), &utc());
 
         assert_eq!(
             shown,
@@ -411,23 +331,26 @@ mod tests {
 
     #[test]
     fn a_track_with_no_plays_says_so() {
-        let projection = project(&[field(WINNER, "Title", "Quiet", &t(1, 10, 0))]);
-        let hash = ContentHash::new(WINNER);
+        let quiet = TrackPlays {
+            artist: None,
+            title: Some("Quiet".to_string()),
+            ..blue_monday(vec![])
+        };
 
-        let shown = track_text(&projection, &hash, &utc()).unwrap();
+        let shown = render_track(&quiet, &utc());
 
         assert_eq!(shown, "aabbccddeeff  - - Quiet\n0 plays, last -");
     }
 
     #[test]
     fn one_play_is_not_plural() {
-        let projection = project(&[
-            field(WINNER, "Title", "Once", &t(1, 10, 0)),
-            started(WINNER, "OnRequest", &t(2, 8, 0)),
-        ]);
-        let hash = ContentHash::new(WINNER);
+        let once = Play::Started {
+            at: t(2, 8, 0),
+            reason: StartReason::OnRequest,
+            stop: None,
+        };
 
-        let shown = track_text(&projection, &hash, &utc()).unwrap();
+        let shown = render_track(&blue_monday(vec![once]), &utc());
 
         assert!(shown.contains("\n1 play, last"), "{shown}");
     }
@@ -435,9 +358,8 @@ mod tests {
     #[test]
     fn times_are_shown_in_the_zone_given() {
         let plus_two = FixedOffset::east_opt(2 * 3600).unwrap();
-        let hash = ContentHash::new("aabbccdd");
 
-        let shown = track_text(&projection(), &hash, &plus_two).unwrap();
+        let shown = render_track(&blue_monday(three_plays()), &plus_two);
 
         let newest = shown.lines().nth(2).unwrap();
         assert_eq!(
@@ -447,35 +369,31 @@ mod tests {
     }
 
     #[test]
-    fn a_hash_the_replica_lacks_is_not_in_the_replica() {
-        let hash = ContentHash::new("12345678");
+    fn recent_lists_one_row_per_play_with_its_track() {
+        let play_of = |hash: &str, artist: &str, title: &str, play: Play| RecentPlay {
+            content_hash: ContentHash::new(hash),
+            artist: Some(artist.to_string()),
+            title: Some(title.to_string()),
+            play,
+        };
+        let plays = three_plays();
+        let recent = vec![
+            play_of(WINNER, "New Order", "Blue Monday", plays[2]),
+            play_of(
+                OTHER,
+                "deadmau5",
+                "Strobe",
+                Play::Started {
+                    at: t(7, 9, 15),
+                    reason: StartReason::ByQueue,
+                    stop: Some(stop(t(7, 9, 20), StopReason::OnSkip)),
+                },
+            ),
+            play_of(WINNER, "New Order", "Blue Monday", plays[1]),
+            play_of(WINNER, "New Order", "Blue Monday", plays[0]),
+        ];
 
-        let missing = track_text(&projection(), &hash, &utc());
-
-        assert_eq!(said(missing), "not in the replica");
-    }
-
-    #[test]
-    fn a_hash_two_tracks_share_is_ambiguous_and_says_how_many() {
-        let projection = project(&[
-            field("sha256:abcdef0011223344", "Title", "A", &t(1, 10, 0)),
-            field("sha256:abcdef0099887766", "Title", "B", &t(1, 10, 0)),
-        ]);
-        let hash = ContentHash::new("abcdef00");
-
-        let ambiguous = track_text(&projection, &hash, &utc());
-
-        let text = said(ambiguous);
-        assert!(text.contains("matches 2 tracks"), "{text}");
-    }
-
-    // --- recent --------------------------------------------------------------
-
-    #[test]
-    fn recent_lists_the_latest_plays_of_every_track_newest_first() {
-        let n = NonZeroUsize::new(10).unwrap();
-
-        let shown = show_recent(&projection(), n, &utc());
+        let shown = render_recent(&recent, &utc());
 
         assert_eq!(
             shown,
@@ -484,61 +402,5 @@ mod tests {
              2026-01-05 12:00  aabbccddeeff  New Order - Blue Monday  OnRequest/-\n\
              2026-01-03 11:00  aabbccddeeff  New Order - Blue Monday  -/OnSkip"
         );
-    }
-
-    #[test]
-    fn recent_stops_after_n_plays() {
-        let n = NonZeroUsize::new(2).unwrap();
-
-        let shown = show_recent(&projection(), n, &utc());
-
-        assert_eq!(shown.lines().count(), 2, "{shown}");
-        assert!(shown.starts_with("2026-01-09 13:00"), "{shown}");
-    }
-
-    // --- the replica note ----------------------------------------------------
-
-    fn fold_of(lines: &[String]) -> ReplicaFold {
-        ReplicaFold {
-            id: NodeId::new("mdma-stage").unwrap(),
-            synced_at: Some(UnixSecs::new(1_000)),
-            projection: project(lines),
-        }
-    }
-
-    #[test]
-    fn the_replica_is_named_and_its_age_given_on_stderr() {
-        let fold = fold_of(&log());
-
-        let notes = replica_notes(&fold, UnixSecs::new(1_000 + 7_200));
-
-        assert_eq!(notes, ["replica of mdma-stage, synced 2 h ago"]);
-    }
-
-    #[test]
-    fn lines_this_mdma_cannot_read_are_reported_too() {
-        let mut lines = log();
-        lines.push(r#"["from-a-newer-node"]"#.to_string());
-        lines.push("garbage".to_string());
-
-        let notes = replica_notes(&fold_of(&lines), UnixSecs::new(1_005));
-
-        assert_eq!(
-            notes,
-            [
-                "replica of mdma-stage, synced 5 s ago",
-                "2 lines this mdma cannot read; plays may be missing; upgrade mdma"
-            ]
-        );
-    }
-
-    #[test]
-    fn a_replica_that_never_synced_says_never() {
-        let mut fold = fold_of(&[]);
-        fold.synced_at = None;
-
-        let notes = replica_notes(&fold, UnixSecs::new(5));
-
-        assert_eq!(notes, ["replica of mdma-stage, synced never"]);
     }
 }

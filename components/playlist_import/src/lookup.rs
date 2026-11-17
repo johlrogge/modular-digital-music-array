@@ -1,6 +1,6 @@
 //! Library-backed [`TrackLookup`].
 
-use library_ipc_client::{ClientError, ContentHash, TrackInfo};
+use library_ipc_client::{ContentHash, TrackInfo};
 use library_search::{StringQuery, TrackQuery};
 use track_matcher::TrackLookup;
 
@@ -35,14 +35,18 @@ impl LookupErrors {
 ///
 /// `search` is the library's `search` call: `LibraryBackend::search` in the
 /// CLI, `LibraryClient::search` in services.
+///
+/// The search may fail with any error that can be shown: a `ClientError` for the
+/// library clients, a `FactsError` where the search reads the replica or the node.
 pub struct LibraryTrackLookup<S> {
     search: S,
     errors: LookupErrors,
 }
 
-impl<S> LibraryTrackLookup<S>
+impl<S, E> LibraryTrackLookup<S>
 where
-    S: Fn(&TrackQuery) -> Result<Vec<TrackInfo>, ClientError>,
+    S: Fn(&TrackQuery) -> Result<Vec<TrackInfo>, E>,
+    E: std::fmt::Display,
 {
     pub fn new(search: S) -> Self {
         Self {
@@ -60,9 +64,10 @@ where
     }
 }
 
-impl<S> TrackLookup for LibraryTrackLookup<S>
+impl<S, E> TrackLookup for LibraryTrackLookup<S>
 where
-    S: Fn(&TrackQuery) -> Result<Vec<TrackInfo>, ClientError>,
+    S: Fn(&TrackQuery) -> Result<Vec<TrackInfo>, E>,
+    E: std::fmt::Display,
 {
     fn find_by_isrc(&self, _isrc: &str) -> Vec<ContentHash> {
         // TODO: ISRC search is not available via TrackQuery — no ISRC field in library_search.
@@ -97,7 +102,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use library_ipc_client::ProtocolError;
+    use library_ipc_client::{ClientError, ProtocolError};
     use pretty_assertions::assert_eq;
 
     #[test]
@@ -121,5 +126,15 @@ mod tests {
         let err = lookup.check().unwrap_err();
         assert!(err.to_string().contains("gateway hiccup"), "got: {err}");
         assert!(lookup.check().is_ok(), "check consumes the recorded error");
+    }
+
+    #[test]
+    fn a_search_may_fail_with_any_error_that_can_be_shown() {
+        let lookup = LibraryTrackLookup::new(|_: &TrackQuery| -> Result<Vec<TrackInfo>, String> {
+            Err("no replica yet".to_string())
+        });
+        assert!(lookup.find_by_artist_title("a", "b").is_empty());
+        let err = lookup.check().unwrap_err();
+        assert!(err.to_string().contains("no replica yet"), "got: {err}");
     }
 }

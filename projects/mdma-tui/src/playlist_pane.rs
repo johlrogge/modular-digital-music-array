@@ -1,4 +1,5 @@
 #![allow(dead_code)]
+use crate::link::{Link, ReadError};
 use crate::pane::{AddPlayingTarget, Pane, PaneAction, PaneKind};
 use crate::rows::{row_for_lookup, rows_content_for_write, rows_for_hashes, ListRow};
 use crate::selection::SelectionState;
@@ -6,8 +7,7 @@ use crate::theme::MUTED;
 use crate::track_list::render_track_list;
 use crossterm::event::{KeyCode, KeyEvent};
 use mdma_client::{
-    entry_tracks, ContentHash, EntryTrackError, LibraryBackend, LibraryClientError, PlaylistEntry,
-    PlaylistName, TrackInfo,
+    entry_tracks, ContentHash, EntryTrackError, PlaylistEntry, PlaylistName, TrackInfo,
 };
 use ratatui::{
     layout::Rect,
@@ -15,7 +15,6 @@ use ratatui::{
     widgets::{Block, Borders},
     Frame,
 };
-use std::rc::Rc;
 
 /// Turn library entries into rows, keeping every entry at its position.
 ///
@@ -25,8 +24,8 @@ use std::rc::Rc;
 /// must not be shown as one.
 fn rows_from_entries(
     entries: &[PlaylistEntry],
-    get_track: impl FnMut(&ContentHash) -> Result<TrackInfo, LibraryClientError>,
-) -> Result<Vec<ListRow>, LibraryClientError> {
+    get_track: impl FnMut(&ContentHash) -> Result<TrackInfo, ReadError>,
+) -> Result<Vec<ListRow>, ReadError> {
     entry_tracks(entries, get_track)
         .map(|entry| match entry {
             Ok(track) => Ok(ListRow::Track(track)),
@@ -38,12 +37,16 @@ fn rows_from_entries(
         .collect()
 }
 
-fn load_rows(
-    library: &LibraryBackend,
-    name: &PlaylistName,
-) -> Result<Vec<ListRow>, LibraryClientError> {
-    let entries = library.playlist_entries(name)?;
-    rows_from_entries(&entries, |h| library.get_track(h))
+/// The rows of playlist `name`: its entries from the node, each row's metadata
+/// from the facts. The error is the text to show.
+fn load_rows(link: &Link, name: &PlaylistName) -> Result<Vec<ListRow>, String> {
+    let entries = link
+        .library()
+        .map_err(|e| e.to_string())?
+        .playlist_entries(name)
+        .map_err(|e| e.to_string())?;
+    // From the node, not the replica: these rows are written back to the playlist.
+    rows_from_entries(&entries, |h| link.node_track(h)).map_err(|e| e.to_string())
 }
 
 /// Maximum number of undo snapshots retained per playlist pane.
@@ -61,7 +64,7 @@ pub struct PlaylistPane {
     name: PlaylistName,
     rows: Vec<ListRow>,
     selection: SelectionState,
-    library: Rc<LibraryBackend>,
+    link: Link,
     title: String,
     undo_stack: Vec<PlaylistSnapshot>,
 }
@@ -72,7 +75,7 @@ impl Clone for PlaylistPane {
             name: self.name.clone(),
             rows: self.rows.clone(),
             selection: self.selection.clone(),
-            library: Rc::clone(&self.library),
+            link: self.link.clone(),
             title: self.title.clone(),
             // Undo history is intentionally not carried over to tab clones —
             // each tab is an independent view.
@@ -82,19 +85,19 @@ impl Clone for PlaylistPane {
 }
 
 impl PlaylistPane {
-    /// Open a playlist pane by loading the playlist from the library backend.
+    /// Open a playlist pane by loading the playlist from the node.
     ///
     /// Entries that do not resolve stay as rows at their position, shown as
     /// unavailable.
-    pub fn open(name: PlaylistName, library: Rc<LibraryBackend>) -> color_eyre::Result<Self> {
-        let rows = load_rows(&library, &name)?;
+    pub fn open(name: PlaylistName, link: Link) -> color_eyre::Result<Self> {
+        let rows = load_rows(&link, &name).map_err(|e| color_eyre::eyre::eyre!("{e}"))?;
         let total = rows.len();
         let title = format!("Playlist: {}", name);
         Ok(PlaylistPane {
             name,
             rows,
             selection: SelectionState::new(total),
-            library,
+            link,
             title,
             undo_stack: Vec::new(),
         })
@@ -131,9 +134,26 @@ impl PlaylistPane {
     /// playlist file is human-readable and matches `mdma search` output.
     /// Unresolved rows are written back as their own token followed by the
     /// reason as a trailing comment, never dropped.
-    fn persist_order(&self) -> Result<(), mdma_client::LibraryClientError> {
-        let content = rows_content_for_write(&self.rows);
-        self.library.playlist_replace(&self.name, content)
+    fn persist_order(&self) -> Result<(), String> {
+        self.replace_content(rows_content_for_write(&self.rows))
+    }
+
+    /// Replace the playlist on the node with `content`. The error is the text to show.
+    fn replace_content(&self, content: String) -> Result<(), String> {
+        self.link
+            .library()
+            .map_err(|e| e.to_string())?
+            .playlist_replace(&self.name, content)
+            .map_err(|e| e.to_string())
+    }
+
+    /// Append `content` to the playlist on the node. The error is the text to show.
+    fn append_content(&self, content: String) -> Result<(), String> {
+        self.link
+            .library()
+            .map_err(|e| e.to_string())?
+            .playlist_append(&self.name, content)
+            .map_err(|e| e.to_string())
     }
 
     /// Undo the most recent mutation by restoring the last snapshot.
@@ -173,7 +193,7 @@ impl PlaylistPane {
             return PaneAction::Info("Clipboard is empty".to_string());
         }
 
-        let pasted = match rows_for_hashes(&hashes, |h| self.library.get_track(h)) {
+        let pasted = match rows_for_hashes(&hashes, |h| self.link.node_track(h)) {
             Ok(rows) => rows,
             Err(e) => return PaneAction::Error(format!("Paste failed: {e}")),
         };
@@ -329,7 +349,7 @@ impl Pane for PlaylistPane {
 
                 let content = rows_content_for_write(&remaining_rows);
 
-                match self.library.playlist_replace(&self.name, content) {
+                match self.replace_content(content) {
                     Ok(()) => {
                         self.rows = remaining_rows;
                         // Clamp cursor to new length
@@ -366,13 +386,13 @@ impl Pane for PlaylistPane {
             return PaneAction::Info("All selected tracks already in playlist".to_string());
         }
 
-        let new_rows = match rows_for_hashes(&new_hashes, |h| self.library.get_track(h)) {
+        let new_rows = match rows_for_hashes(&new_hashes, |h| self.link.node_track(h)) {
             Ok(rows) => rows,
             Err(e) => return PaneAction::Error(format!("Failed to add tracks: {e}")),
         };
 
         let content = rows_content_for_write(&new_rows);
-        match self.library.playlist_append(&self.name, content) {
+        match self.append_content(content) {
             Ok(()) => {
                 let added = new_rows.len();
                 self.rows.extend(new_rows);
@@ -425,7 +445,7 @@ impl Pane for PlaylistPane {
     }
 
     fn refresh(&mut self) -> PaneAction {
-        match load_rows(&self.library, &self.name) {
+        match load_rows(&self.link, &self.name) {
             Ok(rows) => {
                 self.rows = rows;
                 self.selection.set_total_items(self.rows.len());
@@ -1189,7 +1209,40 @@ mod tests {
 
         let result = rows_from_entries(&entries, |_| Err(transport_error()));
 
-        assert!(matches!(result, Err(LibraryClientError::Transport(_))));
+        assert!(matches!(
+            result,
+            Err(ReadError::Facts(client_facts::FactsError::Transport(_)))
+        ));
+    }
+
+    /// A playlist is written back as the rows show it, so its rows are the node's.
+    /// With no replica at all and the node up, it opens; with a replica that has
+    /// other ideas about the track, the node's answer is still what is shown.
+    #[test]
+    fn a_playlist_opens_with_the_rows_of_the_node_when_there_is_no_replica() {
+        use crate::test_support::{node_hash, Services, World};
+        let world = World::new(None);
+        let _services = Services::start(&world);
+
+        let pane = PlaylistPane::open(PlaylistName::new("set").unwrap(), world.link())
+            .expect("the node has the playlist and its track");
+
+        assert_eq!(pane.item_count(), 1);
+        assert_eq!(pane.resolve_selection(), [node_hash()]);
+        assert!(
+            matches!(&pane.rows[0], ListRow::Track(t) if t.title.as_deref() == Some("Node Title"))
+        );
+    }
+
+    #[test]
+    fn a_playlist_on_a_dead_node_does_not_open() {
+        use crate::test_support::{catalog, World};
+        let world = World::new(Some(catalog()));
+
+        let opened = PlaylistPane::open(PlaylistName::new("set").unwrap(), world.link());
+
+        let text = opened.err().expect("the node is dead").to_string();
+        assert!(text.contains("needs the node"), "{text}");
     }
 
     /// A resolved entry whose track the library then reports as not found

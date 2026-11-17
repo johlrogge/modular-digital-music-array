@@ -1,11 +1,12 @@
 #![allow(dead_code)]
 use crate::browse_field::BrowseField;
+use crate::link::Link;
 use crate::pane::{Pane, PaneAction, PaneKind};
 use crate::selection::SelectionState;
 use crate::theme::RowState;
 use crate::track_list::render_track_list;
 use crossterm::event::{KeyCode, KeyEvent};
-use mdma_client::{ContentHash, LibraryBackend, TrackInfo};
+use mdma_client::{ContentHash, TrackInfo};
 use ratatui::{
     layout::Rect,
     text::Span,
@@ -13,7 +14,6 @@ use ratatui::{
     Frame,
 };
 use std::collections::HashMap;
-use std::rc::Rc;
 
 const ROOT_ITEMS: [&str; 4] = ["Tracks", "Artists", "Albums", "Genres"];
 const ROOT_FIELDS: [BrowseField; 4] = [
@@ -54,35 +54,36 @@ enum BrowserLevel {
 #[derive(Clone)]
 pub struct BrowserPane {
     level: BrowserLevel,
-    library: Rc<LibraryBackend>,
+    link: Link,
     breadcrumbs: Vec<String>,
-    /// Cached full track list to avoid repeated backend round-trips.
+    /// The full track list, read from the facts once. Every group, genre included,
+    /// is built from it: nothing is asked or counted again per group.
     all_tracks: Option<Vec<TrackInfo>>,
     /// Dummy selection state for the Root level (4 items, one per category).
     root_selection: SelectionState,
 }
 
 impl BrowserPane {
-    pub fn new(library: Rc<LibraryBackend>) -> Self {
+    pub fn new(link: Link) -> Self {
         let mut root_selection = SelectionState::new(ROOT_ITEMS.len());
         // Start with cursor on Artists (index 1).
         root_selection.list_state.select(Some(1));
         BrowserPane {
             level: BrowserLevel::Root { cursor: 1 },
-            library,
+            link,
             breadcrumbs: vec!["Browser".to_string()],
             all_tracks: None,
             root_selection,
         }
     }
 
-    /// Ensure all_tracks is populated; loads from the library if not yet cached.
+    /// Ensure all_tracks is populated; reads it from the facts if not yet cached.
     ///
     /// Returns `Some(PaneAction::Error(...))` if the load fails, leaving
     /// `all_tracks` as `None` so the next call retries. Returns `None` on success.
     fn ensure_all_tracks(&mut self) -> Option<PaneAction> {
         if self.all_tracks.is_none() {
-            match self.library.list_tracks(None) {
+            match self.link.tracks() {
                 Ok(tracks) => {
                     self.all_tracks = Some(tracks);
                 }
@@ -118,53 +119,6 @@ impl BrowserPane {
                 .cmp(&b.name.to_ascii_lowercase())
         });
         groups
-    }
-
-    /// Build a group list from genre fact values (fallback: from track genre field).
-    fn build_genre_groups(&mut self) -> Vec<GroupEntry> {
-        // Try to get genres from fact values first
-        match self.library.get_fact_values("MainGenre") {
-            Ok(genre_values) if !genre_values.is_empty() => {
-                let Some(all) = &self.all_tracks else {
-                    return genre_values
-                        .into_iter()
-                        .map(|name| GroupEntry { name, count: 0 })
-                        .collect();
-                };
-
-                // Count tracks per genre by looking up each track's MainGenre fact.
-                let mut map: HashMap<String, usize> = HashMap::new();
-                for genre in &genre_values {
-                    map.insert(genre.clone(), 0);
-                }
-
-                for track in all {
-                    if let Ok((_, facts)) = self.library.get_facts(&track.content_hash) {
-                        if let Some(genre) = facts
-                            .into_iter()
-                            .find(|(k, _)| k == "MainGenre")
-                            .map(|(_, v)| v)
-                        {
-                            if let Some(count) = map.get_mut(&genre) {
-                                *count += 1;
-                            }
-                        }
-                    }
-                }
-
-                let mut groups: Vec<GroupEntry> = map
-                    .into_iter()
-                    .map(|(name, count)| GroupEntry { name, count })
-                    .collect();
-                groups.sort_by(|a, b| {
-                    a.name
-                        .to_ascii_lowercase()
-                        .cmp(&b.name.to_ascii_lowercase())
-                });
-                groups
-            }
-            _ => self.build_groups(BrowseField::Genre),
-        }
     }
 
     /// Sort tracks by (disc_number asc, track_number asc) for album views.
@@ -244,16 +198,6 @@ impl BrowserPane {
                     group_name: None,
                     selection: SelectionState::new(total),
                     tracks,
-                };
-            }
-            BrowseField::Genre => {
-                let groups = self.build_genre_groups();
-                let total = groups.len();
-                self.breadcrumbs.push(label.to_string());
-                self.level = BrowserLevel::Groups {
-                    field,
-                    selection: SelectionState::new(total),
-                    groups,
                 };
             }
             _ => {
@@ -368,11 +312,7 @@ impl BrowserPane {
                     if let Some(err) = self.ensure_all_tracks() {
                         return Some(err);
                     }
-                    let groups = if field == BrowseField::Genre {
-                        self.build_genre_groups()
-                    } else {
-                        self.build_groups(field)
-                    };
+                    let groups = self.build_groups(field);
                     let total = groups.len();
                     self.level = BrowserLevel::Groups {
                         field,
@@ -674,6 +614,17 @@ impl Pane for BrowserPane {
         PaneKind::Browser
     }
 
+    /// The facts were read again: go back to the top, and read the tracks anew on
+    /// the next drill, so no group shown is older than the facts.
+    fn refresh(&mut self) -> PaneAction {
+        self.all_tracks = None;
+        self.level = BrowserLevel::Root { cursor: 1 };
+        self.root_selection = SelectionState::new(ROOT_ITEMS.len());
+        self.root_selection.list_state.select(Some(1));
+        self.breadcrumbs = vec!["Browser".to_string()];
+        PaneAction::Consumed
+    }
+
     fn display_string(&self, data_idx: usize) -> Option<String> {
         match &self.level {
             BrowserLevel::Root { .. } => ROOT_ITEMS.get(data_idx).map(|s| s.to_string()),
@@ -696,6 +647,7 @@ impl Pane for BrowserPane {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{catalog, catalog_with_a_fourth, World};
     use mdma_client::ContentHash;
 
     fn make_track(
@@ -723,6 +675,9 @@ mod tests {
             beat_grid: None,
             role: None,
             energy: None,
+            genre: None,
+            label: None,
+            styles: vec![],
         }
     }
 
@@ -746,6 +701,9 @@ mod tests {
             beat_grid: None,
             role: None,
             energy: None,
+            genre: None,
+            label: None,
+            styles: vec![],
         }
     }
 
@@ -863,6 +821,51 @@ mod tests {
         assert_eq!(hashes.len(), 2);
         assert!(hashes.contains(&ContentHash::new("sha256:aaa")));
         assert!(hashes.contains(&ContentHash::new("sha256:bbb")));
+    }
+
+    /// The genre groups, their counts and their tracks all come from the genre each
+    /// `TrackInfo` carries. The node is dead here: one `get_facts` or
+    /// `get_fact_values` per track would show as an unreachable node.
+    #[test]
+    fn genre_groups_come_from_the_track_infos_without_asking_the_node() {
+        let world = World::new(Some(catalog()));
+        let link = world.link();
+        let mut pane = BrowserPane::new(link.clone());
+        let genres = ROOT_FIELDS
+            .iter()
+            .position(|&field| field == BrowseField::Genre)
+            .unwrap();
+
+        assert!(pane.drill_root(genres).is_none());
+
+        let BrowserLevel::Groups { groups, .. } = &pane.level else {
+            panic!("the genres are a list of groups");
+        };
+        let listed: Vec<(&str, usize)> =
+            groups.iter().map(|g| (g.name.as_str(), g.count)).collect();
+        assert_eq!(listed, [("New Wave", 1), ("Synthpop", 2)]);
+        assert!(pane
+            .drill_group(BrowseField::Genre, "Synthpop".into())
+            .is_none());
+        assert_eq!(pane.item_count(), 2);
+        let status = link.status_text().unwrap();
+        assert!(!status.contains("unreachable"), "{status}");
+    }
+
+    #[test]
+    fn refreshing_goes_back_to_the_top_and_reads_the_tracks_anew() {
+        let world = World::new(Some(catalog()));
+        let mut pane = BrowserPane::new(world.link());
+        assert!(pane.drill_root(1).is_none());
+        assert_eq!(pane.item_count(), 2, "two artists");
+
+        world.sync(catalog_with_a_fourth());
+        pane.link.refold().unwrap();
+        pane.refresh();
+
+        assert_eq!(pane.item_count(), ROOT_ITEMS.len());
+        assert!(pane.drill_root(0).is_none());
+        assert_eq!(pane.item_count(), 4, "all four tracks");
     }
 
     #[test]

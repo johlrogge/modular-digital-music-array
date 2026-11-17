@@ -4,14 +4,15 @@ use crate::local_complete::{
     complete_albums, complete_artists, complete_genres, complete_labels, complete_query,
     complete_sources, complete_styles, complete_titles, merge_unlisted,
 };
-use crate::output::{library_error, print_tracks};
+use crate::output::print_tracks;
 use crate::stdin::hashes_if_dash;
 use bpaf::{construct, long, Parser};
+use client_facts::Facts;
 use color_eyre::Result;
 use hicli::{Arg, Candidate, Choice};
 use library_ipc_client::{ContentHash, TrackInfo};
 use library_search::{DateQuery, DurationQuery, KeyQuery, NumericQuery, StringQuery, TrackQuery};
-use mdma_client::LibraryBackend;
+use mdma_client::Node;
 use music_facts::{EnergyLevel, TrackRole};
 use std::str::FromStr;
 
@@ -262,10 +263,10 @@ pub(crate) struct DurationArg(pub DurationQuery);
 /// Search for tracks by filter or free text
 #[hicli::command(default)]
 pub(crate) fn query(args: SearchArgs, ctx: &Ctx) -> Result<()> {
-    let library = ctx.library()?;
     let stdin = args.input.stdin;
     let track_query = build_track_query(args);
-    search_tracks(&library, &track_query, hashes_if_dash(stdin))
+    // The facts are opened (the node resolved, or the replica folded) before stdin is read.
+    ctx.read(|facts| search_tracks(facts, &track_query, hashes_if_dash(stdin)))
 }
 
 /// Filter by playback history (takes precedence over --started); `never` matches
@@ -369,7 +370,7 @@ fn apply_stdin_filter(
 /// Search the library; `stdin_filter` holds the hashes read from stdin (asked for
 /// with `-`), if any, as an intersection filter.
 fn search_tracks(
-    library: &LibraryBackend,
+    facts: &Facts<&Node>,
     query: &TrackQuery,
     stdin_filter: Option<Vec<ContentHash>>,
 ) -> Result<()> {
@@ -385,7 +386,7 @@ fn search_tracks(
         effective_query.not = false;
     }
 
-    let tracks = library.search(&effective_query).map_err(library_error)?;
+    let tracks = facts.search(&effective_query)?;
     let tracks = apply_stdin_filter(tracks, stdin_filter.as_deref(), effective_not);
 
     if tracks.is_empty() && std::io::stdout().is_terminal() {
@@ -412,27 +413,26 @@ fn search_tracks(
 pub(crate) fn fact_values_for(fact_type: FactTypeArg, ctx: &Ctx) -> Result<()> {
     use std::io::IsTerminal;
     let FactTypeArg(fact_type) = fact_type;
-    let library = ctx.library()?;
-    let values = library
-        .get_fact_values(fact_type.as_str())
-        .map_err(library_error)?;
-    if std::io::stdout().is_terminal() {
-        if values.is_empty() {
-            println!("No values found for fact type '{}'", fact_type);
-            return Ok(());
+    ctx.read(|facts| {
+        let values = facts.fact_values(&fact_type)?;
+        if std::io::stdout().is_terminal() {
+            if values.is_empty() {
+                println!("No values found for fact type '{}'", fact_type);
+                return Ok(());
+            }
+            println!("Values for '{}' ({} distinct):", fact_type, values.len());
+            println!("{}", "=".repeat(65));
+            for v in values {
+                println!("  {}", v);
+            }
+        } else {
+            // Pipe mode: one value per line — composable with dmenu, grep, etc.
+            for v in values {
+                println!("{}", v);
+            }
         }
-        println!("Values for '{}' ({} distinct):", fact_type, values.len());
-        println!("{}", "=".repeat(65));
-        for v in values {
-            println!("  {}", v);
-        }
-    } else {
-        // Pipe mode: one value per line — composable with dmenu, grep, etc.
-        for v in values {
-            println!("{}", v);
-        }
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 #[cfg(test)]

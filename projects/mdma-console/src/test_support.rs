@@ -126,6 +126,9 @@ pub fn bare_track(hash: &str) -> library_ipc_client::TrackInfo {
         beat_grid: None,
         role: None,
         energy: None,
+        genre: None,
+        label: None,
+        styles: vec![],
     }
 }
 

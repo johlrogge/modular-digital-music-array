@@ -29,6 +29,15 @@ impl ClientError {
             ClientError::Protocol(ProtocolError::InvalidRequest { .. })
         )
     }
+
+    /// True when the node could not be reached (a timeout, or a refused, reset or
+    /// closed connection), as opposed to answering with a refusal.
+    pub fn is_unreachable(&self) -> bool {
+        match self {
+            ClientError::Transport(error) => error.is_unreachable(),
+            ClientError::Protocol(_) => false,
+        }
+    }
 }
 
 impl From<serde_json::Error> for ClientError {
@@ -49,9 +58,10 @@ impl From<nng_transport::ConnectionError> for ClientError {
     }
 }
 
-/// Client for connecting to the library service.
+/// Client for connecting to the library service. A clone shares the socket.
+#[derive(Clone)]
 pub struct LibraryClient {
-    socket: nng::Socket,
+    socket: nng_transport::SharedSocket,
 }
 
 impl LibraryClient {
@@ -70,8 +80,19 @@ impl LibraryClient {
     /// # Ok::<(), library_ipc_client::ClientError>(())
     /// ```
     pub fn connect(address: &str) -> Result<Self, ClientError> {
-        let socket = nng_transport::connect(address)?;
+        let socket = nng_transport::SharedSocket::connect(address)?;
         Ok(Self { socket })
+    }
+
+    /// Whether `other` is a clone of this client, on the same connection.
+    pub fn is_same_connection(&self, other: &Self) -> bool {
+        self.socket.is_same_socket(&other.socket)
+    }
+
+    /// Why a request found the node unreachable since this was last asked, if one
+    /// did; see [`nng_transport::SharedSocket::take_unreachable`].
+    pub fn take_unreachable(&self) -> Option<String> {
+        self.socket.take_unreachable()
     }
 
     /// Send a request and receive a response.
@@ -79,7 +100,7 @@ impl LibraryClient {
     /// This is the low-level method that sends any request type.
     /// For convenience, use the typed methods like `ping()`, `status()`, etc.
     pub fn request(&self, request: &LibraryRequest) -> Result<LibraryResponse, ClientError> {
-        Ok(nng_transport::request_response(&self.socket, request)?)
+        Ok(self.socket.request_response(request)?)
     }
 
     // =========================================================================
@@ -922,6 +943,9 @@ mod tests {
             beat_grid: None,
             role: None,
             energy: None,
+            genre: None,
+            label: None,
+            styles: vec![],
         }
     }
 

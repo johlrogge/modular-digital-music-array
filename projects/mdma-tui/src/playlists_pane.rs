@@ -1,9 +1,10 @@
 #![allow(dead_code)]
+use crate::link::Link;
 use crate::pane::{Pane, PaneAction, PaneKind};
 use crate::selection::SelectionState;
 use crate::theme::{RowState, MUTED};
 use crossterm::event::{KeyCode, KeyEvent};
-use mdma_client::{ContentHash, LibraryBackend, PlaylistName};
+use mdma_client::{ContentHash, PlaylistName};
 use ratatui::{
     layout::Rect,
     style::Style,
@@ -11,25 +12,25 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem},
     Frame,
 };
-use std::rc::Rc;
 
 /// A pane that lists all available playlists by name.
 #[derive(Clone)]
 pub struct PlaylistsPane {
     names: Vec<PlaylistName>,
     selection: SelectionState,
-    library: Rc<LibraryBackend>,
+    link: Link,
 }
 
 impl PlaylistsPane {
-    /// Create a new PlaylistsPane, loading all playlist names from the library.
-    pub fn new(library: Rc<LibraryBackend>) -> color_eyre::Result<Self> {
-        let names = library.playlist_list()?;
+    /// Create a new PlaylistsPane, loading all playlist names from the node.
+    /// Fails with why when the node cannot be reached.
+    pub fn new(link: Link) -> color_eyre::Result<Self> {
+        let names = link.library()?.playlist_list()?;
         let total = names.len();
         Ok(PlaylistsPane {
             names,
             selection: SelectionState::new(total),
-            library,
+            link,
         })
     }
 }
@@ -128,10 +129,14 @@ impl Pane for PlaylistsPane {
                             .collect()
                     };
 
+                let library = match self.link.library() {
+                    Ok(library) => library,
+                    Err(e) => return PaneAction::Error(format!("Remove failed: {e}")),
+                };
                 let mut errors: Vec<String> = Vec::new();
                 let mut removed = 0usize;
                 for &data_idx in to_remove.iter() {
-                    if let Err(e) = self.library.playlist_remove(&self.names[data_idx]) {
+                    if let Err(e) = library.playlist_remove(&self.names[data_idx]) {
                         errors.push(format!("{}: {}", self.names[data_idx], e));
                     } else {
                         removed += 1;
@@ -184,7 +189,12 @@ impl Pane for PlaylistsPane {
     }
 
     fn refresh(&mut self) -> PaneAction {
-        match self.library.playlist_list() {
+        let listed = self
+            .link
+            .library()
+            .map_err(|e| e.to_string())
+            .and_then(|library| library.playlist_list().map_err(|e| e.to_string()));
+        match listed {
             Ok(names) => {
                 self.names = names;
                 self.selection.set_total_items(self.names.len());

@@ -55,6 +55,10 @@ pub static COMMANDS: &[Command] = &[
         description: "Open or create a playlist  :o <name>",
     },
     Command {
+        name: "refresh",
+        description: "Read the facts again and refresh every pane",
+    },
+    Command {
         name: "history",
         description: "Show recent play history  :history [days]",
     },
