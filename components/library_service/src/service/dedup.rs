@@ -831,11 +831,7 @@ impl LibraryService {
         }
         let rel_str = rel.to_string_lossy();
         let mut cache = self.album_cover_cache.lock().unwrap();
-        let albums: Vec<String> = cache
-            .iter()
-            .filter(|(_, path)| path.as_str() == rel_str)
-            .map(|(album, _)| album.clone())
-            .collect();
+        let albums = cache.albums_showing(&rel_str);
         let mut serving = false;
         for album in albums {
             let of_album = || {
@@ -843,13 +839,13 @@ impl LibraryService {
                     .iter()
                     .filter(|t| t.album.as_deref() == Some(album.as_str()))
             };
-            if let Some(other) = of_album().find_map(|t| t.cover_art_path.as_ref()) {
-                cache.insert(album, other.to_string_lossy().into_owned());
+            if let Some(other) = library_projection::album_cover(of_album()) {
+                cache.set(album, other);
             } else if of_album().next().is_some() {
                 // Tracks of the album without a cover of their own show this one.
                 serving = true;
             } else {
-                cache.remove(&album);
+                cache.evict(&album);
             }
         }
         serving

@@ -4,23 +4,23 @@
 
 use crate::identity::{identity_facts_for_blob, IdentityOpts};
 use crate::ipc::{
-    bookmark_scope_mark, parse_request, AttributeList, BeatGridInfo, Bpm, ContentHash, CueInfo,
-    DurationSeconds, FactType, InboxPath, IngestAllItem, IngestResult, IpcServer, LibraryRequest,
-    LibraryResponse, Mark, MarkWrite, OrphanInfo, OrphanReason, PlaylistName, ProtocolError,
-    ServiceStatus, TrackInfo, TrackQuery, Unmark,
+    bookmark_scope_mark, parse_request, AttributeList, ContentHash, FactType, InboxPath,
+    IngestAllItem, IngestResult, IpcServer, LibraryRequest, LibraryResponse, Mark, MarkWrite,
+    OrphanInfo, OrphanReason, PlaylistName, ProtocolError, ServiceStatus, TrackInfo, TrackQuery,
+    Unmark,
 };
 use crate::pipeline::InboxFile;
 use crate::sources::{self, LibrarySources, ReleaseVersion};
 use acid_client::AcidClient;
 use event_protocol::{acid_event_from_topic_message, AcidEvent, TOPIC_ACID};
 use library_projection::{
-    apply_fact, distinct_retractions, hash_key, is_play_event, is_provenance_tracked, project,
-    remove_cancelled, resolve_prefix, resolve_visible, retain_live, retract_matches,
-    try_parse_fact_line, IndexedTrackInfo, MusicFact, PlayLog, Unresolved,
+    apply_fact, distinct_retractions, entity_facts, fact_values, hash_key, is_play_event,
+    is_provenance_tracked, project, remove_cancelled, resolve_prefix, resolve_visible, retain_live,
+    retract_matches, search, track_info, try_parse_fact_line, visible, AlbumCovers,
+    IndexedTrackInfo, MusicFact, PlayLog, Unresolved,
 };
 #[cfg(test)]
 use library_projection::{apply_fact_to_track, blob_path_for, IndexedCue};
-use library_search::{matches_query, TrackFields};
 #[cfg(test)]
 use music_facts::MarkFilter;
 use music_facts::MusicValue;
@@ -65,7 +65,7 @@ pub struct LibraryService {
     acid_client: AcidClient,
     /// Album name -> cover_art_path for tracks that have cover art.
     /// Used as a fallback when a track on the same album has no cover art of its own.
-    album_cover_cache: Mutex<HashMap<String, String>>,
+    album_cover_cache: Mutex<AlbumCovers>,
     /// Generic fact value index: fact_type -> set of values
     /// Used for fast HasFact/HasFacts lookups (e.g., ItemId -> {"p123", "p456"})
     fact_index: Mutex<HashMap<FactType, HashSet<String>>>,
@@ -362,11 +362,6 @@ fn acid_error(e: acid_client::ClientError) -> ProtocolError {
     }
 }
 
-/// Format a MusicValue for display (returns type name and string value)
-fn format_fact_for_display(value: &MusicValue) -> (String, String) {
-    (value.display_name().to_string(), value.to_string())
-}
-
 impl LibraryService {
     /// Create a new library service. `version` is the release version of the binary
     /// hosting it (ADR-020).
@@ -404,7 +399,7 @@ impl LibraryService {
         let (loaded, final_cursor) = Self::load_from_acid_stream(&acid_client, None)?;
 
         let tracks_count = loaded.tracks.len();
-        let album_cover_cache = Self::build_album_cover_cache(&loaded.tracks);
+        let album_cover_cache = AlbumCovers::build(&loaded.tracks);
 
         // The fallible bootstrap above runs before `new_cyclic`, whose closure cannot fail.
         let service = Arc::new_cyclic(|self_ref| Self {
@@ -1047,7 +1042,9 @@ impl LibraryService {
             }
 
             LibraryRequest::ListMarked { filter } => {
-                LibraryResponse::Tracks(self.tracks_where(|t| t.has_mark(&filter), None))
+                LibraryResponse::Tracks(self.with_catalog(|tracks, covers| {
+                    library_projection::marked(tracks, covers, &filter)
+                }))
             }
 
             LibraryRequest::GetTrack { hash } => match self.get_track(&hash) {
@@ -1069,14 +1066,7 @@ impl LibraryService {
             }
 
             LibraryRequest::GetFactValues { fact_type } => {
-                let mut values: Vec<String> = self
-                    .fact_index
-                    .lock()
-                    .unwrap()
-                    .get(&fact_type)
-                    .map(|s| s.iter().cloned().collect())
-                    .unwrap_or_default();
-                values.sort();
+                let values = fact_values(&self.fact_index.lock().unwrap(), &fact_type);
                 LibraryResponse::FactValues(values)
             }
 
@@ -2093,92 +2083,20 @@ impl LibraryService {
 
     /// Convert internal track to protocol TrackInfo
     fn to_track_info(&self, t: &IndexedTrackInfo) -> TrackInfo {
-        TrackInfo {
-            content_hash: t.content_hash.clone(),
-            title: t.title.clone(),
-            artist: t.artist.clone(),
-            album: t.album.clone(),
-            duration: t.duration_seconds.map(DurationSeconds::new),
-            bpm: t.bpm.and_then(|b| Bpm::from_f32(b).ok()),
-            key: t.key,
-            blob_path: Some(t.blob_path.to_string_lossy().to_string()),
-            cover_art_path: t
-                .cover_art_path
-                .as_ref()
-                .map(|p| p.to_string_lossy().to_string())
-                .or_else(|| {
-                    t.album.as_ref().and_then(|album| {
-                        self.album_cover_cache.lock().unwrap().get(album).cloned()
-                    })
-                }),
-            track_number: t.track_number,
-            disc_number: t.disc_number,
-            added: t.added_at.map(|dt| dt.to_rfc3339()),
-            started: t.last_started.map(|dt| dt.to_rfc3339()),
-            stopped: t.last_stopped.map(|dt| dt.to_rfc3339()),
-            memory_cues: t
-                .memory_cues
-                .iter()
-                .map(|c| CueInfo {
-                    position_ms: c.position_ms,
-                    kind: c.kind.clone(),
-                    label: c.label.clone(),
-                    index: c.index,
-                })
-                .collect(),
-            beat_grid: t
-                .beat_grid
-                .and_then(|(first_beat_ms, bpm_f32, beats_per_bar)| {
-                    Bpm::from_f32(bpm_f32).ok().map(|bpm| BeatGridInfo {
-                        first_beat_ms,
-                        bpm,
-                        beats_per_bar,
-                    })
-                }),
-            role: t.role,
-            energy: t.energy,
-        }
+        track_info(t, &self.album_cover_cache.lock().unwrap())
     }
 
-    /// Build a mapping of album name -> cover_art_path from an indexed track list.
-    ///
-    /// Only tracks that have both an album and a cover_art_path contribute to the cache.
-    /// The first cover art path seen for each album wins.
-    fn build_album_cover_cache(tracks: &[IndexedTrackInfo]) -> HashMap<String, String> {
-        let mut cache = HashMap::new();
-        for track in tracks {
-            if let (Some(album), Some(cover)) = (&track.album, &track.cover_art_path) {
-                cache
-                    .entry(album.clone())
-                    .or_insert_with(|| cover.to_string_lossy().to_string());
-            }
-        }
-        cache
+    /// Run a read over the track index and the album covers, taking the locks in
+    /// their documented order (`tracks` -> `album_cover_cache`).
+    fn with_catalog<R>(&self, read: impl FnOnce(&[IndexedTrackInfo], &AlbumCovers) -> R) -> R {
+        let tracks = self.tracks.lock().unwrap();
+        let covers = self.album_cover_cache.lock().unwrap();
+        read(&tracks, &covers)
     }
 
     /// List tracks from in-memory index (hidden tracks excluded)
     fn list_tracks(&self, limit: Option<usize>) -> Vec<TrackInfo> {
-        self.tracks_where(|_| true, limit)
-    }
-
-    /// Visible tracks from the in-memory index that match `filter` (hidden tracks
-    /// excluded), optionally limited.
-    fn tracks_where(
-        &self,
-        filter: impl Fn(&IndexedTrackInfo) -> bool,
-        limit: Option<usize>,
-    ) -> Vec<TrackInfo> {
-        let tracks = self.tracks.lock().unwrap();
-
-        let iter = tracks
-            .iter()
-            .filter(|t| !t.is_hidden() && filter(t))
-            .map(|t| self.to_track_info(t));
-
-        match limit {
-            Some(n) => iter.take(n).collect(),
-            None => iter.collect(),
-        }
+        self.with_catalog(|tracks, covers| visible(tracks, covers, limit))
     }
 
     /// Apply `mark` to a track unless the track already carries it live; then
@@ -2267,8 +2185,6 @@ impl LibraryService {
         &self,
         hash: &ContentHash,
     ) -> Result<(ContentHash, Vec<(String, String)>), ProtocolError> {
-        use music_facts::FactSource;
-
         let full_hash = self.resolve_hash(hash)?;
 
         let lines = self
@@ -2278,16 +2194,7 @@ impl LibraryService {
                 message: format!("Failed to read entity from ACID: {}", e),
             })?;
 
-        let facts: Vec<_> = lines
-            .iter()
-            .filter_map(|line| {
-                serde_json::from_str::<stainless_facts::Fact<ContentHash, MusicValue, FactSource>>(
-                    line,
-                )
-                .ok()
-            })
-            .map(|f| format_fact_for_display(f.value()))
-            .collect();
+        let facts = entity_facts(lines.iter().map(String::as_str), &full_hash);
 
         if facts.is_empty() {
             Err(ProtocolError::TrackNotFound {
@@ -2375,34 +2282,7 @@ impl LibraryService {
         if query.started.is_some() || query.stopped.is_some() {
             self.refresh_event_timestamps();
         }
-        let tracks = self.tracks.lock().unwrap();
-
-        tracks
-            .iter()
-            .filter(|t| !t.is_hidden())
-            .filter(|t| {
-                let fields = TrackFields {
-                    title: t.title.as_deref(),
-                    artist: t.artist.as_deref(),
-                    album: t.album.as_deref(),
-                    label: t.label.as_deref(),
-                    genre: t.genre.as_deref(),
-                    styles: &t.styles,
-                    bpm: t.bpm,
-                    key: t.key,
-                    duration: t.duration_seconds,
-                    year: t.year,
-                    source: t.source.as_deref(),
-                    last_started: t.last_started,
-                    last_stopped: t.last_stopped,
-                    added: t.added_at,
-                    role: t.role,
-                    energy: t.energy.map(u8::from),
-                };
-                matches_query(query, &fields)
-            })
-            .map(|t| self.to_track_info(t))
-            .collect()
+        self.with_catalog(|tracks, covers| search(tracks, covers, query))
     }
 
     /// Ingest a file from the inbox

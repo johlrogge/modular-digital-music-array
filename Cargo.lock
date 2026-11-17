@@ -5652,8 +5652,10 @@ dependencies = [
 name = "library-projection"
 version = "0.4.0"
 dependencies = [
+ "acid-protocol",
  "chrono",
  "library-ipc-protocol",
+ "library-search",
  "music-facts",
  "pretty_assertions",
  "serde_json",

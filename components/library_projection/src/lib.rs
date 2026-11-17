@@ -30,6 +30,13 @@
 //! ([`PlayHistory`]) read the same resolved events. [`resolve_prefix`] is the one
 //! resolution of a partial hash.
 
+mod read;
+
+pub use read::{
+    album_cover, entity_facts, fact_values, format_fact_for_display, marked, search, search_fields,
+    sort_catalog, track_info, visible, AlbumCovers,
+};
+
 use library_ipc_protocol::{CanonicalHash, EntryError, FactType, PlaylistEntry};
 use music_facts::{ContentHash, Mark, MarkFilter, MusicValue, StartReason, StopReason};
 use stainless_facts::{aggregate_facts, Fact, Operation};
