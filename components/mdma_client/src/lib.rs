@@ -26,8 +26,8 @@ pub use library_ipc_client::{
     entries_for_playback, entry_tracks, track_hashes, unresolved_entries, CanonicalHash,
     ClientError as LibraryClientError, ContentHash, EntryError, EntryTrackError, InboxPath,
     IngestAllItem, IngestResult, IngestSource, LibraryRequest, LibraryResponse, Mark, MarkFilter,
-    MarkNameError, MarkWrite, PlaylistEntry, PlaylistName, ProtocolError, ResolveError,
-    ServiceStatus, TrackInfo, Unmark, UnplayableEntry,
+    MarkNameError, MarkWrite, PlayableEntries, PlaylistEntry, PlaylistName, ProtocolError,
+    ResolveError, ServiceStatus, TrackInfo, Unmark, UnplayableEntry,
 };
 pub use library_search::TrackQuery;
 pub use media_client::{

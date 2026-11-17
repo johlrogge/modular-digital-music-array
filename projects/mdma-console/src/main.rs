@@ -619,10 +619,12 @@ fn library_failure_status(error: &ClientError) -> StatusCode {
         ClientError::Protocol(ProtocolError::PlaylistNotFound { .. }) => StatusCode::NOT_FOUND,
         ClientError::Protocol(
             ProtocolError::AmbiguousHash { .. }
+            | ProtocolError::HashNotCanonical { .. }
             | ProtocolError::TrackNotFound { .. }
             | ProtocolError::InboxFileNotFound { .. }
             | ProtocolError::PlaylistAlreadyExists { .. }
-            | ProtocolError::InvalidPlaylistName { .. },
+            | ProtocolError::InvalidPlaylistName { .. }
+            | ProtocolError::InvalidEdit { .. },
         ) => StatusCode::UNPROCESSABLE_ENTITY,
         ClientError::Protocol(
             ProtocolError::IngestionFailed { .. }
@@ -648,19 +650,30 @@ fn playback_success_or_error(
     client: &GatewayClient,
     command: &Command,
 ) -> axum::response::Response {
+    match playback_command_or_error(client, command) {
+        Ok(()) => Json(serde_json::json!({"success": true})).into_response(),
+        Err(response) => response,
+    }
+}
+
+/// Send one playback command; the error is the response to answer with.
+#[allow(clippy::result_large_err)]
+fn playback_command_or_error(
+    client: &GatewayClient,
+    command: &Command,
+) -> Result<(), axum::response::Response> {
     use gateway_client::Response;
-    match client.playback_command(command) {
-        Ok(Response::Ok { .. }) => Json(serde_json::json!({"success": true})).into_response(),
-        Ok(Response::Err { message }) => (
+    let failed = |message: String| {
+        (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": message})),
         )
-            .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": e.to_string()})),
-        )
-            .into_response(),
+            .into_response()
+    };
+    match client.playback_command(command) {
+        Ok(Response::Ok { .. }) => Ok(()),
+        Ok(Response::Err { message }) => Err(failed(message)),
+        Err(e) => Err(failed(e.to_string())),
     }
 }
 
@@ -1561,7 +1574,8 @@ fn playlist_entries_error(error: &ClientError) -> axum::response::Response {
         .into_response()
 }
 
-async fn library_playlist_queue_replace_handler(
+/// Append a playlist's playable entries to Up next.
+async fn library_playlist_queue_handler(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> axum::response::Response {
@@ -1587,18 +1601,27 @@ async fn library_playlist_queue_replace_handler(
         Ok(entries) => entries,
         Err(e) => return playlist_entries_error(&e),
     };
-    // The library resolved every entry; one that is not a track fails the lot.
-    let entries = match library_ipc_client::entries_for_playback(&entries) {
-        Ok(hashes) => queue_entries(hashes),
-        Err(e) => {
-            return (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                Json(serde_json::json!({"error": e.to_string()})),
-            )
-                .into_response()
+    // Unavailable entries are skipped and reported, not failed on (ADR-027 §10).
+    // The playable ones go after what is already queued; with none, nothing is
+    // sent and the queue stays as it is. The append is per entry and not
+    // atomic: a failure partway leaves the earlier entries queued, and a retry
+    // queues them again (#104 tracks an atomic batch QueueAppend).
+    let playable = library_ipc_client::entries_for_playback(&entries);
+    for hash in &playable.hashes {
+        let command = Command::QueueAppend {
+            hash: hash.clone().into(),
+            source: SourceName::audio(),
+        };
+        if let Err(response) = playback_command_or_error(&client, &command) {
+            return response;
         }
-    };
-    playback_success_or_error(&client, &Command::QueueReplace { entries })
+    }
+    Json(serde_json::json!({
+        "success": true,
+        "queued": playable.hashes.len(),
+        "skipped": playable.skipped,
+    }))
+    .into_response()
 }
 
 /// Queue entries for `hashes`, all from the audio source.
@@ -2044,8 +2067,8 @@ async fn main() -> Result<()> {
             get(library_playlist_tracks_handler),
         )
         .route(
-            "/library/playlists/:name/queue-replace",
-            post(library_playlist_queue_replace_handler),
+            "/library/playlists/:name/queue",
+            post(library_playlist_queue_handler),
         )
         // Cover art
         .route("/cover/:hash", get(cover_art))
@@ -2937,21 +2960,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn playlist_queue_replace_skips_comments_and_sends_full_hashes() {
+    async fn playlist_queue_skips_comments_and_appends_full_hashes() {
         let gateway = FakeGateway::start(
             true,
             "# my playlist\n\n9fb4105e  Artist - Title  [3:45]\n12345678\n",
         );
         let response =
-            library_playlist_queue_replace_handler(gateway.state(), Path("friday".to_string()))
-                .await;
+            library_playlist_queue_handler(gateway.state(), Path("friday".to_string())).await;
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
             gateway.sent(),
-            vec![queue_command(&Command::QueueReplace {
-                entries: vec![entry(FULL_A), entry(FULL_B)],
-            })]
+            vec![append_command(FULL_A), append_command(FULL_B)]
         );
+    }
+
+    fn append_command(hash: &str) -> serde_json::Value {
+        queue_command(&Command::QueueAppend {
+            hash: ContentHash::new(hash),
+            source: SourceName::audio(),
+        })
     }
 
     #[tokio::test]
@@ -3019,6 +3046,13 @@ mod tests {
             StatusCode::UNPROCESSABLE_ENTITY
         );
         assert_eq!(
+            protocol(ProtocolError::HashNotCanonical {
+                hash: "9f".into(),
+                found: "9fb4105e".into()
+            }),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        assert_eq!(
             protocol(ProtocolError::InvalidRequest {
                 message: "x".into()
             }),
@@ -3061,15 +3095,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn playlist_queue_replace_with_an_unresolved_entry_is_422_and_sends_nothing() {
-        let gateway = FakeGateway::start(true, "9fb4105e\n# note\ndeadbeef\n");
+    async fn playlist_queue_skips_unresolved_entries_and_reports_them_zero_based() {
+        let gateway = FakeGateway::start(true, "9fb4105e\n# note\ndeadbeef\n12345678\n");
         let response =
-            library_playlist_queue_replace_handler(gateway.state(), Path("friday".to_string()))
-                .await;
-        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
-        let text = error_text(response).await;
-        assert!(text.contains("entry 2"), "{text}");
-        assert!(text.contains("deadbeef"), "{text}");
+            library_playlist_queue_handler(gateway.state(), Path("friday".to_string())).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_str(&error_text(response).await).unwrap();
+        assert_eq!(body["success"], true);
+        assert_eq!(body["queued"], 2);
+        assert_eq!(body["skipped"].as_array().unwrap().len(), 1);
+        assert_eq!(body["skipped"][0]["position"], 1);
+        assert_eq!(body["skipped"][0]["error"]["Unknown"]["hash"], "deadbeef");
+        assert_eq!(
+            gateway.sent(),
+            vec![append_command(FULL_A), append_command(FULL_B)]
+        );
+    }
+
+    #[tokio::test]
+    async fn playlist_queue_with_nothing_playable_sends_nothing_and_reports() {
+        let gateway = FakeGateway::start(true, "deadbeef\n");
+        let response =
+            library_playlist_queue_handler(gateway.state(), Path("friday".to_string())).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_str(&error_text(response).await).unwrap();
+        assert_eq!(body["queued"], 0);
+        assert_eq!(body["skipped"].as_array().unwrap().len(), 1);
         assert_eq!(gateway.sent(), Vec::<serde_json::Value>::new());
     }
 
@@ -3089,11 +3140,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn playlist_queue_replace_with_the_library_down_is_502_and_sends_nothing() {
+    async fn playlist_queue_with_the_library_down_is_502_and_sends_nothing() {
         let gateway = FakeGateway::start(false, "9fb4105e\n");
         let response =
-            library_playlist_queue_replace_handler(gateway.state(), Path("friday".to_string()))
-                .await;
+            library_playlist_queue_handler(gateway.state(), Path("friday".to_string())).await;
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
         assert_eq!(gateway.sent(), Vec::<serde_json::Value>::new());
     }

@@ -464,9 +464,15 @@ impl LibraryService {
                 LibraryResponse::PlaylistContent(content)
             }
 
+            // Phase 2 of ADR-027 gives the stub Snapshot, Edit, Revert, Delete,
+            // Rename and Remove; Append stays unsupported.
             LibraryRequest::PlaylistAppend { .. }
             | LibraryRequest::PlaylistRemove { .. }
-            | LibraryRequest::PlaylistRename { .. } => {
+            | LibraryRequest::PlaylistRename { .. }
+            | LibraryRequest::PlaylistSnapshot { .. }
+            | LibraryRequest::PlaylistEdit { .. }
+            | LibraryRequest::PlaylistRevert { .. }
+            | LibraryRequest::PlaylistDelete { .. } => {
                 LibraryResponse::Error(ProtocolError::Internal {
                     message: "playlist operations not supported in stub".to_string(),
                 })

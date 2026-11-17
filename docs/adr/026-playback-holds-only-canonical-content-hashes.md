@@ -87,6 +87,8 @@ Supersedes §1.2's "Decided: canonical input returned unchanged" and the Consequ
 
 The first unresolved entry fails the whole batch with its 1-based position (`UnplayableEntry`, "entry N: ..."). The console answers 422 and sends nothing.
 
+**Amended 2026-11-17 (Joakim, ADR-027 §10):** this fail-on-first rule is superseded. `entries_for_playback` returns the playable canonical hashes in order (duplicates kept) and the skipped entries (`UnplayableEntry`). Queueing a playlist appends the playable ones after what is already in the queue and reports the skipped ones (0-based positions) instead of failing the batch. It never replaces or clears the queue; with nothing playable the queue stays as it is.
+
 ### A5. Unresolved rows stay in place in every client
 
 - The console shows unavailable rows.
@@ -109,4 +111,4 @@ The first unresolved entry fails the whole batch with its 1-based position (`Unp
 
 ### A8. Deploy
 
-Gateway, library and console together, because they decode the new types (see ADR-029). Then the CLI and TUI. There is no PlaylistGet fallback.
+Gateway, library and console together, because they decode the new types (see ADR-004). Then the CLI and TUI. There is no PlaylistGet fallback.

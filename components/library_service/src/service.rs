@@ -1173,6 +1173,16 @@ impl LibraryService {
                 }
             }
 
+            // Phase 2 of ADR-027 implements these.
+            LibraryRequest::PlaylistSnapshot { .. }
+            | LibraryRequest::PlaylistEdit { .. }
+            | LibraryRequest::PlaylistRevert { .. }
+            | LibraryRequest::PlaylistDelete { .. } => {
+                LibraryResponse::Error(ProtocolError::Internal {
+                    message: "playlist edits not supported yet".to_string(),
+                })
+            }
+
             LibraryRequest::PlaylistRename { from, to } => {
                 let from_path = self.resolve_playlist_path(&from);
                 let to_path = self.resolve_playlist_path(&to);
