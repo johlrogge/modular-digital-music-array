@@ -92,6 +92,10 @@ pub enum FactsError {
     /// The library refused the request (not found, ambiguous hash, ...).
     #[error("{0}")]
     Library(ProtocolError),
+    /// The facts have no single track for the hash given (not there, or ambiguous),
+    /// in words. For reads that answer in words of their own (`mdma plays`).
+    #[error("{0}")]
+    Refused(String),
     /// `plays` was asked of the node.
     #[error("{}", PLAYS_FROM_NODE)]
     PlaysFromNode,

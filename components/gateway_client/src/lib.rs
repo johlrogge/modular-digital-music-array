@@ -61,6 +61,12 @@ impl GatewayClient {
         self.socket.is_same_socket(&other.socket)
     }
 
+    /// Why a request found the node unreachable since this was last asked, if one
+    /// did; see [`nng_transport::SharedSocket::take_unreachable`].
+    pub fn take_unreachable(&self) -> Option<String> {
+        self.socket.take_unreachable()
+    }
+
     /// Connect without waiting, with every request bounded by `timeout`.
     ///
     /// For probing whether a gateway answers: an unreachable address surfaces

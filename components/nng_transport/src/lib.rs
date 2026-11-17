@@ -363,12 +363,24 @@ where
 /// so two threads on one socket can receive each other's replies. The lock is
 /// held from send to receive, so a clone is as safe to use from another thread
 /// as the original.
+///
+/// The socket also remembers, for all its clones, that a request found the node
+/// unreachable (see [`NngClientError::is_unreachable`]). That is where the
+/// transport says so: whoever holds the connection (the `Node`) asks with
+/// [`SharedSocket::take_unreachable`] and stops using a connection that went dead.
 #[derive(Clone)]
-pub struct SharedSocket(std::sync::Arc<std::sync::Mutex<nng::Socket>>);
+pub struct SharedSocket {
+    socket: std::sync::Arc<std::sync::Mutex<nng::Socket>>,
+    /// Why the last request that found the node unreachable failed, until taken.
+    unreachable: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+}
 
 impl SharedSocket {
     pub fn new(socket: nng::Socket) -> Self {
-        Self(std::sync::Arc::new(std::sync::Mutex::new(socket)))
+        Self {
+            socket: std::sync::Arc::new(std::sync::Mutex::new(socket)),
+            unreachable: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        }
     }
 
     /// [`connect`], shared.
@@ -389,13 +401,30 @@ impl SharedSocket {
     {
         // A panic while holding the lock leaves at most an unanswered request,
         // which the next send cancels.
-        let socket = self.0.lock().unwrap_or_else(|p| p.into_inner());
-        request_response(&socket, request)
+        let socket = self.socket.lock().unwrap_or_else(|p| p.into_inner());
+        let result = request_response(&socket, request);
+        if let Err(error) = &result {
+            if error.is_unreachable() {
+                *self.unreachable.lock().unwrap_or_else(|p| p.into_inner()) =
+                    Some(error.to_string());
+            }
+        }
+        result
+    }
+
+    /// Why a request found the node unreachable since this was last asked, if one
+    /// did. Asking clears it: the caller is expected to act on it (drop the
+    /// connection), so it is told once.
+    pub fn take_unreachable(&self) -> Option<String> {
+        self.unreachable
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
     }
 
     /// Whether `other` is a clone of this socket.
     pub fn is_same_socket(&self, other: &Self) -> bool {
-        std::sync::Arc::ptr_eq(&self.0, &other.0)
+        std::sync::Arc::ptr_eq(&self.socket, &other.socket)
     }
 }
 
@@ -416,6 +445,32 @@ pub enum NngClientError {
 
     #[error("service error: {0}")]
     Service(String),
+}
+
+impl NngClientError {
+    /// Whether the node could not be reached: the request timed out, or the
+    /// connection was refused, reset or closed. The one classification of
+    /// "unreachable" for every client; a service's own refusal or a request that
+    /// could not be serialised says nothing about the node.
+    pub fn is_unreachable(&self) -> bool {
+        let unreachable = |cause: &nng::Error| {
+            matches!(
+                cause,
+                nng::Error::TimedOut
+                    | nng::Error::ConnectionRefused
+                    | nng::Error::ConnectionReset
+                    | nng::Error::Closed
+            )
+        };
+        match self {
+            NngClientError::Nng(cause) => unreachable(cause),
+            NngClientError::Connection(ConnectionError::Nng(cause))
+            | NngClientError::Connection(ConnectionError::Dial { cause, .. }) => unreachable(cause),
+            NngClientError::Connection(_)
+            | NngClientError::Serialization(_)
+            | NngClientError::Service(_) => false,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -496,6 +551,52 @@ mod tests {
         assert!(matches!(err, ConnectionError::Dial { .. }));
         assert_eq!(err.to_string(), format!("{addr}: Connection refused"));
         assert!(err.source().is_none(), "the cause is in the Display text");
+    }
+
+    #[test]
+    fn timeouts_refusals_resets_and_closes_are_unreachable_and_nothing_else_is() {
+        for cause in [
+            nng::Error::TimedOut,
+            nng::Error::ConnectionRefused,
+            nng::Error::ConnectionReset,
+            nng::Error::Closed,
+        ] {
+            assert!(NngClientError::Nng(cause).is_unreachable(), "{cause:?}");
+        }
+        let dial = ConnectionError::Dial {
+            address: "tcp://x:1".to_string(),
+            cause: nng::Error::ConnectionRefused,
+        };
+        assert!(NngClientError::from(dial).is_unreachable());
+
+        let not_json = serde_json::from_str::<u8>("x").unwrap_err();
+        assert!(!NngClientError::Serialization(not_json).is_unreachable());
+        assert!(!NngClientError::Service("no".to_string()).is_unreachable());
+        assert!(!NngClientError::Nng(nng::Error::Canceled).is_unreachable());
+    }
+
+    /// A request that times out is remembered by every clone, once.
+    #[test]
+    fn a_timed_out_request_is_recorded_for_the_clones_and_taken_once() {
+        let addr = format!(
+            "ipc://{}/nng-transport-sticky-{}",
+            std::env::temp_dir().display(),
+            std::process::id()
+        );
+        let server = nng::Socket::new(nng::Protocol::Rep0).unwrap();
+        server.listen(&addr).unwrap();
+        let socket = SharedSocket::connect_with_timeout(&addr, Duration::from_millis(150)).unwrap();
+        let clone = socket.clone();
+        assert_eq!(clone.take_unreachable(), None, "nothing has failed yet");
+
+        let reply: Result<String, _> = socket.request_response(&"ping".to_string());
+
+        assert!(reply
+            .expect_err("the server never answers")
+            .is_unreachable());
+        assert!(clone.take_unreachable().is_some());
+        assert_eq!(socket.take_unreachable(), None, "told once");
+        drop(server);
     }
 
     #[test]

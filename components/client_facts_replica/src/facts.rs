@@ -15,9 +15,10 @@ use std::str::FromStr;
 use fact_replica::UnixSecs;
 use library_ipc_client::{ContentHash, FactType, MarkFilter, ProtocolError, TrackInfo, TrackQuery};
 use library_projection::{
-    entity_facts, resolve_prefix, resolve_visible, track_info, unresolved_error, AlbumCovers,
-    IndexedTrackInfo, Projection,
+    ambiguity_message, entity_facts, resolve_prefix, resolve_visible, track_info, unresolved_error,
+    AlbumCovers, IndexedTrackInfo, Unresolved,
 };
+pub use library_projection::{Play, PlayHistory, Stop};
 use mdma_client::node::NodeError;
 use mdma_client::{LibraryBackend, Node};
 
@@ -36,6 +37,64 @@ pub enum FactsChoice {
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("unknown facts source '{0}'; use replica or node")]
 pub struct UnknownFactsChoice(pub String);
+
+impl FactsChoice {
+    /// What `--facts` or `MDMA_FACTS` named: `None` when nothing was given (an empty
+    /// word counts as not given, in every client), else the choice. Anything else is
+    /// refused.
+    pub fn parse_given(word: &str) -> Result<Option<Self>, UnknownFactsChoice> {
+        if word.is_empty() {
+            return Ok(None);
+        }
+        word.parse().map(Some)
+    }
+}
+
+/// A word `--facts` (or `MDMA_FACTS`) was given, parsed by [`FactsChoice::parse_given`]:
+/// nothing at all counts as not given, in every client. The `Option` inside is that
+/// "nothing", which an argument parser cannot express for a typed value (hicli#40,
+/// and clap's `Option<Option<_>>` is another thing), so it is a type of its own, for
+/// the CLI and the TUI to give their flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FactsWord(Option<FactsChoice>);
+
+impl FactsWord {
+    /// The word for `choice`, as if it had been typed.
+    pub fn given(choice: FactsChoice) -> Self {
+        Self(Some(choice))
+    }
+
+    /// What the word named; `None` when it was empty.
+    pub fn choice(self) -> Option<FactsChoice> {
+        self.0
+    }
+}
+
+impl FromStr for FactsWord {
+    type Err = UnknownFactsChoice;
+
+    fn from_str(word: &str) -> Result<Self, Self::Err> {
+        FactsChoice::parse_given(word).map(Self)
+    }
+}
+
+/// The plays of one track: which track the hash named, and its history.
+#[derive(Debug, Clone)]
+pub struct TrackPlays {
+    pub content_hash: ContentHash,
+    pub artist: Option<String>,
+    pub title: Option<String>,
+    pub history: PlayHistory,
+}
+
+/// One play, and the track it was of.
+#[derive(Debug, Clone)]
+pub struct RecentPlay {
+    pub content_hash: ContentHash,
+    pub artist: Option<String>,
+    pub title: Option<String>,
+    pub play: Play,
+}
 
 impl FromStr for FactsChoice {
     type Err = UnknownFactsChoice;
@@ -210,11 +269,65 @@ impl<N: Deref<Target = Node>> Facts<N> {
         }
     }
 
-    /// The fold with every play: tracks, their play times and the play log. Only the
-    /// replica has it; the node has no plays request yet (ADR-030 §2.2).
-    pub fn plays(&self) -> Result<&Projection, FactsError> {
+    /// The play history of each track `hashes` name (a prefix will do), in the order
+    /// given, each answered or refused on its own (not there, ambiguous). The plays of
+    /// the tracks a track replaced are its own. The plays are resolved once, however
+    /// many tracks are asked for. Only the replica has them; the node has no plays
+    /// request yet (ADR-030 §2.2).
+    pub fn play_histories(
+        &self,
+        hashes: &[ContentHash],
+    ) -> Result<Vec<Result<TrackPlays, FactsError>>, FactsError> {
         match self {
-            Facts::Replica(view) => Ok(&view.fold.projection),
+            Facts::Replica(view) => {
+                let projection = &view.fold.projection;
+                let resolved = projection.plays.resolved(&projection.tracks);
+                Ok(hashes
+                    .iter()
+                    .map(|hash| {
+                        resolve_prefix(&projection.tracks, hash.as_str())
+                            .map(|track| TrackPlays {
+                                content_hash: track.content_hash.clone(),
+                                artist: track.artist.clone(),
+                                title: track.title.clone(),
+                                history: resolved.history(track),
+                            })
+                            .map_err(|unresolved| match unresolved {
+                                Unresolved::NotFound => {
+                                    FactsError::Refused("not in the replica".to_string())
+                                }
+                                Unresolved::Ambiguous(tracks) => {
+                                    FactsError::Refused(ambiguity_message(hash.as_str(), &tracks))
+                                }
+                            })
+                    })
+                    .collect())
+            }
+            Facts::Node(_) => Err(FactsError::PlaysFromNode),
+        }
+    }
+
+    /// The `n` latest plays of any track, newest first. Only the replica has them
+    /// (see [`Facts::play_histories`]).
+    pub fn recent_plays(&self, n: usize) -> Result<Vec<RecentPlay>, FactsError> {
+        match self {
+            Facts::Replica(view) => {
+                let projection = &view.fold.projection;
+                Ok(projection
+                    .plays
+                    .recent(&projection.tracks, n)
+                    .into_iter()
+                    .map(|(i, play)| {
+                        let track = &projection.tracks[i];
+                        RecentPlay {
+                            content_hash: track.content_hash.clone(),
+                            artist: track.artist.clone(),
+                            title: track.title.clone(),
+                            play,
+                        }
+                    })
+                    .collect())
+            }
             Facts::Node(_) => Err(FactsError::PlaysFromNode),
         }
     }
@@ -233,9 +346,7 @@ impl<N: Deref<Target = Node>> Facts<N> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{
-        asserted, env_lock, failure_text, nodes_dir, offline_env, replica_with_lines, EnvVars,
-    };
+    use crate::test_support::{asserted, env_lock, failure_text, offline_env, EnvVars, World};
     use fact_replica::{NodeId, Replica};
     use library_ipc_client::StringQuery;
     use mdma_client::node::NeededBy;
@@ -289,37 +400,6 @@ mod tests {
         Node::with_target(options, node_discovery::Target::LocalIpc)
     }
 
-    /// The cache and config in a temp dir, and the replica of `lines` synced into it
-    /// (none when there are no lines). Fields drop in order: the environment is put
-    /// back before the lock is released.
-    struct World {
-        _env: EnvVars,
-        dir: tempfile::TempDir,
-        _lock: std::sync::MutexGuard<'static, ()>,
-    }
-
-    impl World {
-        fn new(lines: Option<Vec<String>>) -> Self {
-            let lock = env_lock();
-            let dir = tempfile::tempdir().unwrap();
-            let env = offline_env(dir.path());
-            if let Some(lines) = lines {
-                let host = "mdma-stage2.local";
-                replica_with_lines(&nodes_dir(dir.path()), "stage", host, lines);
-            }
-            World {
-                _env: env,
-                dir,
-                _lock: lock,
-            }
-        }
-
-        /// A node with no service behind it: reading from it fails.
-        fn dead_node(&self) -> Node {
-            dead_node(self.dir.path())
-        }
-    }
-
     /// Runs `check` in a [`World`], with a dead node.
     fn with_world(lines: Option<Vec<String>>, check: impl FnOnce(&Node)) {
         let world = World::new(lines);
@@ -351,6 +431,24 @@ mod tests {
             "exactly as spelled"
         );
         assert!("".parse::<FactsChoice>().is_err());
+    }
+
+    #[test]
+    fn an_empty_facts_word_counts_as_not_given() {
+        assert_eq!(FactsChoice::parse_given(""), Ok(None));
+        assert_eq!(
+            FactsChoice::parse_given("node"),
+            Ok(Some(FactsChoice::Node))
+        );
+        assert_eq!(
+            FactsChoice::parse_given("replica"),
+            Ok(Some(FactsChoice::Replica))
+        );
+        let refused = FactsChoice::parse_given("cache").unwrap_err();
+        assert_eq!(
+            refused.to_string(),
+            "unknown facts source 'cache'; use replica or node"
+        );
     }
 
     // --- the replica arm ------------------------------------------------------
@@ -439,11 +537,30 @@ mod tests {
         with_world(Some(catalog()), |node| {
             let facts = replica_of(node);
 
-            let projection = facts.plays().unwrap();
+            let blue = ContentHash::new("aaaa000000000001");
+            let nobody = ContentHash::new("dddd");
+            let both = ContentHash::new("aaaa");
+
+            let mut asked = facts
+                .play_histories(&[blue.clone(), nobody, both])
+                .unwrap()
+                .into_iter();
+            let recent = facts.recent_plays(5).unwrap();
             let played = facts.track(&ContentHash::new("sha256:aaaa000000000001"));
 
-            let histories = projection.plays.histories(&projection.tracks);
-            assert_eq!(histories.iter().map(|h| h.count()).sum::<usize>(), 1);
+            let of_blue = asked.next().unwrap().unwrap();
+            assert_eq!(of_blue.title.as_deref(), Some("Blue Monday"));
+            assert_eq!(of_blue.content_hash.as_str(), "sha256:aaaa000000000001");
+            assert_eq!(of_blue.history.count(), 1);
+            let unknown = asked.next().unwrap().unwrap_err();
+            assert_eq!(unknown.to_string(), "not in the replica");
+            let ambiguous = asked.next().unwrap().unwrap_err();
+            assert!(
+                ambiguous.to_string().contains("matches 2 tracks"),
+                "{ambiguous}"
+            );
+            assert_eq!(recent.len(), 1);
+            assert_eq!(recent[0].title.as_deref(), Some("Blue Monday"));
             assert!(
                 played.unwrap().started.is_some(),
                 "plays applied to the view"
@@ -540,7 +657,7 @@ mod tests {
     /// anything reaches it.
     fn listening(world: &World) -> nng::Socket {
         let server = nng::Socket::new(nng::Protocol::Rep0).expect("server socket");
-        let address = format!("ipc://{}/none.sock", world.dir.path().display());
+        let address = format!("ipc://{}/library.sock", world.dir().display());
         server.listen(&address).expect("listen");
         server
     }
@@ -676,12 +793,12 @@ mod tests {
         with_world(Some(catalog()), |node| {
             let facts = Facts::open(node, FactsChoice::Node).unwrap();
 
-            let refused = facts.plays().err().expect("an error");
+            let refused = facts.play_histories(&[]).expect_err("an error");
+            let recent = facts.recent_plays(3).expect_err("an error");
 
-            assert_eq!(
-                refused.to_string(),
-                "`mdma plays` reads only the replica: the node has no plays request yet; drop --facts=node"
-            );
+            let text = "`mdma plays` reads only the replica: the node has no plays request yet; drop --facts=node";
+            assert_eq!(refused.to_string(), text);
+            assert_eq!(recent.to_string(), text);
         });
     }
 }

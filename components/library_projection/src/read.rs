@@ -101,6 +101,9 @@ pub fn track_info(t: &IndexedTrackInfo, covers: &AlbumCovers) -> TrackInfo {
             }),
         role: t.role,
         energy: t.energy,
+        genre: t.genre.clone(),
+        label: t.label.clone(),
+        styles: t.styles.clone(),
     }
 }
 
@@ -283,6 +286,15 @@ mod tests {
     fn sorted(mut tracks: Vec<TrackInfo>) -> Vec<TrackInfo> {
         sort_catalog(&mut tracks);
         tracks
+    }
+
+    #[test]
+    fn track_info_carries_the_main_genre() {
+        let mut with = indexed("h1");
+        with.genre = Some("Techno".to_owned());
+
+        assert_eq!(info(&with).genre.as_deref(), Some("Techno"));
+        assert_eq!(info(&indexed("h2")).genre, None);
     }
 
     // ---- order ------------------------------------------------------------------

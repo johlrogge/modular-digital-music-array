@@ -69,6 +69,18 @@ pub enum NodeError {
     },
 }
 
+impl NodeError {
+    /// Whether the user cancelled the pick prompt: they chose no node, for the whole
+    /// process. Looks through the label ([`NodeError::Needed`]).
+    pub fn is_cancelled(&self) -> bool {
+        match self {
+            NodeError::Resolve(error) => *error == ResolveError::Cancelled,
+            NodeError::Needed { cause, .. } => cause.is_cancelled(),
+            _ => false,
+        }
+    }
+}
+
 /// The options that say which node to use and where its local services are, as
 /// given by the user. Each is `None` when left at its default (applied where it
 /// is used), so that "given explicitly" can be told apart from "defaulted". An
@@ -163,6 +175,7 @@ impl NodeEffects {
 
 /// The last failure of something tried, and when. It is kept for
 /// [`RETRY_AFTER`]: until then asking again fails with it, without trying.
+#[derive(Clone)]
 struct Failure<E> {
     at: Instant,
     error: E,
@@ -200,23 +213,38 @@ pub struct Node {
     // Each connection is made on first use and kept after the first success. A
     // failure is not kept. Handing out a connection hands out a clone that
     // shares the cached socket, which serialises requests. On a remote node the
-    // library, playback and admin connections are one gateway socket.
-    library: OnceLock<LibraryBackend>,
-    playback: OnceLock<PlaybackBackend>,
-    gateway_client: OnceLock<GatewayClient>,
+    // library, playback and admin connections are one gateway socket. A
+    // connection that a request found dead is dropped (see `Node::live`).
+    library: Mutex<Option<LibraryBackend>>,
+    playback: Mutex<Option<PlaybackBackend>>,
+    gateway_client: Mutex<Option<GatewayClient>>,
+    /// Why each group of connections was last dropped as dead, and when: until
+    /// [`RETRY_AFTER`] has passed, asking for a connection of the group fails with it.
+    dropped: Mutex<[Option<Failure<String>>; 3]>,
+}
+
+/// A connection that can go dead on its own. On a remote node they share one socket.
+#[derive(Clone, Copy)]
+enum Group {
+    Library,
+    Playback,
+    Gateway,
+}
+
+impl Group {
+    const ALL: [Group; 3] = [Group::Library, Group::Playback, Group::Gateway];
 }
 
 /// The connection in `slot`, connecting with `connect` when there is none yet.
 fn cached<T: Clone>(
-    slot: &OnceLock<T>,
+    slot: &Mutex<Option<T>>,
     connect: impl FnOnce() -> Result<T, NodeError>,
 ) -> Result<T, NodeError> {
-    // `OnceLock::get_or_try_init` is unstable.
-    if let Some(connection) = slot.get() {
+    if let Some(connection) = locked(slot).as_ref() {
         return Ok(connection.clone());
     }
     let connection = connect()?;
-    Ok(slot.get_or_init(|| connection).clone())
+    Ok(locked(slot).get_or_insert(connection).clone())
 }
 
 /// The guard of `mutex`; what a panic left behind is still a valid state.
@@ -259,9 +287,10 @@ impl Node {
             effects: NodeEffects::real(),
             resolution: Mutex::new(Resolution::default()),
             reach: Mutex::new(Reach::Untried),
-            library: OnceLock::new(),
-            playback: OnceLock::new(),
-            gateway_client: OnceLock::new(),
+            library: Mutex::new(None),
+            playback: Mutex::new(None),
+            gateway_client: Mutex::new(None),
+            dropped: Mutex::new([None, None, None]),
         }
     }
 
@@ -392,11 +421,16 @@ impl Node {
 
     /// The effective event gateway address: `tcp://<ip>:5556`.
     /// `None` for local IPC. Events are an address to subscribe to, not a
-    /// connection the node keeps; the node must have answered all the same.
+    /// connection the node keeps, and a subscriber dials without waiting and
+    /// reconnects by itself, so the address is not checked for reachability.
     pub fn event_gateway(&self) -> Result<Option<String>, NodeError> {
-        let target = self.target()?;
-        self.reach(target)?;
-        Ok(client_config(Some(target)).event_addr())
+        Ok(client_config(Some(self.target()?)).event_addr())
+    }
+
+    /// [`Node::event_gateway`] if the node is resolved already; never resolves, so it
+    /// is cheap to ask on every tick of a UI.
+    pub fn event_address(&self) -> Option<String> {
+        client_config(self.target.get()).event_addr()
     }
 
     /// The one reachability check, for every connection. A remote node is reached
@@ -431,6 +465,81 @@ impl Node {
                 });
                 Err(self.labelled(NodeError::Connect(text)))
             }
+        }
+    }
+
+    /// Sticky reach (ADR-030 §4.4): the transport records, on the socket every clone
+    /// of a connection shares, that a request found the node unreachable (a timeout,
+    /// a refused, reset or closed connection). The cached connections are asked here,
+    /// before one is handed out.
+    ///
+    /// A connection that went dead is dropped together with those that share its
+    /// socket: on a remote node that is all of them (they are one gateway socket), on
+    /// local IPC only itself, so a hung library leaves playback usable. For
+    /// [`RETRY_AFTER`] asking for a connection of a dropped group fails with the
+    /// transport's text, without dialling. A remote node must then answer the
+    /// reachability check again before it is used.
+    fn live(&self, group: Group) -> Result<(), NodeError> {
+        let now = (self.effects.now)();
+        let remote = matches!(self.target.get(), Some(Target::Remote(_)));
+        let seen = [
+            (
+                Group::Library,
+                locked(&self.library)
+                    .as_ref()
+                    .and_then(LibraryBackend::take_unreachable),
+            ),
+            (
+                Group::Playback,
+                locked(&self.playback)
+                    .as_ref()
+                    .and_then(PlaybackBackend::take_unreachable),
+            ),
+            (
+                Group::Gateway,
+                locked(&self.gateway_client)
+                    .as_ref()
+                    .and_then(GatewayClient::take_unreachable),
+            ),
+        ];
+        for (dead, text) in seen {
+            if let Some(text) = text {
+                self.drop_dead(
+                    dead,
+                    remote,
+                    Failure {
+                        at: now,
+                        error: text,
+                    },
+                );
+            }
+        }
+        match locked(&self.dropped)[group as usize]
+            .as_ref()
+            .and_then(|failure| failure.standing(now))
+        {
+            Some(text) => Err(self.labelled(NodeError::Connect(text))),
+            None => Ok(()),
+        }
+    }
+
+    /// Drop the connection of `dead` and everything that shares its socket.
+    fn drop_dead(&self, dead: Group, remote: bool, failure: Failure<String>) {
+        let groups: &[Group] = if remote {
+            &Group::ALL
+        } else {
+            std::slice::from_ref(&dead)
+        };
+        for group in groups {
+            match group {
+                Group::Library => *locked(&self.library) = None,
+                Group::Playback => *locked(&self.playback) = None,
+                Group::Gateway => *locked(&self.gateway_client) = None,
+            }
+            locked(&self.dropped)[*group as usize] = Some(failure.clone());
+        }
+        if remote {
+            *locked(&self.reach) = Reach::Failed(failure);
         }
     }
 
@@ -469,6 +578,7 @@ impl Node {
     /// Connect to the library backend (gateway or direct).
     /// Later calls reuse the first successful connection.
     pub fn library(&self) -> Result<LibraryBackend, NodeError> {
+        self.live(Group::Library)?;
         cached(&self.library, || match self.gateway()? {
             Some(address) => Ok(LibraryBackend::Gateway(
                 self.gateway_connection("library", &address)?,
@@ -481,6 +591,7 @@ impl Node {
     /// Connect to the playback backend (gateway or direct). Later calls reuse
     /// the first successful connection.
     pub fn playback(&self) -> Result<PlaybackBackend, NodeError> {
+        self.live(Group::Playback)?;
         cached(&self.playback, || match self.gateway()? {
             Some(address) => Ok(PlaybackBackend::Gateway(
                 self.gateway_connection("playback", &address)?,
@@ -531,6 +642,7 @@ impl Node {
     /// Fails with a message when there is no gateway to connect to (local IPC).
     /// Later calls reuse the first successful connection.
     pub fn admin(&self) -> Result<GatewayClient, NodeError> {
+        self.live(Group::Gateway)?;
         let Some(address) = self.gateway()? else {
             return Err(NodeError::NeedsGateway);
         };
@@ -882,9 +994,179 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let node = local_node_in(&dir);
         assert!(node.library().is_err());
-        assert!(node.library.get().is_none());
+        assert!(locked(&node.library).is_none());
         // The second call tries again, and fails the same way.
         assert!(node.library().is_err());
+    }
+
+    /// A service that accepts requests and never answers them: with the node's own
+    /// 5 s request timeout, the first request on a connection to it times out.
+    fn silent_service(dir: &tempfile::TempDir, name: &str) -> (nng::Socket, String) {
+        let address = format!("ipc://{}/{name}.sock", dir.path().display());
+        let server = nng::Socket::new(nng::Protocol::Rep0).expect("server socket");
+        server.listen(&address).expect("listen");
+        (server, address)
+    }
+
+    fn local_node(options: NodeOptions) -> (Node, Fake) {
+        let (effects, fake) = Fake::effects(None);
+        let node = Node::with_target(options, Target::LocalIpc).with_effects(effects);
+        (node, fake)
+    }
+
+    #[test]
+    fn a_timed_out_library_request_makes_the_next_library_fail_without_dialling() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (server, address) = silent_service(&dir, "library");
+        let (node, fake) = local_node(NodeOptions {
+            library_socket: Some(address),
+            ..NodeOptions::default()
+        });
+        let first = node.library().unwrap();
+        assert!(first.ping().expect_err("no answer").is_unreachable());
+
+        // The service goes away: a dial would now fail with its own text, so the
+        // text of the timeout shows that nothing dialled. The window runs from when
+        // the node first hears of the failure: the next ask.
+        drop(server);
+        let refused = node.library().err().expect("fails fast").to_string();
+        assert_eq!(refused, "mdma needs the node: nng error: Timed out");
+        assert!(
+            locked(&node.library).is_none(),
+            "the dead socket is dropped"
+        );
+        fake.advance(Duration::from_secs(9));
+        let refused = node.library().err().expect("still fails fast").to_string();
+        assert_eq!(refused, "mdma needs the node: nng error: Timed out");
+
+        // After the window it connects again, on a new socket.
+        fake.advance(Duration::from_secs(1));
+        let server = nng::Socket::new(nng::Protocol::Rep0).expect("server socket");
+        server.listen(node.library_socket()).expect("listen again");
+        let LibraryBackend::Direct(again) = node.library().unwrap() else {
+            panic!("local IPC is direct");
+        };
+        let LibraryBackend::Direct(first) = first else {
+            panic!("local IPC is direct");
+        };
+        assert!(!first.is_same_connection(&again));
+        drop(server);
+    }
+
+    /// On local IPC the services are separate sockets: a hung library does not take
+    /// playback with it.
+    #[test]
+    fn on_local_ipc_a_library_timeout_leaves_playback_usable() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (_library_server, library) = silent_service(&dir, "library");
+        let (_playback_server, playback) = silent_service(&dir, "playback");
+        let (node, _fake) = local_node(NodeOptions {
+            library_socket: Some(library),
+            playback_socket: Some(playback),
+            ..NodeOptions::default()
+        });
+        let hung = node.library().unwrap();
+        let playing = node.playback().unwrap();
+        assert!(hung.ping().expect_err("no answer").is_unreachable());
+
+        assert!(node.library().is_err(), "the library is dropped");
+        let still = node.playback().expect("playback was not dropped");
+        let (PlaybackBackend::Direct(before), PlaybackBackend::Direct(after)) = (playing, still)
+        else {
+            panic!("local IPC is direct");
+        };
+        assert!(
+            before.is_same_connection(&after),
+            "and it is the same socket"
+        );
+    }
+
+    #[test]
+    fn a_timed_out_playback_request_makes_the_next_playback_fail_without_dialling() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (server, address) = silent_service(&dir, "playback");
+        let (node, fake) = local_node(NodeOptions {
+            playback_socket: Some(address),
+            ..NodeOptions::default()
+        });
+        let first = node.playback().unwrap();
+        assert!(first.queue_list().expect_err("no answer").is_unreachable());
+
+        drop(server);
+        let refused = node.playback().err().expect("fails fast").to_string();
+        assert_eq!(refused, "mdma needs the node: nng error: Timed out");
+        fake.advance(Duration::from_secs(9));
+        let refused = node.playback().err().expect("still fails fast").to_string();
+        assert_eq!(refused, "mdma needs the node: nng error: Timed out");
+
+        fake.advance(Duration::from_secs(1));
+        let server = nng::Socket::new(nng::Protocol::Rep0).expect("server socket");
+        server.listen(node.playback_socket()).expect("listen again");
+        assert!(node.playback().is_ok(), "it dials again after the window");
+        drop(server);
+    }
+
+    #[test]
+    fn a_dead_gateway_socket_is_dropped_for_every_service_and_the_node_is_probed_again() {
+        use nng::options::Options as _;
+        let server = nng::Socket::new(nng::Protocol::Rep0).expect("server socket");
+        let listener = nng::ListenerBuilder::new(&server, "tcp://127.0.0.1:0")
+            .expect("listener")
+            .start()
+            .map_err(|(_, e)| e)
+            .expect("listen");
+        let port = listener
+            .get_opt::<nng::options::transport::tcp::BoundPort>()
+            .expect("bound port");
+        let (effects, fake) = Fake::effects(None);
+        let node = Node::with_target(
+            NodeOptions::default(),
+            Target::Remote(RemoteTarget {
+                host: "localhost".to_string(),
+                ip: Some(Ipv4Addr::LOCALHOST),
+                port,
+                source: Source::Cache,
+            }),
+        )
+        .with_effects(effects);
+        let library = node.library().unwrap();
+        node.playback().unwrap();
+        assert_eq!(fake.probes(), 1);
+
+        assert!(library.ping().expect_err("no answer").is_unreachable());
+
+        // Within the window nothing is handed out and nothing is probed. It runs from
+        // when the node first hears of the failure: the next ask.
+        assert!(node.library().is_err());
+        fake.advance(Duration::from_secs(9));
+        assert!(node.library().is_err());
+        assert!(node.playback().is_err());
+        assert!(node.admin().is_err());
+        assert_eq!(fake.probes(), 1);
+        assert!(locked(&node.gateway_client).is_none());
+
+        // After it the node is probed again, and used on a new socket.
+        fake.advance(Duration::from_secs(1));
+        let LibraryBackend::Gateway(again) = node.library().unwrap() else {
+            panic!("a remote node is reached through its gateway");
+        };
+        let LibraryBackend::Gateway(library) = library else {
+            panic!("a remote node is reached through its gateway");
+        };
+        assert_eq!(fake.probes(), 2);
+        assert!(!library.is_same_connection(&again));
+    }
+
+    #[test]
+    fn a_cancelled_pick_is_cancelled_through_the_label() {
+        let (effects, fake) = Fake::effects(None);
+        *fake.resolve_error.lock().unwrap() = ResolveError::Cancelled;
+        let node = Node::needed_by(NeededBy::new("mdma-tui"), NodeOptions::default())
+            .with_effects(effects);
+        assert!(node.target().err().unwrap().is_cancelled());
+        assert!(node.library().err().unwrap().is_cancelled());
+        assert!(!NodeError::Connect("down".to_string()).is_cancelled());
+        assert!(!NodeError::Resolve(ResolveError::NoNodesFound).is_cancelled());
     }
 
     #[test]

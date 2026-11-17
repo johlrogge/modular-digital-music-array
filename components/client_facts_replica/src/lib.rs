@@ -9,6 +9,8 @@
 //! The pure fold is `library_projection`'s. This component depends on `mdma-client`
 //! for the `Node`; `mdma-client` does not depend on it.
 
+mod background;
+mod detach;
 mod error;
 mod facts;
 mod replica;
@@ -21,8 +23,12 @@ pub mod test_support;
 // The replica store's types that clients name when they ask about a replica.
 pub use fact_replica::{NodeId, Replica, UnixSecs};
 
+pub use background::spawn_background_sync;
 pub use error::{FactsError, Missing};
-pub use facts::{Facts, FactsChoice, ReplicaView, UnknownFactsChoice};
+pub use facts::{
+    Facts, FactsChoice, FactsWord, Play, PlayHistory, RecentPlay, ReplicaView, Stop, TrackPlays,
+    UnknownFactsChoice,
+};
 pub use replica::{
     ago, fold_current, replica_from_environment, replicas_dir, reset, status, sync, Probe, Probed,
     ReplicaFold, PROBE_TTL_SECS,

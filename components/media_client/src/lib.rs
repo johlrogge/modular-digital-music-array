@@ -43,6 +43,17 @@ impl MediaClient {
         Ok(Self { socket })
     }
 
+    /// Whether `other` is a clone of this client, on the same connection.
+    pub fn is_same_connection(&self, other: &Self) -> bool {
+        self.socket.is_same_socket(&other.socket)
+    }
+
+    /// Why a request found the node unreachable since this was last asked, if one
+    /// did; see [`nng_transport::SharedSocket::take_unreachable`].
+    pub fn take_unreachable(&self) -> Option<String> {
+        self.socket.take_unreachable()
+    }
+
     pub fn load_track(&self, path: PathBuf, deck: Deck) -> Result<(), ClientError> {
         let cmd = Command::LoadTrack { path, deck };
         self.send_command(cmd)

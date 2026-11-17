@@ -34,6 +34,15 @@ impl PlaybackBackend {
         }
     }
 
+    /// Why a request on this connection found the node unreachable since this was
+    /// last asked, if one did. The `Node` asks, and drops a connection that went dead.
+    pub fn take_unreachable(&self) -> Option<String> {
+        match self {
+            PlaybackBackend::Direct(c) => c.take_unreachable(),
+            PlaybackBackend::Gateway(gw) => gw.take_unreachable(),
+        }
+    }
+
     pub fn play_queue(&self) -> Result<(), ClientError> {
         match self {
             PlaybackBackend::Direct(c) => c.play_queue(),

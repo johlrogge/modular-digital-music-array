@@ -4085,6 +4085,22 @@ mod tests {
         );
         put(
             "sha256:eq_a1",
+            MusicValue::MainGenre("Techno".to_string()),
+            1,
+        );
+        put("sha256:eq_a1", MusicValue::Label("Drumcode".to_string()), 1);
+        put(
+            "sha256:eq_a1",
+            MusicValue::StyleDescriptor("Deep".to_string()),
+            1,
+        );
+        put(
+            "sha256:eq_a1",
+            MusicValue::StyleDescriptor("Dub".to_string()),
+            1,
+        );
+        put(
+            "sha256:eq_a1",
             MusicValue::MemoryCue {
                 position_ms: 32_000,
                 kind: CueKind::Hot,
@@ -4310,6 +4326,16 @@ mod tests {
             "the album's cover"
         );
         assert!(by_hash("sha256:eq_bare").title.is_none(), "untagged");
+        let tagged = by_hash("sha256:eq_a1");
+        assert_eq!(tagged.genre.as_deref(), Some("Techno"), "genre on the wire");
+        assert_eq!(
+            tagged.label.as_deref(),
+            Some("Drumcode"),
+            "label on the wire"
+        );
+        let mut styles = tagged.styles.clone();
+        styles.sort();
+        assert_eq!(styles, ["Deep", "Dub"], "styles on the wire");
     }
 
     #[test]

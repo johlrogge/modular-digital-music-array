@@ -29,6 +29,15 @@ impl ClientError {
             ClientError::Protocol(ProtocolError::InvalidRequest { .. })
         )
     }
+
+    /// True when the node could not be reached (a timeout, or a refused, reset or
+    /// closed connection), as opposed to answering with a refusal.
+    pub fn is_unreachable(&self) -> bool {
+        match self {
+            ClientError::Transport(error) => error.is_unreachable(),
+            ClientError::Protocol(_) => false,
+        }
+    }
 }
 
 impl From<serde_json::Error> for ClientError {
@@ -78,6 +87,12 @@ impl LibraryClient {
     /// Whether `other` is a clone of this client, on the same connection.
     pub fn is_same_connection(&self, other: &Self) -> bool {
         self.socket.is_same_socket(&other.socket)
+    }
+
+    /// Why a request found the node unreachable since this was last asked, if one
+    /// did; see [`nng_transport::SharedSocket::take_unreachable`].
+    pub fn take_unreachable(&self) -> Option<String> {
+        self.socket.take_unreachable()
     }
 
     /// Send a request and receive a response.
@@ -928,6 +943,9 @@ mod tests {
             beat_grid: None,
             role: None,
             energy: None,
+            genre: None,
+            label: None,
+            styles: vec![],
         }
     }
 

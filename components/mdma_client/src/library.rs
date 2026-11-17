@@ -44,6 +44,15 @@ impl LibraryBackend {
         }
     }
 
+    /// Why a request on this connection found the node unreachable since this was
+    /// last asked, if one did. The `Node` asks, and drops a connection that went dead.
+    pub fn take_unreachable(&self) -> Option<String> {
+        match self {
+            LibraryBackend::Direct(c) => c.take_unreachable(),
+            LibraryBackend::Gateway(gw) => gw.take_unreachable(),
+        }
+    }
+
     pub fn request(&self, req: &LibraryRequest) -> Result<LibraryResponse, ClientError> {
         match self {
             LibraryBackend::Direct(c) => c.request(req),

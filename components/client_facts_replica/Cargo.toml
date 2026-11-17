@@ -23,11 +23,13 @@ color-eyre = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+# Only for the test-support fixtures (a temp dir).
+tempfile = { workspace = true, optional = true }
 
 [features]
 # Environment and fact-line helpers for tests, here and in the clients (mdma-cli).
 # Helpers only: no production behaviour depends on it.
-test-support = ["fact-replica/test-support"]
+test-support = ["fact-replica/test-support", "mdma-client/test-support", "dep:tempfile"]
 
 [dev-dependencies]
 fact-replica = { workspace = true, features = ["test-support"] }

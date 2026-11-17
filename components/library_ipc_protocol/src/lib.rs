@@ -1001,6 +1001,18 @@ pub struct TrackInfo {
     /// Energy level 1–10. None when not set.
     #[serde(default)]
     pub energy: Option<EnergyLevel>,
+    /// Main genre (the `MainGenre` fact). None when not set. Absent on the wire from
+    /// nodes that predate it, so old nodes and clients still decode.
+    #[serde(default)]
+    pub genre: Option<String>,
+    /// Label (the `Label` fact). None when not set. Absent on the wire from nodes
+    /// that predate it (ADR-022 0a).
+    #[serde(default)]
+    pub label: Option<String>,
+    /// Style descriptors (the `StyleDescriptor` facts). Empty when none. Absent on
+    /// the wire from nodes that predate it (ADR-022 0a).
+    #[serde(default)]
+    pub styles: Vec<String>,
 }
 
 /// Service status information.
@@ -2563,6 +2575,9 @@ mod tests {
             beat_grid: None,
             role: None,
             energy: None,
+            genre: None,
+            label: None,
+            styles: vec![],
         };
 
         let json = serde_json::to_string(&track).unwrap();
@@ -2571,6 +2586,24 @@ mod tests {
         assert_eq!(parsed.content_hash.as_str(), track.content_hash.as_str());
         assert_eq!(parsed.memory_cues, track.memory_cues);
         assert_eq!(parsed.beat_grid, track.beat_grid);
+    }
+
+    /// A node that predates `genre` sends no such field: the track still decodes,
+    /// with no genre. And a node that sends it is read by a client that has it.
+    #[test]
+    fn track_info_genre_is_optional_on_the_wire() {
+        let old = r#"{"content_hash":"sha256:abc123","title":null,"artist":null,"album":null,
+            "duration":null,"bpm":null,"key":null,"blob_path":null,"cover_art_path":null,
+            "track_number":null,"disc_number":null,"added":null}"#;
+        let decoded: TrackInfo = serde_json::from_str(old).unwrap();
+        assert_eq!(decoded.genre, None);
+
+        let with_genre = r#"{"content_hash":"sha256:abc123","title":null,"artist":null,
+            "album":null,"duration":null,"bpm":null,"key":null,"blob_path":null,
+            "cover_art_path":null,"track_number":null,"disc_number":null,"added":null,
+            "genre":"Techno"}"#;
+        let decoded: TrackInfo = serde_json::from_str(with_genre).unwrap();
+        assert_eq!(decoded.genre.as_deref(), Some("Techno"));
     }
 
     #[test]
@@ -2611,6 +2644,9 @@ mod tests {
             }),
             role: None,
             energy: None,
+            genre: None,
+            label: None,
+            styles: vec![],
         };
 
         let json = serde_json::to_string(&track).unwrap();

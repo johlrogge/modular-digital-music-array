@@ -460,6 +460,9 @@ mod tests {
             beat_grid: None,
             role: None,
             energy: None,
+            genre: None,
+            label: None,
+            styles: vec![],
         }
     }
 
