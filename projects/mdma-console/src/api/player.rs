@@ -382,15 +382,21 @@ impl From<SeekPlacement> for Placement {
 pub struct SeekTo {
     to_ms: u64,
     placement: SeekPlacement,
+    /// The track the browser means (ADR-031 amendment A3); see [`SeekRequest`].
+    hash: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SeekBy {
     by_beats: i32,
+    /// The track the browser means; see [`SeekRequest`].
+    hash: Option<String>,
 }
 
-/// Where to seek: to a time (placed as asked), or by beats (negative goes back).
+/// Where to seek: to a time (placed as asked), or by beats (negative goes back). Either form may
+/// name the track it means (`hash`): when another track is audible by then (a preview ended and
+/// the held track came back) nothing moves and the answer is 409.
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 pub enum SeekRequest {
@@ -401,7 +407,7 @@ pub enum SeekRequest {
 /// The reply for a seek that could not be made.
 fn seek_failed(error: SeekError) -> Reply {
     match error {
-        SeekError::NothingLoaded | SeekError::NoPosition => {
+        SeekError::NothingLoaded | SeekError::NoPosition | SeekError::TrackChanged => {
             error_reply(StatusCode::CONFLICT, error.to_string())
         }
         SeekError::NoBeatGrid => error_reply(StatusCode::UNPROCESSABLE_ENTITY, error.to_string()),
@@ -411,11 +417,12 @@ fn seek_failed(error: SeekError) -> Reply {
     }
 }
 
-/// `POST /api/seek {to_ms, placement: "snap"|"free"}` or `{by_beats}`: move the audible track of
-/// deck A (the preview, while one runs) and answer like `GET /api/player`. Snapping and beat
-/// steps are mdma_client's rules (`seek_to`, `skip_beats`); playing stays playing and paused
-/// stays paused.
-/// Replies: 409 when nothing is loaded (or playback refuses), 422 for a beat step on a track with
+/// `POST /api/seek {to_ms, placement: "snap"|"free", hash?}` or `{by_beats, hash?}`: move the
+/// audible track of deck A (the preview, while one runs) and answer like `GET /api/player`.
+/// Snapping and beat steps are mdma_client's rules (`seek_to`, `skip_beats`); playing stays
+/// playing and paused stays paused.
+/// Replies: 409 when nothing is loaded, when `hash` names another track than the audible one
+/// (nothing is sent), or when playback refuses, 422 for a beat step on a track with
 /// no beat grid or a body that is neither form, 502/503 per the library's and playback's policy.
 pub async fn seek(State(state): State<Arc<AppState>>, Json(req): Json<SeekRequest>) -> Response {
     let gateway = state.gateway.clone();
@@ -427,16 +434,25 @@ pub async fn seek(State(state): State<Arc<AppState>>, Json(req): Json<SeekReques
                     .map_err(|e| NodeError::Connect(e.to_string()))
             };
             let moved = match req {
-                SeekRequest::To(SeekTo { to_ms, placement }) => seek_to(
+                SeekRequest::To(SeekTo {
+                    to_ms,
+                    placement,
+                    hash,
+                }) => seek_to(
                     &playback,
                     library,
                     Deck::A,
                     PositionMs::new(to_ms),
                     placement.into(),
+                    hash.map(ContentHash::new).as_ref(),
                 ),
-                SeekRequest::By(SeekBy { by_beats }) => {
-                    skip_beats(&playback, library, Deck::A, by_beats)
-                }
+                SeekRequest::By(SeekBy { by_beats, hash }) => skip_beats(
+                    &playback,
+                    library,
+                    Deck::A,
+                    by_beats,
+                    hash.map(ContentHash::new).as_ref(),
+                ),
             };
             match moved {
                 Ok(_) => player_reply(client),
@@ -1916,6 +1932,49 @@ mod tests {
             let res = seek_call(&gw, body.clone()).await;
             assert_eq!(res.status(), StatusCode::CONFLICT, "{body}");
         }
+    }
+
+    /// Every form of seek, each naming the track it means (`A`, `B` or whatever `hash` says).
+    fn seek_bodies_naming(hash: &str) -> [serde_json::Value; 3] {
+        [
+            json!({"to_ms": 1230, "placement": "free", "hash": hash}),
+            json!({"to_ms": 1230, "placement": "snap", "hash": hash}),
+            json!({"by_beats": 1, "hash": hash}),
+        ]
+    }
+
+    #[tokio::test]
+    async fn a_seek_that_names_another_track_than_the_audible_one_is_409_and_seeks_nothing() {
+        // A plays: a seek meant for B (a preview that just ended) must not move A.
+        let gw = seek_script(true, Some(grid()));
+        for body in seek_bodies_naming(B) {
+            let res = seek_call(&gw, body.clone()).await;
+            assert_eq!(res.status(), StatusCode::CONFLICT, "{body}");
+            assert_eq!(body_json(res).await["error"], "the track changed", "{body}");
+        }
+        assert!(seeks(&gw).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_seek_that_names_the_audible_track_proceeds() {
+        let gw = seek_script(true, Some(grid()));
+        for body in seek_bodies_naming(A) {
+            let res = seek_call(&gw, body.clone()).await;
+            assert_eq!(res.status(), StatusCode::OK, "{body}");
+        }
+        assert_eq!(seeks(&gw), [1230, 1100, 1600]);
+    }
+
+    #[tokio::test]
+    async fn a_seek_that_names_a_track_never_asks_the_library_for_a_free_time() {
+        // The guard reads the transport, not the library.
+        let gw = seek_script(true, Some(grid()));
+        let res = seek_call(&gw, seek_bodies_naming(A)[0].clone()).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert!(gw
+            .requests()
+            .iter()
+            .all(|r| !matches!(r, GatewayRequest::Library { .. })));
     }
 
     #[tokio::test]

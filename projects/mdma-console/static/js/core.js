@@ -99,6 +99,14 @@ export function icon(id, cls) {
   return s;
 }
 
+/**
+ * Whether the keys belong to what has the focus (`a`, default the active element) rather than to the
+ * page: a text field, a menu, a sheet or a dialog.
+ */
+export function typing(a = document.activeElement) {
+  return !!a && (/^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName) || !!a.closest("#menu,#fsheet,#confirm"));
+}
+
 /* ============================================================ formatting */
 
 export function fmt(secs) {
@@ -794,7 +802,11 @@ export const actions = {
     if (ok) toast(store.player.now ? "Back to “" + nowTitle() + "”" : "Preview stopped");
     return ok;
   },
-  /** Move the audible track: { to_ms, placement: "snap"|"free" } or { by_beats }. The node snaps to the beat or places freely as asked. */
+  /**
+   * Move the audible track: { to_ms, placement: "snap"|"free", hash? } or { by_beats, hash? }. The
+   * node snaps to the beat or places freely as asked. With `hash` it refuses (409) unless that
+   * track is the audible one, so a seek meant for a preview that just ended moves nothing.
+   */
   seek: (body) => playerAction("/api/seek", body, "seek"),
 };
 

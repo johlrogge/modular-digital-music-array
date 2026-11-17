@@ -19,12 +19,14 @@ pub mod library;
 pub mod marks;
 pub mod player;
 pub mod playlists;
+pub mod timeline;
 
 /// All `/api/...` routes.
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/api/tracks", get(library::tracks))
         .route("/api/tracks/match", get(library::tracks_match))
+        .route("/api/tracks/:hash/timeline", get(timeline::timeline))
         .route("/api/library/match", get(library::library_match))
         .route("/api/marks", post(marks::marks))
         .route("/api/marks/config", get(marks::config))

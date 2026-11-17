@@ -6,7 +6,7 @@
 // the raw /player/play-queue). While previewing, Back (button or B) takes Next's place.
 import { isIdle, outputDown, trackTitle, LIKED, markLabel } from "./logic.js";
 import { artBg, setArt, setCover } from "./art.js";
-import { $, $$, ApiError, actions, api, enc, fmt, h, icon, macroForKey, marksOf, on, openMenu, refreshPlayer, store, toast } from "./core.js";
+import { $, $$, ApiError, actions, api, enc, fmt, h, icon, macroForKey, marksOf, on, openMenu, refreshPlayer, store, toast, typing } from "./core.js";
 
 const DESKTOP = 1024; // px, matches the CSS breakpoint
 
@@ -195,11 +195,25 @@ function flipShown(mark = LIKED) {
   if (shown) (shown.marks.includes(mark) ? actions.unmark : actions.mark)(shown.track.hash, trackTitle(shown.track), mark);
 }
 
-function renderProgress() {
+/** Where the audible track is by the local clock, and how long it is, in ms (0 when idle or unknown). */
+export function position() {
   const p = store.player;
   const dur = durationMs();
   const idle = isIdle(p) || !p.now;
-  const pos = idle ? 0 : Math.min(Math.max(0, localPosition()), dur || Infinity);
+  return { idle, dur, pos: idle ? 0 : Math.min(Math.max(0, localPosition()), dur || Infinity) };
+}
+
+// Drawn alongside the bar's progress, so the workbench's timeline runs on the same clock.
+const progressHooks = new Set();
+
+/** Call `fn()` each time the progress is drawn. Returns the function that stops it. */
+export function onProgress(fn) {
+  progressHooks.add(fn);
+  return () => progressHooks.delete(fn);
+}
+
+function renderProgress() {
+  const { idle, dur, pos } = position();
   const frac = dur > 0 ? pos / dur : 0;
   $("#mini-prog").style.width = frac * 100 + "%";
   $$("[data-seek]").forEach((r) => {
@@ -212,6 +226,7 @@ function renderProgress() {
   $$("[data-rem]").forEach((e) => {
     e.textContent = idle || !dur ? "-0:00" : "-" + fmt(Math.ceil((dur - pos) / 1000));
   });
+  progressHooks.forEach((fn) => fn());
 }
 
 /* ------------------------------------------------------------ transport */
@@ -222,7 +237,7 @@ let busy = false;
  * Run one transport request at a time. `fn` may resolve true when it already applied the new
  * player state itself (the actions answer with it); otherwise the player is refetched after.
  */
-async function transport(fn) {
+export async function transport(fn) {
   if (busy || store.player.offline) return;
   busy = true;
   let applied = false;
@@ -235,6 +250,17 @@ async function transport(fn) {
     busy = false;
     if (!applied) refreshPlayer();
   }
+}
+
+/**
+ * Seek to the fraction `frac` (0..1) of the audible track: the node places it on the nearest beat,
+ * or exactly where asked when `free`. The seek names `hash` (default: what the bar shows playing),
+ * so it moves nothing if another track is audible by the time it arrives.
+ */
+export function seekAt(frac, free, hash = store.player.now, dur = durationMs()) {
+  if (!dur) return Promise.resolve();
+  resetAdvancing(); // the next position legitimately jumps
+  return transport(() => actions.seek({ to_ms: Math.round(frac * dur), placement: free ? "free" : "snap", hash }));
 }
 
 function togglePlay() {
@@ -365,16 +391,15 @@ document.addEventListener("keydown", (e) => {
     return;
   }
   if (e.ctrlKey || e.metaKey || e.altKey) return;
-  const typing = a && (/^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName) || a.closest("#menu,#fsheet,#confirm"));
   // B goes back while previewing, from anywhere but a text field, menu, sheet or dialog.
-  if ((e.key === "b" || e.key === "B") && !e.shiftKey && store.player.preview && !typing) {
+  if ((e.key === "b" || e.key === "B") && !e.shiftKey && store.player.preview && !typing(a)) {
     e.preventDefault();
     if (!e.repeat) transport(() => actions.back());
     return;
   }
   // M likes and Shift+1..9 sets a macro mark on the track the bar shows, but only when no row has
   // the focus (a row handles its own) and not from inside a text field, menu, sheet or dialog.
-  if (!shown || typing || (a && a.closest(".trow"))) return;
+  if (!shown || typing(a) || (a && a.closest(".trow"))) return;
   if ((e.key === "m" || e.key === "M") && !e.shiftKey) {
     e.preventDefault();
     if (!e.repeat) flipShown();
@@ -399,12 +424,7 @@ $$("[data-seek]").forEach((r) => {
     rebase(store.player.now, (Number(r.value) / 1000) * dur, clockRuns(store.player) && advancing);
     renderProgress();
   });
-  r.addEventListener("change", () => {
-    const dur = durationMs();
-    if (!dur) return;
-    resetAdvancing(); // the next position legitimately jumps
-    transport(() => actions.seek({ to_ms: Math.round((Number(r.value) / 1000) * dur), placement: free ? "free" : "snap" }));
-  });
+  r.addEventListener("change", () => seekAt(Number(r.value) / 1000, free));
 });
 
 // Swipe down on the overlay closes it (not while dragging the seek bar).

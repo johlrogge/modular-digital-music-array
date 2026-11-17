@@ -20,12 +20,14 @@
 // always offers Back to what was playing, and this is the one page that offers it. A click on a row
 // (either pane) previews its track; a click on the previewing row pauses or resumes it; Back, B or
 // the toast's Back action ends it. What a preview holds and goes back to is the node's (ADR-031),
-// and so is which track is the preview: every row of it shows as previewing.
+// and so is which track is the preview: every row of it shows as previewing. The previewing row
+// expands into a timeline (timeline.js): seek, cues, bar lines and beat steps.
 import { $, $$, h, icon, route, store, api, enc, plural, toast, catalogue, loadPlaylists, actions } from "./core.js";
 import { trackTitle } from "./logic.js";
 import { narrowedTracks, emptyNote, dragList } from "./lists.js";
 import { NO_MUSIC, NONE, backLink } from "./collections.js";
 import { load, notes, rowsOf, PLAYLIST_ROW } from "./playlist.js";
+import { timeline } from "./timeline.js";
 
 const LIB_KEY = "workbench-lib";
 const PL_KEY = "workbench-pl";
@@ -84,6 +86,10 @@ function viewWorkbench(root, params) {
     return playing ? ["pause", "Pause preview (P)", actions.pause] : ["play", "Resume preview (P)", actions.resume];
   };
   const previewRow = { preview, previewing: isPreviewing };
+  /** A row that is previewing gets the timeline under it. */
+  const withTimeline = (li, row, t) => {
+    if (isPreviewing(t)) timeline(li, t);
+  };
 
   const undoBtn = historyButton("Undo", "left", undo, () => undoIt(), () => busy);
   const redoBtn = historyButton("Redo", "right", redo, () => redoIt(), () => busy);
@@ -243,6 +249,7 @@ function viewWorkbench(root, params) {
       order: "global",
       row: {
         ...previewRow,
+        decorate: withTimeline,
         lead: "art",
         sub: "artist",
         quick: { label: "Add", run: addTrack }, // swipe right
@@ -267,7 +274,10 @@ function viewWorkbench(root, params) {
           tool("trash", "Remove " + quoted(t) + " (Del)", () => remove(t)),
         ],
         extra: (t) => [previewItem(t), ...reorderItems(t), ["trash", "Remove from playlist (Del)", () => remove(t)]],
-        decorate: editable,
+        decorate: (li, row, t) => {
+          editable(li, row, t);
+          withTimeline(li, row, t);
+        },
       },
       empty: { missing: () => (store.order.length ? ["Empty playlist", "Add songs from the library."] : NO_MUSIC), none: NONE },
       onChange: ({ all, narrowed }) => {

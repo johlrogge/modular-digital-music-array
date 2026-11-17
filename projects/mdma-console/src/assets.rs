@@ -88,6 +88,11 @@ const ASSETS: &[Asset] = &[
         body: include_str!("../static/js/workbench.js"),
     },
     Asset {
+        path: "js/timeline.js",
+        content_type: JS,
+        body: include_str!("../static/js/timeline.js"),
+    },
+    Asset {
         path: "js/settings.js",
         content_type: JS,
         body: include_str!("../static/js/settings.js"),
@@ -200,7 +205,7 @@ mod tests {
 
     /// Budgets are for what goes over the wire: gzipped bytes.
     const CSS_BUDGET_GZ: usize = 15 * 1024;
-    const JS_BUDGET_GZ: usize = 55 * 1024; // a tripwire against unintended growth of what goes over the wire for every view; when a feature needs the room, raise it on purpose to the measured size rounded up to a whole KiB
+    const JS_BUDGET_GZ: usize = 58 * 1024; // a tripwire against unintended growth of what goes over the wire for every view; when a feature needs the room, raise it on purpose to the measured size rounded up to a whole KiB
     /// The only external-looking URL allowed: the SVG namespace, which is an identifier, not a request.
     const SVG_NS: &str = "http://www.w3.org/2000/svg";
 
