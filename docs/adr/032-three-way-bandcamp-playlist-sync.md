@@ -95,6 +95,10 @@ Undo reverts the file but keeps the new base. Undone additions therefore count a
 
 §8 changes for delete. A deleted playlist goes to the Bin, and its link stays but is inactive and cannot sync. Restore re-activates the link; restoring under a new name counts as a rename and updates the link. Purge drops the link. Rename is unchanged. See ADR-033.
 
+## Amendment 2026-11-18: typed "not linked" and console routes (phase 4)
+
+`SyncPlaylist` for a playlist that is not linked is answered with the typed `SourceError::PlaylistNotLinked { name }`, not `InvalidRequest` with a message to be read. The console maps it to 409; `InvalidRequest` is always 422. The console reads the links and the sync job through `GET /api/bandcamp/playlist-links` and `GET /api/bandcamp/playlist-sync`, so no static path sits under `/api/playlists/`, where `:name` is a user's playlist name.
+
 ## Phased plan
 
 0. This ADR plus the ROADMAP entry.

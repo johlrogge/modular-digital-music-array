@@ -199,14 +199,17 @@ export function confirmDlg(title, text, ok, fn) {
   $("#cf-cancel").onclick = () => c.classList.remove("open");
 }
 
+/** Ask for a playlist name: askText with a name's pattern. */
+export const askName = (slot, opener, cfg) => askText(slot, opener, { pattern: "[A-Za-z0-9_\\-]+", hint: "Letters, digits, _ and - only", ...cfg });
+
 /**
- * Ask for a playlist name with an input in `slot` (no browser prompt); `opener` is the button that
- * asked (it shows aria-expanded and gets the focus back on Esc). Enter calls `submit(name)`, which
+ * Ask for a text with an input in `slot` (no browser prompt); `opener` is the button that asked
+ * (it shows aria-expanded and gets the focus back on Esc). Enter calls `submit(text)`, which
  * resolves true to close the input or false to keep it open (it reports its own failures); Esc, or
- * leaving the field empty, cancels. A name the field's pattern refuses is reported by the field.
- * cfg: { label (aria-label), placeholder, submit }.
+ * leaving the field empty, cancels. A text the field's pattern refuses is reported by the field.
+ * cfg: { label (aria-label), placeholder, submit, pattern (none: any text), hint (the field's title) }.
  */
-export function askName(slot, opener, { label, placeholder, submit }) {
+export function askText(slot, opener, { label, placeholder, submit, pattern, hint }) {
   const open = slot.querySelector("input");
   if (open) {
     open.focus();
@@ -222,8 +225,8 @@ export function askName(slot, opener, { label, placeholder, submit }) {
     class: "newpl",
     type: "text",
     placeholder,
-    title: "Letters, digits, _ and - only",
-    pattern: "[A-Za-z0-9_\\-]+",
+    title: hint,
+    pattern,
     "aria-label": label,
     autocomplete: "off",
     spellcheck: "false",

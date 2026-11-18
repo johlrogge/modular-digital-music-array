@@ -488,13 +488,11 @@ fn playlist_error(e: &bandcamp_api::BandcampError, playlist: Option<&str>) -> So
 }
 
 /// Map a playlist sync failure to a wire error: a playlist that is not linked
-/// is an invalid request, a local playlist that is not there is not found,
+/// is `PlaylistNotLinked`, a local playlist that is not there is not found,
 /// anything else is a failed sync.
 fn playlist_sync_error(e: PlaylistSyncError) -> SourceError {
     match e {
-        PlaylistSyncError::NotLinked(_) => SourceError::InvalidRequest {
-            message: e.to_string(),
-        },
+        PlaylistSyncError::NotLinked(name) => SourceError::PlaylistNotLinked { name },
         PlaylistSyncError::PlaylistMissing(name) => SourceError::ItemNotFound {
             identifier: name.to_string(),
         },
@@ -3478,17 +3476,17 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn syncing_an_unlinked_playlist_is_an_invalid_request_and_starts_no_job() {
+        async fn syncing_an_unlinked_playlist_is_not_linked_and_starts_no_job() {
             let (_temp, service, client) = service_with_library("sync-unlinked.sock");
             client.playlist_new(&mine(), String::new()).unwrap();
             match service
                 .handle_request(SourceRequest::SyncPlaylist { local: mine() })
                 .await
             {
-                SourceResponse::Error(SourceError::InvalidRequest { message }) => {
-                    assert_eq!(message, "playlist mine is not linked")
+                SourceResponse::Error(SourceError::PlaylistNotLinked { name }) => {
+                    assert_eq!(name, mine())
                 }
-                other => panic!("expected InvalidRequest, got {other:?}"),
+                other => panic!("expected PlaylistNotLinked, got {other:?}"),
             }
             assert_eq!(service.playlist_sync_job.snapshot(), None);
         }

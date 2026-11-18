@@ -111,7 +111,7 @@ pub enum SourceRequest {
     /// Start a background job that three-way syncs the linked local playlist
     /// with its source playlist (ADR-032). Answer with
     /// `SourceResponse::PlaylistSyncStarted`. Only two refusals are answered
-    /// up front: `SourceError::InvalidRequest` when `local` is not linked and
+    /// up front: `SourceError::PlaylistNotLinked` when `local` is not linked and
     /// `SourceError::SyncInProgress` if a job is running. Anything else, such
     /// as a local playlist that does not exist, ends the job as
     /// `PlaylistSyncPhase::Failed { message }`.
@@ -600,6 +600,10 @@ pub enum SourceError {
     /// A playlist sync job is already running.
     #[error("playlist sync already running: job {job_id}")]
     SyncInProgress { job_id: u64 },
+
+    /// The local playlist is not linked to a source playlist (ADR-032 §8).
+    #[error("playlist {name} is not linked")]
+    PlaylistNotLinked { name: PlaylistName },
 }
 
 impl SourceError {
@@ -1300,6 +1304,9 @@ mod tests {
             SourceResponse::PlaylistSyncStatus(Some(status(PlaylistSyncPhase::Rematching))),
             SourceResponse::PlaylistLinks(vec![info]),
             SourceResponse::Error(SourceError::SyncInProgress { job_id: 5 }),
+            SourceResponse::Error(SourceError::PlaylistNotLinked {
+                name: PlaylistName::new("friday").unwrap(),
+            }),
         ] {
             let json = serde_json::to_string(&resp).unwrap();
             let parsed: SourceResponse = serde_json::from_str(&json).unwrap();

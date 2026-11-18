@@ -11,18 +11,22 @@
 //!   There is no fallback to PlaylistReplace: an old node answers 502.
 
 use super::library::{playlist_name, ApiSnapshot};
-use super::{fail, forward, lib, library_failed, respond, Interpret, Reply};
+use super::{
+    error_reply, fail, forward, gateway_failure_status, gw, lib, library_failed, respond,
+    source_failure_status, Interpret, Reply,
+};
 use crate::AppState;
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
     response::{Json, Response},
 };
-use gateway_client::{LibraryRequest, LibraryResponse};
+use gateway_client::{LibraryRequest, LibraryResponse, SourceRequest, SourceResponse};
 use library_ipc_client::{
     EditOp, EditOutcome, PlaylistName, PlaylistSnapshot, PlaylistVersion, StoredPlaylist,
 };
 use serde::Deserialize;
+use source_protocol::{PlaylistLinkInfo, PlaylistSyncJobStatus, PlaylistSyncPhase};
 use std::sync::Arc;
 
 /// 409 `{current}`: the version was stale and nothing was written.
@@ -180,6 +184,177 @@ pub async fn create(
             Err(e) => library_failed(&e),
         }),
     )
+}
+
+// ---- Bandcamp link and sync (ADR-032 §4.4, §8) ----
+//
+// The console forwards to the source (`state.source_name`) and answers with what it answered:
+//
+// - 200: linked (the link) or listed; the sync's status, whatever its phase (`{phase: "none"}`
+//   before the first job); 202: a sync job started (`{job_id}`);
+// - 401: the source is not authenticated; 409: a sync (or another job) is running, or the
+//   playlist is not linked; 422: a source playlist the source cannot use; 429: rate limited;
+//   every status by `source_failure_status`, the one policy of source refusals;
+// - 400: a name no playlist can have (`playlist_name`; the source is not asked);
+// - 502: the source failed or answered something else; 503: the gateway cannot be reached
+//   (`gateway_failure_status`).
+// The two reads are `/api/bandcamp/...`: nothing static sits under `/api/playlists/` (see
+// `routes()`).
+
+/// How the source's answer becomes a reply: `None` for an answer that is not the one asked for.
+type SourceInterpret = fn(SourceResponse) -> Option<Reply>;
+
+/// Send `request` to the source over one gateway connection and answer as `interpret` reads its
+/// answer.
+async fn source_call(
+    state: &Arc<AppState>,
+    request: SourceRequest,
+    interpret: SourceInterpret,
+) -> Response {
+    let source = state.source_name.clone();
+    respond(
+        gw(state, move |client| {
+            match client.source_request(&source, &request) {
+                Ok(SourceResponse::Error(e)) => {
+                    error_reply(source_failure_status(&e), e.to_string())
+                }
+                Ok(answer) => interpret(answer).unwrap_or_else(|| {
+                    error_reply(StatusCode::BAD_GATEWAY, "Unexpected response from source")
+                }),
+                Err(e) => error_reply(gateway_failure_status(&e), e.to_string()),
+            }
+        })
+        .await,
+    )
+}
+
+fn link_json(link: &PlaylistLinkInfo) -> serde_json::Value {
+    serde_json::json!({
+        "local": link.local.as_str(),
+        "source": link.source,
+        "last_synced": link.last_synced,
+        "pending": link.pending,
+    })
+}
+
+fn linked(answer: SourceResponse) -> Option<Reply> {
+    match answer {
+        SourceResponse::PlaylistLinked(link) => Some((StatusCode::OK, link_json(&link))),
+        _ => None,
+    }
+}
+
+fn listed_links(answer: SourceResponse) -> Option<Reply> {
+    match answer {
+        SourceResponse::PlaylistLinks(links) => {
+            let body: Vec<_> = links.iter().map(link_json).collect();
+            Some((StatusCode::OK, serde_json::Value::Array(body)))
+        }
+        _ => None,
+    }
+}
+
+fn sync_started(answer: SourceResponse) -> Option<Reply> {
+    match answer {
+        SourceResponse::PlaylistSyncStarted { job_id } => Some((
+            StatusCode::ACCEPTED,
+            serde_json::json!({ "job_id": job_id }),
+        )),
+        _ => None,
+    }
+}
+
+/// A job as the browser polls it: `{job_id, local, phase, downloads}`, plus `report` when done
+/// (counts and `undo`, which is `null` when the sync wrote nothing) or `message` when failed.
+fn job_json(job: &PlaylistSyncJobStatus) -> serde_json::Value {
+    let phase = match &job.phase {
+        PlaylistSyncPhase::Fetching => "fetching",
+        PlaylistSyncPhase::Matching => "matching",
+        PlaylistSyncPhase::Syncing => "syncing",
+        PlaylistSyncPhase::Rematching => "rematching",
+        PlaylistSyncPhase::Merging => "merging",
+        PlaylistSyncPhase::Done(_) => "done",
+        PlaylistSyncPhase::Failed { .. } => "failed",
+    };
+    let mut body = serde_json::json!({
+        "job_id": job.job_id,
+        "local": job.local.as_str(),
+        "phase": phase,
+        "downloads": job.sync,
+    });
+    match &job.phase {
+        PlaylistSyncPhase::Done(report) => {
+            body["report"] = serde_json::json!({
+                "added": report.added,
+                "removed": report.removed,
+                "moved": report.moved,
+                "pending": report.pending,
+                "undo": report.undo,
+            });
+        }
+        PlaylistSyncPhase::Failed { message } => body["message"] = serde_json::json!(message),
+        _ => {}
+    }
+    body
+}
+
+fn sync_status(answer: SourceResponse) -> Option<Reply> {
+    match answer {
+        SourceResponse::PlaylistSyncStatus(job) => Some((
+            StatusCode::OK,
+            job.as_ref()
+                .map_or_else(|| serde_json::json!({ "phase": "none" }), job_json),
+        )),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct LinkRequest {
+    /// The Bandcamp playlist: a slug or a URL.
+    source: String,
+}
+
+/// `POST /api/playlists/{name}/link {source}`: link the playlist to a Bandcamp playlist (ADR-032
+/// §8). 200 with the link.
+pub async fn link(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Json(req): Json<LinkRequest>,
+) -> Response {
+    match playlist_name(&name) {
+        Ok(local) => {
+            let request = SourceRequest::LinkPlaylist {
+                local,
+                source: req.source,
+            };
+            source_call(&state, request, linked).await
+        }
+        Err(response) => response,
+    }
+}
+
+/// `GET /api/bandcamp/playlist-links`: every link with its pending items.
+pub async fn links(State(state): State<Arc<AppState>>) -> Response {
+    source_call(&state, SourceRequest::ListPlaylistLinks, listed_links).await
+}
+
+/// `POST /api/playlists/{name}/sync`: start the sync job. 202 `{job_id}`; 409 for a playlist that
+/// is not linked or a sync that is running.
+pub async fn sync(State(state): State<Arc<AppState>>, Path(name): Path<String>) -> Response {
+    match playlist_name(&name) {
+        Ok(local) => {
+            let request = SourceRequest::SyncPlaylist { local };
+            source_call(&state, request, sync_started).await
+        }
+        Err(response) => response,
+    }
+}
+
+/// `GET /api/bandcamp/playlist-sync`: the current or last sync job (the source keeps one), for the
+/// browser to follow by the `job_id` it was given.
+pub async fn sync_job(State(state): State<Arc<AppState>>) -> Response {
+    source_call(&state, SourceRequest::GetPlaylistSyncStatus, sync_status).await
 }
 
 #[cfg(test)]
@@ -634,6 +809,399 @@ mod tests {
         let gw = create_gateway(LibraryResponse::Pong);
         let res = create(test_app_with(gw.addr()), "friday").await;
         assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    // ---- Bandcamp link and sync (ADR-032) ----
+
+    use gateway_client::{SourceName, SourceRequest, SourceResponse};
+    use source_protocol::{
+        ImportSyncProgress, PendingPlaylistTrack, PlaylistLinkInfo, PlaylistSyncJobStatus,
+        PlaylistSyncPhase, PlaylistSyncReport, PlaylistUndo, SourceError,
+    };
+
+    fn local(name: &str) -> library_ipc_client::PlaylistName {
+        library_ipc_client::PlaylistName::new(name).unwrap()
+    }
+
+    /// A source that answers every request with `answer`.
+    fn source_gateway(answer: SourceResponse) -> FakeGateway {
+        FakeGateway::start(move |req| match req {
+            GatewayRequest::Source { .. } => GatewayResponse::Source {
+                name: SourceName::new("bandcamp"),
+                response: answer.clone(),
+            },
+            other => GatewayResponse::Error {
+                message: format!("unexpected {other:?}"),
+            },
+        })
+    }
+
+    fn link_info() -> PlaylistLinkInfo {
+        PlaylistLinkInfo {
+            local: local("friday"),
+            source: "https://bandcamp.com/me/playlist/9".into(),
+            pending: vec![PendingPlaylistTrack {
+                source_track_id: "t1".into(),
+                title: "Song".into(),
+                artist: "Band".into(),
+            }],
+            last_synced: Some(1234),
+        }
+    }
+
+    fn link_json() -> Value {
+        json!({
+            "local": "friday",
+            "source": "https://bandcamp.com/me/playlist/9",
+            "last_synced": 1234,
+            "pending": [{"source_track_id": "t1", "title": "Song", "artist": "Band"}],
+        })
+    }
+
+    fn job(phase: PlaylistSyncPhase) -> SourceResponse {
+        SourceResponse::PlaylistSyncStatus(Some(PlaylistSyncJobStatus {
+            job_id: 7,
+            local: local("friday"),
+            phase,
+            sync: Some(ImportSyncProgress {
+                queued: 3,
+                completed: 1,
+                failed: 0,
+                ended: None,
+            }),
+        }))
+    }
+
+    fn report(undo: Option<PlaylistUndo>) -> PlaylistSyncReport {
+        PlaylistSyncReport {
+            local: local("friday"),
+            added: 3,
+            removed: 1,
+            moved: 2,
+            pending: 2,
+            undo,
+        }
+    }
+
+    async fn post(app: axum::Router, path: &str, body: Option<Value>) -> axum::response::Response {
+        send_json(app, "POST", path, body.as_ref()).await
+    }
+
+    async fn get(app: axum::Router, path: &str) -> axum::response::Response {
+        send_json(app, "GET", path, None).await
+    }
+
+    #[tokio::test]
+    async fn linking_is_200_with_the_link_and_sends_the_name_and_source() {
+        let gw = source_gateway(SourceResponse::PlaylistLinked(link_info()));
+        let res = post(
+            test_app_with(gw.addr()),
+            "/api/playlists/friday/link",
+            Some(json!({"source": "https://bandcamp.com/me/playlist/9"})),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(body_json(res).await, link_json());
+        match &gw.requests()[..] {
+            [GatewayRequest::Source {
+                name,
+                request: SourceRequest::LinkPlaylist { local, source },
+            }] => {
+                assert_eq!(name.as_str(), "bandcamp");
+                assert_eq!(local.as_str(), "friday");
+                assert_eq!(source, "https://bandcamp.com/me/playlist/9");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// A playlist called "links" or "sync" is a playlist like any other: no static route may
+    /// shadow it (see `routes()`).
+    #[tokio::test]
+    async fn playlists_called_links_and_sync_are_read_as_playlists() {
+        let gw = FakeGateway::start(|req| match req {
+            GatewayRequest::Library {
+                request: LibraryRequest::PlaylistSnapshot { .. },
+            } => library_ok(LibraryResponse::Error(ProtocolError::PlaylistNotFound {
+                name: "x".into(),
+            })),
+            other => GatewayResponse::Error {
+                message: format!("unexpected {other:?}"),
+            },
+        });
+        for name in ["links", "sync"] {
+            let res = get(test_app_with(gw.addr()), &format!("/api/playlists/{name}")).await;
+            assert_eq!(res.status(), StatusCode::NOT_FOUND, "{name}");
+        }
+        assert!(gw
+            .requests()
+            .iter()
+            .all(|r| matches!(r, GatewayRequest::Library { .. })));
+        assert_eq!(gw.requests().len(), 2);
+    }
+
+    /// Every source refusal and gateway failure has its status, by the shared policies.
+    #[test]
+    fn every_source_refusal_has_a_status() {
+        use super::super::source_failure_status as status;
+        let name = || local("friday");
+        let s = |m: &str| m.to_string();
+        let cases = [
+            (SourceError::NotAuthenticated { message: s("m") }, 401),
+            (SourceError::SyncFailed { message: s("m") }, 502),
+            (
+                SourceError::DownloadFailed {
+                    id: source_protocol::DownloadId::new("p1"),
+                    message: s("m"),
+                },
+                502,
+            ),
+            (
+                SourceError::RateLimited {
+                    retry_after_secs: 3,
+                },
+                429,
+            ),
+            (SourceError::Internal { message: s("m") }, 502),
+            (SourceError::ItemNotFound { identifier: s("i") }, 404),
+            (
+                SourceError::CheckFailed {
+                    identifier: s("i"),
+                    reason: s("r"),
+                },
+                502,
+            ),
+            (SourceError::unsupported("x"), 502),
+            (SourceError::InvalidRequest { message: s("m") }, 422),
+            (SourceError::ImportInProgress { job_id: 1 }, 409),
+            (SourceError::CheckInProgress { job_id: 1 }, 409),
+            (SourceError::SyncInProgress { job_id: 1 }, 409),
+            (SourceError::PlaylistNotLinked { name: name() }, 409),
+        ];
+        for (error, expected) in cases {
+            assert_eq!(status(&error).as_u16(), expected, "{error:?}");
+        }
+    }
+
+    #[test]
+    fn every_gateway_failure_has_a_status() {
+        use super::super::gateway_failure_status as status;
+        use gateway_client::ClientError as E;
+        assert_eq!(status(&E::Service("x".into())), StatusCode::BAD_GATEWAY);
+        assert_eq!(status(&E::Refused("x".into())), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            status(&E::Nng(nng::Error::TimedOut)),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        let bad = serde_json::from_str::<u8>("x").unwrap_err();
+        assert_eq!(
+            status(&E::Serialization(bad)),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    #[tokio::test]
+    async fn linking_a_bad_name_is_400_and_the_source_is_not_asked() {
+        let gw = source_gateway(SourceResponse::PlaylistLinked(link_info()));
+        let res = post(
+            test_app_with(gw.addr()),
+            "/api/playlists/bad%20name/link",
+            Some(json!({"source": "x"})),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert!(gw.requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn linking_a_source_the_source_refuses_is_422() {
+        let gw = source_gateway(SourceResponse::Error(SourceError::InvalidRequest {
+            message: "not a playlist".into(),
+        }));
+        let res = post(
+            test_app_with(gw.addr()),
+            "/api/playlists/friday/link",
+            Some(json!({"source": "nope"})),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(body_json(res).await["error"].is_string());
+    }
+
+    #[tokio::test]
+    async fn linking_when_not_authenticated_is_401() {
+        let gw = source_gateway(SourceResponse::Error(SourceError::NotAuthenticated {
+            message: "no cookies".into(),
+        }));
+        let res = post(
+            test_app_with(gw.addr()),
+            "/api/playlists/friday/link",
+            Some(json!({"source": "x"})),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        assert!(body_json(res).await["error"].is_string());
+    }
+
+    #[tokio::test]
+    async fn the_links_are_listed_with_their_pending_items() {
+        let gw = source_gateway(SourceResponse::PlaylistLinks(vec![link_info()]));
+        let res = get(test_app_with(gw.addr()), "/api/bandcamp/playlist-links").await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(body_json(res).await, json!([link_json()]));
+        assert!(matches!(
+            &gw.requests()[..],
+            [GatewayRequest::Source {
+                request: SourceRequest::ListPlaylistLinks,
+                ..
+            }]
+        ));
+    }
+
+    #[tokio::test]
+    async fn starting_a_sync_answers_the_job_id() {
+        let gw = source_gateway(SourceResponse::PlaylistSyncStarted { job_id: 7 });
+        let res = post(test_app_with(gw.addr()), "/api/playlists/friday/sync", None).await;
+        assert_eq!(res.status(), StatusCode::ACCEPTED);
+        assert_eq!(body_json(res).await, json!({"job_id": 7}));
+        match &gw.requests()[..] {
+            [GatewayRequest::Source {
+                request: SourceRequest::SyncPlaylist { local },
+                ..
+            }] => assert_eq!(local.as_str(), "friday"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn syncing_a_playlist_that_is_not_linked_is_409() {
+        let gw = source_gateway(SourceResponse::Error(SourceError::PlaylistNotLinked {
+            name: local("friday"),
+        }));
+        let res = post(test_app_with(gw.addr()), "/api/playlists/friday/sync", None).await;
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+        assert!(body_json(res).await["error"].is_string());
+    }
+
+    #[tokio::test]
+    async fn syncing_while_a_sync_runs_is_409() {
+        let gw = source_gateway(SourceResponse::Error(SourceError::SyncInProgress {
+            job_id: 6,
+        }));
+        let res = post(test_app_with(gw.addr()), "/api/playlists/friday/sync", None).await;
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+        assert!(body_json(res).await["error"].is_string());
+    }
+
+    #[tokio::test]
+    async fn syncing_a_bad_name_is_400_and_the_source_is_not_asked() {
+        let gw = source_gateway(SourceResponse::PlaylistSyncStarted { job_id: 7 });
+        let res = post(
+            test_app_with(gw.addr()),
+            "/api/playlists/bad%20name/sync",
+            None,
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert!(gw.requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_running_sync_reports_its_phase_and_download_progress() {
+        let gw = source_gateway(job(PlaylistSyncPhase::Syncing));
+        let res = get(test_app_with(gw.addr()), "/api/bandcamp/playlist-sync").await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            body_json(res).await,
+            json!({
+                "job_id": 7,
+                "local": "friday",
+                "phase": "syncing",
+                "downloads": {"queued": 3, "completed": 1, "failed": 0, "ended": null},
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn a_done_sync_reports_the_counts_and_the_undo() {
+        let undo = PlaylistUndo {
+            version: version("after"),
+            previous: StoredPlaylist::new("before\n"),
+        };
+        let gw = source_gateway(job(PlaylistSyncPhase::Done(report(Some(undo)))));
+        let res = get(test_app_with(gw.addr()), "/api/bandcamp/playlist-sync").await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = body_json(res).await;
+        assert_eq!(body["phase"], "done");
+        assert_eq!(
+            body["report"],
+            json!({
+                "added": 3, "removed": 1, "moved": 2, "pending": 2,
+                "undo": {"version": version("after").as_str(), "previous": "before\n"},
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn a_done_sync_that_wrote_nothing_has_no_undo() {
+        let gw = source_gateway(job(PlaylistSyncPhase::Done(report(None))));
+        let res = get(test_app_with(gw.addr()), "/api/bandcamp/playlist-sync").await;
+        assert_eq!(body_json(res).await["report"]["undo"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn a_failed_sync_reports_its_message() {
+        let gw = source_gateway(job(PlaylistSyncPhase::Failed {
+            message: "friday not found".into(),
+        }));
+        let res = get(test_app_with(gw.addr()), "/api/bandcamp/playlist-sync").await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = body_json(res).await;
+        assert_eq!(body["phase"], "failed");
+        assert_eq!(body["message"], "friday not found");
+    }
+
+    #[tokio::test]
+    async fn no_sync_job_yet_is_phase_none() {
+        let gw = source_gateway(SourceResponse::PlaylistSyncStatus(None));
+        let res = get(test_app_with(gw.addr()), "/api/bandcamp/playlist-sync").await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(body_json(res).await, json!({"phase": "none"}));
+    }
+
+    #[tokio::test]
+    async fn another_answer_from_the_source_is_502() {
+        let gw = source_gateway(SourceResponse::Pong);
+        let res = get(test_app_with(gw.addr()), "/api/bandcamp/playlist-links").await;
+        assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
+        let res = post(test_app_with(gw.addr()), "/api/playlists/friday/sync", None).await;
+        assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn a_gateway_that_refuses_is_502_and_one_that_cannot_be_reached_is_503() {
+        let refusing = FakeGateway::start(|_| GatewayResponse::Error {
+            message: "source unavailable".into(),
+        });
+        let res = get(
+            test_app_with(refusing.addr()),
+            "/api/bandcamp/playlist-links",
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
+        let res = get(test_app(), "/api/bandcamp/playlist-links").await;
+        assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let res = post(test_app(), "/api/playlists/friday/sync", None).await;
+        assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let res = post(
+            test_app(),
+            "/api/playlists/friday/link",
+            Some(json!({"source": "x"})),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let res = get(test_app(), "/api/bandcamp/playlist-sync").await;
+        assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]
