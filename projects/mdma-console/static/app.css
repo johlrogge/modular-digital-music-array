@@ -482,6 +482,12 @@ details.more summary{cursor:pointer;min-height:44px;display:flex;align-items:cen
 .rail-head{display:flex;align-items:center;justify-content:space-between}
 .newpl-bar{display:flex;align-items:center;flex-wrap:wrap;gap:var(--s-2);margin-top:var(--s-4)}
 .newpl{box-sizing:border-box;width:100%;max-width:320px}
+.bin-row{flex-wrap:wrap}
+.bin-row .ttl{flex:1 1 200px;min-width:0;font-weight:500}
+/* Repeats the .list .ttl rules on purpose: coming later, they win by source order over the phone rule that hides small, so the time and count stay. */
+.bin-row .ttl small{display:block;font-weight:400;font-size:var(--fs-sm);color:var(--text-2)}
+.bin-ask{flex:1 1 100%}
+.bin-ask:empty{display:none}
 #rail-new-ask:not(:empty){padding:0 var(--s-3) var(--s-2)}
 /* == settings == */
 /* == workbench == */

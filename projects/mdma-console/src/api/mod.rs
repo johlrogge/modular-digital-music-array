@@ -4,7 +4,7 @@ use crate::AppState;
 use axum::{
     http::StatusCode,
     response::{IntoResponse, Json, Response},
-    routing::{get, post},
+    routing::{delete, get, post},
     Router,
 };
 use gateway_client::Response as PlaybackResponse;
@@ -15,6 +15,7 @@ use media_protocol::{ResponseData, SourceName};
 use serde::Serialize;
 use std::sync::Arc;
 
+pub mod bin;
 pub mod library;
 pub mod marks;
 pub mod player;
@@ -39,6 +40,9 @@ pub fn routes() -> Router<Arc<AppState>> {
             "/api/playlists/:name",
             get(library::playlist).delete(playlists::delete),
         )
+        .route("/api/bin", get(bin::list).delete(bin::empty))
+        .route("/api/bin/:id", delete(bin::purge))
+        .route("/api/bin/:id/restore", post(bin::restore))
         .route("/api/playlists/:name/edit", post(playlists::edit))
         .route("/api/playlists/:name/revert", post(playlists::revert))
         .route("/api/playlists/:name/queue", post(player::playlist_queue))
@@ -248,7 +252,7 @@ pub fn library_backend(state: &AppState) -> Result<LibraryBackend, Reply> {
 
 /// The one policy for a library call that failed, shared by every route:
 /// - transport (the gateway or library cannot be reached): 503;
-/// - no such playlist: 404;
+/// - no such playlist or bin entry: 404;
 /// - a playlist that already exists: 409;
 /// - input the library refused (an unknown or ambiguous hash, ...): 422;
 /// - anything else (`InvalidRequest` from an old node, `Internal`): 502.
@@ -258,7 +262,9 @@ pub fn library_backend(state: &AppState) -> Result<LibraryBackend, Reply> {
 pub fn library_failure_status(error: &ClientError) -> StatusCode {
     match error {
         ClientError::Transport(_) => StatusCode::SERVICE_UNAVAILABLE,
-        ClientError::Protocol(ProtocolError::PlaylistNotFound { .. }) => StatusCode::NOT_FOUND,
+        ClientError::Protocol(
+            ProtocolError::PlaylistNotFound { .. } | ProtocolError::BinEntryNotFound { .. },
+        ) => StatusCode::NOT_FOUND,
         ClientError::Protocol(
             ProtocolError::AmbiguousHash { .. }
             | ProtocolError::HashNotCanonical { .. }
@@ -344,6 +350,31 @@ pub fn library(
         LibraryResponse::Error(e) => Err(ClientError::Protocol(e)),
         response => Ok(response),
     }
+}
+
+/// How a write's answer becomes a reply: `None` for an answer that is not one of the write's
+/// outcomes.
+pub type Interpret = fn(LibraryResponse) -> Option<Reply>;
+
+/// Send `request` and say what the library answered, as `interpret` reads it. Any other answer
+/// is a 502, as is every library failure ([`library_failed`]).
+pub fn written(client: &GatewayClient, request: &LibraryRequest, interpret: Interpret) -> Reply {
+    match library(client, request) {
+        Ok(response) => {
+            interpret(response).unwrap_or_else(|| library_failed(&unexpected_library_response()))
+        }
+        Err(e) => library_failed(&e),
+    }
+}
+
+/// Send `request` over one gateway connection and answer as `interpret` reads the library's
+/// answer. 503 when the gateway cannot be reached.
+pub async fn forward(
+    state: &Arc<AppState>,
+    request: LibraryRequest,
+    interpret: Interpret,
+) -> Response {
+    respond(gw(state, move |client| written(client, &request, interpret)).await)
 }
 
 /// The library answered with something other than the answer to the request.

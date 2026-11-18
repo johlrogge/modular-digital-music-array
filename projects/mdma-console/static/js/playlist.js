@@ -6,9 +6,10 @@
 // a track. A line the library resolved but the console's catalogue lacks is a placeholder track
 // (logic.js placeholderTrack). The page is read-only; its Edit link opens the workbench
 // (workbench.js), which uses the server's edit routes (ADR-027 §9).
-import { h, icon, route, store, api, enc, playlistHref, toast, loadPlaylists, ofPlaylist, setOf } from "./core.js";
+import { h, icon, route, store, api, enc, playlistHref, toast, loadPlaylists, ofPlaylist, setOf, askName } from "./core.js";
 import { playlistRows, albumCovers } from "./logic.js";
 import { songCounts } from "./lists.js";
+import { restoreBinned } from "./bin.js";
 import { collectionPage, missing, LIBRARY_LINK, NO_MUSIC, NONE } from "./collections.js";
 
 /** The page's state: "loading" until the fetch answers, then "ready", "notfound" or "failed", with the snapshot's `version` and `entries` when ready. */
@@ -40,6 +41,37 @@ export const notes = (name) => ({
   failed: () => ["Couldn't load this playlist", "Open it again in a moment. ", LIBRARY_LINK],
 });
 
+/**
+ * Delete playlist `name` (at `version`) into the bin, at once: no confirm, because the toast's Undo
+ * restores it by the bin id the server answers. Then back to the playlist list. A stale version
+ * (409) changes nothing and says so.
+ */
+async function binPlaylist(button, name, version) {
+  const path = "/api/playlists/" + enc(name) + "?version=" + enc(version);
+  let binned;
+  button.disabled = true;
+  try {
+    binned = await api(path, { method: "DELETE" });
+  } catch (e) {
+    button.disabled = false;
+    toast(e.status === 409 ? "This playlist changed elsewhere. Open it again to delete it." : "Couldn't delete: " + e.message);
+    return;
+  }
+  await loadPlaylists();
+  location.hash = "#/library/playlists";
+  toast("Moved “" + name + "” to the bin", async () => {
+    const res = await restoreBinned(binned.id);
+    if (!res) return;
+    if (res.taken) {
+      const clash = "There is already a playlist called “" + name + "”. Restore it from the Bin under another name.";
+      toast(clash, () => (location.hash = "#/bin"), "Open Bin");
+    } else {
+      toast("Restored “" + res.name + "”");
+      location.hash = playlistHref(res.name);
+    }
+  });
+}
+
 /** The page for `state` ({ status, entries }), drawn into `root`. Returns the router's cleanup. */
 function drawPlaylist(root, name, state) {
   return collectionPage(root, {
@@ -47,7 +79,13 @@ function drawPlaylist(root, name, state) {
     headerWhenEmpty: () => state.status === "ready" && store.order.length > 0,
     header: {
       // Built afresh for every header the pane draws, so no node moves from one header to the next.
-      actions: () => (state.status === "ready" ? [h("a", { class: "btn", href: playlistHref(name, "edit"), style: "text-decoration:none" }, [icon("wrench", "sm"), "Edit"])] : []),
+      actions: () =>
+        state.status === "ready"
+          ? [
+              h("a", { class: "btn", href: playlistHref(name, "edit"), style: "text-decoration:none" }, [icon("wrench", "sm"), "Edit"]),
+              h("button", { class: "btn danger", onclick: (e) => binPlaylist(e.currentTarget, name, state.version) }, [icon("trash", "sm"), "Delete"]),
+            ]
+          : [],
       label: "Playlist",
       name,
       art: { round: false, covers: albumCovers },
@@ -79,58 +117,21 @@ function drawPlaylist(root, name, state) {
  * any other refusal shows as a toast with the server's message, and the input stays.
  */
 export function askNewPlaylist(slot, opener) {
-  const open = slot.querySelector("input");
-  if (open) {
-    open.focus();
-    return;
-  }
-  let busy = false;
-  const close = (refocus) => {
-    slot.replaceChildren();
-    opener.setAttribute("aria-expanded", "false");
-    if (refocus) opener.focus();
-  };
-  const input = h("input", {
-    class: "newpl",
-    type: "text",
+  askName(slot, opener, {
+    label: "New playlist name",
     placeholder: "New playlist name",
-    title: "Letters, digits, _ and - only",
-    pattern: "[A-Za-z0-9_\\-]+",
-    "aria-label": "New playlist name",
-    autocomplete: "off",
-    spellcheck: "false",
+    submit: async (name) => {
+      try {
+        const made = await api("/api/playlists", { body: { name } });
+        await loadPlaylists();
+        location.hash = playlistHref(made.name, "edit");
+        return true;
+      } catch (e) {
+        toast(e.message);
+        return false;
+      }
+    },
   });
-  async function create() {
-    const name = input.value.trim();
-    if (!name || busy || !input.reportValidity()) return;
-    busy = true;
-    try {
-      const made = await api("/api/playlists", { body: { name } });
-      close(false);
-      await loadPlaylists();
-      location.hash = playlistHref(made.name, "edit");
-    } catch (e) {
-      toast(e.message);
-    } finally {
-      busy = false;
-    }
-  }
-  input.addEventListener("keydown", (e) => {
-    if (e.key === "Enter") {
-      e.preventDefault();
-      create();
-    } else if (e.key === "Escape") {
-      e.preventDefault();
-      e.stopPropagation();
-      close(true);
-    }
-  });
-  input.addEventListener("blur", () => {
-    if (!busy && !input.value) close(false);
-  });
-  slot.replaceChildren(input);
-  opener.setAttribute("aria-expanded", "true");
-  input.focus();
 }
 
 function viewPlaylist(root, params) {

@@ -628,6 +628,46 @@ fn playlists_are_rewritten_from_the_loser_to_the_winner() {
 }
 
 #[test]
+fn a_binned_playlist_is_left_alone_by_the_sweep_and_repaired_when_restored() {
+    // ADR-033 §4: the sweep never sees `.bin/`; the on-read repair fixes the
+    // hash that was merged away meanwhile.
+    let (service, metadata, _acid) = make_service_with_playlists_dir();
+    let old = seed(&service, "old", base(1, Some("p1"), 1));
+    let new = seed(&service, "new", base(1, Some("p1"), 2));
+    let plist = metadata.path().join("playlists").join("set.plist");
+    let text = format!("{}  Artist - Song\n", old.as_str());
+    std::fs::write(&plist, &text).unwrap();
+    let name = PlaylistName::new("set").unwrap();
+
+    let response = service.handle_request(LibraryRequest::PlaylistRemove { name: name.clone() });
+    assert!(matches!(response, LibraryResponse::Pong), "{response:?}");
+    apply(&service);
+
+    let binned: Vec<_> = std::fs::read_dir(metadata.path().join("playlists").join(".bin"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert_eq!(binned.len(), 1);
+    assert_eq!(std::fs::read_to_string(&binned[0]).unwrap(), text);
+
+    let id = match service.handle_request(LibraryRequest::BinList) {
+        LibraryResponse::BinEntries(entries) => entries[0].id.clone(),
+        other => panic!("expected BinEntries, got {other:?}"),
+    };
+    let response = service.handle_request(LibraryRequest::PlaylistRestore { id, as_name: None });
+    assert!(
+        matches!(response, LibraryResponse::PlaylistRestored { .. }),
+        "{response:?}"
+    );
+    let response = service.handle_request(LibraryRequest::PlaylistGet { name });
+    assert!(
+        matches!(&response, LibraryResponse::PlaylistContent(c)
+            if *c == format!("{}  Artist - Song\n", new.as_str())),
+        "{response:?}"
+    );
+}
+
+#[test]
 fn a_rerun_after_a_crash_before_the_retire_completes_without_duplicating_facts() {
     let (service, _d, _acid) = make_empty_service();
     let old = seed(

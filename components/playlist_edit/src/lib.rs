@@ -9,6 +9,7 @@
 //! Only the lines an op names change; every other line, including comments,
 //! short IDs and `# reason` text, stays byte for byte.
 
+mod bin;
 #[cfg(any(test, feature = "test-support"))]
 pub mod contract;
 #[cfg(test)]
@@ -16,6 +17,7 @@ mod fixtures;
 mod ops_between;
 mod plan;
 
+pub use bin::{bin_entry, bin_id_error, fresh_bin_id, restore_target, sort_newest_first};
 pub use ops_between::{ops_between, OpsBetweenError};
 pub use plan::{appended, entries, plan_delete, plan_edit, plan_revert, snapshot, Planned};
 

@@ -199,6 +199,63 @@ export function confirmDlg(title, text, ok, fn) {
   $("#cf-cancel").onclick = () => c.classList.remove("open");
 }
 
+/**
+ * Ask for a playlist name with an input in `slot` (no browser prompt); `opener` is the button that
+ * asked (it shows aria-expanded and gets the focus back on Esc). Enter calls `submit(name)`, which
+ * resolves true to close the input or false to keep it open (it reports its own failures); Esc, or
+ * leaving the field empty, cancels. A name the field's pattern refuses is reported by the field.
+ * cfg: { label (aria-label), placeholder, submit }.
+ */
+export function askName(slot, opener, { label, placeholder, submit }) {
+  const open = slot.querySelector("input");
+  if (open) {
+    open.focus();
+    return;
+  }
+  let busy = false;
+  const close = (refocus) => {
+    slot.replaceChildren();
+    opener.setAttribute("aria-expanded", "false");
+    if (refocus) opener.focus();
+  };
+  const input = h("input", {
+    class: "newpl",
+    type: "text",
+    placeholder,
+    title: "Letters, digits, _ and - only",
+    pattern: "[A-Za-z0-9_\\-]+",
+    "aria-label": label,
+    autocomplete: "off",
+    spellcheck: "false",
+  });
+  async function send() {
+    const name = input.value.trim();
+    if (!name || busy || !input.reportValidity()) return;
+    busy = true;
+    try {
+      if (await submit(name)) close(false);
+    } finally {
+      busy = false;
+    }
+  }
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      send();
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      e.stopPropagation();
+      close(true);
+    }
+  });
+  input.addEventListener("blur", () => {
+    if (!busy && !input.value) close(false);
+  });
+  slot.replaceChildren(input);
+  opener.setAttribute("aria-expanded", "true");
+  input.focus();
+}
+
 /* ============================================================ action menu */
 
 let menuOnClose = null;
