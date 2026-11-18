@@ -8,6 +8,14 @@ All notable changes to MDMA are documented here.
 
 ---
 
+## [0.39.1] — 2026-11-18
+
+### Fixed
+
+- Upgrading from 0.38 or earlier no longer empties the playback queue. Playback looks up the short track IDs older versions saved through the library at startup, keeping the order. The original file is kept as `/metadata/queue.json.rejected`, and any entry the library can't resolve is logged and dropped.
+
+---
+
 ## [0.39.0] — 2026-11-18
 
 ### Added

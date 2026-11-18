@@ -6,6 +6,7 @@
 pub use library_ipc_protocol::*;
 pub use music_primitives::{CanonicalHash, NotCanonical};
 
+use std::time::Duration;
 use thiserror::Error;
 
 /// Errors that can occur when communicating with the library.
@@ -81,6 +82,15 @@ impl LibraryClient {
     /// ```
     pub fn connect(address: &str) -> Result<Self, ClientError> {
         let socket = nng_transport::SharedSocket::connect(address)?;
+        Ok(Self { socket })
+    }
+
+    /// Like [`connect`](Self::connect), but the dial does not wait for the
+    /// library: it happens in the background, and every request is bounded by
+    /// `timeout` (a request made before the library is up fails with a
+    /// transport error). For services that start before the library.
+    pub fn connect_with_timeout(address: &str, timeout: Duration) -> Result<Self, ClientError> {
+        let socket = nng_transport::SharedSocket::connect_with_timeout(address, timeout)?;
         Ok(Self { socket })
     }
 
