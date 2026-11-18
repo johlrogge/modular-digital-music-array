@@ -287,7 +287,7 @@ fn resolve_get_track(
 }
 
 /// Answer each request on `address` with `handler`'s reply, on a thread of its own.
-fn serve(address: &str, handler: impl Fn(&[u8]) -> Vec<u8> + Send + 'static) {
+pub(crate) fn serve(address: &str, handler: impl Fn(&[u8]) -> Vec<u8> + Send + 'static) {
     let socket = nng::Socket::new(nng::Protocol::Rep0).expect("a socket");
     socket.listen(address).expect("listen");
     std::thread::spawn(move || {

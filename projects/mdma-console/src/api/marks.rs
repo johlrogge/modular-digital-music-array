@@ -65,7 +65,9 @@ pub async fn marks(State(state): State<Arc<AppState>>, Json(req): Json<MarksRequ
     let action = req.action;
     respond(
         lib(&state, move |backend| {
-            apply(backend, action, &mark, &hashes)
+            apply_each(backend, &hashes, |hash| {
+                change(backend, action, hash, &mark)
+            })
         })
         .await,
     )
@@ -84,11 +86,13 @@ fn change(
     })
 }
 
-fn apply(
+/// Resolve every hash before anything is written, then run `change` on each track once, in the
+/// order first named, and answer `{changed, tracks}` as the module doc says. `change` says whether
+/// it changed the track. Shared by the marks and energy routes.
+pub(super) fn apply_each(
     backend: &LibraryBackend,
-    action: MarkAction,
-    mark: &Mark,
     hashes: &[ContentHash],
+    change: impl Fn(&ContentHash) -> Result<bool, library_ipc_client::ClientError>,
 ) -> Reply {
     let mut resolved = match backend.resolve_for_playback(hashes) {
         Ok(resolved) => resolved,
@@ -102,7 +106,7 @@ fn apply(
     let mut failure = None;
     for canonical in resolved {
         let hash = ContentHash::from(canonical);
-        let result = change(backend, action, &hash, mark).and_then(|did_change| {
+        let result = change(&hash).and_then(|did_change| {
             if did_change {
                 changed.push(hash.as_str().to_owned());
             }

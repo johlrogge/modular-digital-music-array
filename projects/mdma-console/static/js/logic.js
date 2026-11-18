@@ -2,8 +2,8 @@
 //
 // Track shape: the ApiTrack JSON of GET /api/tracks (src/api/library.rs, pinned by a Rust test).
 // Every key is always present; absent facts are null:
-//   { hash, title, artist, album, track_number, disc, bpm, key, duration_secs, added, has_cover, marks }
-//   hash "sha256:..."; bpm number|null; key { musical, camelot, open_key }|null (core.js keyText picks one); added ISO 8601 string|null; has_cover bool;
+//   { hash, title, artist, album, track_number, disc, bpm, key, energy, duration_secs, added, has_cover, marks }
+//   hash "sha256:..."; bpm number|null; energy 1-10|null; key { musical, camelot, open_key }|null (core.js keyText picks one); added ISO 8601 string|null; has_cover bool;
 //   marks [string]: the marks it carries live, "liked" for the default one.
 // Player shape: GET /api/player is { state: "idle"|"playing"|"paused", now: hash|null, queue: [hash],
 //   output: "absent"|"starting"|"running"|"stalled"|null } (null: the node cannot say).
@@ -56,24 +56,33 @@ export function outputDown(player) {
   );
 }
 
-// Each key function yields a string (collated) or a number (subtracted).
+// Each key function yields a string (collated), a number (subtracted) or null/undefined (missing).
 const KEYERS = {
   title: (t) => t.title,
   artist: (t) => t.artist,
   album: (t) => t.album,
-  bpm: (t) => (t.bpm == null ? 0 : Number(t.bpm)),
+  bpm: (t) => (t.bpm == null ? null : Number(t.bpm)),
   added: (t) => t.added,
+  energy: (t) => (t.energy == null ? null : Number(t.energy)),
 };
 
 function compareValues(x, y) {
   return typeof x === "number" && typeof y === "number" ? x - y : collate(x, y);
 }
 
-/** Comparator for tracks. `by` is title|artist|album|bpm|added, `dir` is "asc"|"desc". Ties break on hash. */
+/**
+ * Comparator for tracks. `by` is title|artist|album|bpm|added|energy, `dir` is "asc"|"desc".
+ * Ties break on hash. A track missing the value sorts last in both directions.
+ */
 export function trackComparator(by, dir) {
   const key = KEYERS[by] || KEYERS.added;
   const sign = dir === "asc" ? 1 : -1;
-  return (a, b) => compareValues(key(a), key(b)) * sign || collate(a.hash, b.hash);
+  return (a, b) => {
+    const x = key(a);
+    const y = key(b);
+    const blank = (x == null) - (y == null);
+    return blank || compareValues(x, y) * sign || collate(a.hash, b.hash);
+  };
 }
 
 /** Sorted copy of tracks. */
@@ -176,6 +185,7 @@ export function placeholderTrack(hash) {
     disc: null,
     bpm: null,
     key: null,
+    energy: null,
     duration_secs: null,
     added: null,
     has_cover: false,
@@ -227,11 +237,23 @@ export function playlistRows(entries, trackOf) {
 }
 
 /**
- * Number of active filter groups in `f` ({ bmin, bmax, key, steps, shape, jump, added, mark }, all fields
- * present): tempo, key, added and mark each count once.
+ * The range filters (min/max fields of the filters, the query param they become, the open ends
+ * the server is sent, an optional cap on what can be typed, and the chip text around the span).
+ */
+export const RANGES = [
+  { lo: "bmin", hi: "bmax", param: "bpm", floor: "0", ceil: "999", pre: "", post: " BPM" },
+  { lo: "emin", hi: "emax", param: "energy", floor: "1", ceil: "10", cap: 10, pre: "Energy ", post: "" },
+];
+
+/** True when either end of range `r` is set in filters `f`. */
+export const rangeOn = (f, r) => !!(f[r.lo] || f[r.hi]);
+
+/**
+ * Number of active filter groups in `f` ({ bmin, bmax, emin, emax, key, steps, shape, jump, added, mark },
+ * all fields present): tempo, energy, key, added and mark each count once.
  */
 export function filterGroups(f) {
-  return (f.bmin || f.bmax ? 1 : 0) + (f.key ? 1 : 0) + (f.added !== "any" ? 1 : 0) + (f.mark ? 1 : 0);
+  return RANGES.filter((r) => rangeOn(f, r)).length + (f.key ? 1 : 0) + (f.added !== "any" ? 1 : 0) + (f.mark ? 1 : 0);
 }
 
 /** The default mark's name: what the server calls the heart. Every other mark is a named one. */

@@ -1,7 +1,7 @@
 // The one narrowing bar: text field, Sort button, Filters button with a count badge, and removable
 // chips for the active filters. It also owns the filters sheet (#fsheet in app.html), sorting and
 // narrowedView(), the controller every narrowed view is built on. Nothing is matched here or
-// anywhere in the browser: text, BPM, key and added all go to the server (GET /api/library/match
+// anywhere in the browser: text, BPM, energy, key and added all go to the server (GET /api/library/match
 // for the Library, GET /api/tracks/match for Up next). See ADR 029.
 //
 // Narrowing state is per view: store.nb[key] is the text and store.f[key] the filters of the
@@ -10,7 +10,7 @@
 // closes). Changing the filters of a view emits "filters" with its key; changing the sort emits
 // "sort"; typing only calls the bar's onChange.
 import { $, $$, h, icon, store, api, emit, on, openMenu, toast, keyText, renderRoute } from "./core.js";
-import { filterGroups, isNarrowedBy, LIKED, markLabel } from "./logic.js";
+import { filterGroups, isNarrowedBy, LIKED, markLabel, RANGES, rangeOn } from "./logic.js";
 
 /** Key of the Library view's narrowing state. */
 export const LIBRARY_KEY = "lib";
@@ -129,7 +129,7 @@ const BPM_PRESETS = [
 
 // steps: how far round the key wheel mixes well (0 = the key alone), shape "straight" | "any" (any
 // path; only means something from 2 steps), jump: also the power jump (seven steps up).
-const emptyFilters = () => ({ bmin: "", bmax: "", key: "", steps: 0, shape: "straight", jump: false, added: "any", mark: "" });
+const emptyFilters = () => ({ bmin: "", bmax: "", emin: "", emax: "", key: "", steps: 0, shape: "straight", jump: false, added: "any", mark: "" });
 
 /**
  * The key query for a key filter, in the grammar the server's parse_key_query reads ("8A+-2d,+7").
@@ -161,7 +161,7 @@ export function matchQuery(f, text = "") {
   const p = new URLSearchParams();
   const q = String(text || "").trim();
   if (q) p.set("q", q);
-  if (f.bmin || f.bmax) p.set("bpm", (f.bmin || "0") + ".." + (f.bmax || "999"));
+  for (const r of RANGES) if (rangeOn(f, r)) p.set(r.param, (f[r.lo] || r.floor) + ".." + (f[r.hi] || r.ceil));
   if (f.key) p.set("key", reachOf(f));
   if (f.added !== "any") {
     const days = Number(f.added);
@@ -279,6 +279,8 @@ export const SORTS = [
   ["artist", "Artist A–Z", "asc"],
   ["bpm", "BPM, slow to fast", "asc"],
   ["bpm", "BPM, fast to slow", "desc"],
+  ["energy", "Energy, low to high", "asc"],
+  ["energy", "Energy, high to low", "desc"],
 ];
 
 /** Sort by a field. Without `dir`, the same field flips direction and a new one starts natural. */
@@ -322,8 +324,10 @@ function setValue(el, v) {
 }
 
 function paintFilters() {
-  setValue($("#f-bmin"), draft.bmin);
-  setValue($("#f-bmax"), draft.bmax);
+  for (const { lo, hi } of RANGES) {
+    setValue($("#f-" + lo), draft[lo]);
+    setValue($("#f-" + hi), draft[hi]);
+  }
   $("#f-jump").checked = draft.jump;
   $$("#f-steps button").forEach((b) => {
     b.setAttribute("aria-pressed", String(Number(b.dataset.steps) === draft.steps));
@@ -398,11 +402,15 @@ function paintFilters() {
   }
 }
 
-for (const [id, field] of [["#f-bmin", "bmin"], ["#f-bmax", "bmax"]]) {
-  $(id).addEventListener("input", (e) => {
-    draft[field] = e.target.value.replace(/\D/g, "");
-    paintFilters();
-  });
+// A range with a cap (energy: 1 to 10) keeps what is typed inside its scale.
+for (const { lo, hi, cap } of RANGES) {
+  for (const field of [lo, hi]) {
+    $("#f-" + field).addEventListener("input", (e) => {
+      const n = e.target.value.replace(/\D/g, "");
+      draft[field] = cap ? (+n ? String(Math.min(cap, n)) : "") : n;
+      paintFilters();
+    });
+  }
 }
 $("#f-jump").addEventListener("change", (e) => {
   draft.jump = e.target.checked;
@@ -494,8 +502,8 @@ function narrowBar(o) {
       ]),
     );
   const f = filtersOf(o.key);
-  if (f.bmin || f.bmax) {
-    chip((f.bmin || "…") + "–" + (f.bmax || "…") + " BPM", (x) => (x.bmin = x.bmax = ""));
+  for (const r of RANGES) {
+    if (rangeOn(f, r)) chip(r.pre + (f[r.lo] || "…") + "–" + (f[r.hi] || "…") + r.post, (x) => (x[r.lo] = x[r.hi] = ""));
   }
   if (f.key) {
     const { note, mode } = parseKeyFilter(f.key);

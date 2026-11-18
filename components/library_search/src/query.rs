@@ -105,6 +105,11 @@ pub enum NumericQuery {
     },
 }
 
+/// A numeric query whose every bound is a valid energy level (1-10): only
+/// `parse_energy_query` makes one. `TrackQuery.energy` carries the inner query.
+#[derive(Debug, Clone)]
+pub struct EnergyQuery(pub NumericQuery);
+
 /// Duration matching with precision semantics.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum DurationQuery {

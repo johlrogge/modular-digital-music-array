@@ -1,9 +1,9 @@
 use crate::query::{
-    DatePrecision, DateQuery, DurationQuery, DurationUnit, KeyQuery, NumericQuery, Reach, Shape,
-    StringQuery,
+    DatePrecision, DateQuery, DurationQuery, DurationUnit, EnergyQuery, KeyQuery, NumericQuery,
+    Reach, Shape, StringQuery,
 };
 use chrono::NaiveDate;
-use music_primitives::TrackRole;
+use music_primitives::{EnergyLevel, TrackRole};
 use std::convert::Infallible;
 use std::str::FromStr;
 use thiserror::Error;
@@ -12,6 +12,8 @@ use thiserror::Error;
 pub enum ParseError {
     #[error("invalid numeric query '{0}': expected a number, 'lo..hi', 'val+-tol', 'val+tol', or 'val-tol'")]
     InvalidNumeric(String),
+    #[error("invalid energy query '{0}': {1}")]
+    InvalidEnergy(String, &'static str),
     #[error("invalid duration query '{0}': expected e.g. '7m15s', '7m', '>5m', '<8m', '6m..8m'")]
     InvalidDuration(String),
     #[error("invalid key query '{0}': expected a key (8B, 1m, Am, C# major), steps (8A+-2, 8A+2, 8A-1; add d for any path: 8A+-2d; extra moves: 8A+-1,+7) or a span (6A..10B)")]
@@ -32,6 +34,7 @@ impl ParseError {
             Self::InvalidNumeric(_) => {
                 "expected a number, `lo..hi`, `val+-tol`, `val+tol` or `val-tol`"
             }
+            Self::InvalidEnergy(_, phrase) => phrase,
             Self::InvalidDuration(_) => {
                 "expected a duration such as `7m15s`, `7m`, `>5m`, `<8m` or `6m..8m`"
             }
@@ -66,6 +69,7 @@ macro_rules! from_str_query {
 }
 
 from_str_query!(NumericQuery, parse_numeric_query);
+from_str_query!(EnergyQuery, parse_energy_query);
 from_str_query!(DurationQuery, parse_duration_query);
 from_str_query!(KeyQuery, parse_key_query);
 from_str_query!(DateQuery, parse_date_query);
@@ -172,6 +176,35 @@ pub fn parse_numeric_query(s: &str) -> Result<NumericQuery, ParseError> {
         .parse()
         .map_err(|_| ParseError::InvalidNumeric(s.to_string()))?;
     Ok(NumericQuery::Exact(value))
+}
+
+/// Parse an energy query (1-10): the numeric formats, with every bound a valid
+/// [`EnergyLevel`]; a tolerance's centre must be one, and the tolerance itself is unbounded
+/// (`10+-1` covers 9-10, `7+-20` covers 1-10). `0`, `11`, `0..5`, `7.5` and `7.5+-1` are
+/// rejected.
+pub fn parse_energy_query(s: &str) -> Result<EnergyQuery, ParseError> {
+    let query = parse_numeric_query(s)?;
+    let reject = |phrase| ParseError::InvalidEnergy(s.trim().to_string(), phrase);
+    let check = |bound: f32, phrase| {
+        let whole = bound.fract() == 0.0 && (0.0..=255.0).contains(&bound);
+        whole
+            .then_some(bound as u8)
+            .and_then(|level| EnergyLevel::new(level).ok())
+            .map(drop)
+            .ok_or_else(|| reject(phrase))
+    };
+    match &query {
+        NumericQuery::Exact(v) => check(*v, "must be a whole level from 1 to 10")?,
+        NumericQuery::Range(lo, hi) => {
+            check(*lo, "lower bound must be a whole level from 1 to 10")?;
+            check(*hi, "upper bound must be a whole level from 1 to 10")?;
+        }
+        NumericQuery::Tolerance { value, .. } => {
+            // The tolerance is unbounded: it covers whatever part of 1-10 it reaches.
+            check(*value, "value must be a whole level from 1 to 10")?;
+        }
+    }
+    Ok(EnergyQuery(query))
 }
 
 /// Parse a CLI duration string into a DurationQuery.
@@ -523,6 +556,45 @@ mod tests {
     fn string_query_regex() {
         let sq = parse_string_query("/^Carbon.*/");
         assert!(matches!(sq, StringQuery::Regex(ref p) if p == "^Carbon.*"));
+    }
+
+    #[rstest]
+    #[case("1")]
+    #[case("7")]
+    #[case("10")]
+    #[case("5..8")]
+    #[case("1..10")]
+    #[case("7+-2")]
+    #[case("7+2")]
+    #[case("7-2")]
+    #[case("10+-1")]
+    #[case("1+-1")]
+    #[case("10+2")]
+    #[case("7+-20")]
+    fn energy_query_accepts_valid(#[case] input: &str) {
+        assert!(parse_energy_query(input).is_ok(), "{input}");
+    }
+
+    #[rstest]
+    #[case("0", "must be a whole level")]
+    #[case("11", "must be a whole level")]
+    #[case("7.5", "must be a whole level")]
+    #[case("0..5", "lower bound")]
+    #[case("5..11", "upper bound")]
+    #[case("0+-2", "value must be")]
+    #[case("11+-1", "value must be")]
+    #[case("7.5+-1", "value must be")]
+    fn energy_query_rejects_out_of_range(#[case] input: &str, #[case] reason: &str) {
+        let err = parse_energy_query(input).unwrap_err();
+        assert!(err.reason().contains(reason), "{input}: {err}");
+    }
+
+    #[test]
+    fn energy_query_rejects_garbage_as_numeric() {
+        assert!(matches!(
+            parse_energy_query("loud"),
+            Err(ParseError::InvalidNumeric(_))
+        ));
     }
 
     #[test]

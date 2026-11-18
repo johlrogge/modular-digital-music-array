@@ -13,8 +13,8 @@
 //              every player answer that says where the track is (a refresh, a seek, a preview).
 //              detail and store.player.position are { hash, position_ms, duration_ms };
 //              position is reset to null whenever player.now changes.
-//   marks      when a track's marks (store.tracks.get(hash).marks) changed after a mark action, or the
-//              macro marks (store.macros) were loaded. Views redraw hearts and chips in place.
+//   marks      when a track's marks (store.tracks.get(hash).marks) or energy changed after a mark or
+//              energy action, or the macro marks (store.macros) were loaded. Views redraw hearts and chips in place.
 //   filters    when store.f[key] was changed by the narrowing UI (emitted by narrow.js).
 //              detail is always the view key whose filters changed.
 //   sort       when store.sort was changed (emitted by narrow.js). No detail: the sort is global.
@@ -263,7 +263,7 @@ let menuOnClose = null;
 /**
  * Open the action menu (#menu): a bottom sheet on phones, a popover anchored to `anchor` from
  * 600px up (anchor may be null: then it stays where the CSS puts it). items: [icon, label, fn,
- * cls?] or the string "-" for a separator. head: [title, subtitle?]. opts.onClose runs once when
+ * cls?] (icon may be null) or the string "-" for a separator. head: [title, subtitle?]. opts.onClose runs once when
  * the menu closes, however it closes.
  */
 export function openMenu(anchor, items, head, opts = {}) {
@@ -296,7 +296,7 @@ export function openMenu(anchor, items, head, opts = {}) {
             it[2]();
           },
         },
-        [icon(it[0], "sm"), it[1]],
+        [it[0] ? icon(it[0], "sm") : null, it[1]],
       ),
     );
   }
@@ -796,19 +796,24 @@ async function markCall(action, hash, mark) {
     toast("Couldn't change the mark: " + (e.message || "error"));
     return null;
   }
-  const marked = [];
-  for (const t of body.tracks || []) {
-    if (store.tracks.has(t.hash)) {
-      store.tracks.set(t.hash, t);
-      marked.push(t.hash);
-    }
-  }
-  if (marked.length) emit("marks", marked);
+  settled(body);
   if (body.error) {
     toast("Couldn't change the mark: " + body.error);
     return null;
   }
   return body;
+}
+
+/** Replace the catalogue's tracks with the ones a marks or energy answer carries and fire "marks". A 207 carries `error`; the caller says so. */
+function settled(body) {
+  const changed = [];
+  for (const t of body.tracks || []) {
+    if (store.tracks.has(t.hash)) {
+      store.tracks.set(t.hash, t);
+      changed.push(t.hash);
+    }
+  }
+  if (changed.length) emit("marks", changed);
 }
 
 const SAID = {
@@ -827,6 +832,59 @@ async function setMark(action, hash, subject, mark) {
     });
   }
   return true;
+}
+
+/* ------------------------------------------------------------ energy */
+
+// Energy is a set operation like a mark: POST /api/energy { hashes, level } with level 1..10 sets
+// the user's energy on every track, null clears it. The server answers { changed, tracks } as it
+// does for marks (a track already at that level is not in `changed`), and the "marks" event
+// repaints rows. Undo puts back each changed track's energy as the catalogue held it BEFORE.
+
+/** POST one energy change and apply the tracks the server returns. The body (a 207's carries `error`), or null after toasting why there is none. */
+async function energyCall(hashes, level) {
+  let body;
+  try {
+    body = await api("/api/energy", { body: { hashes, level } });
+  } catch (e) {
+    toast("Couldn't set the energy: " + (e.message || "error"));
+    return null;
+  }
+  settled(body);
+  return body;
+}
+
+/**
+ * Set (level 1..10) or clear (null) the energy of `tracks` (catalogue tracks), named `subject` in
+ * the toast. Toast offers Undo for the tracks that changed, also when the node stopped partway
+ * (the toast then says how far it got and why it stopped).
+ */
+async function setEnergy(tracks, level, subject) {
+  const before = new Map(tracks.map((t) => [t.hash, (store.tracks.get(t.hash) || t).energy ?? null]));
+  const body = await energyCall([...before.keys()], level);
+  if (!body) return false;
+  const stopped = body.error ? " (stopped: " + body.error + ")" : "";
+  if (!body.changed.length) {
+    toast(stopped ? "Couldn't set the energy: " + body.error : "Nothing changed");
+    return !stopped;
+  }
+  const what = stopped ? body.changed.length + " of " + plural(before.size, "track") : subject;
+  toast((level == null ? "Cleared energy of " + what : "Energy of " + what + " set to " + level) + stopped, async () => {
+    // One call per previous level: each track goes back to what it had, or to none.
+    const groups = new Map();
+    for (const hash of body.changed) {
+      const was = before.has(hash) ? before.get(hash) : null;
+      groups.set(was, [...(groups.get(was) || []), hash]);
+    }
+    let ok = true;
+    for (const [was, hashes] of groups) {
+      const undone = await energyCall(hashes, was);
+      if (undone && undone.error) toast("Couldn't undo: " + undone.error);
+      ok = !!undone && !undone.error && ok;
+    }
+    if (ok) toast("Undone");
+  });
+  return !stopped;
 }
 
 /* ------------------------------------------------------------ transport */
@@ -884,6 +942,8 @@ export const actions = {
   mark: (hash, subject, mark = LIKED) => setMark("mark", hash, subject, mark),
   /** Take `mark` off the track. Toast says "Unliked “X”", with Undo when it changed. */
   unmark: (hash, subject, mark = LIKED) => setMark("unmark", hash, subject, mark),
+  /** Set the energy of the catalogue tracks to `level` 1..10, or clear it with null. Toast says "Energy of <subject> set to N", with Undo when it changed. */
+  setEnergy,
   /** Pause what plays (the preview, while one runs). The caller says pause or resume from the state it showed. */
   pause: () => playerAction("/api/pause", {}, "pause"),
   /** Resume what is paused (the preview, while one runs). */

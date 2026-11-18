@@ -11,9 +11,11 @@ use client_facts::Facts;
 use color_eyre::Result;
 use hicli::{Arg, Candidate, Choice};
 use library_ipc_client::{ContentHash, TrackInfo};
-use library_search::{DateQuery, DurationQuery, KeyQuery, NumericQuery, StringQuery, TrackQuery};
+use library_search::{
+    DateQuery, DurationQuery, EnergyQuery, KeyQuery, NumericQuery, StringQuery, TrackQuery,
+};
 use mdma_client::Node;
-use music_facts::{EnergyLevel, Mark, TrackRole};
+use music_facts::{Mark, TrackRole};
 use std::str::FromStr;
 
 // Every filter is its own argument type and takes its help from its doc comment.
@@ -65,8 +67,9 @@ impl Arg for SearchInput {
     }
 }
 
-// The filters wrap the query types of `library_search`, which parse themselves:
-// a filter has no `FromStr` of its own, so what a bad value says is theirs.
+// The filters wrap the query types of `library_search`, which parse themselves (an energy
+// filter wraps `EnergyQuery`, which also checks the 1-10 bounds): a filter has no `FromStr`
+// of its own, so what a bad value says is theirs.
 
 /// Filter by artist name
 #[derive(Debug, Clone, Arg)]
@@ -209,37 +212,9 @@ impl From<RoleArg> for TrackRole {
 }
 
 /// Filter by energy level (1-10; formats: 7  5..8  7+-2)
-///
-/// Every bound must be a valid `EnergyLevel`.
 #[derive(Debug, Clone, Arg)]
 #[arg(long = "energy", metavar = "ENERGY")]
-pub(crate) struct EnergyArg(pub NumericQuery);
-
-impl FromStr for EnergyArg {
-    type Err = &'static str;
-
-    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        let query: NumericQuery = s.parse()?;
-        let bounds: Vec<(f32, &'static str)> = match &query {
-            NumericQuery::Exact(v) => vec![(*v, "must be a whole level from 1 to 10")],
-            NumericQuery::Range(lo, hi) => vec![
-                (*lo, "lower bound must be a whole level from 1 to 10"),
-                (*hi, "upper bound must be a whole level from 1 to 10"),
-            ],
-            NumericQuery::Tolerance { value, .. } => {
-                vec![(*value, "value must be a whole level from 1 to 10")]
-            }
-        };
-        for (bound, phrase) in bounds {
-            let whole = bound.fract() == 0.0 && (0.0..=255.0).contains(&bound);
-            whole
-                .then_some(bound as u8)
-                .and_then(|level| EnergyLevel::new(level).ok())
-                .ok_or(phrase)?;
-        }
-        Ok(EnergyArg(query))
-    }
-}
+pub(crate) struct EnergyArg(pub EnergyQuery);
 
 /// Filter by mark (`liked` is the default mark; any other name is a named mark, e.g. banger)
 #[derive(Debug, Clone, Arg)]
@@ -335,7 +310,7 @@ fn build_track_query(args: SearchArgs) -> TrackQuery {
         stopped: stopped.map(|StoppedFilter(q)| q),
         added: added.map(|AddedFilter(q)| q),
         role: role.map(TrackRole::from),
-        energy: energy.map(|EnergyArg(q)| q),
+        energy: energy.map(|EnergyArg(EnergyQuery(q))| q),
         mark: mark.map(|MarkedArg(m)| m),
         not: not.0,
     }
@@ -541,7 +516,7 @@ mod tests {
         ));
         assert!(matches!(
             run_arg::<EnergyArg>(&["--energy", "7"]),
-            Ok(EnergyArg(NumericQuery::Exact(v))) if v == 7.0
+            Ok(EnergyArg(EnergyQuery(NumericQuery::Exact(v)))) if v == 7.0
         ));
         assert!(run_arg::<BpmArg>(&[]).is_err());
     }
