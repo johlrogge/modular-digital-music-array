@@ -8,6 +8,41 @@ All notable changes to MDMA are documented here.
 
 ---
 
+## [0.40.0] — 2026-11-18
+
+### Added
+
+- **Playlist bin** (ADR-033). Deleting a playlist moves it to a bin, with Undo. A Bin view at `#/bin` offers Restore, Restore as…, Purge and Empty bin; only Purge and Empty ask for confirmation. CLI: `mdma playlist rm` now bins and prints the bin id, plus `mdma playlist bin ls|restore|purge|empty --yes`.
+- **Energy in the console.**
+  - A per-view From/To filter, an Energy column, and energy sorts.
+  - Set or clear energy per track or for every narrowed track, with Undo.
+  - `mdma search --energy` uses the same shared check.
+  - Blanks now sort last in every column.
+- **Rekordbox rating ↔ energy** (ADR-034).
+  - `mdma rekordbox import --enrich` merges star ratings into energy (energy = stars × 2) with a three-way merge against the last exchange. Local changes win.
+  - Export writes the stars back.
+  - A per-node state file lives in `~/.local/state/mdma/rekordbox-exchange.json`.
+  - Run import before export.
+- **Bandcamp playlist sync** (ADR-032).
+  - Link a local playlist to a Bandcamp playlist from the playlist page, then Sync.
+  - It is a one-way three-way merge: your local deletions, additions and order changes win, and Bandcamp's adds, removes and moves are applied.
+  - It runs as a background job, shows progress, and ends with a toast with counts and Undo.
+  - Pending tracks are listed.
+- **Preview timeline.** Bar lines are red, and Shift+←/→ jumps to the previous or next bar.
+
+### Changed
+
+- Console clear removes energy from every source, rekordbox included.
+- The console JS budget is 73 KiB.
+
+### Known issues
+
+- #121: an untagged track exported to rekordbox can't be matched on re-import.
+- #118: `rm` refuses a playlist file that isn't valid UTF-8.
+- Renaming, deleting or binning a linked playlist doesn't update its Bandcamp link yet.
+
+---
+
 ## [0.39.1] — 2026-11-18
 
 ### Fixed
