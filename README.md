@@ -35,7 +35,9 @@ mdma search --role banger --bpm "128+-3" --key "8A+-1"
 mdma search --energy "8..10" --genre Techno
 
 # Keys: 8A, 1m, Am, "A minor" (exact); 8A+-2, 8A+2, 8A-1 (steps round the Camelot
-# wheel, an A/B switch costs one step); 6A..10B (numbers clockwise, letters A or B)
+# wheel in one letter, or the relative key: 6A 7A 8A 9A 10A 8B); add d for any path
+# (8A+-2d also takes 7B, 9B); ,+7 adds a power jump (8A+-1,+7 adds 3A);
+# 6A..10B (numbers clockwise, letters A or B)
 
 # Filter by when tracks were added (date expressions: ~ = today, ^week = start of week)
 mdma search --added "^week"

@@ -172,6 +172,22 @@ impl Key {
         Self { pitch, mode }
     }
 
+    /// All 24 keys: the minor keys, then the major keys, each in chromatic order from C.
+    pub fn all() -> impl Iterator<Item = Key> {
+        [Mode::Minor, Mode::Major].into_iter().flat_map(|mode| {
+            PitchClass::ALL
+                .into_iter()
+                .map(move |pitch| Key::new(pitch, mode))
+        })
+    }
+
+    /// All 24 keys in Camelot wheel order: 1A..12A (minor), then 1B..12B (major).
+    pub fn camelot_wheel() -> impl Iterator<Item = Key> {
+        [Mode::Minor, Mode::Major]
+            .into_iter()
+            .flat_map(|mode| (1..=12).filter_map(move |number| Key::from_wheel(number, mode)))
+    }
+
     /// Parse from traditional notation (e.g., "C Major", "A Minor", "Eb Major")
     ///
     /// # Examples
@@ -454,6 +470,26 @@ mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
     use rstest::rstest;
+
+    #[test]
+    fn all_lists_minor_then_major_in_chromatic_order() {
+        let keys: Vec<Key> = Key::all().collect();
+        assert_eq!(keys.len(), 24);
+        assert_eq!(keys[0], Key::new(PitchClass::C, Mode::Minor));
+        assert_eq!(keys[11], Key::new(PitchClass::B, Mode::Minor));
+        assert_eq!(keys[12], Key::new(PitchClass::C, Mode::Major));
+        assert_eq!(keys[23], Key::new(PitchClass::B, Mode::Major));
+    }
+
+    #[test]
+    fn camelot_wheel_runs_1a_to_12a_then_1b_to_12b() {
+        let names: Vec<String> = Key::camelot_wheel().map(|k| k.to_camelot()).collect();
+        let expected: Vec<String> = ["A", "B"]
+            .iter()
+            .flat_map(|l| (1..=12).map(move |n| format!("{n}{l}")))
+            .collect();
+        assert_eq!(names, expected);
+    }
 
     #[rstest]
     #[case("C Major", PitchClass::C, Mode::Major)]

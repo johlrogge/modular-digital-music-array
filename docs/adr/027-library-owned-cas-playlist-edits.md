@@ -71,7 +71,7 @@ enum Duplicates { Skip, Keep }
 ```rust
 LibraryResponse::PlaylistEdited(EditOutcome)
 enum EditOutcome {
-    Applied  { snapshot: PlaylistSnapshot, skipped: Vec<Skipped>, previous: StoredPlaylist },
+    Applied  { snapshot: PlaylistSnapshot, skipped: Vec<Skipped>, previous: Option<StoredPlaylist> },
     Conflict { current: PlaylistSnapshot },
 }
 
@@ -82,6 +82,7 @@ LibraryRequest::PlaylistRevert { name: PlaylistName, version: PlaylistVersion, c
 2. Each `skipped` item names a hash that `Skip` left out and the position of the entry already holding it. Positions are 0-based, in the state after the op that skipped it (not after the whole edit). The console offers "Add again", which resends that Insert with `Keep`.
 3. **Undo is a revert to the whole previous file.** Playlists are small, so `Applied.previous` holds the exact bytes the file had before the edit (`StoredPlaylist`, a newtype over the text). To undo, the client sends `PlaylistRevert { name, version, content: previous }` with the version it last saw. The revert goes through the same version check as an edit and answers `PlaylistEdited(EditOutcome)`. If someone else edited in between, the answer is Conflict and nothing is written: undo never overwrites. The content is written verbatim.
 4. The revert's own `Applied.previous` is the file before the revert, so redo needs no extra work. The client holds the undo stack as a list of `previous` values.
+5. **`previous` is present only when the edit wrote** (the plan decides: the bytes differ). An edit that leaves the bytes as they are (everything skipped, no ops, a move onto itself) answers `Applied` with the same version and `previous: None`, so there is nothing to undo. The client pushes `previous` when it is there and compares no versions. This matches the queue routes, where `previous` is present exactly when Undo makes sense. The console leaves the field out of the JSON when it is `None`.
 
 ### 6. Create, rename, delete
 
@@ -149,3 +150,18 @@ The TUI, and CLI `playlist` edits, keep PlaylistReplace for now. Later the TUI r
 - **Undo as inverse ops** (Insert undone by Remove, Remove by a Restore of the removed line, Move by the reverse Move). Rejected: the inverses are not exact once comments and blank lines are in play, because a position among entry lines does not say where the non-entry lines around it were (the gap problem). A whole-file snapshot (`previous`) is simpler and always byte-exact; playlists are small.
 - **A per-playlist counter stored next to the file.** Rejected: hand edits and old writers would not bump it. Hashing the bytes catches every change.
 - **Fail the whole queue batch on the first unavailable line** (ADR-026 A4 as first written). Rejected by Joakim: one lost track should not block the rest of the playlist.
+
+## Amendment 2026-11-17: queue actions in the console
+
+Settles how the console queues a playlist or a list of tracks. It refines §10 and ADR-026 A4's amendment.
+
+1. **Actions.** There are four, the same for a playlist (`POST /api/playlists/{name}/queue {action}`) and for a list of hashes (`POST /api/queue {action, hashes}`):
+   - `next`: the set goes to the front of Up next, in the order given.
+   - `last`: the set goes to the end of Up next, in the order given.
+   - `replace`: the set becomes the whole of Up next, in one atomic `QueueReplace`. The track that plays keeps playing: playback replaces only its queue.
+   - `now`: the set goes to the front and starts, only while nothing is loaded (409 `busy` otherwise, before any lookup).
+2. **An empty set never changes Up next.** This holds for every action and both routes, and is structural: the console runs an action only on a non-empty `TrackSet`. A playlist with nothing playable answers 200 `{queued: 0, queue, skipped}` and sends nothing, `replace` included (it does not clear Up next). A hash list that is empty is a malformed request: 400. In particular `now` on nothing never sends `PlayQueue`, so it cannot start what was already queued.
+3. **Names.** A playlist name in the path that no playlist can have is 400, and nothing is sent. A name the library refuses (`InvalidPlaylistName`) is 422.
+4. **Resolution.** Hashes in `POST /api/queue` are resolved against the Add set of ADR-026 A1 (the library's visible tracks) for every action, `replace` included. This departs from A1, which lists "Replace/edit" as resolved against queue and library together (a stale queue entry survives, a new one must exist in the library). That rule exists so that an edit of the current queue can keep entries whose track has left the library. `replace` is not an edit: the browser names the whole new queue from tracks it is showing from the library, and nothing in it is kept from the old queue. So every entry must exist in the library, and a track the library has lost is refused (422) rather than put into Up next. `/api/queue/edit` keeps the A1 rule. A playlist's hashes are already resolved by the library.
+5. **Undo.** `previous` is present exactly when the change can be undone: next, last and replace. `now` has none, because an Undo cannot stop the track it started. Nothing queued has none either. It is the queue as the console read it just before sending the change, like `previous` in §5. The browser undoes with a CAS edit from the returned `queue` back to `previous`, and never reads its own idea of the queue. Between the read and the change another writer can still move the queue; that change is then not in `previous`. This read-then-replace race is the same as `/api/queue/edit`'s and stays until playback offers an atomic replace that returns what it replaced. `/api/queue/edit` follows the same rule: it answers `{queue, previous}` when it changed the queue, and when the requested queue equals the current one (compared after the hashes are resolved, so a short hash naming the same track is no change) it sends no `QueueReplace` and answers `{queue}` with no `previous`. The browser sees "no `previous`" and says "Nothing changed"; it compares nothing itself.
+6. **Two 409 shapes (known debt).** *(Amended: `POST /api/playlists {name}` (create, `PlaylistNew`) belongs in §9.2, and it adds a third 409 shape, `{error}` for a playlist that already exists, so read "two" as three.)* A stale Up next edit answers `{error: "stale", queue}`; a stale playlist write answers `{current}`. They are different because one is a queue of hashes and the other a snapshot with a version. They should be one shape; this needs an issue.

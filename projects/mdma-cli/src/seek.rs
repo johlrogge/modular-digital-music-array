@@ -102,12 +102,12 @@ pub(crate) fn run(
     let said = match target {
         SeekTarget::At(position) => {
             let status =
-                mdma_client::seek_to(playback, library, Deck::A, position, Placement::Free)
+                mdma_client::seek_to(playback, library, Deck::A, position, Placement::Free, None)
                     .map_err(display_error)?;
             format!("Seeked{}", to(&status))
         }
         SeekTarget::Beats(beats) => {
-            let status = mdma_client::skip_beats(playback, library, Deck::A, beats)
+            let status = mdma_client::skip_beats(playback, library, Deck::A, beats, None)
                 .map_err(display_error)?;
             format!("Seeked {beats:+} beats{}", to(&status))
         }
@@ -304,6 +304,7 @@ mod tests {
             Deck::A,
             PositionMs::new(1_230),
             Placement::Snap,
+            None,
         )
         .unwrap();
         assert_eq!(status.position(), Some(PositionMs::new(1_100)));
@@ -330,6 +331,7 @@ mod tests {
             Deck::A,
             PositionMs::new(1_230),
             Placement::Snap,
+            None,
         )
         .unwrap();
         assert_eq!(

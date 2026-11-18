@@ -1351,24 +1351,12 @@ impl LibraryService {
                 }
             }
 
-            LibraryRequest::PlaylistList => {
-                let dir = self.metadata_dir.join("playlists");
-                let mut names: Vec<library_ipc_protocol::PlaylistName> = std::fs::read_dir(&dir)
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|e| e.ok())
-                    .filter_map(|e| {
-                        let path = e.path();
-                        if path.extension().and_then(|x| x.to_str()) == Some("plist") {
-                            path.file_stem()
-                                .and_then(|s| s.to_str())
-                                .and_then(|s| library_ipc_protocol::PlaylistName::new(s).ok())
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-                names.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+            LibraryRequest::PlaylistList => LibraryResponse::PlaylistNames(self.playlist_names()),
+
+            LibraryRequest::PlaylistSearch { query } => {
+                let matcher = library_search::StringMatcher::new(&query);
+                let mut names = self.playlist_names();
+                names.retain(|n| matcher.matches(n.as_str()));
                 LibraryResponse::PlaylistNames(names)
             }
 
@@ -2266,6 +2254,28 @@ impl LibraryService {
         }
 
         LibraryResponse::OrphansList(orphans)
+    }
+
+    /// The names of all playlists on disk, sorted.
+    fn playlist_names(&self) -> Vec<library_ipc_protocol::PlaylistName> {
+        let dir = self.metadata_dir.join("playlists");
+        let mut names: Vec<library_ipc_protocol::PlaylistName> = std::fs::read_dir(&dir)
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e.ok())
+            .filter_map(|e| {
+                let path = e.path();
+                if path.extension().and_then(|x| x.to_str()) == Some("plist") {
+                    path.file_stem()
+                        .and_then(|s| s.to_str())
+                        .and_then(|s| library_ipc_protocol::PlaylistName::new(s).ok())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        names.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        names
     }
 
     /// Resolve a PlaylistName to an absolute filesystem path
@@ -3526,6 +3536,31 @@ mod tests {
             }
             other => panic!("Expected PlaylistNames, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn playlist_search_uses_the_library_text_rules() {
+        use library_ipc_protocol::PlaylistName;
+        let (service, _dir, _acid) = make_service_with_playlists_dir();
+        for n in ["Carbon-Based-Lifeforms", "warmup"] {
+            service.handle_request(LibraryRequest::PlaylistNew {
+                name: PlaylistName::new(n).unwrap(),
+                content: String::new(),
+            });
+        }
+        let search = |text: &str| match service.handle_request(LibraryRequest::PlaylistSearch {
+            query: library_search::parse_string_query(text),
+        }) {
+            LibraryResponse::PlaylistNames(names) => names
+                .iter()
+                .map(|n| n.as_str().to_string())
+                .collect::<Vec<_>>(),
+            other => panic!("Expected PlaylistNames, got {:?}", other),
+        };
+        // Upper case is an initialism; lower case is a plain "contains".
+        assert_eq!(search("CBL"), ["Carbon-Based-Lifeforms"]);
+        assert!(search("cbl").is_empty());
+        assert_eq!(search("warm"), ["warmup"]);
     }
 
     #[test]

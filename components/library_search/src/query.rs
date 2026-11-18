@@ -75,7 +75,8 @@ impl TrackQuery {
 ///
 /// Detection rules in `parse_string_query`:
 /// 1. Starts and ends with `/` → `Regex` (slashes stripped)
-/// 2. No spaces AND 2+ uppercase letters AND not all-caps → `Initialism`
+/// 2. No spaces AND 2+ uppercase letters → `Initialism`
+///    (CamelCase like "CarbBased" and all-caps like "CBL" alike)
 /// 3. Otherwise → `Contains`
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum StringQuery {
@@ -128,15 +129,21 @@ pub enum DurationUnit {
 
 /// Musical key matching on the Camelot wheel. Any notation `Key` parses is accepted.
 ///
-/// Every key's distance from the centre costs 1 per step around the wheel plus 1 for
-/// an A/B (mode) switch; `+` goes clockwise (a fifth up), `-` counter-clockwise.
+/// `+` goes clockwise round the wheel (a fifth up per step), `-` counter-clockwise.
+/// The [`Shape`] says which keys within the reach count; `jumps` add exact moves.
 ///
 /// On the wire a query is its string form (`"8A+-2"`), the same text the CLI accepts.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(into = "String", try_from = "String")]
 pub enum KeyQuery {
-    /// `centre` and how far from it to reach.
-    Steps { centre: Key, reach: Reach },
+    /// `centre` and how far from it to reach, in which shape, plus exact `jumps`:
+    /// wheel steps from the centre (`,+7`), keeping the letter, as a union.
+    Steps {
+        centre: Key,
+        reach: Reach,
+        shape: Shape,
+        jumps: Vec<i8>,
+    },
     /// `"6A..10B"`: numbers run clockwise from `from` to `to` (inclusive, wrapping);
     /// letters are the set {from's, to's}.
     Span { from: Key, to: Key },
@@ -153,6 +160,17 @@ pub enum Reach {
     Down(u8),
 }
 
+/// Which keys inside the reach count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shape {
+    /// The default, a T: the steps round the wheel in the centre's letter, or exactly
+    /// the relative switch (8A <-> 8B), never both. `"8A+-2"` is 6A 7A 8A 9A 10A 8B.
+    Straight,
+    /// `"8A+-2d"`: distance only, any path. A wheel step costs 1 and so does an A/B
+    /// switch, so it adds the diagonals (7B, 9B) to Straight.
+    AnyPath,
+}
+
 impl Reach {
     /// Steps reachable (clockwise, counter-clockwise).
     fn up_down(self) -> (u8, u8) {
@@ -167,16 +185,37 @@ impl Reach {
 impl KeyQuery {
     /// Whether `key` satisfies the query.
     pub fn matches(&self, key: Key) -> bool {
-        match *self {
-            KeyQuery::Steps { centre, reach } => {
+        match self {
+            KeyQuery::Steps {
+                centre,
+                reach,
+                shape,
+                jumps,
+            } => {
+                let centre = *centre;
                 let (up, down) = reach.up_down();
                 let cw = key.camelot_steps_from(centre);
                 let ccw = centre.camelot_steps_from(key);
                 let switch = u8::from(key.mode_differs(centre));
-                cw + switch <= up || ccw + switch <= down
+                let in_reach = match shape {
+                    Shape::AnyPath => cw + switch <= up || ccw + switch <= down,
+                    // Round the wheel in one letter, or the relative alone (cost 1).
+                    Shape::Straight => {
+                        if switch == 1 {
+                            cw == 0 && (up >= 1 || down >= 1)
+                        } else {
+                            cw <= up || ccw <= down
+                        }
+                    }
+                };
+                in_reach
+                    || (!key.mode_differs(centre)
+                        && jumps
+                            .iter()
+                            .any(|&j| i16::from(cw) == i16::from(j).rem_euclid(12)))
             }
             KeyQuery::Span { from, to } => {
-                key.camelot_steps_from(from) <= to.camelot_steps_from(from)
+                key.camelot_steps_from(*from) <= to.camelot_steps_from(*from)
                     && (key.mode() == from.mode() || key.mode() == to.mode())
             }
         }
@@ -186,15 +225,22 @@ impl KeyQuery {
 impl fmt::Display for KeyQuery {
     /// Canonical form that parses back to an equal query.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match *self {
-            KeyQuery::Steps { centre, reach } => {
+        match self {
+            KeyQuery::Steps {
+                centre,
+                reach,
+                shape,
+                jumps,
+            } => {
                 let c = centre.to_camelot();
+                let d = if *shape == Shape::AnyPath { "d" } else { "" };
                 match reach {
-                    Reach::Both(0) => write!(f, "{c}"),
-                    Reach::Both(n) => write!(f, "{c}+-{n}"),
-                    Reach::Up(n) => write!(f, "{c}+{n}"),
-                    Reach::Down(n) => write!(f, "{c}-{n}"),
+                    Reach::Both(0) => write!(f, "{c}")?,
+                    Reach::Both(n) => write!(f, "{c}+-{n}{d}")?,
+                    Reach::Up(n) => write!(f, "{c}+{n}{d}")?,
+                    Reach::Down(n) => write!(f, "{c}-{n}{d}")?,
                 }
+                jumps.iter().try_for_each(|j| write!(f, ",{j:+}"))
             }
             KeyQuery::Span { from, to } => {
                 write!(f, "{}..{}", from.to_camelot(), to.to_camelot())

@@ -24,6 +24,10 @@ pub enum SeekError {
     NoPosition,
     #[error("the track has no beat grid")]
     NoBeatGrid,
+    /// The seek named a track and another one is audible now (a preview ended and the held track
+    /// came back); nothing was sent.
+    #[error("the track changed")]
+    TrackChanged,
     #[error(transparent)]
     Playback(#[from] PlaybackClientError),
     #[error(transparent)]
@@ -73,6 +77,18 @@ impl Audible {
     }
 }
 
+/// Whether what is audible is the track the caller meant: `Ok` when no track was named or it is
+/// the one named, [`SeekError::TrackChanged`] when another is audible, and
+/// [`SeekError::NothingLoaded`] when a track was named and nothing is loaded.
+fn is_expected(transport: &TransportStatus, expect: Option<&ContentHash>) -> Result<(), SeekError> {
+    match (transport, expect) {
+        (_, None) => Ok(()),
+        (TransportStatus::Idle, Some(_)) => Err(SeekError::NothingLoaded),
+        (TransportStatus::Loaded { now, .. }, Some(expected)) if now == expected => Ok(()),
+        (TransportStatus::Loaded { .. }, Some(_)) => Err(SeekError::TrackChanged),
+    }
+}
+
 /// The track's grid, if it has a usable one.
 fn grid_of(track: &TrackInfo) -> Option<BeatGrid> {
     track.beat_grid.as_ref().and_then(|info| info.grid())
@@ -80,15 +96,18 @@ fn grid_of(track: &TrackInfo) -> Option<BeatGrid> {
 
 /// What is playing on `deck`, with its grid: the opening of every operation
 /// that needs the grid. The library is connected to only here, so an
-/// operation that does not need the grid never needs the library.
+/// operation that does not need the grid never needs the library. When `expect`
+/// names a track, another one being audible is refused before the library is
+/// asked.
 fn audible_with_grid(
     playback: &PlaybackBackend,
     library: impl FnOnce() -> Result<LibraryBackend, NodeError>,
     deck: Deck,
+    expect: Option<&ContentHash>,
 ) -> Result<Audible, SeekError> {
-    Audible::of(&playback.get_transport(deck)?, |hash| {
-        Ok(library()?.get_track(hash)?)
-    })
+    let transport = playback.get_transport(deck)?;
+    is_expected(&transport, expect)?;
+    Audible::of(&transport, |hash| Ok(library()?.get_track(hash)?))
 }
 
 /// Where `beats` beats from `audible` is: snap to the nearest beat, step, clamp.
@@ -115,34 +134,46 @@ fn placed(ms: PositionMs, placement: Placement, grid: Option<BeatGrid>) -> Posit
 
 /// Move the audible track of `deck` by `beats` beats (negative goes back):
 /// read where it is, read its grid, snap, step, clamp, seek. Answers where it
-/// went. Playing stays playing and paused stays paused.
+/// went. Playing stays playing and paused stays paused. With `expect` the step
+/// is refused ([`SeekError::TrackChanged`]) unless that track is the audible
+/// one, so a step meant for a track that just stopped being audible moves
+/// nothing.
 pub fn skip_beats(
     playback: &PlaybackBackend,
     library: impl FnOnce() -> Result<LibraryBackend, NodeError>,
     deck: Deck,
     beats: i32,
+    expect: Option<&ContentHash>,
 ) -> Result<TransportStatus, SeekError> {
-    let target = skip_target(&audible_with_grid(playback, library, deck)?, beats)?;
+    let target = skip_target(&audible_with_grid(playback, library, deck, expect)?, beats)?;
     Ok(playback.seek(deck, target)?)
 }
 
 /// Seek the audible track of `deck` to `ms`. With `Placement::Snap` the time
 /// goes to the nearest beat when the track has a grid (without one, where
 /// asked); with `Placement::Free` it goes where asked and the library is never
-/// connected to. Answers where the track went.
+/// connected to. With `expect` the seek is refused ([`SeekError::TrackChanged`])
+/// unless that track is the audible one (the transport is read for that, as for
+/// a snap). Answers where the track went.
 pub fn seek_to(
     playback: &PlaybackBackend,
     library: impl FnOnce() -> Result<LibraryBackend, NodeError>,
     deck: Deck,
     ms: PositionMs,
     placement: Placement,
+    expect: Option<&ContentHash>,
 ) -> Result<TransportStatus, SeekError> {
     let target = match placement {
-        Placement::Free => ms,
+        Placement::Free => {
+            if expect.is_some() {
+                is_expected(&playback.get_transport(deck)?, expect)?;
+            }
+            ms
+        }
         Placement::Snap => placed(
             ms,
             placement,
-            audible_with_grid(playback, library, deck)?.grid,
+            audible_with_grid(playback, library, deck, expect)?.grid,
         ),
     };
     Ok(playback.seek(deck, target)?)
@@ -270,6 +301,34 @@ mod tests {
             PositionMs::new(1_100)
         );
         assert_eq!(placed(ms, Placement::Free, Some(grid())), ms);
+    }
+
+    #[test]
+    fn another_track_than_the_one_named_is_refused() {
+        let err = is_expected(&loaded(Some(0), Some(1)), Some(&ContentHash::new("b"))).unwrap_err();
+        assert!(matches!(err, SeekError::TrackChanged), "{err}");
+    }
+
+    #[test]
+    fn the_track_named_is_expected() {
+        let status = loaded(Some(0), Some(1));
+        assert!(is_expected(&status, Some(&ContentHash::new("a"))).is_ok());
+    }
+
+    #[test]
+    fn no_track_named_expects_whatever_is_audible() {
+        assert!(is_expected(&loaded(Some(0), Some(1)), None).is_ok());
+    }
+
+    #[test]
+    fn no_track_named_expects_nothing_of_an_idle_deck() {
+        assert!(is_expected(&TransportStatus::Idle, None).is_ok());
+    }
+
+    #[test]
+    fn a_track_named_while_nothing_is_loaded_is_nothing_loaded() {
+        let err = is_expected(&TransportStatus::Idle, Some(&ContentHash::new("a"))).unwrap_err();
+        assert!(matches!(err, SeekError::NothingLoaded), "{err}");
     }
 
     #[test]

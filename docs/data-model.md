@@ -108,3 +108,18 @@ source    → exact string (case-insensitive)
 ```
 
 See `components/library_search/src/query.rs` for full type definitions.
+
+### Key query grammar
+
+- `8A` exact; `8A+-2`, `8A+2`, `8A-1` steps round the Camelot wheel; `6A..10B` a span.
+- Steps are **Straight** by default, a T shape: up to n wheel steps in the centre's
+  letter, or exactly the relative key (8A <-> 8B), never both. `8A+-2` is
+  6A 7A 8A 9A 10A 8B.
+- The `d` suffix (`8A+-2d`) is distance only, any path: a wheel step and an A/B switch
+  each cost 1, so it adds the diagonals (7B, 9B). Works on `+-`, `+` and `-`.
+- `,+7` after a steps term adds an exact move from the centre, keeping the letter
+  (`8A+-1,+7` adds 3A, the power jump). Any signed offset is accepted (`,-7`).
+
+**Amendment 2026-11-17:** `8A+-2` used to mean any path; it now means Straight, and the
+old meaning is spelled `8A+-2d`. At +-1 the two shapes give the same keys (7A 9A 8B),
+so `8A+-1` is unchanged. Spans are unchanged.

@@ -256,7 +256,7 @@ pub(crate) struct BpmArg(pub NumericQuery);
 #[arg(long = "year", metavar = "YEAR")]
 pub(crate) struct YearArg(pub NumericQuery);
 
-/// Filter by musical key (formats: 8B  1m  Am  "A minor"  8B+-2  8B+2  8B-1  6A..10B)
+/// Filter by musical key (formats: 8B  1m  Am  "A minor"  8B+-2  8B+2  8B-1  8B+-2d  8B+-1,+7  6A..10B)
 #[derive(Debug, Clone, Arg)]
 #[arg(long = "key", metavar = "KEY")]
 pub(crate) struct KeyArg(pub KeyQuery);

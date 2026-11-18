@@ -402,6 +402,16 @@ pub struct SyncLock {
     dir: PathBuf,
 }
 
+impl Drop for SyncLock {
+    /// Unlock explicitly. A `flock` belongs to the open file description, so a
+    /// child forked elsewhere holds a duplicate descriptor until it execs, and
+    /// merely closing ours would leave the lock held. An explicit unlock releases
+    /// it for every descriptor sharing the description.
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+
 /// One node's replica directory.
 #[derive(Debug, Clone)]
 pub struct Replica {
@@ -1344,6 +1354,22 @@ mod tests {
         drop(first);
         let node = FakeNode::new("e1", 1);
         synced(node.sync(&replica, 200));
+    }
+
+    #[test]
+    fn dropping_the_lock_releases_it_even_while_a_duplicate_descriptor_lives() {
+        // A forked child holds a duplicate of the descriptor until it execs; a
+        // `try_clone` shares the open file description exactly like that.
+        let dir = tempfile::tempdir().unwrap();
+        let replica = replica_in(&dir);
+        let lock = replica.try_lock().unwrap().expect("lock is free");
+        let inherited = lock.file.try_clone().unwrap();
+
+        drop(lock);
+
+        let again = File::open(replica.dir().join(LOCK_FILE)).unwrap();
+        assert!(again.try_lock().is_ok(), "released despite the duplicate");
+        drop(inherited);
     }
 
     // --- throttle ------------------------------------------------------------

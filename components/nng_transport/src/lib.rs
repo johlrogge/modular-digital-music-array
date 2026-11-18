@@ -445,6 +445,11 @@ pub enum NngClientError {
 
     #[error("service error: {0}")]
     Service(String),
+
+    /// The service understood the command and said no (a playback `Response::Err`), as opposed
+    /// to `Service`: a gateway that did not understand it, or an answer of the wrong kind.
+    #[error("service error: {0}")]
+    Refused(String),
 }
 
 impl NngClientError {
@@ -468,7 +473,8 @@ impl NngClientError {
             | NngClientError::Connection(ConnectionError::Dial { cause, .. }) => unreachable(cause),
             NngClientError::Connection(_)
             | NngClientError::Serialization(_)
-            | NngClientError::Service(_) => false,
+            | NngClientError::Service(_)
+            | NngClientError::Refused(_) => false,
         }
     }
 }

@@ -14,7 +14,7 @@ pub mod source;
 pub mod test_support;
 
 pub use client_config::ClientConfig;
-pub use error::{source_label, upgrade_node_text};
+pub use error::{map_gw_to_lib_error, source_label, upgrade_node_text};
 pub use library::LibraryBackend;
 pub use node::{Answer, NeededBy, Node, NodeError, NodeOptions};
 pub use node_discovery::{NodeSpec, RemoteTarget, Source, Target};

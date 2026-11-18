@@ -250,7 +250,7 @@ impl MediaClient {
 
         match response {
             Response::Ok { .. } => Ok(()),
-            Response::Err { message } => Err(ClientError::Service(message)),
+            Response::Err { message } => Err(ClientError::Refused(message)),
         }
     }
 
@@ -262,7 +262,7 @@ impl MediaClient {
         let response: Response = self.socket.request_response(&cmd)?;
 
         match response {
-            Response::Err { message } => Err(ClientError::Service(message)),
+            Response::Err { message } => Err(ClientError::Refused(message)),
             Response::Ok { data: Some(data) } => extract(data)
                 .ok_or_else(|| ClientError::Service("Unexpected response data type".to_string())),
             Response::Ok { data: None } => {
