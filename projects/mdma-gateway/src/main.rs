@@ -199,13 +199,19 @@ impl BackendSlot {
     /// Drop `backend`, unless another worker has already replaced it with a newer
     /// connection.
     fn forget(&self, backend: &Backend) {
-        let mut current = self.current.lock().unwrap_or_else(|e| e.into_inner());
-        if current
-            .as_ref()
-            .is_some_and(|held| held.socket == backend.socket)
-        {
-            *current = None;
-        }
+        let dropped = {
+            let mut current = self.current.lock().unwrap_or_else(|e| e.into_inner());
+            if current
+                .as_ref()
+                .is_some_and(|held| held.socket == backend.socket)
+            {
+                current.take()
+            } else {
+                None
+            }
+        };
+        // Dropped after the lock is released: closing a socket may block.
+        drop(dropped);
     }
 
     /// One attempt: forward on the current connection, forgetting it if the
@@ -262,6 +268,13 @@ impl BackendSlot {
 /// The `Aio` callback only hands the result to a channel, so the owning thread can
 /// block on one operation at a time while the socket serves many such contexts.
 /// Timeouts live on the `Aio`, so they apply per operation, not per socket.
+///
+/// Invariant: never let the last `Aio` handle drop on an NNG callback thread.
+/// The callback sends its result before the nng crate's trampoline releases its
+/// own handle, so an owner that only waited for the result could drop its handle
+/// first. The trampoline's would then be last, and its drop (`nng_aio_stop`) would
+/// wait on NNG's own callback thread for that thread's own task, losing the thread
+/// for good (#113). Hence `finish` and `Drop` both `Aio::wait`.
 struct BlockingContext {
     ctx: nng::Context,
     aio: nng::Aio,
@@ -281,21 +294,41 @@ impl BlockingContext {
     fn recv(&self, timeout: Option<Duration>) -> Result<nng::Message, nng::Error> {
         self.aio.set_timeout(timeout)?;
         self.ctx.recv(&self.aio)?;
-        match self.results.recv() {
-            Ok(nng::AioResult::Recv(result)) => result,
-            Ok(_) => Err(nng::Error::IncorrectState),
-            Err(_) => Err(nng::Error::Closed),
+        match self.finish()? {
+            nng::AioResult::Recv(result) => result,
+            _ => Err(nng::Error::IncorrectState),
         }
     }
 
     fn send(&self, msg: nng::Message, timeout: Option<Duration>) -> Result<(), nng::Error> {
         self.aio.set_timeout(timeout)?;
         self.ctx.send(&self.aio, msg).map_err(|(_, e)| e)?;
-        match self.results.recv() {
-            Ok(nng::AioResult::Send(result)) => result.map_err(|(_, e)| e),
-            Ok(_) => Err(nng::Error::IncorrectState),
-            Err(_) => Err(nng::Error::Closed),
+        match self.finish()? {
+            nng::AioResult::Send(result) => result.map_err(|(_, e)| e),
+            _ => Err(nng::Error::IncorrectState),
         }
+    }
+
+    /// Wait for the started operation to complete. The Aio's own timeout bounds
+    /// every operation that has one.
+    ///
+    /// Every wait for a completion goes through here: after the result arrives,
+    /// `Aio::wait` returns only once the callback has returned, and so once the
+    /// nng crate's trampoline has released its own `Aio` handle (see the
+    /// invariant on [`BlockingContext`]).
+    fn finish(&self) -> Result<nng::AioResult, nng::Error> {
+        let outcome = self.results.recv().map_err(|_| nng::Error::Closed);
+        self.aio.wait();
+        outcome
+    }
+}
+
+impl Drop for BlockingContext {
+    /// Guards a panic in the middle of an operation, and future edits: the
+    /// operation must be over before the handle can drop.
+    fn drop(&mut self) {
+        self.aio.cancel();
+        self.aio.wait();
     }
 }
 
@@ -817,6 +850,7 @@ mod tests {
 
     #[test]
     fn backend_never_resends_requests() {
+        let _deadline = Deadline::start();
         let backend = connect_backend("ipc:///tmp/mdma-gateway-test-no-backend.sock").unwrap();
         assert_eq!(
             backend
@@ -866,7 +900,7 @@ mod tests {
             self.changed.notify_all();
             let (mut state, _) = self
                 .changed
-                .wait_timeout_while(state, 30 * SAFETY_TIMEOUT, |s| !s.open)
+                .wait_timeout_while(state, TEST_DEADLINE / 2, |s| !s.open)
                 .unwrap();
             state.in_flight -= 1;
         }
@@ -888,6 +922,77 @@ mod tests {
         fn open(&self) {
             self.state.lock().unwrap().open = true;
             self.changed.notify_all();
+        }
+    }
+
+    /// How long a test that talks over NNG may run before it counts as deadlocked.
+    /// Every such test finishes in well under a second; this only bounds a hang.
+    const TEST_DEADLINE: Duration = Duration::from_secs(20);
+
+    /// Fails a hung test fast instead of hanging CI (#113). Hold one for the whole
+    /// test: if it is still alive after `TEST_DEADLINE`, the test binary exits
+    /// naming the test (a panic on another thread could not fail the test).
+    struct Deadline {
+        _finished: mpsc::Sender<()>,
+    }
+
+    impl Deadline {
+        fn start() -> Self {
+            let test = std::thread::current().name().unwrap_or("?").to_string();
+            let (finished, ended) = mpsc::channel::<()>();
+            std::thread::spawn(move || {
+                // Dropping the guard disconnects the channel: the test ended.
+                if let Err(mpsc::RecvTimeoutError::Timeout) = ended.recv_timeout(TEST_DEADLINE) {
+                    eprintln!("DEADLOCK: test {test} still running after {TEST_DEADLINE:?}");
+                    // Not `exit`: its atexit handlers (nng teardown) could hang too.
+                    std::process::abort();
+                }
+            });
+            Deadline {
+                _finished: finished,
+            }
+        }
+    }
+
+    /// Regression for #113: creating, using and dropping many `BlockingContext`s
+    /// from many threads must not lose NNG callback threads. If the last `Aio`
+    /// handle drops on a callback thread, that thread is lost for good; once all
+    /// are gone every NNG operation in the process hangs (the Deadline trips).
+    #[test]
+    fn dropping_contexts_never_loses_nng_callback_threads() {
+        const THREADS: usize = 32;
+        const CYCLES: usize = 300;
+        let _deadline = Deadline::start();
+
+        let rep = nng::Socket::new(nng::Protocol::Rep0).unwrap();
+        rep.listen("inproc://mdma-gw-stress-113").unwrap();
+        let peer = rep.clone();
+        std::thread::spawn(move || {
+            while let Ok(msg) = peer.recv() {
+                if peer.send(msg).is_err() {
+                    break;
+                }
+            }
+        });
+        let req = nng::Socket::new(nng::Protocol::Req0).unwrap();
+        req.dial("inproc://mdma-gw-stress-113").unwrap();
+
+        let timeout = Some(Duration::from_secs(10));
+        let clients: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let req = req.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..CYCLES {
+                        let io = BlockingContext::new(&req).unwrap();
+                        io.send(nng::Message::from(&b"ping"[..]), timeout).unwrap();
+                        let reply = io.recv(timeout).unwrap();
+                        assert_eq!(reply.as_slice(), b"ping");
+                    }
+                })
+            })
+            .collect();
+        for client in clients {
+            client.join().unwrap();
         }
     }
 
@@ -969,7 +1074,10 @@ mod tests {
     fn ask(address: &str, request: &GatewayRequest) -> GatewayResponse {
         let client = nng::Socket::new(nng::Protocol::Req0).unwrap();
         client
-            .set_opt::<nng::options::RecvTimeout>(Some(30 * SAFETY_TIMEOUT))
+            .set_opt::<nng::options::RecvTimeout>(Some(TEST_DEADLINE / 2))
+            .unwrap();
+        client
+            .set_opt::<nng::options::SendTimeout>(Some(TEST_DEADLINE / 2))
             .unwrap();
         client.dial(address).unwrap();
         client
@@ -1103,6 +1211,7 @@ mod tests {
     /// failed receive is reported and the service sees the command exactly once.
     #[test]
     fn a_request_the_service_took_is_not_retried_after_a_recv_failure() {
+        let _deadline = Deadline::start();
         let dir = temp_dir("no-retry");
         let (address, commands) = spawn_fake_playback_dropping_request(&dir);
         let slot = BackendSlot::new(
@@ -1125,6 +1234,7 @@ mod tests {
 
     #[test]
     fn forget_drops_only_the_connection_it_was_given() {
+        let _deadline = Deadline::start();
         let slot = BackendSlot::service("ipc:///tmp/mdma-gateway-test-no-backend.sock");
         let a = slot.get().unwrap();
         slot.forget(&a);
@@ -1157,6 +1267,7 @@ mod tests {
     /// for #111: the dead-dialer test below is.
     #[test]
     fn playback_restart_between_requests_still_answers() {
+        let _deadline = Deadline::start();
         let dir = temp_dir("restart");
         let first = spawn_fake_playback(&dir);
         let (address, _gateway) = start_gateway_with(&dir, quick_playback_slot(&first.address));
@@ -1171,6 +1282,7 @@ mod tests {
     /// socket and retry once.
     #[test]
     fn a_dead_dialer_is_replaced_and_the_request_retried() {
+        let _deadline = Deadline::start();
         let dir = temp_dir("dead-dialer");
         let fake = spawn_fake_playback(&dir);
         let (address, gateway) = start_gateway_with(&dir, quick_playback_slot(&fake.address));
@@ -1187,6 +1299,7 @@ mod tests {
         use media_protocol::{
             Command, Deck, PositionMs, Response, ResponseData, Transport, TransportStatus,
         };
+        let _deadline = Deadline::start();
         let dir = temp_dir("transport");
         let FakePlayback {
             address: playback,
@@ -1258,6 +1371,7 @@ mod tests {
     #[test]
     fn preview_and_end_preview_pass_through_the_gateway() {
         use media_protocol::{Command, ContentHash, Deck, Response};
+        let _deadline = Deadline::start();
         let dir = temp_dir("preview");
         let FakePlayback {
             address: playback,
@@ -1313,6 +1427,7 @@ mod tests {
 
     #[test]
     fn slow_source_does_not_delay_a_fast_one() {
+        let _deadline = Deadline::start();
         let dir = temp_dir("slow-fast");
         let slow_gate = Gate::new(false);
         spawn_fake_source(&dir, "slow", &slow_gate, 1);
@@ -1333,6 +1448,7 @@ mod tests {
 
     #[test]
     fn concurrent_requests_to_one_backend_run_in_parallel_and_reach_their_requesters() {
+        let _deadline = Deadline::start();
         let dir = temp_dir("parallel");
         let gate = Gate::new(false);
         spawn_fake_source(&dir, "a", &gate, 8);
@@ -1357,6 +1473,7 @@ mod tests {
 
     #[test]
     fn list_sources_omits_a_hung_source_after_the_short_ping_timeout() {
+        let _deadline = Deadline::start();
         let dir = temp_dir("list");
         let hung_gate = Gate::new(false);
         spawn_fake_source(&dir, "hung", &hung_gate, 1);
