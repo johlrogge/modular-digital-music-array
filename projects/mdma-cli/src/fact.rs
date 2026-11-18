@@ -204,7 +204,8 @@ pub(crate) struct OriginArg(pub OriginKind);
 /// The origin kinds the CLI writes, that start with `typed`, then the others found in
 /// the replica's facts.
 fn complete_origins(typed: &str) -> Vec<hicli::Candidate> {
-    use crate::origins::{REKORDBOX_ORIGIN, UPLOAD_ORIGIN};
+    use crate::origins::UPLOAD_ORIGIN;
+    use library_ipc_client::REKORDBOX_ORIGIN;
     let written = [
         (USER_ORIGIN, "manual edits"),
         (REKORDBOX_ORIGIN, "imported from Rekordbox"),
@@ -426,7 +427,8 @@ mod tests {
 
     #[test]
     fn retract_help_names_the_origins_it_knows() {
-        use crate::origins::{REKORDBOX_ORIGIN, UPLOAD_ORIGIN};
+        use crate::origins::UPLOAD_ORIGIN;
+        use library_ipc_client::REKORDBOX_ORIGIN;
         let help = crate::test_support::help(&["fact", "retract", "--help"]);
         for origin in [USER_ORIGIN, REKORDBOX_ORIGIN, UPLOAD_ORIGIN] {
             assert!(help.contains(origin), "{origin}: {help}");

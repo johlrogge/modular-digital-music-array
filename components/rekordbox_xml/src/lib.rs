@@ -255,6 +255,8 @@ pub mod xml {
         pub bitrate: Option<u32>,
         pub sample_rate: Option<u32>,
         pub location: String, // file://localhost/ URI
+        /// The `Rating` attribute: 0, 51, 102, 153, 204 or 255 (0 to 5 stars). 0 when absent.
+        pub rating: u32,
         /// Beat-grid anchor. `None` produces `Inizio="0.000"` (backward-compat).
         pub tempo_anchor: Option<TempoAnchor>,
         /// Cue points and loops. Empty vec produces no `<POSITION_MARK>` output.
@@ -385,7 +387,7 @@ pub mod xml {
             " Comments=\"{}\"",
             xml_escape(track.comment.as_deref().unwrap_or(""))
         ));
-        out.push_str(" Rating=\"0\"");
+        out.push_str(&format!(" Rating=\"{}\"", track.rating));
         out.push_str(" Colour=\"0\"");
         out.push_str(&format!(
             " DateAdded=\"{}\"",
@@ -466,6 +468,7 @@ pub mod xml {
                     sample_rate: Some(44100),
                     location: "file://localhost/music/Test%20Track.aiff".to_string(),
                     tempo_anchor: None,
+                    rating: 0,
                     position_marks: vec![],
                 }],
                 playlists: vec![RekordboxPlaylist {
@@ -546,6 +549,7 @@ pub mod xml {
                     sample_rate: None,
                     location: "file://localhost/music/nobpm.mp3".to_string(),
                     tempo_anchor: None,
+                    rating: 0,
                     position_marks: vec![],
                 }],
                 playlists: vec![],
@@ -612,6 +616,7 @@ pub mod xml {
                     sample_rate: None,
                     location: "file://localhost/music/track.mp3".to_string(),
                     tempo_anchor: None,
+                    rating: 0,
                     position_marks: vec![],
                 }],
                 playlists: vec![],
@@ -663,6 +668,7 @@ pub mod xml {
                     tempo_anchor: Some(TempoAnchor {
                         inizio_seconds: 1.5,
                     }),
+                    rating: 0,
                     position_marks: vec![],
                 }],
                 playlists: vec![],
@@ -698,6 +704,7 @@ pub mod xml {
                     sample_rate: None,
                     location: "file://localhost/music/t.aiff".to_string(),
                     tempo_anchor: None,
+                    rating: 0,
                     position_marks: vec![PositionMark {
                         name: "Loop".to_string(),
                         mark_type: 4,
@@ -744,6 +751,7 @@ pub mod xml {
                     sample_rate: None,
                     location: "file://localhost/music/t.aiff".to_string(),
                     tempo_anchor: None,
+                    rating: 0,
                     position_marks: vec![PositionMark {
                         name: "Intro".to_string(),
                         mark_type: 0,
@@ -767,6 +775,15 @@ pub mod xml {
                 !xml.contains("POSITION_MARK"),
                 "no marks → no POSITION_MARK element"
             );
+        }
+
+        #[test]
+        fn xml_writes_the_rating_of_the_track() {
+            let mut library = make_test_library();
+            library.tracks[0].rating = 204;
+            let xml = library.to_xml();
+            assert!(xml.contains(" Rating=\"204\""), "{xml}");
+            assert!(!xml.contains(" Rating=\"0\""), "no hardcoded rating: {xml}");
         }
 
         #[test]
@@ -1063,6 +1080,7 @@ pub mod parse {
         let bitrate = attr_u32(&attrs, b"BitRate");
         let sample_rate = attr_u32(&attrs, b"SampleRate");
         let location = attr_str(&attrs, b"Location").unwrap_or_default();
+        let rating = attr_u32(&attrs, b"Rating").unwrap_or(0);
 
         tracks.push(RekordboxTrack {
             track_id,
@@ -1085,6 +1103,7 @@ pub mod parse {
             sample_rate,
             location,
             tempo_anchor: None,
+            rating,
             position_marks: vec![],
         });
         Ok(())
@@ -1145,6 +1164,24 @@ pub mod parse {
             assert_eq!(t.bitrate, Some(1411));
             assert_eq!(t.sample_rate, Some(44100));
             assert_eq!(t.location, "file://localhost/music/Test%20Track.aiff");
+        }
+
+        #[rstest::rstest]
+        #[case::unrated("0", 0)]
+        #[case::one_star("51", 51)]
+        #[case::five_stars("255", 255)]
+        #[case::not_a_number("many", 0)]
+        fn parse_xml_reads_the_rating(#[case] attr: &str, #[case] expected: u32) {
+            let xml = format!(
+                r#"<DJ_PLAYLISTS><COLLECTION Entries="1"><TRACK TrackID="1" Rating="{attr}" Location="file://localhost/a.aiff"/></COLLECTION></DJ_PLAYLISTS>"#
+            );
+            assert_eq!(parse_xml(&xml).unwrap().tracks[0].rating, expected);
+        }
+
+        #[test]
+        fn parse_xml_without_a_rating_is_unrated() {
+            let lib = parse_xml(SAMPLE_XML).unwrap();
+            assert_eq!(lib.tracks[1].rating, 0);
         }
 
         #[test]
@@ -1215,6 +1252,7 @@ pub mod parse {
                     sample_rate: Some(44100),
                     location: "file://localhost/music/Round%20Trip.flac".to_string(),
                     tempo_anchor: None,
+                    rating: 0,
                     position_marks: vec![],
                 }],
                 playlists: vec![RekordboxPlaylist {
@@ -1359,6 +1397,7 @@ pub mod parse {
                     tempo_anchor: Some(TempoAnchor {
                         inizio_seconds: 0.25,
                     }),
+                    rating: 153,
                     position_marks: vec![
                         // memory cue: Num=-1
                         PositionMark {
@@ -1405,6 +1444,7 @@ pub mod parse {
                 anchor.inizio_seconds
             );
 
+            assert_eq!(t.rating, 153, "the rating survives the round-trip");
             assert_eq!(t.position_marks.len(), 3, "all 3 marks survive round-trip");
 
             let mem = &t.position_marks[0];
@@ -1639,6 +1679,8 @@ pub mod merge {
         pub bitrate: Option<u32>,
         pub sample_rate: Option<u32>,
         pub location: String,
+        /// The `Rating` to write: 0, 51, 102, 153, 204 or 255.
+        pub rating: u32,
         pub position_marks: Vec<PositionMark>,
     }
 
@@ -1816,6 +1858,7 @@ pub mod merge {
                         sample_rate: r.sample_rate,
                         location: r.location,
                         tempo_anchor: None,
+                        rating: r.rating,
                         position_marks: r.position_marks,
                     }
                 } else if let Some(mut existing_track) = existing_tracks_by_location.remove(loc) {
@@ -1917,6 +1960,7 @@ pub mod merge {
                 sample_rate: None,
                 location: location.to_string(),
                 tempo_anchor: None,
+                rating: 0,
                 position_marks: vec![],
             }
         }
@@ -1941,6 +1985,7 @@ pub mod merge {
                 bitrate: None,
                 sample_rate: None,
                 location: location.to_string(),
+                rating: 0,
                 position_marks: vec![],
             }
         }
@@ -2093,6 +2138,14 @@ pub mod merge {
                 lib.playlists.is_empty(),
                 "empty name + empty locations must not append a playlist"
             );
+        }
+
+        #[test]
+        fn merge_export_takes_the_rating_of_the_refreshed_track() {
+            let mut refreshed = make_refreshed("Track A", LOC_A);
+            refreshed.rating = 102;
+            let lib = merge_export(None, vec![refreshed], &[]);
+            assert_eq!(lib.tracks[0].rating, 102);
         }
 
         #[test]

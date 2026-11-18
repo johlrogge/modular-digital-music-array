@@ -129,6 +129,7 @@ export function trackMenu(anchor, track, extra, opts) {
   const flip = (m) => () => (marks.includes(m) ? actions.unmark : actions.mark)(track.hash, label, m);
   items.push("-", ["heart", marks.includes(LIKED) ? "Unlike (M)" : "Like (M)", flip(LIKED)]);
   store.macros.forEach((m, i) => items.push(["tag", (marks.includes(m) ? "Remove " + markLabel(m) + " mark" : "Mark as " + markLabel(m)) + " (Shift+" + (i + 1) + ")", flip(m)]));
+  items.push(["sliders", "Set energy…", () => energyMenu(anchor, [track], label)]);
   const nav = [];
   if (track.album) nav.push(["disc", "Go to album", () => (location.hash = "#/album/" + enc(track.album))]);
   if (track.artist) nav.push(["user", "Go to artist", () => (location.hash = "#/artist/" + enc(track.artist))]);
@@ -138,6 +139,22 @@ export function trackMenu(anchor, track, extra, opts) {
 }
 
 on("marks", () => $$("[data-mid]").forEach((e) => e._msync && e._msync()));
+
+/**
+ * Menu to set the energy (1..10) of `tracks`, or clear it: one entry per level, the level every
+ * track already has checked, and Clear when any has one. No confirm: the toast offers Undo.
+ */
+export function energyMenu(anchor, tracks, label) {
+  const now = tracks.map((t) => (store.tracks.get(t.hash) || t).energy ?? null);
+  const same = now.every((e) => e === now[0]) ? now[0] : null;
+  const items = [];
+  for (let level = 1; level <= 10; level++) {
+    const note = level === same ? " (current)" : level === 1 ? " (mellow)" : level === 10 ? " (peak)" : "";
+    items.push([level === same ? "check" : null, "Energy " + level + note, () => actions.setEnergy(tracks, level, label)]);
+  }
+  if (now.some((e) => e !== null)) items.push("-", ["close", "Clear energy", () => actions.setEnergy(tracks, null, label)]);
+  openMenu(anchor, items, ["Energy", label]);
+}
 
 /** Menu for a set of tracks (a card or a collection): Play now only when idle, Queue next, Queue last, Replace queue. */
 export function collMenu(anchor, tracks, label) {
@@ -154,6 +171,7 @@ export function collMenu(anchor, tracks, label) {
 
 const dateOf = (added) => (added ? String(added).slice(0, 10) : "");
 const bpmOf = (t) => (t.bpm == null ? "" : String(Math.round(t.bpm)));
+const energyOf = (t) => (t.energy == null ? "" : String(t.energy));
 
 /**
  * A playlist line the library could not resolve ({ kind: "unresolved", at, token, reason }), in
@@ -171,7 +189,7 @@ function unavailableRow(t, opts, index) {
       [
         h("span", { class: "no", text: numbered ? String(opts.number(t)) : "" }),
         h("div", { style: "min-width:0" }, [h("div", { class: "t", text: title }), h("div", { class: "m", text: t.reason })]),
-        ...Array.from({ length: 5 }, () => h("span", { class: "c" })),
+        ...Array.from({ length: 6 }, () => h("span", { class: "c" })),
         h("div", { class: "end" }, opts.end ? opts.end(t, index) : []),
       ],
     ),
@@ -213,6 +231,7 @@ function resolvedRow(t, opts, index) {
   const ql = h("button", { class: "qa", title: "Queue last (L)", tabindex: "-1" }, [icon("plus", "sm"), "Queue last"]);
   const heart = h("button", { class: "icon-btn more-btn heart-btn", tabindex: "-1" });
   const mks = h("span", { class: "mks" });
+  const energyCell = h("span", { class: "c num", text: energyOf(t) });
   // What a click, P or Shift+Up/Down does on a preview row, from the state this row is drawn
   // with: pause or resume the preview it is, else preview it. Null on a row that is no preview row.
   const start = opts.preview ? () => opts.preview(t, index) : null;
@@ -243,6 +262,7 @@ function resolvedRow(t, opts, index) {
       h("span", { class: "c", text: t.album || "" }),
       h("span", { class: "c num", text: bpmOf(t) }),
       h("span", { class: "c num", text: keyText(t.key) }),
+      energyCell,
       h("span", { class: "c num", text: dateOf(t.added) }),
       h("span", { class: "c num", text: t.duration_secs ? fmt(t.duration_secs) : "" }),
       h("div", { class: "end" }, [pv, ...(opts.end ? opts.end(t, index) : []), qn, ql, heart, more]),
@@ -270,6 +290,7 @@ function resolvedRow(t, opts, index) {
     heart.setAttribute("aria-keyshortcuts", "M");
     heart.title = liked ? "Unlike (M)" : "Like (M)";
     mks.replaceChildren(...painted.filter((m) => m !== LIKED).map((m) => h("span", { class: "mk", text: markLabel(m) })));
+    energyCell.textContent = energyOf(store.tracks.get(t.hash) || t);
   };
   row._msync();
   heart.addEventListener("click", (e) => {
@@ -366,7 +387,7 @@ function resolvedRow(t, opts, index) {
 
 /**
  * Desktop column header for a track list. opts: sortable (headers sort via onSort(by)), numbered.
- * `sort` is store.sort; Title and BPM and Added sort, the rest are plain labels.
+ * `sort` is store.sort; Title, BPM, Energy and Added sort, the rest are plain labels.
  */
 export function thead(opts = {}) {
   const cols = [
@@ -375,6 +396,7 @@ export function thead(opts = {}) {
     ["Album", null],
     ["BPM", "bpm"],
     ["Key", null],
+    ["Energy", "energy"],
     ["Added", "added"],
     ["Time", null],
     ["", null],
@@ -473,7 +495,8 @@ export function queueButtons(set, subject, { suffix = "" } = {}) {
 export function bulkBar(tracks) {
   if (!tracks.length) return null;
   const what = plural(tracks.length, "track");
-  return h("div", { class: "bulk" }, [h("span", { class: "kicker", text: what + " match" }), queueButtons(setOf(tracks), what)]);
+  const energy = h("button", { class: "btn", "aria-haspopup": "menu", onclick: (e) => energyMenu(e.currentTarget, tracks, what) }, [icon("sliders", "sm"), "Set energy…"]);
+  return h("div", { class: "bulk" }, [h("span", { class: "kicker", text: what + " match" }), queueButtons(setOf(tracks), what), energy]);
 }
 
 /** A page's heading row: title, an optional line under it, an optional `link` node, and the Settings gear on phones. */

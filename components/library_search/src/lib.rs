@@ -31,10 +31,10 @@ pub mod query;
 
 pub use eval::{matches_query, StringMatcher, TrackFields, TrackMatcher};
 pub use parse::{
-    parse_date_query, parse_duration_query, parse_key_query, parse_numeric_query, parse_role_query,
-    parse_string_query, ParseError,
+    parse_date_query, parse_duration_query, parse_energy_query, parse_key_query,
+    parse_numeric_query, parse_role_query, parse_string_query, ParseError,
 };
 pub use query::{
-    DatePrecision, DateQuery, DurationQuery, DurationUnit, KeyQuery, NumericQuery, Reach, Shape,
-    StringQuery, TrackQuery,
+    DatePrecision, DateQuery, DurationQuery, DurationUnit, EnergyQuery, KeyQuery, NumericQuery,
+    Reach, Shape, StringQuery, TrackQuery,
 };

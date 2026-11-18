@@ -22,7 +22,9 @@ tempfile = "3"
 nng = "1.0"
 nng-transport = { path = "../../components/nng_transport" }
 node-discovery = { workspace = true }
+serde = { workspace = true }
 serde_json = "1.0"
+private-file = { workspace = true }
 audio-transcoder = { path = "../../components/audio_transcoder" }
 library-ipc-client = { path = "../../components/library_ipc_client" }
 library-search = { path = "../../components/library_search" }
