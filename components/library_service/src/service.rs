@@ -26,7 +26,7 @@ use music_facts::MarkFilter;
 use music_facts::MusicValue;
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -233,6 +233,8 @@ fn commit_playlist(path: &std::path::Path, planned: playlist_edit::Planned) -> L
 type IdentityWriteHook = Box<dyn Fn(&LibraryService, &ContentHash) + Send + Sync>;
 
 mod backfill;
+#[cfg(test)]
+mod cover_tests;
 mod dedup;
 #[cfg(test)]
 mod dedup_tests;
@@ -321,6 +323,53 @@ impl Drop for ProjectOnDrop<'_> {
     }
 }
 
+/// Live tracks with a blob, sorted by the state of their cover.
+#[derive(Debug, Default)]
+struct CoverScan {
+    /// Cover fact and file both there
+    present: usize,
+    /// A cover fact whose file is gone or empty: (content hash, blob, cover file),
+    /// the paths relative to the music dir. Cover files inside `cover-art/` only.
+    dangling: Vec<(ContentHash, PathBuf, PathBuf)>,
+    /// Cover facts naming a path outside `cover-art/`: never written to
+    failed: usize,
+    /// No cover fact: (content hash, blob)
+    missing: Vec<(ContentHash, PathBuf)>,
+}
+
+/// What one cover heal did, per track.
+#[derive(Debug, Default, PartialEq, Eq, Clone, Copy)]
+struct CoverSummary {
+    present: usize,
+    /// Cover file re-extracted to the path its fact names (no fact written)
+    repaired: usize,
+    /// Art extracted and a `CoverArtPath` fact asserted
+    extracted: usize,
+    /// The blob has no usable picture; nothing changed
+    no_art: usize,
+    failed: usize,
+}
+
+impl CoverSummary {
+    fn log(&self) {
+        tracing::info!(
+            present = self.present,
+            repaired = self.repaired,
+            extracted = self.extracted,
+            no_art = self.no_art,
+            failed = self.failed,
+            "Cover heal complete"
+        );
+    }
+}
+
+/// The outcome of repairing one cover file.
+enum CoverRepair {
+    Repaired,
+    NoArt,
+    Failed,
+}
+
 /// Result of loading tracks from the fact stream
 struct LoadResult {
     tracks: Vec<IndexedTrackInfo>,
@@ -331,8 +380,6 @@ struct LoadResult {
     content_hashes: HashSet<String>,
     /// Content hashes of tracks that already have a Format fact
     has_format: HashSet<String>,
-    /// Content hashes of tracks that already have a CoverArtPath fact
-    has_cover_art: HashSet<String>,
 }
 
 /// One line of a fact stream, or `None` for a line that is not a fact. Never dropped
@@ -455,8 +502,30 @@ impl LibraryService {
         // Backfill Format facts for tracks that don't have one yet
         service.backfill_format_facts(&loaded.has_format);
 
-        // Backfill cover art for tracks that don't have CoverArtPath yet
-        service.backfill_cover_art(&loaded.has_cover_art);
+        // Heal covers, in the two halves `heal_covers_with` runs in a row. Both start
+        // from one scan taken here (memory and file stats only, no ACID request).
+        // Extracting the art of tracks with no cover fact asserts facts, so it is done
+        // before serving, like the other startup backfills: a caller (and every test)
+        // may rely on those facts existing once the service is up. Repairing the files
+        // that went missing writes no fact and opens one blob per cover (some hundreds
+        // after a lost cover dir), so it runs on a thread and needs no ACID client.
+        let scan = service.scan_covers();
+        let mut summary = CoverSummary {
+            present: scan.present,
+            failed: scan.failed,
+            ..CoverSummary::default()
+        };
+        service.extract_missing_covers(&service.acid_client, &scan.missing, &mut summary);
+        let worker = Arc::clone(&service);
+        let spawned = std::thread::Builder::new()
+            .name("cover-repair".into())
+            .spawn(move || {
+                worker.repair_dangling_covers(&scan.dangling, &mut summary);
+                summary.log();
+            });
+        if let Err(e) = spawned {
+            tracing::warn!(error = %e, "Cover repair thread did not start");
+        }
 
         // Ensure playlists directory exists so writes never fail on a fresh install
         std::fs::create_dir_all(service.metadata_dir.join("playlists"))?;
@@ -468,7 +537,7 @@ impl LibraryService {
     ///
     /// Reads all paged fact lines from ACID, then uses `stainless_facts::aggregate_facts`
     /// to fold them into `IndexedTrackInfo` aggregators (one per entity), then
-    /// post-processes the result to build `fact_index`, `has_format`, `has_cover_art`.
+    /// post-processes the result to build `fact_index`, `has_format`.
     ///
     /// Returns `Ok((LoadResult, Option<cursor>))`:
     /// - ACID reachable with 0 facts → `Ok((empty, Some(cursor)))` — correct on fresh system
@@ -528,7 +597,6 @@ impl LibraryService {
             fact_index: projection.fact_index,
             content_hashes: projection.content_hashes,
             has_format: projection.has_format,
-            has_cover_art: projection.has_cover_art,
         };
         Ok((loaded, final_cursor))
     }
@@ -557,7 +625,6 @@ impl LibraryService {
                         fact_index: HashMap::new(),
                         content_hashes: HashSet::new(),
                         has_format: HashSet::new(),
-                        has_cover_art: HashSet::new(),
                     };
                 }
             };
@@ -565,7 +632,6 @@ impl LibraryService {
         let mut tracks_map: HashMap<String, IndexedTrackInfo> = HashMap::new();
         let mut fact_index: HashMap<FactType, HashSet<String>> = HashMap::new();
         let mut has_format: HashSet<String> = HashSet::new();
-        let mut has_cover_art: HashSet<String> = HashSet::new();
         let mut errors = 0;
         let mut total = 0;
 
@@ -638,9 +704,6 @@ impl LibraryService {
             {
                 has_format.insert(key.clone());
             }
-            if entry.cover_art_path.is_some() {
-                has_cover_art.insert(key.clone());
-            }
         }
 
         let content_hashes: HashSet<String> = tracks_map.keys().cloned().collect();
@@ -651,7 +714,6 @@ impl LibraryService {
             fact_index,
             content_hashes,
             has_format,
-            has_cover_art,
         }
     }
 
@@ -717,36 +779,87 @@ impl LibraryService {
         }
     }
 
+    /// The picture to show for an audio file: the front cover, else the first one.
+    /// `Ok(None)` when the file has no picture; `Err` when it cannot be read.
+    fn best_cover_picture(blob_path: &Path) -> Result<Option<audio_metadata::PictureData>, String> {
+        use audio_metadata::{extract_pictures, PictureType};
+
+        let mut pictures = extract_pictures(blob_path).map_err(|e| e.to_string())?;
+        let best = pictures
+            .iter()
+            .position(|p| p.picture_type == PictureType::CoverFront)
+            .unwrap_or(0);
+        Ok((best < pictures.len()).then(|| pictures.swap_remove(best)))
+    }
+
+    /// Store a cover image at `path` (directory created if need be). Atomic with a
+    /// unique temp file: a reader (the console's `/cover` route) never sees half an
+    /// image, and two writers of the same cover (startup heal and `ReindexCovers`) each
+    /// leave a complete one.
+    fn store_cover_file(path: &Path, data: &[u8]) -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        private_file::write_file_atomic(path, data, 0o644)
+    }
+
+    /// Re-extract the embedded art of `blob_abs` into `cover_abs`, the file a
+    /// `CoverArtPath` fact already names. Writes no fact. The image goes there even if
+    /// its type does not match the extension (the blob is what the original was
+    /// extracted from, so it does not in practice): a new path would need a new fact.
+    fn repair_cover_file(blob_abs: &Path, cover_abs: &Path) -> CoverRepair {
+        match Self::best_cover_picture(blob_abs) {
+            Ok(Some(picture)) => match Self::store_cover_file(cover_abs, &picture.data) {
+                Ok(()) => CoverRepair::Repaired,
+                Err(e) => {
+                    tracing::warn!(error = %e, path = %cover_abs.display(), "Failed to write repaired cover");
+                    CoverRepair::Failed
+                }
+            },
+            Ok(None) => {
+                tracing::info!(blob = %blob_abs.display(), cover = %cover_abs.display(), "Cover file is missing and the blob has no embedded picture; fact left alone");
+                CoverRepair::NoArt
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, blob = %blob_abs.display(), "Cannot read the blob to repair its cover");
+                CoverRepair::Failed
+            }
+        }
+    }
+
     /// Extract the best available picture from an audio file and write it to cover-art storage.
     ///
     /// Returns the relative path (e.g. `cover-art/<hash>.jpg`) on success, or `None` if no
     /// picture is present or writing fails.
     fn extract_and_store_cover_art(
         &self,
-        blob_path: &PathBuf,
+        blob_path: &Path,
         content_hash: &ContentHash,
     ) -> Option<PathBuf> {
-        use audio_metadata::{extract_pictures, PictureType};
+        self.try_extract_and_store_cover_art(blob_path, content_hash)
+            .ok()
+            .flatten()
+    }
 
-        let pictures = match extract_pictures(blob_path) {
-            Ok(p) => p,
+    /// [`extract_and_store_cover_art`](Self::extract_and_store_cover_art) telling "no
+    /// (usable) picture" (`Ok(None)`) from a failure (`Err`).
+    fn try_extract_and_store_cover_art(
+        &self,
+        blob_path: &Path,
+        content_hash: &ContentHash,
+    ) -> Result<Option<PathBuf>, ()> {
+        let picture = match Self::best_cover_picture(blob_path) {
+            Ok(Some(p)) => p,
+            Ok(None) => return Ok(None),
             Err(e) => {
                 tracing::debug!(error = %e, "Failed to extract pictures from blob");
-                return None;
+                return Err(());
             }
         };
 
-        if pictures.is_empty() {
-            return None;
-        }
-
-        // Prefer CoverFront; fall back to first available
-        let picture = pictures
-            .iter()
-            .find(|p| p.picture_type == PictureType::CoverFront)
-            .or_else(|| pictures.first())?;
-
-        let ext = Self::mime_to_ext(&picture.mime_type)?;
+        let Some(ext) = Self::mime_to_ext(&picture.mime_type) else {
+            return Ok(None);
+        };
 
         let hash_clean = content_hash
             .as_str()
@@ -756,86 +869,177 @@ impl LibraryService {
         let rel_path = PathBuf::from("cover-art").join(&filename);
         let abs_path = self.music_dir.join(&rel_path);
 
-        // Ensure cover-art directory exists
-        if let Some(parent) = abs_path.parent() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
-                tracing::warn!(error = %e, "Failed to create cover-art directory");
-                return None;
-            }
-        }
-
-        if let Err(e) = std::fs::write(&abs_path, &picture.data) {
+        if let Err(e) = Self::store_cover_file(&abs_path, &picture.data) {
             tracing::warn!(error = %e, path = %abs_path.display(), "Failed to write cover art");
-            return None;
+            return Err(());
         }
 
         tracing::debug!(path = %rel_path.display(), "Stored cover art");
-        Some(rel_path)
+        Ok(Some(rel_path))
     }
 
-    /// Backfill CoverArtPath facts for tracks that don't have cover art stored yet.
+    /// Sort the live tracks that have a blob by the state of their cover. A cover is
+    /// present when the track has a live `CoverArtPath` fact AND that file exists under
+    /// the music dir; this is the one check startup and `ReindexCovers` share. Only
+    /// stats files: cheap enough to run on every start. A zero-length file is not a
+    /// cover. A fact naming a path outside `cover-art/` is counted failed, never
+    /// repaired: a fact must not steer a write out of the store.
     ///
-    /// Returns the number of CoverArtPath facts written.
-    fn backfill_cover_art(&self, has_cover_art: &HashSet<String>) -> usize {
-        let tracks = self.tracks.lock().unwrap();
-
-        // Collect tracks that need backfill: have a blob_path but no CoverArtPath fact,
-        // and are not retired by a `Replaces`
-        let needs_backfill: Vec<_> = tracks
+    /// Limit: only a track's own fact is checked. An heir showing a cover inherited
+    /// from a retired loser (ADR-013) whose file is gone stays broken: the loser is
+    /// retired, so its blob is skipped here.
+    fn scan_covers(&self) -> CoverScan {
+        // Copy out under the lock; stat after releasing it.
+        let candidates: Vec<(ContentHash, PathBuf, Option<PathBuf>)> = self
+            .tracks
+            .lock()
+            .unwrap()
             .iter()
             .filter(|t| !t.is_retired())
-            .filter(|t| !has_cover_art.contains(t.content_hash.as_str()))
             .filter(|t| !t.blob_path.as_os_str().is_empty())
-            .map(|t| (t.content_hash.clone(), t.blob_path.clone()))
+            .map(|t| {
+                (
+                    t.content_hash.clone(),
+                    t.blob_path.clone(),
+                    t.cover_art_path.clone(),
+                )
+            })
             .collect();
 
-        drop(tracks);
-
-        if needs_backfill.is_empty() {
-            return 0;
-        }
-
-        tracing::info!(
-            count = needs_backfill.len(),
-            "Backfilling CoverArtPath facts for tracks"
-        );
-
-        let fact_source = self.sources.derived.clone();
-
-        // Written facts are projected through the single path when the batch ends.
-        let backfilled = self.write_batch_and_project_with(&self.acid_client, |w| {
-            let mut backfilled = 0;
-            for (hash, blob_rel_path) in &needs_backfill {
-                let blob_abs = self.music_dir.join(blob_rel_path);
-                if let Some(rel_path) = self.extract_and_store_cover_art(&blob_abs, hash) {
-                    let value = MusicValue::CoverArtPath(rel_path.to_string_lossy().to_string());
-                    if w.write_music_facts(hash, &[(value, fact_source.clone())])
-                        .is_ok()
-                    {
-                        backfilled += 1;
+        let mut scan = CoverScan::default();
+        for (hash, blob, cover) in candidates {
+            match cover {
+                Some(cover) => {
+                    let present = std::fs::metadata(self.music_dir.join(&cover))
+                        .map(|m| m.is_file() && m.len() > 0)
+                        .unwrap_or(false);
+                    if present {
+                        scan.present += 1;
+                    } else if dedup::is_store_path(&cover, "cover-art") {
+                        scan.dangling.push((hash, blob, cover));
+                    } else {
+                        tracing::warn!(
+                            hash = %hash.as_str(), cover = %cover.display(),
+                            "Cover fact names a path outside cover-art/; not repairing"
+                        );
+                        scan.failed += 1;
                     }
                 }
+                None => scan.missing.push((hash, blob)),
             }
-            backfilled
-        });
-
-        tracing::info!(backfilled, "CoverArtPath fact backfill complete");
-        backfilled
+        }
+        scan
     }
 
-    /// Re-extract and store cover art for all tracks missing a CoverArtPath fact.
-    /// Returns the number of tracks processed.
-    fn reindex_covers_internal(&self) -> usize {
-        let has_cover_art: HashSet<String> = {
-            let tracks = self.tracks.lock().unwrap();
-            tracks
-                .iter()
-                .filter(|t| t.cover_art_path.is_some())
-                .map(|t| t.content_hash.as_str().to_owned())
-                .collect()
-        };
+    /// Whether a live track `hash` still names `cover` as its cover. Call under
+    /// `retire_gate`: a retire that finishes after the check cannot have its cover file
+    /// written meanwhile.
+    fn names_cover(&self, _gate: &RetireGuard<'_>, hash: &ContentHash, cover: &Path) -> bool {
+        self.tracks.lock().unwrap().iter().any(|t| {
+            t.content_hash.as_str() == hash.as_str()
+                && !t.is_retired()
+                && t.cover_art_path.as_deref() == Some(cover)
+        })
+    }
 
-        self.backfill_cover_art(&has_cover_art)
+    /// Re-extract the file of every `dangling` cover fact. Writes files, never facts.
+    /// One outcome per cover path: tracks sharing a path are tried in order and the
+    /// first blob with art wins. Each write is made under `retire_gate` after checking
+    /// that a live track still names the path, so a track retired meanwhile gets no
+    /// orphan file.
+    fn repair_dangling_covers(
+        &self,
+        dangling: &[(ContentHash, PathBuf, PathBuf)],
+        summary: &mut CoverSummary,
+    ) {
+        let mut by_cover: Vec<(&PathBuf, Vec<(&ContentHash, &PathBuf)>)> = Vec::new();
+        for (hash, blob, cover) in dangling {
+            match by_cover.iter_mut().find(|(c, _)| *c == cover) {
+                Some((_, owners)) => owners.push((hash, blob)),
+                None => by_cover.push((cover, vec![(hash, blob)])),
+            }
+        }
+
+        for (cover, owners) in by_cover {
+            let mut outcome = None;
+            for (hash, blob) in owners {
+                let gate = self.retire_gate.lock().unwrap();
+                if !self.names_cover(&gate, hash, cover) {
+                    tracing::debug!(cover = %cover.display(), "Track retired or cover changed; not repairing");
+                    continue;
+                }
+                let result = Self::repair_cover_file(
+                    &self.music_dir.join(blob),
+                    &self.music_dir.join(cover),
+                );
+                drop(gate);
+                let done = matches!(result, CoverRepair::Repaired);
+                // A failure outranks "no art" when no later owner repairs it.
+                outcome = match (outcome, result) {
+                    (Some(CoverRepair::Failed), CoverRepair::NoArt) => Some(CoverRepair::Failed),
+                    (_, r) => Some(r),
+                };
+                if done {
+                    break;
+                }
+            }
+            match outcome {
+                Some(CoverRepair::Repaired) => summary.repaired += 1,
+                Some(CoverRepair::NoArt) => summary.no_art += 1,
+                Some(CoverRepair::Failed) => summary.failed += 1,
+                None => {}
+            }
+        }
+    }
+
+    /// Extract the art of every `missing` track (no cover fact) and assert its
+    /// `CoverArtPath`, through `client`.
+    fn extract_missing_covers(
+        &self,
+        client: &AcidClient,
+        missing: &[(ContentHash, PathBuf)],
+        summary: &mut CoverSummary,
+    ) {
+        if missing.is_empty() {
+            return;
+        }
+        let fact_source = self.sources.derived.clone();
+        // Written facts are projected through the single path when the batch ends.
+        self.write_batch_and_project_with(client, |w| {
+            for (hash, blob_rel) in missing {
+                let blob_abs = self.music_dir.join(blob_rel);
+                match self.try_extract_and_store_cover_art(&blob_abs, hash) {
+                    Ok(Some(rel_path)) => {
+                        let value =
+                            MusicValue::CoverArtPath(rel_path.to_string_lossy().to_string());
+                        match w.write_music_facts(hash, &[(value, fact_source.clone())]) {
+                            Ok(_) => summary.extracted += 1,
+                            Err(_) => summary.failed += 1,
+                        }
+                    }
+                    Ok(None) => summary.no_art += 1,
+                    Err(()) => summary.failed += 1,
+                }
+            }
+        });
+    }
+
+    /// Make every live track's cover present (see [`scan_covers`](Self::scan_covers)):
+    /// a fact whose file is gone gets its file re-extracted from the blob (no fact is
+    /// written), a track with no fact gets the art extracted and a `CoverArtPath` fact
+    /// asserted through `client`. Runs to the end on the calling thread. Logs and
+    /// returns the summary.
+    fn heal_covers_with(&self, client: &AcidClient) -> CoverSummary {
+        let scan = self.scan_covers();
+        let mut summary = CoverSummary {
+            present: scan.present,
+            failed: scan.failed,
+            ..CoverSummary::default()
+        };
+        self.repair_dangling_covers(&scan.dangling, &mut summary);
+        self.extract_missing_covers(client, &scan.missing, &mut summary);
+        summary.log();
+        summary
     }
 
     // =========================================================================
@@ -1289,10 +1493,13 @@ impl LibraryService {
             }
 
             LibraryRequest::ReindexCovers => {
-                let reindexed = self.reindex_covers_internal();
+                let s = self.heal_covers_with(&self.acid_client);
                 LibraryResponse::IngestResult(IngestResult::Success {
                     hash: None,
-                    message: format!("Cover art reindexed for {} tracks", reindexed),
+                    message: format!(
+                        "Cover art: {} present, {} repaired, {} extracted, {} without art, {} failed",
+                        s.present, s.repaired, s.extracted, s.no_art, s.failed
+                    ),
                 })
             }
 

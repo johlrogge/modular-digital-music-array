@@ -889,8 +889,6 @@ pub struct Projection {
     pub content_hashes: HashSet<String>,
     /// Content hashes of tracks that already have a Format fact
     pub has_format: HashSet<String>,
-    /// Content hashes of tracks that already have a CoverArtPath fact
-    pub has_cover_art: HashSet<String>,
     /// Lines that were not facts and were skipped ([`project_lines`]); 0 for [`project`].
     pub unparseable_lines: usize,
     /// Every play event of the log, and the covers of the lineage. Tracks carry no play
@@ -922,7 +920,6 @@ pub fn project(facts: Vec<MusicFact>) -> Projection {
 
     let mut fact_index: HashMap<FactType, HashSet<String>> = HashMap::new();
     let mut has_format: HashSet<String> = HashSet::new();
-    let mut has_cover_art: HashSet<String> = HashSet::new();
 
     for (entity, entry) in &mut aggregated {
         entry.content_hash = entity.clone();
@@ -946,9 +943,6 @@ pub fn project(facts: Vec<MusicFact>) -> Projection {
         {
             has_format.insert(entity.as_str().to_owned());
         }
-        if entry.cover_art_path.is_some() {
-            has_cover_art.insert(entity.as_str().to_owned());
-        }
     }
 
     let content_hashes: HashSet<String> =
@@ -958,7 +952,6 @@ pub fn project(facts: Vec<MusicFact>) -> Projection {
         fact_index,
         content_hashes,
         has_format,
-        has_cover_art,
         unparseable_lines: 0,
         lineage,
     }
