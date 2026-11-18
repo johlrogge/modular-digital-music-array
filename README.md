@@ -279,7 +279,7 @@ Quick install is at the [top](#install). Every `vX.Y.Z` release publishes `mdma-
 
 ```bash
 # Install a specific release
-curl -fsSL https://raw.githubusercontent.com/johlrogge/modular-digital-music-array/master/scripts/install-mdma.sh | bash -s v0.39.0
+curl -fsSL https://raw.githubusercontent.com/johlrogge/modular-digital-music-array/master/scripts/install-mdma.sh | bash -s v0.39.1
 
 # Install to a user-writable location (no sudo)
 curl -fsSL https://raw.githubusercontent.com/johlrogge/modular-digital-music-array/master/scripts/install-mdma.sh | MDMA_INSTALL_DIR=~/.local/bin bash
@@ -309,6 +309,7 @@ See [ROADMAP.md](ROADMAP.md) for detailed status and planned work.
 - **Marks and hearts with macro marks** in the console (macro buttons are configured on the node, defaults "banger" and "opener"), a **key notation setting** (Musical, Camelot or Open Key, stored per browser), and **row keyboard navigation** (↑/↓ or `j`/`k`).
 - **Mix-well key filter,** also in `mdma search --key`: `8A+-2` (Straight), a `d` suffix for any path, `,+7` for a power jump.
 - **Local reads from the client replica** (ADR-030), through the shared `library_projection::search`.
+- **0.39.1 fixes an upgrade bug:** upgrading from 0.38 or earlier no longer empties the playback queue.
 - **The library repairs covers at startup:** it re-extracts art for cover facts whose file is missing or empty, and extracts art for tracks with no cover fact. The gateway no longer hangs on the NNG callback thread (#113).
 
 **Upgrade notes:** none. Upgrade the mdma-* packages together, by name. See CHANGELOG.md.
