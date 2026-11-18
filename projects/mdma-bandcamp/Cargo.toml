@@ -17,6 +17,9 @@ library-ipc-client = { path = "../../components/library_ipc_client" }
 library-search = { workspace = true }
 track-matcher = { workspace = true }
 playlist-import = { workspace = true }
+playlist-edit = { workspace = true }
+sequence-merge = { workspace = true }
+private-file = { workspace = true }
 inbox-utils = { path = "../../components/inbox_utils" }
 service = { workspace = true }
 nng = "1.0"
@@ -42,5 +45,3 @@ music-facts = { workspace = true }
 stainless-facts = { git = "https://github.com/johlrogge/stainless_facts", rev = "2aa820a808fd5345a1bd59c11d90969bfa84b285" }
 chrono = "0.4"
 library-ipc-protocol = { workspace = true }
-# consumer lands in ADR-032 phase 3
-sequence-merge = { workspace = true }

@@ -352,6 +352,38 @@ impl LibraryClient {
         )
     }
 
+    /// Get a playlist's entries with the version they were read at (ADR-027).
+    pub fn playlist_snapshot(&self, name: &PlaylistName) -> Result<PlaylistSnapshot, ClientError> {
+        match self.request(&LibraryRequest::PlaylistSnapshot { name: name.clone() })? {
+            LibraryResponse::PlaylistSnapshot(snapshot) => Ok(snapshot),
+            LibraryResponse::Error(e) => Err(ClientError::Protocol(e)),
+            _ => Err(ClientError::Protocol(ProtocolError::Internal {
+                message: "Unexpected response to PlaylistSnapshot".to_string(),
+            })),
+        }
+    }
+
+    /// Apply `ops` to a playlist if it is still at `version` (ADR-027). A stale
+    /// version is not an error: it answers `EditOutcome::Conflict`.
+    pub fn playlist_edit(
+        &self,
+        name: &PlaylistName,
+        version: &PlaylistVersion,
+        ops: Vec<EditOp>,
+    ) -> Result<EditOutcome, ClientError> {
+        match self.request(&LibraryRequest::PlaylistEdit {
+            name: name.clone(),
+            version: version.clone(),
+            ops,
+        })? {
+            LibraryResponse::PlaylistEdited(outcome) => Ok(outcome),
+            LibraryResponse::Error(e) => Err(ClientError::Protocol(e)),
+            _ => Err(ClientError::Protocol(ProtocolError::Internal {
+                message: "Unexpected response to PlaylistEdit".to_string(),
+            })),
+        }
+    }
+
     /// Create a new playlist with pre-formatted content.
     ///
     /// `content` must be in the canonical `{8hash}  {Artist} - {Title}  [{duration}]`

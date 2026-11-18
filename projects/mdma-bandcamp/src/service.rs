@@ -11,6 +11,8 @@ use crate::ipc::{
     SourceStatus,
 };
 use crate::job::{spawn_guarded, JobSlot};
+use crate::playlist_links::{LinkStore, PlaylistLink};
+use crate::playlist_sync::{library_error, resolve_items, sync_playlist, PlaylistSyncError};
 use bandcamp_api::{AudioFormat, BandcampClient, CollectionItem, CookieJar};
 use library_ipc_client::PlaylistName;
 use library_ipc_client::{
@@ -24,7 +26,8 @@ use playlist_import::{
 };
 use source_protocol::{
     CheckJobStatus, CheckPhase, ImportJobStatus, ImportPhase, ImportResult, ImportSyncProgress,
-    ImportWritten, SyncWaitEnd,
+    ImportWritten, PlaylistLinkInfo, PlaylistSyncJobStatus, PlaylistSyncPhase, PlaylistSyncReport,
+    SyncWaitEnd,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -85,6 +88,15 @@ impl InternalDownloadState {
             InternalDownloadState::Cancelled => DownloadState::Cancelled,
         }
     }
+}
+
+/// The steps of `resolve_outcomes`, which an import and a playlist sync each
+/// map to their own phases.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResolveStep {
+    Matching,
+    Syncing,
+    Rematching,
 }
 
 /// Tool of the source this service states for everything it writes to the library.
@@ -196,6 +208,12 @@ pub struct BandcampService {
     import_job: JobSlot<ImportJobStatus>,
     /// Current or last check-updates job
     check_job: JobSlot<CheckJobStatus>,
+    /// Current or last playlist sync job (ADR-032)
+    playlist_sync_job: JobSlot<PlaylistSyncJobStatus>,
+    /// The playlist link state (ADR-032), beside the download cache
+    links: LinkStore,
+    /// Held while the link state is read and written, so syncs never interleave
+    link_lock: Arc<Mutex<()>>,
 }
 
 /// How often an import job polls the downloads it is waiting for.
@@ -469,6 +487,30 @@ fn playlist_error(e: &bandcamp_api::BandcampError, playlist: Option<&str>) -> So
     }
 }
 
+/// Map a playlist sync failure to a wire error: a playlist that is not linked
+/// is an invalid request, a local playlist that is not there is not found,
+/// anything else is a failed sync.
+fn playlist_sync_error(e: PlaylistSyncError) -> SourceError {
+    match e {
+        PlaylistSyncError::NotLinked(_) => SourceError::InvalidRequest {
+            message: e.to_string(),
+        },
+        PlaylistSyncError::PlaylistMissing(name) => SourceError::ItemNotFound {
+            identifier: name.to_string(),
+        },
+        other => SourceError::SyncFailed {
+            message: other.to_string(),
+        },
+    }
+}
+
+/// Seconds since the Unix epoch.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
 impl BandcampService {
     /// Create a new service
     pub fn new(
@@ -482,6 +524,7 @@ impl BandcampService {
     ) -> Result<Self, ServiceError> {
         // Load cache
         let cache = DownloadCache::open(&cache_path)?;
+        let links = LinkStore::beside(&cache_path);
 
         // A missing or invalid cookie file is not fatal: stay up in the
         // NotConfigured state (warn once) so supervisors don't crash-loop us.
@@ -512,6 +555,9 @@ impl BandcampService {
             username,
             import_job: JobSlot::new(),
             check_job: JobSlot::new(),
+            playlist_sync_job: JobSlot::new(),
+            links,
+            link_lock: Arc::new(Mutex::new(())),
         })
     }
 
@@ -662,7 +708,190 @@ impl BandcampService {
             SourceRequest::CheckUpdates { item_ids } => self.handle_check_updates(item_ids),
 
             SourceRequest::GetCheckStatus => SourceResponse::CheckStatus(self.check_job.snapshot()),
+
+            SourceRequest::LinkPlaylist { local, source } => {
+                match self.link_playlist(local, &source).await {
+                    Ok(info) => SourceResponse::PlaylistLinked(info),
+                    Err(e) => SourceResponse::Error(e),
+                }
+            }
+
+            SourceRequest::SyncPlaylist { local } => self.handle_sync_playlist(local),
+
+            SourceRequest::GetPlaylistSyncStatus => {
+                SourceResponse::PlaylistSyncStatus(self.playlist_sync_job.snapshot())
+            }
+
+            SourceRequest::ListPlaylistLinks => match self.links.load() {
+                Ok(links) => SourceResponse::PlaylistLinks(
+                    links.links.iter().map(PlaylistLink::info).collect(),
+                ),
+                Err(e) => SourceResponse::Error(playlist_sync_error(e.into())),
+            },
         }
+    }
+
+    /// Link the local playlist `local` to the Bandcamp playlist `source`
+    /// (ADR-032 §8). Both playlists must exist; the link keeps the playlist's
+    /// URL. Linking what `local` is already linked to changes nothing.
+    async fn link_playlist(
+        &self,
+        local: PlaylistName,
+        source: &str,
+    ) -> Result<PlaylistLinkInfo, SourceError> {
+        let fetched = self.fetch_playlist(source).await?;
+        let socket = self.library_socket.clone();
+        let (store, lock) = (self.links.clone(), Arc::clone(&self.link_lock));
+        tokio::task::spawn_blocking(move || -> Result<PlaylistLinkInfo, PlaylistSyncError> {
+            let client = LibraryClient::connect(&socket)
+                .map_err(|e| PlaylistSyncError::Library(e.to_string()))?;
+            client
+                .playlist_snapshot(&local)
+                .map_err(|e| library_error(&local, e))?;
+            let _held = lock.lock();
+            let mut links = store.load()?;
+            let info = links.link(local, fetched.url);
+            store.save(&links)?;
+            Ok(info)
+        })
+        .await
+        .map_err(|e| SourceError::Internal {
+            message: format!("link task failed: {e}"),
+        })?
+        .map_err(playlist_sync_error)
+    }
+
+    /// Start a playlist sync job in the background and return at once.
+    ///
+    /// Only one job runs at a time. The job ends in Done or Failed, whatever
+    /// happens inside it. An unlinked playlist is refused up front.
+    fn handle_sync_playlist(self: &Arc<Self>, local: PlaylistName) -> SourceResponse {
+        let source = match self.links.load() {
+            Ok(links) => match links.get(&local) {
+                Some(link) => link.bandcamp.clone(),
+                None => {
+                    return SourceResponse::Error(playlist_sync_error(
+                        PlaylistSyncError::NotLinked(local),
+                    ))
+                }
+            },
+            Err(e) => return SourceResponse::Error(playlist_sync_error(e.into())),
+        };
+        let job_id = match self
+            .playlist_sync_job
+            .begin(|job_id| PlaylistSyncJobStatus {
+                job_id,
+                local: local.clone(),
+                phase: PlaylistSyncPhase::Fetching,
+                sync: None,
+            }) {
+            Ok(job_id) => job_id,
+            Err(running) => {
+                return SourceResponse::Error(SourceError::SyncInProgress { job_id: running })
+            }
+        };
+        tracing::info!(job_id, %local, "Playlist sync job started");
+
+        let service = Arc::clone(self);
+        spawn_guarded(
+            {
+                let service = Arc::clone(&service);
+                async move { service.run_playlist_sync_job(job_id, local, source).await }
+            },
+            move |message| service.fail_playlist_sync(job_id, message),
+        );
+        SourceResponse::PlaylistSyncStarted { job_id }
+    }
+
+    /// End playlist sync job `job_id` as Failed.
+    fn fail_playlist_sync(&self, job_id: u64, message: String) {
+        tracing::error!(job_id, error = %message, "Playlist sync job failed");
+        self.set_playlist_sync_phase(job_id, PlaylistSyncPhase::Failed { message });
+    }
+
+    /// Move playlist sync job `job_id` to `phase`, logging the change.
+    fn set_playlist_sync_phase(&self, job_id: u64, phase: PlaylistSyncPhase) {
+        self.playlist_sync_job.update(job_id, |status| {
+            tracing::info!(
+                job_id = status.job_id,
+                ?phase,
+                "Playlist sync phase changed"
+            );
+            status.phase = phase;
+        });
+    }
+
+    /// Fetch the playlist, sync with it, and end the job with the result.
+    async fn run_playlist_sync_job(&self, job_id: u64, local: PlaylistName, source: String) {
+        let result = async {
+            let fetched = self.fetch_playlist(&source).await?;
+            self.sync_from_source(
+                local,
+                &source,
+                fetched,
+                |phase| self.set_playlist_sync_phase(job_id, phase),
+                |progress| {
+                    self.playlist_sync_job
+                        .update(job_id, |status| status.sync = Some(progress))
+                },
+            )
+            .await
+        }
+        .await;
+        match result {
+            Ok(report) => self.set_playlist_sync_phase(job_id, PlaylistSyncPhase::Done(report)),
+            Err(e) => self.fail_playlist_sync(job_id, e.to_string()),
+        }
+    }
+
+    /// The sync after the fetch: the steps of an import (match, download the
+    /// owned tracks that are missing, match again), then the three-way merge
+    /// of `fetched`, the playlist at `source`, into the playlist `local`. The
+    /// merge is refused if the link of `local` no longer points at `source`.
+    async fn sync_from_source(
+        &self,
+        local: PlaylistName,
+        source: &str,
+        fetched: SourcePlaylist,
+        on_phase: impl Fn(PlaylistSyncPhase),
+        on_progress: impl Fn(ImportSyncProgress),
+    ) -> Result<PlaylistSyncReport, SourceError> {
+        let tracks: Arc<[SourcePlaylistTrack]> = fetched.tracks.into();
+        let outcomes = self
+            .resolve_outcomes(
+                &tracks,
+                true,
+                |step| {
+                    on_phase(match step {
+                        ResolveStep::Matching => PlaylistSyncPhase::Matching,
+                        ResolveStep::Syncing => PlaylistSyncPhase::Syncing,
+                        ResolveStep::Rematching => PlaylistSyncPhase::Rematching,
+                    })
+                },
+                |_| {},
+                on_progress,
+            )
+            .await
+            .map_err(|message| SourceError::SyncFailed { message })?;
+        let items = resolve_items(&tracks, &outcomes).map_err(|e| SourceError::SyncFailed {
+            message: format!("bad track id in the Bandcamp playlist: {e}"),
+        })?;
+        on_phase(PlaylistSyncPhase::Merging);
+
+        let socket = self.library_socket.clone();
+        let source = source.to_string();
+        let (store, lock) = (self.links.clone(), Arc::clone(&self.link_lock));
+        tokio::task::spawn_blocking(move || -> Result<PlaylistSyncReport, PlaylistSyncError> {
+            let client = LibraryClient::connect(&socket)
+                .map_err(|e| PlaylistSyncError::Library(e.to_string()))?;
+            let _held = lock.lock();
+            sync_playlist(&client, &store, &local, &source, &items, unix_now())
+        })
+        .await
+        .map_err(|e| SourceError::Internal {
+            message: format!("sync task failed: {e}"),
+        })?
+        .map_err(playlist_sync_error)
     }
 
     /// Start a check-updates job in the background and return at once.
@@ -1256,49 +1485,29 @@ impl BandcampService {
 
         let tracks: Arc<[SourcePlaylistTrack]> = source.tracks.into();
 
-        self.set_import_phase(job_id, ImportPhase::Matching);
-        let mut outcomes = self.match_import_tracks(&tracks).await?;
-        self.update_import(job_id, |status| {
-            status.tracks = to_import_reports(&tracks, &outcomes)
-        });
-
         // A dry run never syncs: it reports what the library has now.
-        if !dry_run && has_owned_missing(&tracks, &outcomes) {
-            self.set_import_phase(job_id, ImportPhase::Syncing);
-            match self.queue_collection_sync().await {
-                Ok(sync) => {
-                    self.wait_for_downloads(
+        let outcomes = self
+            .resolve_outcomes(
+                &tracks,
+                !dry_run,
+                |step| {
+                    self.set_import_phase(
                         job_id,
-                        &sync.queued_ids,
-                        IMPORT_DOWNLOAD_POLL,
-                        IMPORT_DOWNLOAD_LIMIT,
+                        match step {
+                            ResolveStep::Matching => ImportPhase::Matching,
+                            ResolveStep::Syncing => ImportPhase::Syncing,
+                            ResolveStep::Rematching => ImportPhase::Rematching,
+                        },
                     )
-                    .await;
-
-                    self.set_import_phase(job_id, ImportPhase::Rematching);
-                    outcomes = self.match_import_tracks(&tracks).await?;
+                },
+                |outcomes| {
                     self.update_import(job_id, |status| {
-                        status.tracks = to_import_reports(&tracks, &outcomes)
-                    });
-                }
-                Err(SyncError::LibraryUnavailable(reason)) => {
-                    // Carry on with the first-pass matches; the report lists
-                    // the rest as missing. The status has no field for the
-                    // reason: a sync that never waited is `sync` with
-                    // nothing queued and no end reason.
-                    tracing::warn!(%reason, "Import sync deferred, library unavailable");
-                    self.update_import(job_id, |status| {
-                        status.sync = Some(ImportSyncProgress {
-                            queued: 0,
-                            completed: 0,
-                            failed: 0,
-                            ended: None,
-                        })
-                    });
-                }
-                Err(SyncError::Source(e)) => return Err(e.to_string()),
-            }
-        }
+                        status.tracks = to_import_reports(&tracks, outcomes)
+                    })
+                },
+                |progress| self.update_import(job_id, |status| status.sync = Some(progress)),
+            )
+            .await?;
 
         let hashes = matched_hashes(&outcomes);
         if hashes.is_empty() {
@@ -1341,6 +1550,62 @@ impl BandcampService {
         Ok(())
     }
 
+    /// The steps an import and a playlist sync share: match the tracks, and
+    /// when `sync_missing` and an owned track is missing, run a collection
+    /// sync, wait for the downloads it needs and match again.
+    ///
+    /// The hooks tell the caller what happens: `on_phase` at each phase
+    /// (Matching, Syncing, Rematching), `on_outcomes` after each match,
+    /// `on_progress` while waiting for downloads. A sync deferred because the
+    /// library is unavailable reports a progress of nothing queued and no end
+    /// reason, and the first-pass outcomes stand. Other sync errors fail.
+    async fn resolve_outcomes(
+        &self,
+        tracks: &Arc<[SourcePlaylistTrack]>,
+        sync_missing: bool,
+        on_phase: impl Fn(ResolveStep),
+        on_outcomes: impl Fn(&[TrackOutcome]),
+        on_progress: impl Fn(ImportSyncProgress),
+    ) -> Result<Vec<TrackOutcome>, String> {
+        on_phase(ResolveStep::Matching);
+        let mut outcomes = self.match_import_tracks(tracks).await?;
+        on_outcomes(&outcomes);
+
+        if sync_missing && has_owned_missing(tracks, &outcomes) {
+            on_phase(ResolveStep::Syncing);
+            match self.queue_collection_sync().await {
+                Ok(sync) => {
+                    self.wait_for_downloads(
+                        &sync.queued_ids,
+                        IMPORT_DOWNLOAD_POLL,
+                        IMPORT_DOWNLOAD_LIMIT,
+                        &on_progress,
+                    )
+                    .await;
+
+                    on_phase(ResolveStep::Rematching);
+                    outcomes = self.match_import_tracks(tracks).await?;
+                    on_outcomes(&outcomes);
+                }
+                Err(SyncError::LibraryUnavailable(reason)) => {
+                    // Carry on with the first-pass matches; the report lists
+                    // the rest as missing. The status has no field for the
+                    // reason: a sync that never waited is a progress with
+                    // nothing queued and no end reason.
+                    tracing::warn!(%reason, "Sync deferred, library unavailable");
+                    on_progress(ImportSyncProgress {
+                        queued: 0,
+                        completed: 0,
+                        failed: 0,
+                        ended: None,
+                    });
+                }
+                Err(SyncError::Source(e)) => return Err(e.to_string()),
+            }
+        }
+        Ok(outcomes)
+    }
+
     /// Match the playlist tracks against the library. The library calls
     /// block, so they run on the blocking pool with their own client.
     /// A failed library lookup is an error: nothing may be written from a
@@ -1364,16 +1629,16 @@ impl BandcampService {
     }
 
     /// Wait until every id in `ids` has finished downloading (completed or
-    /// failed) or `limit` has passed, updating the job's sync progress on
-    /// each poll. On timeout, or when downloads are paused (the remaining
-    /// ones would not arrive), it only logs: the import carries on with
-    /// whatever has arrived.
+    /// failed) or `limit` has passed, reporting the progress to `on_progress`
+    /// on each poll. On timeout, or when downloads are paused (the remaining
+    /// ones would not arrive), it only logs: the caller (an import or a
+    /// playlist sync) carries on with whatever has arrived.
     async fn wait_for_downloads(
         &self,
-        job_id: u64,
         ids: &[String],
         poll: Duration,
         limit: Duration,
+        on_progress: impl Fn(ImportSyncProgress),
     ) -> SyncWaitEnd {
         let queued = ids.len() as u32;
         let started = Instant::now();
@@ -1386,7 +1651,7 @@ impl BandcampService {
                     queued,
                     completed,
                     failed,
-                    "Downloads are paused, continuing import with what has arrived"
+                    "Downloads are paused, continuing with what has arrived"
                 );
                 Some(SyncWaitEnd::Paused)
             } else if started.elapsed() >= limit {
@@ -1394,19 +1659,17 @@ impl BandcampService {
                     queued,
                     completed,
                     failed,
-                    "Timed out waiting for import downloads, continuing with what has arrived"
+                    "Timed out waiting for downloads, continuing with what has arrived"
                 );
                 Some(SyncWaitEnd::TimedOut)
             } else {
                 None
             };
-            self.update_import(job_id, |status| {
-                status.sync = Some(ImportSyncProgress {
-                    queued,
-                    completed,
-                    failed,
-                    ended,
-                });
+            on_progress(ImportSyncProgress {
+                queued,
+                completed,
+                failed,
+                ended,
             });
             if let Some(end) = ended {
                 return end;
@@ -1889,6 +2152,7 @@ mod tests {
     use super::*;
     use crate::job::{join_error_message, JobStatus};
     use library_ipc_protocol::{ContentHash, TrackInfo};
+    use std::cell::RefCell;
 
     // =========================================================================
     // Source identity
@@ -2303,7 +2567,7 @@ mod tests {
     async fn wait_for_downloads_returns_when_all_finished_and_reports_progress() {
         let dir = tempfile::tempdir().unwrap();
         let service = make_service(dir.path(), dir.path().join("missing.json"));
-        let job_id = service.begin_import_job(false).unwrap();
+        let progress = RefCell::new(Vec::new());
         // "a" is still absent from active_downloads (between pop_front and insert).
         service.active_downloads.lock().insert(
             "b".to_string(),
@@ -2324,30 +2588,31 @@ mod tests {
 
         let outcome = service
             .wait_for_downloads(
-                job_id,
                 &ids(&["a", "b"]),
                 Duration::from_millis(10),
                 Duration::from_secs(10),
+                |p| progress.borrow_mut().push(p),
             )
             .await;
         finish.await.unwrap();
         assert_eq!(outcome, SyncWaitEnd::AllFinished);
         assert_eq!(
-            import_status(&service).sync,
-            Some(ImportSyncProgress {
+            progress.borrow().last(),
+            Some(&ImportSyncProgress {
                 queued: 2,
                 completed: 1,
                 failed: 1,
                 ended: Some(SyncWaitEnd::AllFinished)
             })
         );
+        assert!(progress.borrow().len() > 1, "each poll is reported");
     }
 
     #[tokio::test]
     async fn wait_for_downloads_gives_up_at_the_limit() {
         let dir = tempfile::tempdir().unwrap();
         let service = make_service(dir.path(), dir.path().join("missing.json"));
-        let job_id = service.begin_import_job(false).unwrap();
+        let progress = RefCell::new(Vec::new());
         service.active_downloads.lock().insert(
             "a".to_string(),
             queued_download("a", InternalDownloadState::Downloading),
@@ -2355,16 +2620,16 @@ mod tests {
 
         let outcome = service
             .wait_for_downloads(
-                job_id,
                 &ids(&["a", "never"]),
                 Duration::from_millis(10),
                 Duration::from_millis(50),
+                |p| progress.borrow_mut().push(p),
             )
             .await;
         assert_eq!(outcome, SyncWaitEnd::TimedOut);
         assert_eq!(
-            import_status(&service).sync,
-            Some(ImportSyncProgress {
+            progress.borrow().last(),
+            Some(&ImportSyncProgress {
                 queued: 2,
                 completed: 0,
                 failed: 0,
@@ -2377,18 +2642,15 @@ mod tests {
     async fn wait_for_downloads_with_nothing_queued_returns_at_once() {
         let dir = tempfile::tempdir().unwrap();
         let service = make_service(dir.path(), dir.path().join("missing.json"));
-        let job_id = service.begin_import_job(false).unwrap();
+        let progress = RefCell::new(Vec::new());
         service
-            .wait_for_downloads(
-                job_id,
-                &[],
-                Duration::from_secs(60),
-                Duration::from_secs(60),
-            )
+            .wait_for_downloads(&[], Duration::from_secs(60), Duration::from_secs(60), |p| {
+                progress.borrow_mut().push(p)
+            })
             .await;
         assert_eq!(
-            import_status(&service).sync,
-            Some(ImportSyncProgress {
+            progress.borrow().last(),
+            Some(&ImportSyncProgress {
                 queued: 0,
                 completed: 0,
                 failed: 0,
@@ -2401,7 +2663,7 @@ mod tests {
     async fn wait_for_downloads_ends_at_once_when_downloads_are_paused() {
         let dir = tempfile::tempdir().unwrap();
         let service = make_service(dir.path(), dir.path().join("missing.json"));
-        let job_id = service.begin_import_job(false).unwrap();
+        let progress = RefCell::new(Vec::new());
         service.active_downloads.lock().insert(
             "a".to_string(),
             queued_download("a", InternalDownloadState::Downloading),
@@ -2411,17 +2673,17 @@ mod tests {
         let started = Instant::now();
         let outcome = service
             .wait_for_downloads(
-                job_id,
                 &ids(&["a"]),
                 Duration::from_millis(10),
                 Duration::from_secs(60),
+                |p| progress.borrow_mut().push(p),
             )
             .await;
         assert_eq!(outcome, SyncWaitEnd::Paused);
         assert!(started.elapsed() < Duration::from_secs(5));
         assert_eq!(
-            import_status(&service).sync,
-            Some(ImportSyncProgress {
+            progress.borrow().last(),
+            Some(&ImportSyncProgress {
                 queued: 1,
                 completed: 0,
                 failed: 0,
@@ -2434,7 +2696,6 @@ mod tests {
     async fn wait_for_downloads_reports_finished_even_when_paused() {
         let dir = tempfile::tempdir().unwrap();
         let service = make_service(dir.path(), dir.path().join("missing.json"));
-        let job_id = service.begin_import_job(false).unwrap();
         service.active_downloads.lock().insert(
             "a".to_string(),
             queued_download("a", InternalDownloadState::Completed),
@@ -2442,10 +2703,10 @@ mod tests {
         service.paused.store(true, Ordering::Relaxed);
         let outcome = service
             .wait_for_downloads(
-                job_id,
                 &ids(&["a"]),
                 Duration::from_millis(10),
                 Duration::from_secs(60),
+                |_| {},
             )
             .await;
         assert_eq!(outcome, SyncWaitEnd::AllFinished);
@@ -2950,7 +3211,7 @@ mod tests {
         ) -> SourcePlaylistTrack {
             SourcePlaylistTrack {
                 position,
-                source_track_id: format!("t{position}"),
+                source_track_id: position.to_string(),
                 title: title.to_string(),
                 artist: artist.to_string(),
                 album: None,
@@ -3139,6 +3400,211 @@ mod tests {
                 ImportPhase::Done(ImportResult::NothingMatched)
             );
             assert!(status.dry_run);
+        }
+
+        fn mine() -> PlaylistName {
+            PlaylistName::new("mine").unwrap()
+        }
+
+        /// Create the empty local playlist `mine` and link it to a Bandcamp
+        /// playlist, with no base.
+        fn link_mine(service: &Arc<BandcampService>, client: &LibraryClient) {
+            client.playlist_new(&mine(), String::new()).unwrap();
+            let mut links = service.links.load().unwrap();
+            links.upsert(PlaylistLink::new(mine(), "my-set".to_string()));
+            service.links.save(&links).unwrap();
+        }
+
+        #[tokio::test]
+        async fn sync_matches_adds_the_matched_and_keeps_the_rest_pending() {
+            let (_temp, service, client) = service_with_library("sync-happy.sock");
+            link_mine(&service, &client);
+            // The second track is not owned, so nothing is downloaded for it.
+            let playlist = source_playlist(vec![
+                source_track(1, "Carbon Based Lifeforms", "Interloper", true),
+                source_track(2, "Nobody", "Nothing", false),
+            ]);
+
+            let phases = RefCell::new(Vec::new());
+            let report = service
+                .sync_from_source(
+                    mine(),
+                    "my-set",
+                    playlist,
+                    |phase| phases.borrow_mut().push(phase),
+                    |_| {},
+                )
+                .await
+                .expect("sync");
+            assert_eq!(
+                *phases.borrow(),
+                vec![PlaylistSyncPhase::Matching, PlaylistSyncPhase::Merging],
+                "nothing to download: no sync phases"
+            );
+
+            assert_eq!((report.added, report.removed, report.moved), (1, 0, 0));
+            assert_eq!(report.pending, 1);
+            assert_eq!(client.playlist_get(&mine()).unwrap().len(), 1);
+            match service
+                .handle_request(SourceRequest::ListPlaylistLinks)
+                .await
+            {
+                SourceResponse::PlaylistLinks(links) => {
+                    assert_eq!(links.len(), 1);
+                    assert_eq!(links[0].pending.len(), 1);
+                    assert_eq!(links[0].pending[0].title, "Nothing");
+                    assert_eq!(links[0].pending[0].source_track_id, "2");
+                    assert!(links[0].last_synced.is_some());
+                }
+                other => panic!("expected PlaylistLinks, got {other:?}"),
+            }
+
+            // The same list again changes nothing.
+            let again = service
+                .sync_from_source(
+                    mine(),
+                    "my-set",
+                    source_playlist(vec![
+                        source_track(1, "Carbon Based Lifeforms", "Interloper", true),
+                        source_track(2, "Nobody", "Nothing", false),
+                    ]),
+                    |_| {},
+                    |_| {},
+                )
+                .await
+                .expect("second sync");
+            assert_eq!((again.added, again.removed, again.moved), (0, 0, 0));
+            assert_eq!(again.undo, None);
+        }
+
+        #[tokio::test]
+        async fn syncing_an_unlinked_playlist_is_an_invalid_request_and_starts_no_job() {
+            let (_temp, service, client) = service_with_library("sync-unlinked.sock");
+            client.playlist_new(&mine(), String::new()).unwrap();
+            match service
+                .handle_request(SourceRequest::SyncPlaylist { local: mine() })
+                .await
+            {
+                SourceResponse::Error(SourceError::InvalidRequest { message }) => {
+                    assert_eq!(message, "playlist mine is not linked")
+                }
+                other => panic!("expected InvalidRequest, got {other:?}"),
+            }
+            assert_eq!(service.playlist_sync_job.snapshot(), None);
+        }
+
+        #[tokio::test]
+        async fn a_sync_is_a_job_that_answers_at_once_and_ends_failed_without_cookies() {
+            let (_temp, service, client) = service_with_library("sync-job.sock");
+            link_mine(&service, &client);
+            let status = |service: &Arc<BandcampService>| service.playlist_sync_job.snapshot();
+            match service
+                .handle_request(SourceRequest::GetPlaylistSyncStatus)
+                .await
+            {
+                SourceResponse::PlaylistSyncStatus(None) => {}
+                other => panic!("expected no job yet, got {other:?}"),
+            }
+
+            let job_id = match service
+                .handle_request(SourceRequest::SyncPlaylist { local: mine() })
+                .await
+            {
+                SourceResponse::PlaylistSyncStarted { job_id } => job_id,
+                other => panic!("expected PlaylistSyncStarted, got {other:?}"),
+            };
+
+            let started = Instant::now();
+            let ended = loop {
+                let current = status(&service).expect("the job has a status");
+                assert_eq!(current.job_id, job_id);
+                assert_eq!(current.local, mine());
+                if current.phase.is_finished() {
+                    break current;
+                }
+                assert!(
+                    started.elapsed() < Duration::from_secs(10),
+                    "job never ended"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            };
+            match ended.phase {
+                PlaylistSyncPhase::Failed { message } => {
+                    assert!(message.contains("not configured"), "got: {message}")
+                }
+                other => panic!("expected Failed, got {other:?}"),
+            }
+
+            // A finished job does not block the next one.
+            match service
+                .handle_request(SourceRequest::SyncPlaylist { local: mine() })
+                .await
+            {
+                SourceResponse::PlaylistSyncStarted { job_id: next } => assert!(next > job_id),
+                other => panic!("expected PlaylistSyncStarted, got {other:?}"),
+            }
+        }
+
+        #[tokio::test]
+        async fn a_second_sync_while_one_runs_is_refused() {
+            let (_temp, service, client) = service_with_library("sync-busy.sock");
+            link_mine(&service, &client);
+            service
+                .playlist_sync_job
+                .begin(|job_id| PlaylistSyncJobStatus {
+                    job_id,
+                    local: mine(),
+                    phase: PlaylistSyncPhase::Syncing,
+                    sync: None,
+                })
+                .unwrap();
+
+            match service
+                .handle_request(SourceRequest::SyncPlaylist { local: mine() })
+                .await
+            {
+                SourceResponse::Error(SourceError::SyncInProgress { .. }) => {}
+                other => panic!("expected SyncInProgress, got {other:?}"),
+            }
+        }
+
+        #[tokio::test]
+        async fn linking_needs_the_bandcamp_cookies() {
+            let (_temp, service, _client) = service_with_library("link-nocookies.sock");
+            match service
+                .handle_request(SourceRequest::LinkPlaylist {
+                    local: mine(),
+                    source: "my-set".to_string(),
+                })
+                .await
+            {
+                SourceResponse::Error(SourceError::NotAuthenticated { .. }) => {}
+                other => panic!("expected NotAuthenticated, got {other:?}"),
+            }
+            assert_eq!(service.links.load().unwrap().links.len(), 0);
+        }
+
+        #[tokio::test]
+        async fn a_sync_with_the_library_down_fails_without_touching_the_link() {
+            let temp = tempfile::TempDir::new().unwrap();
+            let service = make_service(temp.path(), temp.path().join("missing.json"));
+            let mut links = service.links.load().unwrap();
+            links.upsert(PlaylistLink::new(mine(), "my-set".to_string()));
+            service.links.save(&links).unwrap();
+            let before = service.links.load().unwrap();
+
+            let result = service
+                .sync_from_source(
+                    mine(),
+                    "my-set",
+                    source_playlist(vec![source_track(1, "A", "B", false)]),
+                    |_| {},
+                    |_| {},
+                )
+                .await;
+
+            assert!(matches!(result, Err(SourceError::SyncFailed { .. })));
+            assert_eq!(service.links.load().unwrap(), before);
         }
 
         #[test]
