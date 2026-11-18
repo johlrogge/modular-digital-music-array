@@ -230,6 +230,16 @@ The web console (`projects/mdma-console`) is the first client to put marks on sc
 - **Surfaces:** a heart on every catalogue track row (library, album, artist, playlist, workbench, Marked; not Up next), in the now-playing bar and in the full player; named marks as small chips on a row's meta line; "Like/Unlike" and "Mark as <macro>" in the row menu; macro chips in the full player. Keys: `M` likes and `Shift+1..9` sets macro n, on the focused row, or on the bar's track when no row has focus. Mark or unmark is chosen from the marks the user saw painted, not from the store at click time. A mark answers with a toast with Undo (shown only when `changed` holds the track) and never asks to confirm. Undoing an unmark marks again with a new time; the original time is lost.
 - **Marked view** at `#/marked/:mark?`: chips All, Liked and one per macro, linked from the Library. It is built from the catalogue's `marks`, so "All" means any live mark and a track marked only with a legacy free-text scope is not listed (`mdma marked` is the place to see those). `ApiTrack.marks` is the one source; there is no separate list route.
 
+## Amendment 2026-11-18
+
+The console also writes scalar facts, starting with Energy, directly to the node (the same direct-write convention as marks above), with the user source (`user_fact_source`, tool `mdma`, origin `User`) stated by the console on each `WriteFact` / `RetractFact`. No new IPC request.
+
+- `POST /api/energy {hashes, level: 1..10 | null}` (`api/energy.rs`): a set operation like marks, with the same `{changed, tracks}` reply and the same status policy (400 without hashes, 422 for a level outside 1..10 or an unknown hash with nothing written, 207 partway, 502/503 per the library failure policy). A track already showing that level, or showing no energy to clear, is not in `changed`.
+  - Setting writes the level. The last live energy of any source is the one shown, so the new write wins.
+  - Clearing retracts every level the user asserted, so an older user value does not surface again. How energy from imports and user values combine, and what clear means across sources, is decided before the Rekordbox import lands (follow-up ADR). The clear semantics stay as they are for now.
+- The browser offers Undo by setting each changed track back to the energy `ApiTrack` showed before, or clearing it.
+- Offline push of energy is still deferred: like marks, the console writes online only, and an offline edit outbox for energy comes with the later phases of this ADR.
+
 ## Related
 
 - ADR-001, ADR-004, ADR-009, ADR-011, ADR-013, ADR-014, ADR-015

@@ -15,6 +15,7 @@ use media_protocol::{ResponseData, SourceName};
 use serde::Serialize;
 use std::sync::Arc;
 
+pub mod energy;
 pub mod library;
 pub mod marks;
 pub mod player;
@@ -31,6 +32,7 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/api/library/match", get(library::library_match))
         .route("/api/marks", post(marks::marks))
         .route("/api/marks/config", get(marks::config))
+        .route("/api/energy", post(energy::energy))
         .route(
             "/api/playlists",
             get(library::playlists).post(playlists::create),
