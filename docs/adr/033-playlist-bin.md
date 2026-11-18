@@ -25,7 +25,7 @@ Amends ADR-027 §6.1 (delete) and ADR-032 §8 (rename and delete). Builds on ADR
 
 ### 2. Storage
 
-1. **Decided:** binning renames the file, under `playlists_lock`, to `playlists/.bin/<name>.<unix-ms>.plist`. The bytes are never rewritten, so comments, short IDs and trailing text survive byte for byte.
+1. **Decided:** binning renames the file, under `playlists_lock`, to `playlists/.bin/<name>.<unix-ms>.plist`. The bytes are never rewritten, so comments, short IDs and trailing text survive byte for byte. "Never rewritten" refers to the bin step itself: `PlaylistBin` and `PlaylistDelete` read the playlist first, so the binned bytes are the file after the on-read repair (ADR-004).
 2. `BinId` is a newtype for `<name>.<unix-ms>`. It parses unambiguously, because a `PlaylistName` cannot contain `.`. Binning the same name twice is fine: the timestamps differ.
 3. `.bin/` is a directory, so the top-level `*.plist` listing never sees it. List, Search and the dedup sweep need no new branch.
 4. The directory is created when first needed. The rename is atomic (`rename(2)` within one directory tree).

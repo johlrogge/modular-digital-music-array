@@ -5,9 +5,9 @@
 //! ACID, ingestion, or file-system side effects.
 
 use crate::ipc::{
-    bookmark_scope_mark, parse_request, ContentHash, FactType, IpcServer, LibraryRequest,
-    LibraryResponse, Mark, MarkWrite, OrphanInfo, OrphanReason, PlaylistName, ProtocolError,
-    ServiceStatus, TrackInfo, TrackQuery, Unmark,
+    bookmark_scope_mark, parse_request, BinId, ContentHash, FactType, IpcServer, LibraryRequest,
+    LibraryResponse, Mark, MarkWrite, OrphanInfo, OrphanReason, PlaylistName, PlaylistVersion,
+    ProtocolError, ServiceStatus, TrackInfo, TrackQuery, Unmark,
 };
 use library_projection::{
     apply_fact, distinct_retractions, fact_values, marked, project, resolve_prefix,
@@ -56,6 +56,16 @@ impl ReleaseVersion {
     }
 }
 
+/// What `playlists_lock` guards.
+#[derive(Default)]
+struct Playlists {
+    /// Playlist name -> content (everything but append).
+    live: HashMap<String, String>,
+    /// The playlist bin (ADR-033): id -> the stored content, as the real service
+    /// keeps `playlists/.bin/<id>.plist`. Read by neither list nor search.
+    bin: Vec<(BinId, String)>,
+}
+
 /// In-memory library service (stub for BDD tests).
 ///
 /// It holds the projection's own track index and answers through the projection's
@@ -69,11 +79,12 @@ pub struct LibraryService {
     /// Lock order: `tracks` -> `lineage`.
     lineage: Mutex<LineageLog>,
     fact_index: Mutex<HashMap<FactType, HashSet<String>>>,
-    /// Playlist name -> content (everything but append). This mutex is the
-    /// stub's `playlists_lock`: held by every playlist reader and writer.
+    /// The playlists and the bin. This mutex is the stub's `playlists_lock`: held
+    /// by every playlist reader and writer, the bin's included, so the bin needs
+    /// no lock order of its own.
     ///
     /// Lock order: `playlists` -> `tracks`, as in the real service.
-    playlists: Mutex<HashMap<String, String>>,
+    playlists: Mutex<Playlists>,
     /// Every `WriteFact` received, with the source it stated, in order.
     written: Mutex<Vec<(ContentHash, MusicValue, Option<FactSource>)>>,
     tracks_count: usize,
@@ -90,6 +101,7 @@ impl LibraryService {
             .playlists
             .lock()
             .unwrap()
+            .live
             .keys()
             .filter_map(|n| PlaylistName::new(n).ok())
             .collect();
@@ -204,7 +216,7 @@ impl LibraryService {
             tracks: Mutex::new(projection.tracks),
             lineage: Mutex::new(projection.lineage),
             fact_index: Mutex::new(projection.fact_index),
-            playlists: Mutex::new(HashMap::new()),
+            playlists: Mutex::new(Playlists::default()),
             written: Mutex::new(Vec::new()),
             facts_count,
             version,
@@ -332,31 +344,69 @@ impl LibraryService {
                 commit(entry, planned)
             }),
 
+            // Delete bins too (ADR-033 §3), and answers as it always did.
             LibraryRequest::PlaylistDelete { name, version } => {
-                self.with_playlist(&name, |entry, tracks| {
-                    match playlist_edit::plan_delete(entry.get(), &version, tracks) {
-                        Ok(()) => {
-                            entry.remove();
-                            LibraryResponse::PlaylistDeleted
-                        }
-                        Err(current) => LibraryResponse::PlaylistDeleteConflict { current },
+                self.bin_at_version(&name, &version, |_| LibraryResponse::PlaylistDeleted)
+            }
+
+            LibraryRequest::PlaylistBin { name, version } => {
+                self.bin_at_version(&name, &version, |id| LibraryResponse::PlaylistBinned { id })
+            }
+
+            LibraryRequest::PlaylistRestore { id, as_name } => {
+                let mut guard = self.playlists.lock().unwrap();
+                let playlists = &mut *guard;
+                let Some(at) = playlists.bin.iter().position(|(held, _)| *held == id) else {
+                    return bin_entry_not_found(&id);
+                };
+                let target = playlist_edit::restore_target(&id, as_name);
+                if playlists.live.contains_key(target.as_str()) {
+                    return LibraryResponse::Error(ProtocolError::PlaylistAlreadyExists {
+                        name: target.to_string(),
+                    });
+                }
+                let (_, content) = playlists.bin.remove(at);
+                playlists.live.insert(target.as_str().to_string(), content);
+                LibraryResponse::PlaylistRestored { name: target }
+            }
+
+            LibraryRequest::BinList => {
+                let mut entries: Vec<_> = self
+                    .playlists
+                    .lock()
+                    .unwrap()
+                    .bin
+                    .iter()
+                    .map(|(id, content)| playlist_edit::bin_entry(id.clone(), content))
+                    .collect();
+                playlist_edit::sort_newest_first(&mut entries);
+                LibraryResponse::BinEntries(entries)
+            }
+
+            LibraryRequest::BinPurge { id } => {
+                let mut playlists = self.playlists.lock().unwrap();
+                match playlists.bin.iter().position(|(held, _)| *held == id) {
+                    Some(at) => {
+                        playlists.bin.remove(at);
+                        LibraryResponse::Pong
+                    }
+                    None => bin_entry_not_found(&id),
+                }
+            }
+
+            LibraryRequest::BinEmpty => {
+                self.playlists.lock().unwrap().bin.clear();
+                LibraryResponse::Pong
+            }
+
+            LibraryRequest::PlaylistRemove { name } => {
+                self.with_playlist_and_bin(&name, |entry, bin, _| {
+                    match bin_playlist(bin, entry, &name) {
+                        Ok(_) => LibraryResponse::Pong,
+                        Err(e) => LibraryResponse::Error(e),
                     }
                 })
             }
-
-            // ADR-033 P1: the protocol is there, the behaviour is P2.
-            LibraryRequest::PlaylistBin { .. }
-            | LibraryRequest::PlaylistRestore { .. }
-            | LibraryRequest::BinList
-            | LibraryRequest::BinPurge { .. }
-            | LibraryRequest::BinEmpty => LibraryResponse::Error(ProtocolError::Internal {
-                message: "playlist bin not implemented yet".to_string(),
-            }),
-
-            LibraryRequest::PlaylistRemove { name } => self.with_playlist(&name, |entry, _| {
-                entry.remove();
-                LibraryResponse::Pong
-            }),
 
             LibraryRequest::PlaylistAppend { name, content } => {
                 self.with_playlist(&name, |mut entry, _| {
@@ -368,28 +418,31 @@ impl LibraryService {
 
             LibraryRequest::PlaylistRename { from, to } => {
                 let mut playlists = self.playlists.lock().unwrap();
-                if !playlists.contains_key(from.as_str()) {
+                let live = &mut playlists.live;
+                if !live.contains_key(from.as_str()) {
                     return not_found(&from);
                 }
-                if playlists.contains_key(to.as_str()) {
+                if live.contains_key(to.as_str()) {
                     return LibraryResponse::Error(ProtocolError::PlaylistAlreadyExists {
                         name: to.to_string(),
                     });
                 }
-                if let Some(content) = playlists.remove(from.as_str()) {
-                    playlists.insert(to.as_str().to_string(), content);
+                if let Some(content) = live.remove(from.as_str()) {
+                    live.insert(to.as_str().to_string(), content);
                 }
                 LibraryResponse::Pong
             }
 
             LibraryRequest::PlaylistNew { name, content } => {
                 let mut playlists = self.playlists.lock().unwrap();
-                if playlists.contains_key(name.as_str()) {
+                if playlists.live.contains_key(name.as_str()) {
                     LibraryResponse::Error(ProtocolError::PlaylistAlreadyExists {
                         name: name.to_string(),
                     })
                 } else {
-                    playlists.insert(name.as_str().to_string(), content.clone());
+                    playlists
+                        .live
+                        .insert(name.as_str().to_string(), content.clone());
                     LibraryResponse::PlaylistContent(content)
                 }
             }
@@ -398,6 +451,7 @@ impl LibraryService {
                 self.playlists
                     .lock()
                     .unwrap()
+                    .live
                     .insert(name.as_str().to_string(), content.clone());
                 LibraryResponse::PlaylistContent(content)
             }
@@ -734,6 +788,10 @@ fn not_found(name: &PlaylistName) -> LibraryResponse {
     })
 }
 
+fn bin_entry_not_found(id: &BinId) -> LibraryResponse {
+    LibraryResponse::Error(ProtocolError::BinEntryNotFound { id: id.to_string() })
+}
+
 /// Store what `planned` says to write, and answer its outcome.
 fn commit(
     entry: OccupiedEntry<'_, String, String>,
@@ -746,7 +804,42 @@ fn commit(
     LibraryResponse::PlaylistEdited(outcome)
 }
 
+/// Move the playlist of `entry` into `bin` and answer its id.
+fn bin_playlist(
+    bin: &mut Vec<(BinId, String)>,
+    entry: OccupiedEntry<'_, String, String>,
+    name: &PlaylistName,
+) -> Result<BinId, ProtocolError> {
+    let id = playlist_edit::fresh_bin_id(name, std::time::SystemTime::now(), |id| {
+        bin.iter().any(|(held, _)| held == id)
+    })
+    .map_err(playlist_edit::bin_id_error)?;
+    bin.push((id.clone(), entry.remove()));
+    Ok(id)
+}
+
 impl LibraryService {
+    /// Move playlist `name` to the bin if it is still at `version` and answer
+    /// `done` with its id; a stale `version` answers `PlaylistDeleteConflict`.
+    fn bin_at_version(
+        &self,
+        name: &PlaylistName,
+        version: &PlaylistVersion,
+        done: impl FnOnce(BinId) -> LibraryResponse,
+    ) -> LibraryResponse {
+        self.with_playlist_and_bin(name, |entry, bin, tracks| match playlist_edit::plan_delete(
+            entry.get(),
+            version,
+            tracks,
+        ) {
+            Ok(()) => match bin_playlist(bin, entry, name) {
+                Ok(id) => done(id),
+                Err(e) => LibraryResponse::Error(e),
+            },
+            Err(current) => LibraryResponse::PlaylistDeleteConflict { current },
+        })
+    }
+
     /// Run `f` on the entry of playlist `name` (read, change or remove it) and on
     /// the tracks, under the playlists lock and then the tracks lock (the lock
     /// order). A missing playlist is `PlaylistNotFound`.
@@ -755,12 +848,26 @@ impl LibraryService {
         name: &PlaylistName,
         f: impl FnOnce(OccupiedEntry<'_, String, String>, &[IndexedTrackInfo]) -> LibraryResponse,
     ) -> LibraryResponse {
-        let mut playlists = self.playlists.lock().unwrap();
-        let Entry::Occupied(entry) = playlists.entry(name.as_str().to_string()) else {
+        self.with_playlist_and_bin(name, |entry, _, tracks| f(entry, tracks))
+    }
+
+    /// `with_playlist`, for `f` that also moves playlists in or out of the bin.
+    fn with_playlist_and_bin(
+        &self,
+        name: &PlaylistName,
+        f: impl FnOnce(
+            OccupiedEntry<'_, String, String>,
+            &mut Vec<(BinId, String)>,
+            &[IndexedTrackInfo],
+        ) -> LibraryResponse,
+    ) -> LibraryResponse {
+        let mut guard = self.playlists.lock().unwrap();
+        let playlists = &mut *guard;
+        let Entry::Occupied(entry) = playlists.live.entry(name.as_str().to_string()) else {
             return not_found(name);
         };
         let tracks = self.tracks.lock().unwrap();
-        f(entry, &tracks)
+        f(entry, &mut playlists.bin, &tracks)
     }
 }
 

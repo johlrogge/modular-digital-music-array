@@ -9,9 +9,9 @@
 //! with `PlaylistGet`.
 
 use library_ipc_protocol::{
-    CanonicalHash, ContentHash, Duplicates, EditOp, EditOutcome, EntryError, LibraryRequest,
-    LibraryResponse, PlaylistEntry, PlaylistName, PlaylistSnapshot, PlaylistVersion, ProtocolError,
-    Skipped, StoredPlaylist,
+    BinEntry, BinId, CanonicalHash, ContentHash, Duplicates, EditOp, EditOutcome, EntryError,
+    LibraryRequest, LibraryResponse, PlaylistEntry, PlaylistName, PlaylistSnapshot,
+    PlaylistVersion, ProtocolError, Skipped, StoredPlaylist, StringQuery,
 };
 
 /// Generates one `#[test]` per scenario of this module, each run against the
@@ -29,14 +29,24 @@ macro_rules! playlist_contract_tests {
             keep_adds_a_duplicate_again,
             revert_restores_the_exact_bytes_and_its_own_previous_redoes_the_edit,
             stale_revert_conflicts_and_writes_nothing,
-            versioned_delete_deletes,
+            versioned_delete_bins_the_playlist,
             stale_delete_conflicts_and_keeps_the_file,
             rename_is_refused_onto_an_existing_playlist,
-            remove_deletes_unconditionally,
+            remove_bins_unconditionally,
             a_refused_insert_refuses_the_whole_edit_and_writes_nothing,
             a_missing_playlist_is_not_found_for_every_operation,
             a_crlf_playlist_keeps_its_bytes_through_read_and_edit,
             append_joins_on_a_line_break,
+            binning_keeps_the_bytes_byte_identical,
+            a_stale_bin_conflicts_and_the_file_is_untouched,
+            restore_round_trips_the_bytes_under_the_same_name,
+            restoring_onto_a_taken_name_is_refused_and_writes_nothing,
+            restore_as_gives_the_playlist_another_name,
+            binning_the_same_name_twice_gives_two_entries_newest_first,
+            purge_removes_one_entry_and_empty_removes_all,
+            an_unknown_bin_id_is_bin_entry_not_found,
+            binned_playlists_are_absent_from_list_and_search,
+            delete_and_remove_bin_the_playlist,
         );
     };
     (@scenarios $setup:expr; $($scenario:ident),* $(,)?) => {
@@ -99,10 +109,7 @@ fn bytes(handler: &Handler) -> String {
 }
 
 fn snapshot(handler: &Handler) -> PlaylistSnapshot {
-    match handler(LibraryRequest::PlaylistSnapshot { name: set() }) {
-        LibraryResponse::PlaylistSnapshot(snapshot) => snapshot,
-        other => panic!("expected PlaylistSnapshot, got {other:?}"),
-    }
+    snapshot_of(handler, &set())
 }
 
 fn edit(handler: &Handler, version: &PlaylistVersion, ops: Vec<EditOp>) -> LibraryResponse {
@@ -387,7 +394,7 @@ pub fn stale_revert_conflicts_and_writes_nothing(setup: Setup) {
     assert_eq!(bytes(&handler), content());
 }
 
-pub fn versioned_delete_deletes(setup: Setup) {
+pub fn versioned_delete_bins_the_playlist(setup: Setup) {
     let handler = setup(&content());
     let version = snapshot(&handler).version;
     let response = handler(LibraryRequest::PlaylistDelete {
@@ -447,7 +454,7 @@ pub fn rename_is_refused_onto_an_existing_playlist(setup: Setup) {
     assert_not_found(handler(LibraryRequest::PlaylistGet { name: set() }));
 }
 
-pub fn remove_deletes_unconditionally(setup: Setup) {
+pub fn remove_bins_unconditionally(setup: Setup) {
     let handler = setup(&content());
     let response = handler(LibraryRequest::PlaylistRemove { name: set() });
     assert!(matches!(response, LibraryResponse::Pong), "{response:?}");
@@ -574,6 +581,10 @@ pub fn a_missing_playlist_is_not_found_for_every_operation(setup: Setup) {
             version,
         },
         LibraryRequest::PlaylistRemove { name: name.clone() },
+        LibraryRequest::PlaylistBin {
+            name: name.clone(),
+            version: stale(),
+        },
         LibraryRequest::PlaylistAppend {
             name: name.clone(),
             content: "x\n".to_string(),
@@ -586,4 +597,262 @@ pub fn a_missing_playlist_is_not_found_for_every_operation(setup: Setup) {
     for request in requests {
         assert_not_found(handler(request));
     }
+}
+
+// ----- The bin (ADR-033) -----
+
+fn bin(handler: &Handler, name: &PlaylistName) -> BinId {
+    let version = snapshot_of(handler, name).version;
+    match handler(LibraryRequest::PlaylistBin {
+        name: name.clone(),
+        version,
+    }) {
+        LibraryResponse::PlaylistBinned { id } => id,
+        other => panic!("expected PlaylistBinned, got {other:?}"),
+    }
+}
+
+fn snapshot_of(handler: &Handler, name: &PlaylistName) -> PlaylistSnapshot {
+    match handler(LibraryRequest::PlaylistSnapshot { name: name.clone() }) {
+        LibraryResponse::PlaylistSnapshot(snapshot) => snapshot,
+        other => panic!("expected PlaylistSnapshot, got {other:?}"),
+    }
+}
+
+fn bin_entries(handler: &Handler) -> Vec<BinEntry> {
+    match handler(LibraryRequest::BinList) {
+        LibraryResponse::BinEntries(entries) => entries,
+        other => panic!("expected BinEntries, got {other:?}"),
+    }
+}
+
+fn restore(handler: &Handler, id: &BinId, as_name: Option<&PlaylistName>) -> LibraryResponse {
+    handler(LibraryRequest::PlaylistRestore {
+        id: id.clone(),
+        as_name: as_name.cloned(),
+    })
+}
+
+fn restored(response: LibraryResponse) -> PlaylistName {
+    match response {
+        LibraryResponse::PlaylistRestored { name } => name,
+        other => panic!("expected PlaylistRestored, got {other:?}"),
+    }
+}
+
+fn assert_bin_entry_not_found(response: LibraryResponse) {
+    assert!(
+        matches!(
+            response,
+            LibraryResponse::Error(ProtocolError::BinEntryNotFound { .. })
+        ),
+        "expected BinEntryNotFound, got {response:?}"
+    );
+}
+
+fn name_of(text: &str) -> PlaylistName {
+    PlaylistName::new(text).expect("valid name")
+}
+
+pub fn binning_keeps_the_bytes_byte_identical(setup: Setup) {
+    // Comments, short ids, trailing text and CRLF all come back as they went.
+    for text in [content(), crlf_content()] {
+        let handler = setup(&text);
+        let id = bin(&handler, &set());
+        assert_not_found(handler(LibraryRequest::PlaylistGet { name: set() }));
+        restored(restore(&handler, &id, None));
+        assert_eq!(bytes(&handler), text);
+    }
+}
+
+pub fn a_stale_bin_conflicts_and_the_file_is_untouched(setup: Setup) {
+    let handler = setup(&content());
+    let current = snapshot(&handler);
+    let response = handler(LibraryRequest::PlaylistBin {
+        name: set(),
+        version: stale(),
+    });
+    match response {
+        LibraryResponse::PlaylistDeleteConflict { current: got } => assert_eq!(got, current),
+        other => panic!("expected PlaylistDeleteConflict, got {other:?}"),
+    }
+    assert_eq!(bytes(&handler), content());
+    assert_eq!(bin_entries(&handler), vec![]);
+}
+
+pub fn restore_round_trips_the_bytes_under_the_same_name(setup: Setup) {
+    let handler = setup(&content());
+    let before = snapshot(&handler);
+    let id = bin(&handler, &set());
+    assert_eq!(id.name(), &set());
+
+    assert_eq!(restored(restore(&handler, &id, None)), set());
+    assert_eq!(bytes(&handler), content());
+    assert_eq!(snapshot(&handler), before);
+    assert_eq!(bin_entries(&handler), vec![], "a restore empties its entry");
+}
+
+pub fn restoring_onto_a_taken_name_is_refused_and_writes_nothing(setup: Setup) {
+    let handler = setup(&content());
+    let id = bin(&handler, &set());
+    handler(LibraryRequest::PlaylistNew {
+        name: set(),
+        content: "taken\n".to_string(),
+    });
+
+    let response = restore(&handler, &id, None);
+    assert!(
+        matches!(
+            &response,
+            LibraryResponse::Error(ProtocolError::PlaylistAlreadyExists { name }) if name == "set"
+        ),
+        "{response:?}"
+    );
+    assert_eq!(bytes(&handler), "taken\n");
+    let listed = bin_entries(&handler);
+    assert_eq!(listed.len(), 1, "the entry stays in the bin");
+    assert_eq!(listed[0].id, id);
+
+    // `as` onto a taken name is refused the same way.
+    let response = restore(&handler, &id, Some(&set()));
+    assert!(
+        matches!(
+            response,
+            LibraryResponse::Error(ProtocolError::PlaylistAlreadyExists { .. })
+        ),
+        "{response:?}"
+    );
+    assert_eq!(bytes(&handler), "taken\n");
+}
+
+pub fn restore_as_gives_the_playlist_another_name(setup: Setup) {
+    let handler = setup(&content());
+    let id = bin(&handler, &set());
+    let other = name_of("renamed");
+
+    assert_eq!(restored(restore(&handler, &id, Some(&other))), other);
+    assert_eq!(get(&handler, &other), content());
+    assert_not_found(handler(LibraryRequest::PlaylistGet { name: set() }));
+    assert_eq!(bin_entries(&handler), vec![]);
+}
+
+pub fn binning_the_same_name_twice_gives_two_entries_newest_first(setup: Setup) {
+    let handler = setup(&content());
+    let first = bin(&handler, &set());
+    handler(LibraryRequest::PlaylistNew {
+        name: set(),
+        content: "second\n".to_string(),
+    });
+    let second = bin(&handler, &set());
+    assert_ne!(first, second);
+
+    let listed = bin_entries(&handler);
+    assert_eq!(
+        listed,
+        vec![
+            BinEntry {
+                id: second.clone(),
+                entry_count: 1
+            },
+            BinEntry {
+                id: first.clone(),
+                entry_count: 3
+            },
+        ]
+    );
+
+    let one = name_of("one");
+    let two = name_of("two");
+    restored(restore(&handler, &first, Some(&one)));
+    restored(restore(&handler, &second, Some(&two)));
+    assert_eq!(get(&handler, &one), content());
+    assert_eq!(get(&handler, &two), "second\n");
+}
+
+pub fn purge_removes_one_entry_and_empty_removes_all(setup: Setup) {
+    let handler = setup(&content());
+    let first = bin(&handler, &set());
+    handler(LibraryRequest::PlaylistNew {
+        name: set(),
+        content: "second\n".to_string(),
+    });
+    let second = bin(&handler, &set());
+
+    let response = handler(LibraryRequest::BinPurge { id: first.clone() });
+    assert!(matches!(response, LibraryResponse::Pong), "{response:?}");
+    let listed = bin_entries(&handler);
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].id, second);
+    assert_bin_entry_not_found(handler(LibraryRequest::BinPurge { id: first.clone() }));
+    assert_bin_entry_not_found(restore(&handler, &first, None));
+
+    handler(LibraryRequest::PlaylistNew {
+        name: set(),
+        content: "third\n".to_string(),
+    });
+    bin(&handler, &set());
+    assert_eq!(bin_entries(&handler).len(), 2);
+    let response = handler(LibraryRequest::BinEmpty);
+    assert!(matches!(response, LibraryResponse::Pong), "{response:?}");
+    assert_eq!(bin_entries(&handler), vec![]);
+    assert_bin_entry_not_found(restore(&handler, &second, None));
+
+    // Emptying an empty bin is fine.
+    let response = handler(LibraryRequest::BinEmpty);
+    assert!(matches!(response, LibraryResponse::Pong), "{response:?}");
+}
+
+pub fn an_unknown_bin_id_is_bin_entry_not_found(setup: Setup) {
+    let handler = setup(&content());
+    let unknown: BinId = "nope.1".parse().expect("a valid id");
+    assert_bin_entry_not_found(restore(&handler, &unknown, None));
+    // Even onto a name that is taken, the missing entry is what is answered.
+    assert_bin_entry_not_found(restore(&handler, &unknown, Some(&set())));
+    assert_bin_entry_not_found(handler(LibraryRequest::BinPurge { id: unknown }));
+    assert_eq!(bytes(&handler), content());
+}
+
+pub fn binned_playlists_are_absent_from_list_and_search(setup: Setup) {
+    let handler = setup(&content());
+    let names = |response: LibraryResponse| match response {
+        LibraryResponse::PlaylistNames(names) => names,
+        other => panic!("expected PlaylistNames, got {other:?}"),
+    };
+    let search = |handler: &Handler| {
+        names(handler(LibraryRequest::PlaylistSearch {
+            query: StringQuery::Contains("set".to_string()),
+        }))
+    };
+    assert_eq!(search(&handler), vec![set()]);
+
+    bin(&handler, &set());
+    assert_eq!(names(handler(LibraryRequest::PlaylistList)), vec![]);
+    assert_eq!(search(&handler), vec![]);
+}
+
+pub fn delete_and_remove_bin_the_playlist(setup: Setup) {
+    let handler = setup(&content());
+    let version = snapshot(&handler).version;
+    let response = handler(LibraryRequest::PlaylistDelete {
+        name: set(),
+        version,
+    });
+    assert!(
+        matches!(response, LibraryResponse::PlaylistDeleted),
+        "{response:?}"
+    );
+    let listed = bin_entries(&handler);
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].id.name(), &set());
+    assert_eq!(listed[0].entry_count, 3);
+    restored(restore(&handler, &listed[0].id, None));
+    assert_eq!(bytes(&handler), content());
+
+    let response = handler(LibraryRequest::PlaylistRemove { name: set() });
+    assert!(matches!(response, LibraryResponse::Pong), "{response:?}");
+    let listed = bin_entries(&handler);
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].id.name(), &set());
+    restored(restore(&handler, &listed[0].id, None));
+    assert_eq!(bytes(&handler), content());
 }

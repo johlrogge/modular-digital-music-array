@@ -150,7 +150,8 @@ pub struct LibraryService {
     retire_gate: Mutex<gate::RetireToken>,
     /// Serialises every playlist writer and every playlist read-modify-write
     /// (ADR-027 §7): the IPC handlers (New, Append, Replace, Edit, Revert, Delete,
-    /// Remove, Rename), the on-read repair (read, repair and write are one critical
+    /// Remove, Rename, and the bin's Bin, Restore, BinList, BinPurge and
+    /// BinEmpty, ADR-033), the on-read repair (read, repair and write are one critical
     /// section, so Get, Entries and Snapshot read under it), and the dedup rewrite
     /// (for its whole sweep). Without it a repair or dedup pass that read before an
     /// edit would write the old content back over it. Playlists are small and rare
@@ -207,14 +208,101 @@ fn write_playlist_atomic(path: &std::path::Path, bytes: &[u8]) -> Result<(), Pro
     })
 }
 
-/// Delete a playlist file and answer `done`. The caller holds `playlists_lock`.
-fn remove_playlist_file(path: &std::path::Path, done: LibraryResponse) -> LibraryResponse {
-    match std::fs::remove_file(path) {
-        Ok(()) => done,
-        Err(e) => LibraryResponse::Error(ProtocolError::Internal {
-            message: format!("Failed to remove playlist: {e}"),
-        }),
+/// The directory binned playlists live in (ADR-033 §2): a directory, so the
+/// top-level `*.plist` listing never sees it.
+fn bin_dir(playlists_dir: &Path) -> PathBuf {
+    playlists_dir.join(".bin")
+}
+
+/// The file a binned playlist is stored in.
+fn bin_file(playlists_dir: &Path, id: &library_ipc_protocol::BinId) -> PathBuf {
+    bin_dir(playlists_dir).join(format!("{id}.plist"))
+}
+
+fn bin_io_error(what: &str, e: std::io::Error) -> ProtocolError {
+    ProtocolError::Internal {
+        message: format!("Failed to {what}: {e}"),
     }
+}
+
+/// Move playlist `name` into the bin by `rename(2)`, so its bytes are never
+/// rewritten (ADR-033 §2), and answer its id. `.bin/` is created on first use.
+/// The one path of `PlaylistBin`, `PlaylistDelete` and `PlaylistRemove`. The
+/// caller holds `playlists_lock`.
+fn bin_playlist_file(
+    playlists_dir: &Path,
+    name: &PlaylistName,
+) -> Result<library_ipc_protocol::BinId, ProtocolError> {
+    std::fs::create_dir_all(bin_dir(playlists_dir))
+        .map_err(|e| bin_io_error("create the bin", e))?;
+    let id = playlist_edit::fresh_bin_id(name, std::time::SystemTime::now(), |id| {
+        bin_file(playlists_dir, id).exists()
+    })
+    .map_err(playlist_edit::bin_id_error)?;
+    let from = playlists_dir.join(format!("{name}.plist"));
+    std::fs::rename(&from, bin_file(playlists_dir, &id))
+        .map_err(|e| bin_io_error("move the playlist to the bin", e))?;
+    Ok(id)
+}
+
+/// Move a binned playlist back to `playlists/<target>.plist` unless that name
+/// is taken. Link then unlink, so an existing playlist is never replaced, even
+/// by a writer that does not take `playlists_lock`. The caller holds the lock.
+fn restore_playlist_file(
+    playlists_dir: &Path,
+    id: &library_ipc_protocol::BinId,
+    target: &PlaylistName,
+) -> Result<(), ProtocolError> {
+    let from = bin_file(playlists_dir, id);
+    let to = playlists_dir.join(format!("{target}.plist"));
+    match std::fs::hard_link(&from, &to) {
+        Ok(()) => std::fs::remove_file(&from).map_err(|e| {
+            // Leave the entry in the bin and no half restore behind.
+            if let Err(cleanup) = std::fs::remove_file(&to) {
+                tracing::warn!(error = %cleanup, path = %to.display(), "Could not undo a half restore");
+            }
+            bin_io_error("restore the playlist", e)
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            Err(ProtocolError::PlaylistAlreadyExists {
+                name: target.to_string(),
+            })
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && !from.exists() => {
+            Err(ProtocolError::BinEntryNotFound { id: id.to_string() })
+        }
+        Err(e) => Err(bin_io_error("restore the playlist", e)),
+    }
+}
+
+/// The bin's entries with their files: every `<BinId>.plist` that can be read.
+/// A file that is not one, or cannot be read, is skipped with a warning. It is
+/// not an entry, so neither `BinList` shows it nor `BinEmpty` unlinks it
+/// (`BinPurge` by id still can). The one view `BinList` and `BinEmpty` share.
+fn bin_listing(playlists_dir: &Path) -> Vec<(library_ipc_protocol::BinEntry, PathBuf)> {
+    let Ok(dir) = std::fs::read_dir(bin_dir(playlists_dir)) else {
+        return Vec::new();
+    };
+    dir.filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let path = e.path();
+            let id = (path.extension().and_then(|x| x.to_str()) == Some("plist"))
+                .then(|| path.file_stem().and_then(|s| s.to_str()))
+                .flatten()
+                .and_then(|stem| stem.parse::<library_ipc_protocol::BinId>().ok());
+            let Some(id) = id else {
+                tracing::warn!(path = %path.display(), "Not a bin entry; ignored");
+                return None;
+            };
+            match std::fs::read_to_string(&path) {
+                Ok(content) => Some((playlist_edit::bin_entry(id, &content), path)),
+                Err(error) => {
+                    tracing::warn!(%error, path = %path.display(), "Unreadable bin entry; ignored");
+                    None
+                }
+            }
+        })
+        .collect()
 }
 
 /// Store what `planned` says to write, and answer its outcome. The caller holds
@@ -1404,27 +1492,58 @@ impl LibraryService {
                 commit_playlist(path, planned)
             }),
 
+            // Delete bins too (ADR-033 §3), and answers as it always did.
             LibraryRequest::PlaylistDelete { name, version } => {
-                self.with_playlist(&name, |path, content| {
-                    let verdict = {
-                        let tracks = self.tracks.lock().unwrap();
-                        playlist_edit::plan_delete(content, &version, &tracks)
-                    };
-                    match verdict {
-                        Ok(()) => remove_playlist_file(path, LibraryResponse::PlaylistDeleted),
-                        Err(current) => LibraryResponse::PlaylistDeleteConflict { current },
-                    }
-                })
+                self.bin_at_version(&name, &version, |_| LibraryResponse::PlaylistDeleted)
             }
 
-            // ADR-033 P1: the protocol is there, the behaviour is P2.
-            LibraryRequest::PlaylistBin { .. }
-            | LibraryRequest::PlaylistRestore { .. }
-            | LibraryRequest::BinList
-            | LibraryRequest::BinPurge { .. }
-            | LibraryRequest::BinEmpty => LibraryResponse::Error(ProtocolError::Internal {
-                message: "playlist bin not implemented yet".to_string(),
-            }),
+            LibraryRequest::PlaylistBin { name, version } => {
+                self.bin_at_version(&name, &version, |id| LibraryResponse::PlaylistBinned { id })
+            }
+
+            LibraryRequest::PlaylistRestore { id, as_name } => {
+                let _lock = self.playlists_lock.lock().unwrap();
+                let target = playlist_edit::restore_target(&id, as_name);
+                match restore_playlist_file(&self.playlists_dir(), &id, &target) {
+                    Ok(()) => LibraryResponse::PlaylistRestored { name: target },
+                    Err(e) => LibraryResponse::Error(e),
+                }
+            }
+
+            LibraryRequest::BinList => {
+                let _lock = self.playlists_lock.lock().unwrap();
+                let mut entries: Vec<_> = bin_listing(&self.playlists_dir())
+                    .into_iter()
+                    .map(|(entry, _)| entry)
+                    .collect();
+                playlist_edit::sort_newest_first(&mut entries);
+                LibraryResponse::BinEntries(entries)
+            }
+
+            LibraryRequest::BinPurge { id } => {
+                let _lock = self.playlists_lock.lock().unwrap();
+                match std::fs::remove_file(bin_file(&self.playlists_dir(), &id)) {
+                    Ok(()) => LibraryResponse::Pong,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        LibraryResponse::Error(ProtocolError::BinEntryNotFound {
+                            id: id.to_string(),
+                        })
+                    }
+                    Err(e) => LibraryResponse::Error(bin_io_error("purge the bin entry", e)),
+                }
+            }
+
+            LibraryRequest::BinEmpty => {
+                let _lock = self.playlists_lock.lock().unwrap();
+                for (_, path) in bin_listing(&self.playlists_dir()) {
+                    if let Err(e) = std::fs::remove_file(&path) {
+                        if e.kind() != std::io::ErrorKind::NotFound {
+                            return LibraryResponse::Error(bin_io_error("empty the bin", e));
+                        }
+                    }
+                }
+                LibraryResponse::Pong
+            }
 
             LibraryRequest::PlaylistNew { name, content } => {
                 let _lock = self.playlists_lock.lock().unwrap();
@@ -1481,12 +1600,12 @@ impl LibraryService {
             }
 
             LibraryRequest::PlaylistRemove { name } => {
-                let _lock = self.playlists_lock.lock().unwrap();
-                let path = self.resolve_playlist_path(&name);
-                if !path.exists() {
-                    return LibraryResponse::Error(playlist_not_found(&name));
-                }
-                remove_playlist_file(&path, LibraryResponse::Pong)
+                self.with_playlist(&name, |_path, _content| {
+                    match bin_playlist_file(&self.playlists_dir(), &name) {
+                        Ok(_) => LibraryResponse::Pong,
+                        Err(e) => LibraryResponse::Error(e),
+                    }
+                })
             }
 
             LibraryRequest::ReindexCovers => {
@@ -2267,7 +2386,7 @@ impl LibraryService {
 
     /// The names of all playlists on disk, sorted.
     fn playlist_names(&self) -> Vec<library_ipc_protocol::PlaylistName> {
-        let dir = self.metadata_dir.join("playlists");
+        let dir = self.playlists_dir();
         let mut names: Vec<library_ipc_protocol::PlaylistName> = std::fs::read_dir(&dir)
             .into_iter()
             .flatten()
@@ -2287,10 +2406,38 @@ impl LibraryService {
         names
     }
 
+    /// Move playlist `name` to the bin if it is still at `version` (CAS through
+    /// `plan_delete`) and answer `done` with its id; a stale `version` answers
+    /// `PlaylistDeleteConflict` and changes nothing.
+    fn bin_at_version(
+        &self,
+        name: &PlaylistName,
+        version: &library_ipc_protocol::PlaylistVersion,
+        done: impl FnOnce(library_ipc_protocol::BinId) -> LibraryResponse,
+    ) -> LibraryResponse {
+        self.with_playlist(name, |_path, content| {
+            let verdict = {
+                let tracks = self.tracks.lock().unwrap();
+                playlist_edit::plan_delete(content, version, &tracks)
+            };
+            match verdict {
+                Ok(()) => match bin_playlist_file(&self.playlists_dir(), name) {
+                    Ok(id) => done(id),
+                    Err(e) => LibraryResponse::Error(e),
+                },
+                Err(current) => LibraryResponse::PlaylistDeleteConflict { current },
+            }
+        })
+    }
+
+    /// The directory the playlists (and the bin) live in.
+    fn playlists_dir(&self) -> PathBuf {
+        self.metadata_dir.join("playlists")
+    }
+
     /// Resolve a PlaylistName to an absolute filesystem path
     fn resolve_playlist_path(&self, name: &library_ipc_protocol::PlaylistName) -> PathBuf {
-        self.metadata_dir
-            .join("playlists")
+        self.playlists_dir()
             .join(format!("{}.plist", name.as_str()))
     }
 
@@ -8936,6 +9083,98 @@ mod tests {
     }
 
     playlist_edit::playlist_contract_tests!(contract_setup);
+
+    // ---- ADR-033: the bin on disk ------------------------------------------
+
+    #[test]
+    fn binning_moves_the_file_into_a_bin_directory_made_on_first_use() {
+        let (service, path, _dir, _acid) = service_with_playlist("aaaaaaaa  A\n");
+        let bin = path.parent().unwrap().join(".bin");
+        assert!(!bin.exists());
+        let response = service.handle_request(LibraryRequest::PlaylistRemove {
+            name: PlaylistName::new("set").unwrap(),
+        });
+        assert!(matches!(response, LibraryResponse::Pong), "{response:?}");
+        assert!(!path.exists());
+        let files: Vec<_> = std::fs::read_dir(&bin)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        assert_eq!(files.len(), 1);
+        assert_eq!(std::fs::read(&files[0]).unwrap(), b"aaaaaaaa  A\n");
+    }
+
+    #[test]
+    fn files_in_the_bin_that_are_no_entries_are_skipped_and_never_deleted() {
+        let (service, path, _dir, _acid) = service_with_playlist("aaaaaaaa  A\n");
+        let bin = path.parent().unwrap().join(".bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let junk = [bin.join("notes.txt"), bin.join("not-an-id.plist")];
+        for file in &junk {
+            std::fs::write(file, "keep me\n").unwrap();
+        }
+        let listed =
+            |service: &LibraryService| match service.handle_request(LibraryRequest::BinList) {
+                LibraryResponse::BinEntries(entries) => entries,
+                other => panic!("expected BinEntries, got {other:?}"),
+            };
+        assert_eq!(listed(&service), vec![]);
+
+        // A well-named entry that cannot be read is no entry either: BinList
+        // does not show it, so BinEmpty must not unlink it.
+        let unreadable = bin.join("set.1.plist");
+        std::fs::write(&unreadable, [0xff, 0xfe, b'\n']).unwrap();
+        assert_eq!(listed(&service), vec![]);
+
+        service.handle_request(LibraryRequest::PlaylistRemove {
+            name: PlaylistName::new("set").unwrap(),
+        });
+        assert_eq!(listed(&service).len(), 1);
+        let response = service.handle_request(LibraryRequest::BinEmpty);
+        assert!(matches!(response, LibraryResponse::Pong), "{response:?}");
+        assert_eq!(listed(&service), vec![]);
+        for file in &junk {
+            assert_eq!(std::fs::read_to_string(file).unwrap(), "keep me\n");
+        }
+        assert_eq!(std::fs::read(&unreadable).unwrap(), [0xff, 0xfe, b'\n']);
+
+        // BinPurge by id can still remove it.
+        let response = service.handle_request(LibraryRequest::BinPurge {
+            id: "set.1".parse().unwrap(),
+        });
+        assert!(matches!(response, LibraryResponse::Pong), "{response:?}");
+        assert!(!unreadable.exists());
+    }
+
+    #[test]
+    fn a_hash_replaced_while_binned_is_repaired_when_the_playlist_is_restored() {
+        let old = ContentHash::new(full_hash("aaaa", 'a'));
+        let new = ContentHash::new(full_hash("bbbb", 'b'));
+        let (service, metadata_dir, _acid) =
+            make_service_with_replaces(&[(new.clone(), "New")], &[(new.clone(), old.clone())]);
+        let playlists = metadata_dir.path().join("playlists");
+        let path = playlists.join("set.plist");
+        let text = format!("# c\n{old}  Artist - Title\n");
+        let name = PlaylistName::new("set").unwrap();
+
+        // A file binned before the hash was replaced, written straight into the bin.
+        std::fs::create_dir_all(playlists.join(".bin")).unwrap();
+        std::fs::write(playlists.join(".bin").join("set.5.plist"), &text).unwrap();
+        let id: library_ipc_protocol::BinId = "set.5".parse().unwrap();
+
+        service.handle_request(LibraryRequest::PlaylistRestore { id, as_name: None });
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            text,
+            "restore itself rewrites nothing"
+        );
+        let got = service.handle_request(LibraryRequest::PlaylistGet { name });
+        let expected = format!("# c\n{new}  Artist - Title\n");
+        assert!(
+            matches!(&got, LibraryResponse::PlaylistContent(c) if *c == expected),
+            "{got:?}"
+        );
+    }
 
     #[test]
     fn a_repair_keeps_crlf_line_ends_and_trailing_text() {
