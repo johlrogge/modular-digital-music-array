@@ -344,6 +344,15 @@ impl LibraryService {
                 })
             }
 
+            // ADR-033 P1: the protocol is there, the behaviour is P2.
+            LibraryRequest::PlaylistBin { .. }
+            | LibraryRequest::PlaylistRestore { .. }
+            | LibraryRequest::BinList
+            | LibraryRequest::BinPurge { .. }
+            | LibraryRequest::BinEmpty => LibraryResponse::Error(ProtocolError::Internal {
+                message: "playlist bin not implemented yet".to_string(),
+            }),
+
             LibraryRequest::PlaylistRemove { name } => self.with_playlist(&name, |entry, _| {
                 entry.remove();
                 LibraryResponse::Pong

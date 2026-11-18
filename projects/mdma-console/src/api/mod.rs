@@ -248,7 +248,7 @@ pub fn library_backend(state: &AppState) -> Result<LibraryBackend, Reply> {
 
 /// The one policy for a library call that failed, shared by every route:
 /// - transport (the gateway or library cannot be reached): 503;
-/// - no such playlist: 404;
+/// - no such playlist or bin entry: 404;
 /// - a playlist that already exists: 409;
 /// - input the library refused (an unknown or ambiguous hash, ...): 422;
 /// - anything else (`InvalidRequest` from an old node, `Internal`): 502.
@@ -258,7 +258,9 @@ pub fn library_backend(state: &AppState) -> Result<LibraryBackend, Reply> {
 pub fn library_failure_status(error: &ClientError) -> StatusCode {
     match error {
         ClientError::Transport(_) => StatusCode::SERVICE_UNAVAILABLE,
-        ClientError::Protocol(ProtocolError::PlaylistNotFound { .. }) => StatusCode::NOT_FOUND,
+        ClientError::Protocol(
+            ProtocolError::PlaylistNotFound { .. } | ProtocolError::BinEntryNotFound { .. },
+        ) => StatusCode::NOT_FOUND,
         ClientError::Protocol(
             ProtocolError::AmbiguousHash { .. }
             | ProtocolError::HashNotCanonical { .. }

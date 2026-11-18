@@ -1417,6 +1417,15 @@ impl LibraryService {
                 })
             }
 
+            // ADR-033 P1: the protocol is there, the behaviour is P2.
+            LibraryRequest::PlaylistBin { .. }
+            | LibraryRequest::PlaylistRestore { .. }
+            | LibraryRequest::BinList
+            | LibraryRequest::BinPurge { .. }
+            | LibraryRequest::BinEmpty => LibraryResponse::Error(ProtocolError::Internal {
+                message: "playlist bin not implemented yet".to_string(),
+            }),
+
             LibraryRequest::PlaylistNew { name, content } => {
                 let _lock = self.playlists_lock.lock().unwrap();
                 let path = self.resolve_playlist_path(&name);

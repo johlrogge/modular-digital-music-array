@@ -35,12 +35,12 @@ Amends ADR-027 §6.1 (delete) and ADR-032 §8 (rename and delete). Builds on ADR
 1. **`PlaylistBin { name, version }`** is a new request. It is CAS, through `plan_delete`, and answers `PlaylistBinned { id }` (or `PlaylistDeleteConflict { current }`, the ADR-027 shape). It is a new variant so that an old node refuses it as an unknown variant instead of really deleting.
 2. **`PlaylistDelete` and `PlaylistRemove` also bin**, on the server. There is one path, and a stale caller loses nothing.
 3. Only **`BinPurge { id }`** and **`BinEmpty`** unlink files.
-4. **`BinList`** answers `BinEntries [{ id, name, binned_at, entry_count }]`. `binned_at` comes from the id; `entry_count` counts entry lines of the stored bytes.
+4. **`BinList`** answers `BinEntries [{ id, entry_count }]`. The name and the binned time come from the id (`id.name()`, and the unix ms in `id.binned_at_ms()`), so an entry cannot contradict its id. `entry_count` counts entry lines of the stored bytes.
 
 ### 4. Restore
 
 1. `PlaylistRestore { id, as: Option<PlaylistName> }` renames the file back to `playlists/<name>.plist` under `playlists_lock`. `as` gives another name.
-2. If the target name is taken, it answers the existing `PlaylistAlreadyExists` (ADR-027's third 409 shape) and writes nothing. The console then offers "Restore as...".
+2. On success it answers `PlaylistRestored { name }`, the name the playlist now has. If the target name is taken, it answers the existing `PlaylistAlreadyExists` (ADR-027's third 409 shape) and writes nothing. The console then offers "Restore as...". An id that is not in the bin answers `BinEntryNotFound { id }`, which the console maps to 404.
 3. The library never picks a name by itself and never suggests one. The user types it.
 4. Stale hashes need no special work. The dedup sweep skipped the binned file, so a hash that was merged away meanwhile is fixed by the normal on-read successor repair after Restore (ADR-004).
 
@@ -63,7 +63,7 @@ Amends ADR-027 §6.1 (delete) and ADR-032 §8 (rename and delete). Builds on ADR
    - `DELETE /api/bin/{id}`
    - `DELETE /api/bin`
    - `DELETE /api/playlists/{name}` now bins.
-5. Status codes follow ADR-027 §9: 409 for a version conflict (`{current}`) and for a restore name clash (`{error}`), 422 for an invalid name or id, 404 for a missing playlist or bin entry. A node without the new variants answers 502 (no fallback).
+5. Status codes follow ADR-027 §9: 409 for a version conflict (`{current}`) and for a restore name clash (`{error}`), 422 for an invalid name or id, 404 for a missing playlist or bin entry. An invalid bin id gives 422, parsed in the console route handler before the library is asked. An invalid playlist name on the existing `DELETE /api/playlists/{name}` keeps today's 400. A node without the new variants answers 502 (no fallback).
 
 ### 7. CLI
 

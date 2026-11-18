@@ -5676,6 +5676,7 @@ dependencies = [
  "music-facts",
  "music-primitives",
  "pretty_assertions",
+ "proptest",
  "rstest",
  "serde",
  "serde_json",
