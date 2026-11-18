@@ -5,6 +5,8 @@ mod cache;
 mod check_updates;
 mod ipc;
 mod job;
+mod playlist_links;
+mod playlist_sync;
 mod service;
 
 use ::service::{ServiceConfig, ServiceSockets};

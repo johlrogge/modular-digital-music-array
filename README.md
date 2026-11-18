@@ -170,7 +170,7 @@ This is a [Polylith](https://polylith.gitbook.io/polylith/) workspace. Deployabl
 | `mdma-audio` | Audio playback source — wraps PlaybackEngine (Symphonia + rubato + PipeWire), speaks `stream_source_protocol` over NNG |
 | `mdma-tui` | Terminal UI — multi-pane tabs (nnn-style, `1`–`5`/`6`–`0`), field-aware search grammar (`:artist`, `:bpm`, `:added`, …), DJ shortcuts (`A`, `P`, `d`/`p`, `u`), modal keybindings, command palette, live queue sync, intelligent column compression, own theme colours on every terminal (`MDMA_TUI_COLORS=truecolor\|24bit\|256` overrides detection) |
 | `mdma-bandcamp` | Bandcamp source — collection sync into the library inbox, fan playlist listing/fetching, and background playlist import jobs for `mdma source bandcamp` |
-| `mdma-console` | Web management console — player controls, search with mix-well key filter, queue, playlist workbench with preview timeline and seek, marks/hearts, key notation setting, upload, export |
+| `mdma-console` | Web management console — player controls, search with mix-well key filter, queue, playlist workbench with preview timeline and seek, marks/hearts, energy filter/column/editing, playlist bin, Bandcamp playlist sync, key notation setting, upload, export |
 | `mdma-cli` | CLI — search, queue, playlists, playback, export, subscribe, marks, Bandcamp playlist import, play history, local fact replica, offline shell completions |
 | `dj-workspace` | Bevy GUI app (laptop-only, not packaged for Pi) — playlist browser and BPM/Key/Role/Energy candidate finder with sortable results; connects via gateway (`dj-workspace --node <host>`) |
 
@@ -279,7 +279,7 @@ Quick install is at the [top](#install). Every `vX.Y.Z` release publishes `mdma-
 
 ```bash
 # Install a specific release
-curl -fsSL https://raw.githubusercontent.com/johlrogge/modular-digital-music-array/master/scripts/install-mdma.sh | bash -s v0.39.1
+curl -fsSL https://raw.githubusercontent.com/johlrogge/modular-digital-music-array/master/scripts/install-mdma.sh | bash -s v0.40.0
 
 # Install to a user-writable location (no sudo)
 curl -fsSL https://raw.githubusercontent.com/johlrogge/modular-digital-music-array/master/scripts/install-mdma.sh | MDMA_INSTALL_DIR=~/.local/bin bash
@@ -297,6 +297,20 @@ cp target/release/mdma /usr/local/bin/
 ---
 
 See [ROADMAP.md](ROADMAP.md) for detailed status and planned work.
+
+---
+
+## What's new in 0.40
+
+### Playlist bin, energy, rekordbox ratings, Bandcamp playlist sync
+
+- **Playlist bin** (ADR-033): deleting a playlist moves it to a bin, with Undo. The `#/bin` view restores, restores under a new name, purges or empties; `mdma playlist rm` bins, and `mdma playlist bin ls|restore|purge|empty --yes` manages it.
+- **Energy in the console:** From/To filter, Energy column and sorts, set or clear per track or for all narrowed tracks (with Undo). `mdma search --energy` shares the check. Blanks sort last everywhere.
+- **Rekordbox rating ↔ energy** (ADR-034): `mdma rekordbox import --enrich` merges stars into energy (stars × 2) with a three-way merge; local changes win, export writes stars back. Run import before export.
+- **Bandcamp playlist sync** (ADR-032): link a local playlist to a Bandcamp one and Sync. Your local changes win, Bandcamp's changes are applied; it runs as a background job and ends with a toast with counts and Undo.
+- **Preview timeline:** red bar lines, and Shift+←/→ jumps a bar.
+
+**Known issues:** #121 (untagged track exported to rekordbox can't be matched on re-import), #118 (`rm` refuses a non-UTF-8 playlist file), and renaming, deleting or binning a linked playlist doesn't update its Bandcamp link yet. See CHANGELOG.md.
 
 ---
 

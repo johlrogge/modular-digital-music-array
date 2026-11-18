@@ -308,6 +308,27 @@ User-authored metadata written as facts through ACID:
 
 ---
 
+### 17. Three-way Bandcamp Playlist Sync (ADR-032)
+
+**Why:** The Bandcamp import drops unmatched items and replaces the playlist whole, so local edits are lost and later Bandcamp changes cannot be pulled in safely.
+
+- One-way three-way merge (base = last synced, theirs = Bandcamp now, ours = local); local changes win; MDMA never writes to Bandcamp
+- Sync only from a console Sync button; "Bandcamp" link badge; unmatched items shown as pending
+- Phases: 0 ADR, 1 `sequence_merge`, 2 `playlist_edit::ops_between`, 3 mdma-bandcamp link/sync requests, 4 console routes and UI, 5 stage2 hardware test
+
+---
+
+### 18. Playlist Bin (ADR-033)
+
+**Why:** Deleting a playlist unlinks the file for good, so a mis-click or a stale `rm` loses comments, short IDs and order.
+
+- Every delete moves the file to `playlists/.bin/<name>.<unix-ms>.plist`; bytes untouched; only Purge and Empty bin unlink
+- Restore (optionally `as` a new name; a clash is a 409, the user types the name); Bandcamp link inactive while binned
+- Console: delete with Undo toast, Bin section with Restore/Purge; CLI `mdma playlist bin ls|restore|purge|empty`
+- Phases: 0 ADR, 1 protocol and `BinId`, 2 library service and stub contract suite, 3 gateway and console routes, 4 console UI, 5 CLI, 6 stage2 (deploy gateway, library, console together)
+
+---
+
 ## Post-Beta: Party Modes (placeholder — needs design discussion)
 
 See `documents/vision/The_Art_of_Shared_Listening_-_Party_Modes_Marketing_Copy.md` for initial thinking.

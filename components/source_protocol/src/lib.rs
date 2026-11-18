@@ -4,6 +4,7 @@
 //! Authentication and configuration are internal concerns — the source
 //! service reads its own config files.
 
+use library_ipc_protocol::{PlaylistName, PlaylistVersion, StoredPlaylist};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use thiserror::Error;
@@ -100,6 +101,29 @@ pub enum SourceRequest {
     /// Get the current or last check-updates job.
     /// Answer with `SourceResponse::CheckStatus`.
     GetCheckStatus,
+
+    /// Link the local playlist `local` to a source playlist (a slug or a URL).
+    /// Linking the playlist `local` is already linked to changes nothing; a
+    /// different one replaces the link and starts without a base (ADR-032 §7,
+    /// §8). Answer with `SourceResponse::PlaylistLinked`.
+    LinkPlaylist { local: PlaylistName, source: String },
+
+    /// Start a background job that three-way syncs the linked local playlist
+    /// with its source playlist (ADR-032). Answer with
+    /// `SourceResponse::PlaylistSyncStarted`. Only two refusals are answered
+    /// up front: `SourceError::PlaylistNotLinked` when `local` is not linked and
+    /// `SourceError::SyncInProgress` if a job is running. Anything else, such
+    /// as a local playlist that does not exist, ends the job as
+    /// `PlaylistSyncPhase::Failed { message }`.
+    SyncPlaylist { local: PlaylistName },
+
+    /// Get the current or last playlist sync job.
+    /// Answer with `SourceResponse::PlaylistSyncStatus`.
+    GetPlaylistSyncStatus,
+
+    /// List the playlist links with their pending items.
+    /// Answer with `SourceResponse::PlaylistLinks`.
+    ListPlaylistLinks,
 }
 
 // ============================================================================
@@ -165,6 +189,18 @@ pub enum SourceResponse {
 
     /// Result of a GetCheckStatus request: the current or last job, if any.
     CheckStatus(Option<CheckJobStatus>),
+
+    /// A playlist was linked.
+    PlaylistLinked(PlaylistLinkInfo),
+
+    /// A playlist sync job was started.
+    PlaylistSyncStarted { job_id: u64 },
+
+    /// Result of a GetPlaylistSyncStatus request: the current or last job, if any.
+    PlaylistSyncStatus(Option<PlaylistSyncJobStatus>),
+
+    /// Result of a ListPlaylistLinks request.
+    PlaylistLinks(Vec<PlaylistLinkInfo>),
 
     /// Error response.
     Error(SourceError),
@@ -427,6 +463,88 @@ pub struct CheckJobStatus {
     pub results: Vec<ItemCheckResult>,
 }
 
+/// A source playlist item the library cannot match yet (ADR-032 §4): waiting
+/// to be added once it resolves.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingPlaylistTrack {
+    pub source_track_id: String,
+    pub title: String,
+    pub artist: String,
+}
+
+/// A link between a local playlist and a source playlist.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlaylistLinkInfo {
+    pub local: PlaylistName,
+    /// The source playlist as linked: a slug or a URL.
+    pub source: String,
+    /// Items of the source playlist the library cannot match yet, in source order.
+    pub pending: Vec<PendingPlaylistTrack>,
+    /// Unix seconds of the last completed sync; `None` before the first.
+    pub last_synced: Option<u64>,
+}
+
+/// What it takes to undo a sync with `PlaylistRevert` (ADR-027).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlaylistUndo {
+    /// The version the sync left the playlist at.
+    pub version: PlaylistVersion,
+    /// The playlist as it was before the sync.
+    pub previous: StoredPlaylist,
+}
+
+/// What one sync did to the local playlist, in counts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlaylistSyncReport {
+    pub local: PlaylistName,
+    pub added: u32,
+    pub removed: u32,
+    pub moved: u32,
+    /// Source items still unmatched after the sync.
+    pub pending: u32,
+    /// Present exactly when the sync wrote the playlist.
+    pub undo: Option<PlaylistUndo>,
+}
+
+/// Phase of a playlist sync job.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PlaylistSyncPhase {
+    /// Fetching the playlist from the source.
+    Fetching,
+    /// Matching its tracks against the library.
+    Matching,
+    /// Syncing the collection and waiting for queued downloads.
+    Syncing,
+    /// Matching again after downloads finished.
+    Rematching,
+    /// Merging into the local playlist.
+    Merging,
+    /// Finished successfully, with what the sync did.
+    Done(PlaylistSyncReport),
+    /// Aborted with an error.
+    Failed { message: String },
+}
+
+impl PlaylistSyncPhase {
+    /// Whether the job has ended (Done or Failed).
+    pub fn is_finished(&self) -> bool {
+        matches!(
+            self,
+            PlaylistSyncPhase::Done(_) | PlaylistSyncPhase::Failed { .. }
+        )
+    }
+}
+
+/// Status of a playlist sync job.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlaylistSyncJobStatus {
+    pub job_id: u64,
+    pub local: PlaylistName,
+    pub phase: PlaylistSyncPhase,
+    /// Progress of the downloads the sync waits for, as in an import.
+    pub sync: Option<ImportSyncProgress>,
+}
+
 impl CheckPhase {
     /// Whether the job has ended (Done or Failed).
     pub fn is_finished(&self) -> bool {
@@ -478,6 +596,14 @@ pub enum SourceError {
     /// A check-updates job is already running.
     #[error("check already running: job {job_id}")]
     CheckInProgress { job_id: u64 },
+
+    /// A playlist sync job is already running.
+    #[error("playlist sync already running: job {job_id}")]
+    SyncInProgress { job_id: u64 },
+
+    /// The local playlist is not linked to a source playlist (ADR-032 §8).
+    #[error("playlist {name} is not linked")]
+    PlaylistNotLinked { name: PlaylistName },
 }
 
 impl SourceError {
@@ -1110,6 +1236,81 @@ mod tests {
                 assert_eq!(e.to_string(), "check already running: job 2");
             }
             _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn playlist_link_requests_and_responses_roundtrip() {
+        let local = PlaylistName::new("friday").unwrap();
+        for req in [
+            SourceRequest::LinkPlaylist {
+                local: local.clone(),
+                source: "friday-set".to_string(),
+            },
+            SourceRequest::SyncPlaylist {
+                local: local.clone(),
+            },
+            SourceRequest::GetPlaylistSyncStatus,
+            SourceRequest::ListPlaylistLinks,
+        ] {
+            let json = serde_json::to_string(&req).unwrap();
+            let parsed: SourceRequest = serde_json::from_str(&json).unwrap();
+            assert_eq!(format!("{parsed:?}"), format!("{req:?}"));
+        }
+
+        let info = PlaylistLinkInfo {
+            local: local.clone(),
+            source: "friday-set".to_string(),
+            pending: vec![PendingPlaylistTrack {
+                source_track_id: "9".to_string(),
+                title: "Nine".to_string(),
+                artist: "N".to_string(),
+            }],
+            last_synced: Some(1_700_000_000),
+        };
+        let report = PlaylistSyncReport {
+            local,
+            added: 2,
+            removed: 1,
+            moved: 3,
+            pending: 1,
+            undo: Some(PlaylistUndo {
+                version: PlaylistVersion::of(b"after"),
+                previous: StoredPlaylist::new("before"),
+            }),
+        };
+        let status = |phase| PlaylistSyncJobStatus {
+            job_id: 5,
+            local: PlaylistName::new("friday").unwrap(),
+            phase,
+            sync: Some(ImportSyncProgress {
+                queued: 2,
+                completed: 1,
+                failed: 0,
+                ended: None,
+            }),
+        };
+        assert!(!PlaylistSyncPhase::Syncing.is_finished());
+        assert!(PlaylistSyncPhase::Done(report.clone()).is_finished());
+        assert!(PlaylistSyncPhase::Failed {
+            message: "x".to_string()
+        }
+        .is_finished());
+        for resp in [
+            SourceResponse::PlaylistLinked(info.clone()),
+            SourceResponse::PlaylistSyncStarted { job_id: 5 },
+            SourceResponse::PlaylistSyncStatus(None),
+            SourceResponse::PlaylistSyncStatus(Some(status(PlaylistSyncPhase::Done(report)))),
+            SourceResponse::PlaylistSyncStatus(Some(status(PlaylistSyncPhase::Rematching))),
+            SourceResponse::PlaylistLinks(vec![info]),
+            SourceResponse::Error(SourceError::SyncInProgress { job_id: 5 }),
+            SourceResponse::Error(SourceError::PlaylistNotLinked {
+                name: PlaylistName::new("friday").unwrap(),
+            }),
+        ] {
+            let json = serde_json::to_string(&resp).unwrap();
+            let parsed: SourceResponse = serde_json::from_str(&json).unwrap();
+            assert_eq!(format!("{parsed:?}"), format!("{resp:?}"));
         }
     }
 

@@ -37,6 +37,11 @@ impl EnergyLevel {
         Ok(EnergyLevel(level))
     }
 
+    /// Every level, from 1 to 10.
+    pub fn all() -> impl Iterator<Item = EnergyLevel> {
+        (1..=10).map(EnergyLevel)
+    }
+
     /// Get the raw value (1..=10).
     pub fn value(self) -> u8 {
         self.0
@@ -76,6 +81,12 @@ mod tests {
     #[case(10)]
     fn valid_range(#[case] level: u8) {
         assert!(EnergyLevel::new(level).is_ok());
+    }
+
+    #[test]
+    fn all_is_every_level_in_order() {
+        let all: Vec<u8> = EnergyLevel::all().map(EnergyLevel::value).collect();
+        assert_eq!(all, (1..=10).collect::<Vec<u8>>());
     }
 
     #[rstest]

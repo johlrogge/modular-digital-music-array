@@ -12,6 +12,10 @@ interface = "rekordbox-roundtrip"
 [dependencies]
 rekordbox-xml = { workspace = true }
 music-facts = { workspace = true }
+sequence-merge = { workspace = true }
+serde = { workspace = true }
 
 [dev-dependencies]
 pretty_assertions = "1"
+proptest = { workspace = true }
+rstest = { workspace = true }

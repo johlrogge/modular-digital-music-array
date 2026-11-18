@@ -17,6 +17,9 @@ library-ipc-client = { path = "../../components/library_ipc_client" }
 library-search = { workspace = true }
 track-matcher = { workspace = true }
 playlist-import = { workspace = true }
+playlist-edit = { workspace = true }
+sequence-merge = { workspace = true }
+private-file = { workspace = true }
 inbox-utils = { path = "../../components/inbox_utils" }
 service = { workspace = true }
 nng = "1.0"

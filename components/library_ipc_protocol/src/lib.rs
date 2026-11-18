@@ -245,6 +245,121 @@ impl std::fmt::Display for PlaylistName {
 }
 
 // ============================================================================
+// Playlist Bin (ADR-033)
+// ============================================================================
+
+/// Id of a binned playlist: `<name>.<unix-ms>`. A `PlaylistName` cannot hold
+/// `.`, so the split at the dot is unambiguous. Binning the same name twice
+/// gives two ids, because the timestamps differ.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct BinId {
+    name: PlaylistName,
+    binned_at_ms: u64,
+}
+
+/// Why a string is not a `BinId`.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum BinIdError {
+    #[error("bin id must be <name>.<unix-ms>: {id}")]
+    Malformed { id: String },
+    #[error("bin id has an invalid playlist name: {id}")]
+    InvalidName { id: String },
+    #[error("bin id has an invalid timestamp: {id}")]
+    InvalidTimestamp { id: String },
+}
+
+impl BinId {
+    /// The id of `name` binned at `at`, to the millisecond. Refused when `at` is
+    /// before the Unix epoch or beyond the range an id can hold.
+    pub fn new(name: PlaylistName, at: std::time::SystemTime) -> Result<Self, BinIdError> {
+        let binned_at_ms = at
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|d| u64::try_from(d.as_millis()).ok())
+            .and_then(Self::checked_ms)
+            .ok_or_else(|| BinIdError::InvalidTimestamp {
+                id: format!("{name}.{at:?}"),
+            })?;
+        Ok(Self { name, binned_at_ms })
+    }
+
+    /// `ms` when it is in range: it fits an `i64` and is a time `SystemTime`
+    /// can hold, so `binned_at` never panics. The one bound, for `new` and
+    /// for parsing.
+    fn checked_ms(ms: u64) -> Option<u64> {
+        i64::try_from(ms).ok()?;
+        std::time::UNIX_EPOCH.checked_add(std::time::Duration::from_millis(ms))?;
+        Some(ms)
+    }
+
+    /// The playlist's name when it was binned.
+    pub fn name(&self) -> &PlaylistName {
+        &self.name
+    }
+
+    /// When the playlist was binned, milliseconds since the Unix epoch.
+    pub fn binned_at_ms(&self) -> u64 {
+        self.binned_at_ms
+    }
+
+    /// When the playlist was binned.
+    pub fn binned_at(&self) -> std::time::SystemTime {
+        std::time::UNIX_EPOCH + std::time::Duration::from_millis(self.binned_at_ms)
+    }
+}
+
+impl std::str::FromStr for BinId {
+    type Err = BinIdError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let (name, ms) = s
+            .split_once('.')
+            .ok_or_else(|| BinIdError::Malformed { id: s.to_string() })?;
+        let name =
+            PlaylistName::new(name).map_err(|_| BinIdError::InvalidName { id: s.to_string() })?;
+        // Only the canonical form, so that parse and display round-trip: digits
+        // only (`u64::from_str` also takes '+'), and no leading zero.
+        let canonical =
+            ms.bytes().all(|b| b.is_ascii_digit()) && (ms == "0" || !ms.starts_with('0'));
+        let binned_at_ms = canonical
+            .then(|| ms.parse::<u64>().ok())
+            .flatten()
+            .and_then(Self::checked_ms)
+            .ok_or_else(|| BinIdError::InvalidTimestamp { id: s.to_string() })?;
+        Ok(Self { name, binned_at_ms })
+    }
+}
+
+impl TryFrom<String> for BinId {
+    type Error = BinIdError;
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        s.parse()
+    }
+}
+
+impl From<BinId> for String {
+    fn from(id: BinId) -> String {
+        id.to_string()
+    }
+}
+
+impl std::fmt::Display for BinId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}", self.name, self.binned_at_ms)
+    }
+}
+
+/// One binned playlist, as `BinList` lists it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BinEntry {
+    /// Carries the name (`id.name()`) and the binned time (`id.binned_at_ms()`).
+    pub id: BinId,
+    /// Entry lines in the stored bytes.
+    pub entry_count: usize,
+}
+
+// ============================================================================
 // Playlist Entries
 // ============================================================================
 
@@ -383,7 +498,7 @@ pub enum EditOutcome {
 }
 
 /// One playlist line as the library resolved it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "status")]
 pub enum PlaylistEntry {
     /// The line names this track.
@@ -393,7 +508,7 @@ pub enum PlaylistEntry {
 }
 
 /// Why a playlist line did not resolve to a track. `hash` is the stored token.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Error)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Error)]
 pub enum EntryError {
     #[error("unknown track {hash}")]
     Unknown { hash: ContentHash },
@@ -469,6 +584,10 @@ pub enum ProtocolError {
     #[error("playlist already exists: {name}")]
     PlaylistAlreadyExists { name: String },
 
+    /// No such entry in the playlist bin (ADR-033).
+    #[error("bin entry not found: {id}")]
+    BinEntryNotFound { id: String },
+
     #[error("invalid playlist name: {name}")]
     InvalidPlaylistName { name: String },
 
@@ -532,6 +651,21 @@ pub const USER_ORIGIN: &str = "User";
 /// they carry no `source`. `version` is the version of the writer.
 pub fn user_fact_source(version: impl Into<String>) -> FactSource {
     FactSource::new(USER_TOOL, version, USER_ORIGIN)
+}
+
+/// Origin kind of facts imported from Rekordbox.
+pub const REKORDBOX_ORIGIN: &str = "Rekordbox";
+
+/// The source of facts a Rekordbox import writes (ADR-034). `version` is the version
+/// of the writer.
+pub fn rekordbox_source(version: impl Into<String>) -> FactSource {
+    FactSource::new(USER_TOOL, version, REKORDBOX_ORIGIN)
+}
+
+/// Every source that writes energy: the user's and Rekordbox's. A clear retracts the
+/// energy of all of them, or one it left behind would show again (ADR-034 §4).
+pub fn energy_sources(version: &str) -> [FactSource; 2] {
+    [user_fact_source(version), rekordbox_source(version)]
 }
 
 // ============================================================================
@@ -641,6 +775,31 @@ pub enum LibraryRequest {
         name: PlaylistName,
         version: PlaylistVersion,
     },
+
+    /// Move a playlist to the bin if it is still at `version` (ADR-033).
+    /// Answers `PlaylistBinned`, or `PlaylistDeleteConflict`.
+    PlaylistBin {
+        name: PlaylistName,
+        version: PlaylistVersion,
+    },
+
+    /// Move a binned playlist back to `playlists/`, under `as` when given
+    /// (ADR-033). Answers `PlaylistRestored`; `PlaylistAlreadyExists` when the
+    /// target name is taken, `BinEntryNotFound` when the id is not in the bin.
+    PlaylistRestore {
+        id: BinId,
+        #[serde(rename = "as", default, skip_serializing_if = "Option::is_none")]
+        as_name: Option<PlaylistName>,
+    },
+
+    /// List the binned playlists. Answers `BinEntries`.
+    BinList,
+
+    /// Permanently delete one binned playlist. Answers `Pong`.
+    BinPurge { id: BinId },
+
+    /// Permanently delete every binned playlist. Answers `Pong`.
+    BinEmpty,
 
     /// Create a new playlist (fails if it already exists).
     PlaylistNew { name: PlaylistName, content: String },
@@ -876,6 +1035,15 @@ pub enum LibraryResponse {
     /// Answer to `PlaylistDelete` when the version did not match; nothing was
     /// removed.
     PlaylistDeleteConflict { current: PlaylistSnapshot },
+
+    /// Answer to `PlaylistBin`: the playlist is in the bin under `id`.
+    PlaylistBinned { id: BinId },
+
+    /// Answer to `PlaylistRestore`: the playlist is back under `name`.
+    PlaylistRestored { name: PlaylistName },
+
+    /// Answer to `BinList`.
+    BinEntries(Vec<BinEntry>),
 
     /// Bookmark written successfully.
     BookmarkWritten,
@@ -1549,6 +1717,158 @@ mod tests {
         );
     }
 
+    fn bin_id(s: &str) -> BinId {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn bin_id_parses_and_displays_round_trip() {
+        let id = bin_id("friday-set_2.1763470000123");
+        assert_eq!(id.name().as_str(), "friday-set_2");
+        assert_eq!(id.binned_at_ms(), 1_763_470_000_123);
+        assert_eq!(
+            id.binned_at(),
+            std::time::UNIX_EPOCH + std::time::Duration::from_millis(1_763_470_000_123)
+        );
+        assert_eq!(id.to_string(), "friday-set_2.1763470000123");
+        assert_eq!(bin_id(&id.to_string()), id);
+    }
+
+    #[rstest::rstest]
+    #[case::no_dot("friday")]
+    #[case::empty("")]
+    #[case::empty_name(".123")]
+    #[case::empty_ms("friday.")]
+    #[case::bad_name("fri day.123")]
+    #[case::non_numeric_ms("friday.abc")]
+    #[case::signed_ms("friday.+123")]
+    #[case::negative_ms("friday.-1")]
+    #[case::overflowing_ms("friday.99999999999999999999999")]
+    #[case::out_of_range_ms("friday.18446744073709551615")]
+    #[case::leading_zero("friday.042")]
+    #[case::extra_dots("friday.1.2")]
+    #[case::dotted_name("a.b.123")]
+    fn bin_id_rejects(#[case] input: &str) {
+        assert!(input.parse::<BinId>().is_err(), "{input:?} was accepted");
+    }
+
+    #[test]
+    fn bin_id_serializes_as_a_string_and_rejects_bad_strings() {
+        let id = bin_id("friday.42");
+        assert_eq!(serde_json::to_string(&id).unwrap(), "\"friday.42\"");
+        assert_eq!(roundtrip(&id), id);
+        assert!(serde_json::from_str::<BinId>("\"friday\"").is_err());
+    }
+
+    #[test]
+    fn bin_requests_roundtrip_json() {
+        let name = PlaylistName::new("friday").unwrap();
+        let id = bin_id("friday.42");
+        let requests = [
+            LibraryRequest::PlaylistBin {
+                name: name.clone(),
+                version: PlaylistVersion::of(b"abc"),
+            },
+            LibraryRequest::PlaylistRestore {
+                id: id.clone(),
+                as_name: None,
+            },
+            LibraryRequest::PlaylistRestore {
+                id: id.clone(),
+                as_name: Some(name),
+            },
+            LibraryRequest::BinList,
+            LibraryRequest::BinPurge { id },
+            LibraryRequest::BinEmpty,
+        ];
+        for request in requests {
+            let json = serde_json::to_string(&request).unwrap();
+            let back = parse_request(json.as_bytes()).unwrap();
+            assert_eq!(serde_json::to_string(&back).unwrap(), json);
+        }
+    }
+
+    #[test]
+    fn restore_request_names_its_field_as() {
+        let request = LibraryRequest::PlaylistRestore {
+            id: bin_id("friday.42"),
+            as_name: Some(PlaylistName::new("saturday").unwrap()),
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"PlaylistRestore","id":"friday.42","as":"saturday"}"#
+        );
+        let without = parse_request(br#"{"type":"PlaylistRestore","id":"friday.42"}"#).unwrap();
+        assert!(matches!(
+            without,
+            LibraryRequest::PlaylistRestore { as_name: None, .. }
+        ));
+    }
+
+    #[test]
+    fn bin_responses_roundtrip_json() {
+        let id = bin_id("friday.42");
+        match roundtrip(&LibraryResponse::PlaylistBinned { id: id.clone() }) {
+            LibraryResponse::PlaylistBinned { id: back } => assert_eq!(back, id),
+            other => panic!("expected PlaylistBinned, got {other:?}"),
+        }
+        let entry = BinEntry {
+            id: id.clone(),
+            entry_count: 7,
+        };
+        match roundtrip(&LibraryResponse::BinEntries(vec![entry.clone()])) {
+            LibraryResponse::BinEntries(back) => assert_eq!(back, vec![entry]),
+            other => panic!("expected BinEntries, got {other:?}"),
+        }
+        let name = PlaylistName::new("friday").unwrap();
+        match roundtrip(&LibraryResponse::PlaylistRestored { name: name.clone() }) {
+            LibraryResponse::PlaylistRestored { name: back } => assert_eq!(back, name),
+            other => panic!("expected PlaylistRestored, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bin_entry_not_found_error_roundtrips_and_names_the_id() {
+        let error = ProtocolError::BinEntryNotFound {
+            id: "friday.42".to_string(),
+        };
+        let back: ProtocolError = roundtrip(&error);
+        assert_eq!(back.to_string(), "bin entry not found: friday.42");
+    }
+
+    #[test]
+    fn bin_id_new_takes_a_time_and_refuses_one_out_of_range() {
+        let name = PlaylistName::new("friday").unwrap();
+        let at = std::time::UNIX_EPOCH + std::time::Duration::from_millis(1_763_470_000_123);
+        let id = BinId::new(name.clone(), at).unwrap();
+        assert_eq!(id.to_string(), "friday.1763470000123");
+        assert_eq!(id.binned_at(), at);
+
+        let beyond = std::time::UNIX_EPOCH + std::time::Duration::from_millis(u64::MAX);
+        assert!(BinId::new(name.clone(), beyond).is_err());
+        let before = std::time::UNIX_EPOCH - std::time::Duration::from_millis(1);
+        assert!(BinId::new(name, before).is_err());
+    }
+
+    mod bin_id_properties {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #[test]
+            fn parse_of_display_is_the_id(
+                name in "[A-Za-z0-9_-]{1,24}",
+                ms in 0..=i64::MAX as u64,
+            ) {
+                let at = std::time::UNIX_EPOCH + std::time::Duration::from_millis(ms);
+                let id = BinId::new(PlaylistName::new(&name).unwrap(), at).unwrap();
+                prop_assert_eq!(id.binned_at_ms(), ms);
+                prop_assert_eq!(id.to_string().parse::<BinId>().unwrap(), id);
+            }
+        }
+    }
+
     #[test]
     fn parse_request_accepts_a_known_request() {
         let req = parse_request(br#"{"type":"Ping"}"#);
@@ -1979,6 +2299,22 @@ mod tests {
         assert_eq!(source.tool, USER_TOOL);
         assert_eq!(source.origin.kind, USER_ORIGIN);
         assert_eq!(source.version, "1.2.3");
+    }
+
+    #[test]
+    fn rekordbox_is_its_own_source_under_the_user_tool() {
+        let source = rekordbox_source("1.2.3");
+        assert_eq!(source.tool, USER_TOOL);
+        assert_eq!(source.origin.kind, REKORDBOX_ORIGIN);
+        assert!(!source.same_source(&user_fact_source("1.2.3")));
+    }
+
+    #[test]
+    fn every_source_that_writes_energy_is_listed() {
+        let sources = energy_sources("9");
+        assert_eq!(sources.len(), 2);
+        assert!(sources[0].same_source(&user_fact_source("0")));
+        assert!(sources[1].same_source(&rekordbox_source("0")));
     }
 
     fn named(s: &str) -> Mark {

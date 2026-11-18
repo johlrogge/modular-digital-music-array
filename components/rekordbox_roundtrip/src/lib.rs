@@ -8,11 +8,17 @@
 //! - [`grid_from_tempo`] — convert a Rekordbox [`TempoAnchor`] + BPM to a [`MusicValue::BeatGrid`]
 //! - [`cues_from_position_marks`] — convert Rekordbox [`PositionMark`]s to [`MusicValue::MemoryCue`] facts
 //! - [`position_marks_from_cues`] — exact inverse of `cues_from_position_marks`
+//! - [`Stars`] and [`decide`] — Rekordbox `Rating` ↔ energy, and the three-way merge of
+//!   an import (ADR-034)
 
 use std::collections::{hash_map::Entry, HashMap};
 
-use music_facts::{Bpm, ContentHash, CueKind, MusicValue};
+use music_facts::{Bpm, ContentHash, CueKind, EnergyLevel, MusicValue};
 use rekordbox_xml::xml::{PositionMark, TempoAnchor};
+use sequence_merge::scalar::merge3_scalar;
+use serde::{Deserialize, Serialize};
+
+pub use sequence_merge::scalar::Decision;
 
 // =============================================================================
 // Hash ↔ Location maps (hoisted from mdma-cli)
@@ -246,6 +252,107 @@ pub fn position_marks_from_cues(cues: &[MusicValue]) -> Vec<PositionMark> {
             }
         })
         .collect()
+}
+
+// =============================================================================
+// Rating ↔ energy (ADR-034)
+// =============================================================================
+
+/// A Rekordbox star rating, 0 to 5 (0 is unrated). Pioneer vocabulary: it stays out
+/// of the library, where the same thing is energy 1..10.
+///
+/// Every comparison of a rating with an energy happens in star space: star to energy
+/// to star is the identity, which is what makes a round-trip stable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(try_from = "u8", into = "u8")]
+pub struct Stars(u8);
+
+/// A number that is not 0 to 5 stars.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NotStars(pub u8);
+
+impl std::fmt::Display for NotStars {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} is not 0 to 5 stars", self.0)
+    }
+}
+
+impl std::error::Error for NotStars {}
+
+impl TryFrom<u8> for Stars {
+    type Error = NotStars;
+
+    fn try_from(stars: u8) -> Result<Self, NotStars> {
+        Stars::new(stars).ok_or(NotStars(stars))
+    }
+}
+
+impl From<Stars> for u8 {
+    fn from(stars: Stars) -> u8 {
+        stars.0
+    }
+}
+
+/// The distance between two ratings Rekordbox writes: 0, 51, 102, 153, 204, 255.
+const RATING_PER_STAR: u32 = 51;
+
+impl Stars {
+    /// Unrated.
+    pub const NONE: Stars = Stars(0);
+
+    /// `Some` for 0..=5.
+    pub fn new(stars: u8) -> Option<Stars> {
+        (stars <= 5).then_some(Stars(stars))
+    }
+
+    pub fn value(self) -> u8 {
+        self.0
+    }
+
+    /// The stars of a `Rating` attribute: `round(r / 51)`. A rating above 255 is not one
+    /// Rekordbox writes: it warns on stderr and counts as unrated.
+    pub fn from_rating(rating: u32) -> Stars {
+        if rating > 5 * RATING_PER_STAR {
+            eprintln!("warning: rekordbox rating {rating} is above 255; counted as unrated");
+            return Stars::NONE;
+        }
+        // Integer round(r / 51); the halfway points are not whole numbers, so no tie.
+        Stars(((rating + RATING_PER_STAR / 2) / RATING_PER_STAR) as u8)
+    }
+
+    /// The `Rating` attribute for these stars: `s × 51`.
+    pub fn to_rating(self) -> u32 {
+        u32::from(self.0) * RATING_PER_STAR
+    }
+
+    /// The stars of an energy: `ceil(e / 2)`; no energy is unrated.
+    pub fn from_energy(energy: Option<EnergyLevel>) -> Stars {
+        Stars(energy.map_or(0, |e| e.value().div_ceil(2)))
+    }
+
+    /// The energy of these stars: `2s`; unrated is no energy.
+    pub fn to_energy(self) -> Option<EnergyLevel> {
+        EnergyLevel::new(self.0 * 2).ok()
+    }
+}
+
+impl std::fmt::Display for Stars {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}★", self.0)
+    }
+}
+
+/// What an import does with the energy of a track (ADR-034 §2): `base` is the stars last
+/// exchanged (none counts as 0), `theirs` the rating in Rekordbox now, `ours` the stars
+/// of the energy now.
+///
+/// The three-way merge, local wins, except that a local clear gives way: with `ours`
+/// unrated a changed rating is taken.
+pub fn decide(base: Stars, theirs: Stars, ours: Stars) -> Decision<Stars> {
+    match merge3_scalar(base, theirs, ours) {
+        Decision::Conflict if ours == Stars::NONE => Decision::Take(theirs),
+        decision => decision,
+    }
 }
 
 // =============================================================================
@@ -802,5 +909,148 @@ mod tests {
             roundtripped, original_cues,
             "cues → marks → cues must be lossless"
         );
+    }
+
+    // ── Stars ─────────────────────────────────────────────────────────────────
+
+    use proptest::prelude::*;
+    use rstest::rstest;
+
+    fn stars(n: u8) -> Stars {
+        Stars::new(n).unwrap()
+    }
+
+    fn energy(n: u8) -> Option<EnergyLevel> {
+        Some(EnergyLevel::new(n).unwrap())
+    }
+
+    #[rstest]
+    #[case::unrated(0, 0)]
+    #[case::just_below_half_a_star(25, 0)]
+    #[case::just_above_half_a_star(26, 1)]
+    #[case::one_star(51, 1)]
+    #[case::just_below_one_and_a_half(76, 1)]
+    #[case::just_above_one_and_a_half(77, 2)]
+    #[case::two_stars(102, 2)]
+    #[case::three_stars(153, 3)]
+    #[case::four_stars(204, 4)]
+    #[case::five_stars(255, 5)]
+    #[case::too_high_counts_as_unrated(256, 0)]
+    #[case::far_too_high(u32::MAX, 0)]
+    fn a_rating_is_the_nearest_star(#[case] rating: u32, #[case] expected: u8) {
+        assert_eq!(Stars::from_rating(rating), stars(expected));
+    }
+
+    #[rstest]
+    #[case(0, 0)]
+    #[case(1, 51)]
+    #[case(2, 102)]
+    #[case(3, 153)]
+    #[case(4, 204)]
+    #[case(5, 255)]
+    fn stars_are_written_as_a_rating(#[case] s: u8, #[case] rating: u32) {
+        assert_eq!(stars(s).to_rating(), rating);
+    }
+
+    #[rstest]
+    #[case(0, None)]
+    #[case(1, Some(2))]
+    #[case(2, Some(4))]
+    #[case(3, Some(6))]
+    #[case(4, Some(8))]
+    #[case(5, Some(10))]
+    fn stars_are_twice_the_energy(#[case] s: u8, #[case] expected: Option<u8>) {
+        assert_eq!(stars(s).to_energy(), expected.and_then(energy));
+    }
+
+    #[rstest]
+    #[case(None, 0)]
+    #[case(Some(1), 1)]
+    #[case(Some(2), 1)]
+    #[case(Some(3), 2)]
+    #[case(Some(4), 2)]
+    #[case(Some(7), 4)]
+    #[case(Some(8), 4)]
+    #[case(Some(9), 5)]
+    #[case(Some(10), 5)]
+    fn an_energy_is_rounded_up_to_stars(#[case] e: Option<u8>, #[case] expected: u8) {
+        assert_eq!(Stars::from_energy(e.and_then(energy)), stars(expected));
+    }
+
+    #[test]
+    fn stars_beyond_five_do_not_exist() {
+        assert_eq!(Stars::new(6), None);
+        assert_eq!(stars(4).to_string(), "4★");
+    }
+
+    proptest! {
+        /// Star to energy to star is the identity, so comparing in star space is exact.
+        #[test]
+        fn star_to_energy_to_star_is_the_identity(s in 0u8..=5) {
+            prop_assert_eq!(Stars::from_energy(stars(s).to_energy()), stars(s));
+        }
+
+        /// Rating to stars to rating is the identity on what Rekordbox writes.
+        #[test]
+        fn stars_to_rating_to_stars_is_the_identity(s in 0u8..=5) {
+            prop_assert_eq!(Stars::from_rating(stars(s).to_rating()), stars(s));
+        }
+
+        /// Export, then re-import with nothing changed: the energy is kept, whichever
+        /// of 1..10 it is.
+        #[test]
+        fn export_then_reimport_keeps_every_energy(e in 1u8..=10) {
+            let ours = Stars::from_energy(energy(e));
+            let exported = ours.to_rating();
+            let base = Stars::from_rating(exported); // export sets base := what it wrote
+            let theirs = Stars::from_rating(exported);
+            prop_assert_eq!(decide(base, theirs, ours), Decision::Keep);
+        }
+
+        /// An unrated local never conflicts: it gives way. The import relies on this to
+        /// know that a conflict always has a local energy to report.
+        #[test]
+        fn an_unrated_local_never_conflicts(b in 0u8..=5, t in 0u8..=5) {
+            prop_assert_ne!(decide(stars(b), stars(t), Stars::NONE), Decision::Conflict);
+        }
+
+        /// Merging again with base advanced to theirs never changes anything.
+        #[test]
+        fn deciding_twice_with_base_advanced_keeps(b in 0u8..=5, t in 0u8..=5, o in 0u8..=5) {
+            let (b, t, o) = (stars(b), stars(t), stars(o));
+            let after = match decide(b, t, o) {
+                Decision::Take(v) => v,
+                _ => o,
+            };
+            prop_assert_eq!(decide(t, t, after), Decision::Keep);
+        }
+    }
+
+    // ── decide: one test per row of the table of ADR-034 ──────────────────────
+
+    #[rstest]
+    #[case::theirs_unchanged_ours_unchanged(2, 2, 2, Decision::Keep)]
+    #[case::theirs_unchanged_ours_edited(2, 2, 4, Decision::Keep)]
+    #[case::theirs_unchanged_ours_cleared(2, 2, 0, Decision::Keep)]
+    #[case::theirs_changed_ours_unchanged(2, 4, 2, Decision::Take(stars(4)))]
+    #[case::theirs_cleared_ours_unchanged(2, 0, 2, Decision::Take(stars(0)))]
+    #[case::theirs_changed_ours_cleared_gives_way(2, 4, 0, Decision::Take(stars(4)))]
+    #[case::theirs_changed_to_what_ours_is(2, 4, 4, Decision::Converged)]
+    #[case::theirs_cleared_and_ours_cleared(2, 0, 0, Decision::Converged)]
+    #[case::both_changed_differently(2, 4, 3, Decision::Conflict)]
+    #[case::theirs_cleared_ours_edited(2, 0, 3, Decision::Conflict)]
+    // No base counts as 0 stars, with no special case.
+    #[case::no_base_unrated_both(0, 0, 0, Decision::Keep)]
+    #[case::no_base_unrated_theirs_keeps_ours(0, 0, 5, Decision::Keep)]
+    #[case::no_base_rated_theirs_ours_without_energy(0, 3, 0, Decision::Take(stars(3)))]
+    #[case::no_base_rated_theirs_ours_same(0, 3, 3, Decision::Converged)]
+    #[case::no_base_rated_theirs_ours_different(0, 3, 5, Decision::Conflict)]
+    fn the_decision_table(
+        #[case] base: u8,
+        #[case] theirs: u8,
+        #[case] ours: u8,
+        #[case] expected: Decision<Stars>,
+    ) {
+        assert_eq!(decide(stars(base), stars(theirs), stars(ours)), expected);
     }
 }

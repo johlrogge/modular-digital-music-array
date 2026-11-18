@@ -46,6 +46,7 @@ members = [
     "components/rekordbox_roundtrip",
     "components/rekordbox_xml",
     "components/rpi_eeprom",
+    "components/sequence_merge",
     "components/source_protocol",
     "components/storage_primitives",
     "components/stream_source_protocol",
@@ -75,7 +76,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.39.1"
+version = "0.40.0"
 edition = "2021"
 authors = ["MDMA Development Team"]
 license = "MIT"
@@ -126,6 +127,7 @@ private-file = { path = "components/private_file" }
 rekordbox-roundtrip = { path = "components/rekordbox_roundtrip" }
 rekordbox-xml = { path = "components/rekordbox_xml" }
 rpi-eeprom = { path = "components/rpi_eeprom" }
+sequence-merge = { path = "components/sequence_merge" }
 service = { path = "bases/service" }
 source-protocol = { path = "components/source_protocol" }
 storage_primitives = { path = "components/storage_primitives" }

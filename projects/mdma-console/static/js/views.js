@@ -4,7 +4,7 @@
 import { h, icon, route, routeFallback, appInfo, store, catalogue, onView, enc, plural } from "./core.js";
 import { art } from "./art.js";
 import { groupAlbums, groupArtists, sortTracks, collate, visiblePlaylists, LIKED, markLabel } from "./logic.js";
-import { pagedList, thead, bulkBar, emptyNote, albumCard, artistCard, playlistCard, playlistTile, recentAlbums, narrowedTracks } from "./lists.js";
+import { topbar, pagedList, thead, bulkBar, emptyNote, albumCard, artistCard, playlistCard, playlistTile, recentAlbums, narrowedTracks } from "./lists.js";
 import { narrowedView, matchLibrary, filterCount, setSort, LIBRARY_KEY, SEARCH_FAILED_NOTE, FILTERS_EMPTY_NOTE } from "./narrow.js";
 import { backLink, NONE } from "./collections.js";
 import { askNewPlaylist } from "./playlist.js";
@@ -16,14 +16,6 @@ function greeting(hour) {
   if (hour < 12) return "Good morning";
   if (hour < 18) return "Good afternoon";
   return "Good evening";
-}
-
-function topbar(title, sub, link) {
-  const gear = h("a", { class: "icon-btn status-dot mobile-only", href: "#/settings", "aria-label": "Settings" }, [icon("gear")]);
-  return h("div", { class: "topbar" }, [
-    h("div", {}, [h("h1", { text: title }), sub ? h("div", { class: "sub", text: sub }) : null]),
-    link ? h("div", { style: "display:flex;align-items:center;gap:4px" }, [link, gear]) : gear,
-  ]);
 }
 
 function section(title, count, href, row) {
@@ -187,7 +179,8 @@ function viewLibrary(root, params, query) {
     // Outside draw(), so the name being typed survives the redraws a player or playlists event brings.
     const ask = h("div");
     const opener = h("button", { class: "btn", "aria-expanded": "false", onclick: () => askNewPlaylist(ask, opener) }, [icon("plus", "sm"), "New playlist"]);
-    root.appendChild(h("div", { class: "newpl-bar" }, [opener, ask]));
+    const bin = h("a", { class: "btn ghost", href: "#/bin", style: "text-decoration:none" }, [icon("trash", "sm"), "Bin"]);
+    root.appendChild(h("div", { class: "newpl-bar" }, [opener, bin, ask]));
   }
   root.appendChild(region);
 

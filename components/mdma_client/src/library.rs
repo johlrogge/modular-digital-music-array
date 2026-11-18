@@ -3,15 +3,15 @@
 use crate::error::map_gw_to_lib_error;
 use crate::queue_resolve::{combine, queue_entries, resolve_queue_entry, Outcome};
 use library_ipc_client::{
-    content_to_hashes, interpret_archive_emptied, interpret_archive_listing,
+    content_to_hashes, energy_sources, interpret_archive_emptied, interpret_archive_listing,
     interpret_dedup_merged, interpret_dedup_scan, interpret_identity_backfill,
     interpret_identity_backfill_status, interpret_playlist_entries, resolve_full_hash,
     resolve_full_hashes, ArchiveEmptyReport, ArchiveListing, CanonicalHash, ClientError,
-    ContentHash, DedupApplyReport, DedupScanReport, FactSource, FactType, IdentityBackfillStart,
-    IdentityBackfillStatus, InboxPath, IngestAllItem, IngestResult, IngestSource, LibraryClient,
-    LibraryRequest, LibraryResponse, Mark, MarkFilter, MarkWrite, MusicValue, OrphanInfo,
-    PlaylistEntry, PlaylistName, ProtocolError, ResolveError, ServiceStatus, TrackInfo, TrackQuery,
-    Unmark,
+    ContentHash, DedupApplyReport, DedupScanReport, EnergyLevel, FactSource, FactType,
+    IdentityBackfillStart, IdentityBackfillStatus, InboxPath, IngestAllItem, IngestResult,
+    IngestSource, LibraryClient, LibraryRequest, LibraryResponse, Mark, MarkFilter, MarkWrite,
+    MusicValue, OrphanInfo, PlaylistEntry, PlaylistName, ProtocolError, ResolveError,
+    ServiceStatus, TrackInfo, TrackQuery, Unmark,
 };
 use playlist_import::PlaylistWriteOps;
 
@@ -408,6 +408,19 @@ impl LibraryBackend {
             fact,
             source: Some(source.clone()),
         })?)
+    }
+
+    /// Retract every energy level of every source that writes energy
+    /// ([`energy_sources`]), so that none an older write left behind shows again
+    /// (ADR-034 §4). `false` when the track had none. `version` is the writer's.
+    pub fn retract_energy(&self, hash: &ContentHash, version: &str) -> Result<bool, ClientError> {
+        let mut retracted = false;
+        for source in energy_sources(version) {
+            for level in EnergyLevel::all() {
+                retracted |= self.retract_fact_as(hash, MusicValue::Energy(level), &source)?;
+            }
+        }
+        Ok(retracted)
     }
 
     // =========================================================================

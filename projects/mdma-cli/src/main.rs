@@ -52,6 +52,7 @@ mod queue;
 /// ```
 #[hicli::group]
 mod rekordbox;
+mod rekordbox_exchange;
 /// Local copy of the node's facts, kept for offline use
 ///
 /// Synced in the background; `status` shows it and `reset` deletes it.
