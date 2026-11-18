@@ -8,6 +8,25 @@ All notable changes to MDMA are documented here.
 
 ---
 
+## [0.39.0] — 2026-11-18
+
+### Added
+
+- **Console playlist workbench.** Browse and narrow the library and add tracks to a playlist in the same view. Clicking a workbench row previews it; clicking the previewing row toggles pause and play, and Back ends the preview and resumes what was playing. The previewing row expands into a timeline with cues, bar lines, beat-step skipping and keys; click it to seek, snapped to the beat (hold Alt to place freely). Seek also works in the main player. Playlists are listed in the left rail, you can create a playlist from the console, and playlist rows show a cover mosaic of their tracks.
+- **"Replace queue"** in track and collection menus replaces Up next with the set and leaves the playing track alone.
+- **Marks and hearts in the console, with macro marks.** Heart a track to apply the default "liked" mark. Macro mark buttons apply a named mark (Shift+1, Shift+2, ...); they are configured on the node and default to "banger" and "opener".
+- **Key notation setting.** Show keys as Musical, Camelot or Open Key; the choice is stored per browser (localStorage).
+- **Row keyboard navigation.** Move between rows with ↑/↓ or `j`/`k`.
+- **Mix-well key filter.** `8A+-2` steps round the Camelot wheel in one letter (Straight), a `d` suffix allows any path (`8A+-2d` also takes 7B and 9B), and `,+7` adds a power jump (`8A+-1,+7` adds 3A). Works in the console's narrowing and in `mdma search --key`.
+- **Local reads from the client replica** (ADR-030). `mdma search` and other reads use the replica through the shared `library_projection::search`.
+
+### Fixed
+
+- **The library repairs covers at startup.** It finds cover facts whose file is missing or empty and re-extracts the art from the track into the same path. It also extracts art for tracks that have no cover fact.
+- **The gateway no longer hangs on the NNG callback thread** (#113).
+
+---
+
 ## [0.38.3] — 2026-11-15
 
 ### Changed
