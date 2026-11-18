@@ -318,6 +318,17 @@ User-authored metadata written as facts through ACID:
 
 ---
 
+### 18. Playlist Bin (ADR-033)
+
+**Why:** Deleting a playlist unlinks the file for good, so a mis-click or a stale `rm` loses comments, short IDs and order.
+
+- Every delete moves the file to `playlists/.bin/<name>.<unix-ms>.plist`; bytes untouched; only Purge and Empty bin unlink
+- Restore (optionally `as` a new name; a clash is a 409, the user types the name); Bandcamp link inactive while binned
+- Console: delete with Undo toast, Bin section with Restore/Purge; CLI `mdma playlist bin ls|restore|purge|empty`
+- Phases: 0 ADR, 1 protocol and `BinId`, 2 library service and stub contract suite, 3 gateway and console routes, 4 console UI, 5 CLI, 6 stage2 (deploy gateway, library, console together)
+
+---
+
 ## Post-Beta: Party Modes (placeholder — needs design discussion)
 
 See `documents/vision/The_Art_of_Shared_Listening_-_Party_Modes_Marketing_Copy.md` for initial thinking.
