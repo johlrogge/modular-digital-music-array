@@ -55,7 +55,7 @@ Amends ADR-027 §6.1 (delete) and ADR-032 §8 (rename and delete). Builds on ADR
 ### 6. Console
 
 1. **Delete acts at once** and shows an **Undo** toast. Undo is Restore. There is no confirm, because the action can be undone.
-2. A **Bin** section under Collections lists binned playlists with Restore and Purge.
+2. A **Bin** view (`#/bin`) lists binned playlists with Restore and Purge. It is reached from the Library's Playlists tab, next to "New playlist", and from the desktop rail.
 3. **Purge and Empty bin do confirm**, because they cannot be undone.
 4. Routes:
    - `GET /api/bin`

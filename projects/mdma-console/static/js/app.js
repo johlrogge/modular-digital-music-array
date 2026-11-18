@@ -9,6 +9,7 @@ import "./views.js";
 import "./rail.js";
 import "./collections.js";
 import "./playlist.js";
+import "./bin.js";
 import "./workbench.js";
 import "./settings.js";
 

@@ -3,7 +3,7 @@
 //! playlist: it forwards the ops and the version, and answers with what the library answered.
 //!
 //! - 200: applied (`{snapshot, skipped, previous}`; `previous` only when the edit wrote, so Undo
-//!   exists exactly then) or deleted (`{deleted: true}`);
+//!   exists exactly then) or deleted into the bin (`{id}`, ADR-033);
 //! - 201: created (`{name}`), by `POST /api/playlists {name}`;
 //! - 409: the version was stale, nothing was written (`{current}`, the playlist as it is now);
 //!   or, for a create, the playlist already exists (`{error}`);
@@ -11,14 +11,14 @@
 //!   There is no fallback to PlaylistReplace: an old node answers 502.
 
 use super::library::{playlist_name, ApiSnapshot};
-use super::{fail, gw, lib, library, library_failed, respond, unexpected_library_response, Reply};
+use super::{fail, forward, lib, library_failed, respond, Interpret, Reply};
 use crate::AppState;
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
     response::{Json, Response},
 };
-use gateway_client::{GatewayClient, LibraryRequest, LibraryResponse};
+use gateway_client::{LibraryRequest, LibraryResponse};
 use library_ipc_client::{
     EditOp, EditOutcome, PlaylistName, PlaylistSnapshot, PlaylistVersion, StoredPlaylist,
 };
@@ -32,10 +32,6 @@ fn conflict(current: &PlaylistSnapshot) -> Reply {
         serde_json::json!({ "current": ApiSnapshot::from(current) }),
     )
 }
-
-/// How a write's answer becomes a reply: `None` for an answer that is not one of the write's
-/// outcomes.
-type Interpret = fn(LibraryResponse) -> Option<Reply>;
 
 /// The answer to an edit or a revert: applied (200) or conflict (409).
 fn edited(response: LibraryResponse) -> Option<Reply> {
@@ -62,46 +58,29 @@ fn edited(response: LibraryResponse) -> Option<Reply> {
     }
 }
 
-/// The answer to a delete: deleted (200) or conflict (409).
-fn deleted(response: LibraryResponse) -> Option<Reply> {
+/// The answer to a delete, which bins (ADR-033): binned (200 `{id}`, for Undo) or conflict (409).
+fn binned(response: LibraryResponse) -> Option<Reply> {
     match response {
-        LibraryResponse::PlaylistDeleted => {
-            Some((StatusCode::OK, serde_json::json!({ "deleted": true })))
+        LibraryResponse::PlaylistBinned { id } => {
+            Some((StatusCode::OK, serde_json::json!({ "id": id.to_string() })))
         }
         LibraryResponse::PlaylistDeleteConflict { current } => Some(conflict(&current)),
         _ => None,
     }
 }
 
-/// Send `request` and say what the library answered, as `interpret` reads it. Any other answer
-/// is a 502, as is every library failure ([`library_failed`]).
-fn written(client: &GatewayClient, request: &LibraryRequest, interpret: Interpret) -> Reply {
-    match library(client, request) {
-        Ok(response) => {
-            interpret(response).unwrap_or_else(|| library_failed(&unexpected_library_response()))
-        }
-        Err(e) => library_failed(&e),
-    }
-}
-
 /// The one path of every write: `name` from the path is checked ([`playlist_name`]), then
-/// `request` is built for it and sent.
+/// `request` is built for it and sent ([`forward`]).
 async fn write(
     state: Arc<AppState>,
     name: String,
     interpret: Interpret,
-    request: impl FnOnce(PlaylistName) -> LibraryRequest + Send + 'static,
+    request: impl FnOnce(PlaylistName) -> LibraryRequest + Send,
 ) -> Response {
-    let name = match playlist_name(&name) {
-        Ok(n) => n,
-        Err(response) => return response,
-    };
-    respond(
-        gw(&state, move |client| {
-            written(client, &request(name), interpret)
-        })
-        .await,
-    )
+    match playlist_name(&name) {
+        Ok(name) => forward(&state, request(name), interpret).await,
+        Err(response) => response,
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -155,15 +134,15 @@ pub struct DeleteParams {
     version: PlaylistVersion,
 }
 
-/// `DELETE /api/playlists/{name}?version=`: remove the playlist if it is still at `version`.
-/// 400 without a version.
+/// `DELETE /api/playlists/{name}?version=`: move the playlist to the bin if it is still at
+/// `version` (ADR-033). 200 `{id}`, the bin id to restore it by. 400 without a version.
 pub async fn delete(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
     Query(params): Query<DeleteParams>,
 ) -> Response {
-    write(state, name, deleted, move |name| {
-        LibraryRequest::PlaylistDelete {
+    write(state, name, binned, move |name| {
+        LibraryRequest::PlaylistBin {
             name,
             version: params.version,
         }
@@ -285,7 +264,7 @@ mod tests {
                 request:
                     LibraryRequest::PlaylistEdit { .. }
                     | LibraryRequest::PlaylistRevert { .. }
-                    | LibraryRequest::PlaylistDelete { .. },
+                    | LibraryRequest::PlaylistBin { .. },
             } => library_ok(answer.clone()),
             other => GatewayResponse::Error {
                 message: format!("unexpected {other:?}"),
@@ -435,15 +414,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_delete_is_200_when_deleted_and_409_with_current_when_stale() {
+    async fn a_delete_bins_with_200_and_the_id_and_is_409_with_current_when_stale() {
         let all = calls();
-        let gw = write_gateway(LibraryResponse::PlaylistDeleted);
+        let gw = write_gateway(LibraryResponse::PlaylistBinned {
+            id: "set.42".parse().unwrap(),
+        });
         let res = send_call(test_app_with(gw.addr()), &all[2]).await;
         assert_eq!(res.status(), StatusCode::OK);
-        assert_eq!(body_json(res).await, json!({"deleted": true}));
+        assert_eq!(body_json(res).await, json!({"id": "set.42"}));
         match &gw.requests()[..] {
             [GatewayRequest::Library {
-                request: LibraryRequest::PlaylistDelete { name, version: v },
+                request: LibraryRequest::PlaylistBin { name, version: v },
             }] => {
                 assert_eq!(name.as_str(), "set");
                 assert_eq!(*v, version("old"));
@@ -657,7 +638,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_delete_without_a_version_is_400_and_the_library_is_not_asked() {
-        let gw = write_gateway(LibraryResponse::PlaylistDeleted);
+        let gw = write_gateway(LibraryResponse::Pong);
         let res = send_json(
             test_app_with(gw.addr()),
             "DELETE",

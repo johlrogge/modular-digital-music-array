@@ -476,6 +476,15 @@ export function bulkBar(tracks) {
   return h("div", { class: "bulk" }, [h("span", { class: "kicker", text: what + " match" }), queueButtons(setOf(tracks), what)]);
 }
 
+/** A page's heading row: title, an optional line under it, an optional `link` node, and the Settings gear on phones. */
+export function topbar(title, sub, link) {
+  const gear = h("a", { class: "icon-btn status-dot mobile-only", href: "#/settings", "aria-label": "Settings" }, [icon("gear")]);
+  return h("div", { class: "topbar" }, [
+    h("div", {}, [h("h1", { text: title, tabindex: "-1" }), sub ? h("div", { class: "sub", text: sub }) : null]),
+    link ? h("div", { style: "display:flex;align-items:center;gap:4px" }, [link, gear]) : gear,
+  ]);
+}
+
 /** A note in place of rows. link: { href, text } adds a link after the text. */
 export function emptyNote(title, text, link) {
   return h("div", { class: "empty" }, [h("b", { text: title }), text, link ? h("a", { class: "link", href: link.href, text: link.text }) : null]);
