@@ -383,7 +383,7 @@ pub enum EditOutcome {
 }
 
 /// One playlist line as the library resolved it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "status")]
 pub enum PlaylistEntry {
     /// The line names this track.
@@ -393,7 +393,7 @@ pub enum PlaylistEntry {
 }
 
 /// Why a playlist line did not resolve to a track. `hash` is the stored token.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Error)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Error)]
 pub enum EntryError {
     #[error("unknown track {hash}")]
     Unknown { hash: ContentHash },

@@ -7616,6 +7616,8 @@ dependencies = [
  "library-ipc-protocol",
  "library-projection",
  "pretty_assertions",
+ "proptest",
+ "sequence-merge",
  "thiserror 1.0.69",
  "track-formatter",
 ]

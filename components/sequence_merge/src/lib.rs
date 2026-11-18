@@ -65,13 +65,16 @@
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 
+/// The `nth` occurrence of `key` in a sequence: how duplicates are told apart.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct Occurrence<K> {
-    key: K,
-    nth: usize,
+pub struct Occurrence<K> {
+    pub key: K,
+    pub nth: usize,
 }
 
-fn occurrences<K: Eq + Hash + Clone>(items: &[K]) -> Vec<Occurrence<K>> {
+/// Each item of `items` as an [`Occurrence`]: `nth` counts the equal keys
+/// before it in `items`.
+pub fn occurrences<K: Eq + Hash + Clone>(items: &[K]) -> Vec<Occurrence<K>> {
     let mut seen: HashMap<&K, usize> = HashMap::new();
     items
         .iter()
@@ -91,7 +94,7 @@ fn occurrences<K: Eq + Hash + Clone>(items: &[K]) -> Vec<Occurrence<K>> {
 ///
 /// Deterministic: with equal heads the match is taken; otherwise the item of
 /// `a` is skipped if that loses nothing (`>=`), else the item of `b`.
-fn lcs<T: PartialEq + Copy>(a: &[T], b: &[T]) -> Vec<T> {
+pub fn lcs<T: PartialEq + Copy>(a: &[T], b: &[T]) -> Vec<T> {
     // table[i][j] = length of the LCS of a[i..] and b[j..].
     let mut table = vec![vec![0usize; b.len() + 1]; a.len() + 1];
     for i in (0..a.len()).rev() {
