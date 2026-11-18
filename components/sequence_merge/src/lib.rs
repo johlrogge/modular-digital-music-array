@@ -62,6 +62,8 @@
 //!   `merge3("aa", "aaa", "a")` gives `aa` and merging that again gives
 //!   `aaa`. For unique keys idempotence holds.
 
+pub mod scalar;
+
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 

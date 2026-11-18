@@ -45,9 +45,10 @@ b = base (none counts as 0★), t = theirs (rekordbox now), o = stars(ours).
 ### 3. Storage
 
 1. Base lives in a CLI-owned state file, `$XDG_STATE_HOME/mdma/rekordbox-exchange.json`, written atomically:
-   `{node, tracks: {content_hash: stars}, last_import, last_export}`.
+   `{nodes: {<node_key>: {tracks: {content_hash: stars}, last_import, last_export}}}`.
+   The node key is the lowercased host of the remote node, or `local` for the services on this machine. A save rewrites only its own node's entry. A stored value above 5 makes the file invalid: it is an error, never read as 0 stars.
 2. It is not a fact. The library holds no Pioneer data.
-3. Base is per machine.
+3. Base is per machine, and per node within it.
 
 ### 4. Sources
 
@@ -88,7 +89,7 @@ b = base (none counts as 0★), t = theirs (rekordbox now), o = stars(ours).
 
 - Round-trips are stable.
 - A user clear stays until rekordbox changes the rating.
-- Base is per machine.
+- Base is per machine, and per node within it. Two exchanges with the same node running at once can leave a stale base; that heals on the next import, so there is no lock.
 - An export before an import can overwrite a changed rekordbox rating.
 - Each conflict is reported once.
 

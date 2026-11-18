@@ -6,9 +6,7 @@ use super::marks::apply_each;
 use super::{error_reply, lib, parse_hashes, respond};
 use crate::AppState;
 use axum::{extract::State, http::StatusCode, response::Response, Json};
-use library_ipc_client::{
-    user_fact_source, ClientError, ContentHash, EnergyLevel, FactSource, MusicValue,
-};
+use library_ipc_client::{user_fact_source, ClientError, ContentHash, EnergyLevel, MusicValue};
 use mdma_client::LibraryBackend;
 use serde::{Deserialize, Deserializer};
 use std::sync::Arc;
@@ -57,12 +55,9 @@ pub async fn energy(
             }
         },
     };
-    let source = user_fact_source(env!("CARGO_PKG_VERSION"));
     respond(
         lib(&state, move |backend| {
-            apply_each(backend, &hashes, |hash| {
-                change(backend, hash, level, &source)
-            })
+            apply_each(backend, &hashes, |hash| change(backend, hash, level))
         })
         .await,
     )
@@ -70,30 +65,26 @@ pub async fn energy(
 
 /// Whether the track's energy changed.
 ///
-/// The catalogue shows the last live energy of any source, so setting writes unless it already
-/// shows that level, and clearing retracts every level the user ever asserted (an older one would
-/// surface again otherwise). A track that shows no energy has nothing to clear.
+/// The catalogue shows the last live energy of any source, so setting writes unless it
+/// already shows that level, and clearing retracts every level that any source that writes
+/// energy (the user's, Rekordbox's) ever asserted: an older one would surface again
+/// otherwise (ADR-034). A track that shows no energy has nothing to clear.
 fn change(
     backend: &LibraryBackend,
     hash: &ContentHash,
     level: Option<EnergyLevel>,
-    source: &FactSource,
 ) -> Result<bool, ClientError> {
+    let version = env!("CARGO_PKG_VERSION");
     let shown = backend.get_track(hash)?.energy;
     match level {
         Some(level) if shown == Some(level) => Ok(false),
         Some(level) => {
-            backend.write_fact_as(hash, MusicValue::Energy(level), source)?;
+            let source = user_fact_source(version);
+            backend.write_fact_as(hash, MusicValue::Energy(level), &source)?;
             Ok(true)
         }
         None if shown.is_none() => Ok(false),
-        None => {
-            let mut retracted = false;
-            for level in EnergyLevel::all() {
-                retracted |= backend.retract_fact_as(hash, MusicValue::Energy(level), source)?;
-            }
-            Ok(retracted)
-        }
+        None => backend.retract_energy(hash, version),
     }
 }
 
@@ -104,7 +95,7 @@ mod tests {
         bare_track, body_json, library_ok, send_post_json, test_app_with, FakeGateway,
     };
     use gateway_client::{GatewayRequest, GatewayResponse, LibraryRequest, LibraryResponse};
-    use library_ipc_client::ProtocolError;
+    use library_ipc_client::{FactSource, ProtocolError};
     use serde_json::json;
     use std::collections::HashMap;
     use std::sync::Mutex;
@@ -122,12 +113,25 @@ mod tests {
     /// A write adds an assertion; a retract removes every assertion of that level. A write for
     /// the track `fail_on` fails.
     fn gateway_failing(initial: &[(char, Option<u8>)], fail_on: Option<char>) -> FakeGateway {
-        let state: Mutex<HashMap<String, Vec<u8>>> = Mutex::new(
+        let user = user_fact_source("any");
+        gateway_seeded(
             initial
                 .iter()
-                .map(|(c, e)| (full(*c), e.iter().copied().collect()))
+                .map(|(c, e)| (*c, e.iter().map(|n| (*n, user.clone())).collect()))
                 .collect(),
-        );
+            fail_on,
+        )
+    }
+
+    /// Like `gateway_failing`, but each assertion states the source that wrote it, and a
+    /// retract only removes the assertions of the source it names.
+    fn gateway_seeded(
+        initial: Vec<(char, Vec<(u8, FactSource)>)>,
+        fail_on: Option<char>,
+    ) -> FakeGateway {
+        let user = user_fact_source("any");
+        let state: Mutex<HashMap<String, Vec<(u8, FactSource)>>> =
+            Mutex::new(initial.into_iter().map(|(c, e)| (full(c), e)).collect());
         FakeGateway::start(move |req| {
             let mut state = state.lock().unwrap();
             match req {
@@ -136,7 +140,7 @@ mod tests {
                 } => match state.get(hash.as_str()) {
                     Some(asserted) => {
                         let mut t = bare_track(hash.as_str());
-                        t.energy = asserted.last().map(|n| EnergyLevel::new(*n).unwrap());
+                        t.energy = asserted.last().map(|(n, _)| EnergyLevel::new(*n).unwrap());
                         library_ok(LibraryResponse::Track(Box::new(t)))
                     }
                     None => library_ok(LibraryResponse::Error(ProtocolError::TrackNotFound {
@@ -160,13 +164,14 @@ mod tests {
                         LibraryRequest::WriteFact {
                             hash,
                             fact: MusicValue::Energy(level),
-                            ..
+                            source,
                         },
                 } => {
+                    let by = source.clone().unwrap_or_else(|| user.clone());
                     state
                         .entry(hash.as_str().to_owned())
                         .or_default()
-                        .push(level.value());
+                        .push((level.value(), by));
                     library_ok(LibraryResponse::FactWritten)
                 }
                 GatewayRequest::Library {
@@ -174,12 +179,13 @@ mod tests {
                         LibraryRequest::RetractFact {
                             hash,
                             fact: MusicValue::Energy(level),
-                            ..
+                            source,
                         },
                 } => {
+                    let by = source.clone().unwrap_or_else(|| user.clone());
                     let asserted = state.entry(hash.as_str().to_owned()).or_default();
                     let before = asserted.len();
-                    asserted.retain(|n| *n != level.value());
+                    asserted.retain(|(n, s)| *n != level.value() || !s.same_source(&by));
                     if asserted.len() < before {
                         library_ok(LibraryResponse::FactRetracted)
                     } else {
@@ -252,6 +258,26 @@ mod tests {
         assert!(writes(&gw)
             .iter()
             .all(|r| matches!(r, LibraryRequest::RetractFact { .. })));
+    }
+
+    /// ADR-034: a rekordbox import writes energy under its own source, and a clear
+    /// retracts that too, or the level it wrote would show again.
+    #[tokio::test]
+    async fn clearing_retracts_a_level_rekordbox_asserted_too() {
+        let user = user_fact_source("any");
+        let rekordbox = library_ipc_client::rekordbox_source("any");
+        let gw = gateway_seeded(
+            vec![('a', vec![(3, user), (8, rekordbox.clone()), (4, rekordbox)])],
+            None,
+        );
+        let res = post(&gw, json!({"hashes": [full('a')], "level": null})).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = body_json(res).await;
+        assert_eq!(body["changed"], json!([full('a')]));
+        assert_eq!(body["tracks"][0]["energy"], json!(null));
+        // Nothing resurfaces: a second clear has nothing left to do.
+        let res = post(&gw, json!({"hashes": [full('a')], "level": null})).await;
+        assert_eq!(body_json(res).await["changed"], json!([]));
     }
 
     #[tokio::test]

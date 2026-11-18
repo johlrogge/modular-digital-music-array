@@ -534,6 +534,21 @@ pub fn user_fact_source(version: impl Into<String>) -> FactSource {
     FactSource::new(USER_TOOL, version, USER_ORIGIN)
 }
 
+/// Origin kind of facts imported from Rekordbox.
+pub const REKORDBOX_ORIGIN: &str = "Rekordbox";
+
+/// The source of facts a Rekordbox import writes (ADR-034). `version` is the version
+/// of the writer.
+pub fn rekordbox_source(version: impl Into<String>) -> FactSource {
+    FactSource::new(USER_TOOL, version, REKORDBOX_ORIGIN)
+}
+
+/// Every source that writes energy: the user's and Rekordbox's. A clear retracts the
+/// energy of all of them, or one it left behind would show again (ADR-034 §4).
+pub fn energy_sources(version: &str) -> [FactSource; 2] {
+    [user_fact_source(version), rekordbox_source(version)]
+}
+
 // ============================================================================
 // Request Types
 // ============================================================================
@@ -1979,6 +1994,22 @@ mod tests {
         assert_eq!(source.tool, USER_TOOL);
         assert_eq!(source.origin.kind, USER_ORIGIN);
         assert_eq!(source.version, "1.2.3");
+    }
+
+    #[test]
+    fn rekordbox_is_its_own_source_under_the_user_tool() {
+        let source = rekordbox_source("1.2.3");
+        assert_eq!(source.tool, USER_TOOL);
+        assert_eq!(source.origin.kind, REKORDBOX_ORIGIN);
+        assert!(!source.same_source(&user_fact_source("1.2.3")));
+    }
+
+    #[test]
+    fn every_source_that_writes_energy_is_listed() {
+        let sources = energy_sources("9");
+        assert_eq!(sources.len(), 2);
+        assert!(sources[0].same_source(&user_fact_source("0")));
+        assert!(sources[1].same_source(&rekordbox_source("0")));
     }
 
     fn named(s: &str) -> Mark {

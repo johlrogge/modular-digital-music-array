@@ -2067,6 +2067,51 @@ mod tests {
         assert!(!titles.contains(&title("Gone").to_string()));
     }
 
+    /// ADR-034: the user and a Rekordbox import both write energy, each under its own
+    /// source. The shown energy is the last live one, whoever wrote it, and a clear that
+    /// retracts every source leaves none.
+    #[test]
+    fn energy_shows_the_last_live_level_of_any_source_and_retracting_all_shows_none() {
+        use music_facts::EnergyLevel;
+        let ingest = src("ingest", "1.0.0");
+        let user = FactSource::new("mdma", "1", "User");
+        let rekordbox = FactSource::new("mdma", "1", "Rekordbox");
+        let level = |n| MusicValue::Energy(EnergyLevel::new(n).unwrap());
+        let track = |facts: Vec<MusicFact>| {
+            let mut all = vec![
+                assert_fact("sha256:aabbcc", title("T"), 1, &ingest),
+                assert_fact(
+                    "sha256:aabbcc",
+                    MusicValue::FilePath(PathBuf::from("x/y.flac")),
+                    1,
+                    &ingest,
+                ),
+            ];
+            all.extend(facts);
+            project(all).tracks.remove(0)
+        };
+        let written = vec![
+            assert_fact("sha256:aabbcc", level(8), 2, &rekordbox),
+            assert_fact("sha256:aabbcc", level(6), 3, &user),
+            assert_fact("sha256:aabbcc", level(4), 4, &rekordbox),
+        ];
+        assert_eq!(track(written.clone()).energy, EnergyLevel::new(4).ok());
+
+        let mut cleared = written;
+        for (at, (n, source)) in [(8, &rekordbox), (6, &user), (4, &rekordbox)]
+            .into_iter()
+            .enumerate()
+        {
+            cleared.push(retract_fact(
+                "sha256:aabbcc",
+                level(n),
+                5 + at as u32,
+                source,
+            ));
+        }
+        assert_eq!(track(cleared).energy, None);
+    }
+
     #[test]
     fn project_lines_skips_lines_that_are_not_facts() {
         let s = src("ingest", "1.0.0");

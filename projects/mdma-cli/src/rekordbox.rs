@@ -2,8 +2,8 @@ use crate::args::{
     DryRun, ExistingFileArg, OutputDir, PlaylistArg, SanitizedPlaylistName, StdinDash,
 };
 use crate::ctx::Ctx;
-use crate::origins::rekordbox_source;
 use crate::output::library_error;
+use crate::rekordbox_exchange;
 use crate::stdin::{require_stdin_hashes_or_usage, resolve_tracks_or_abort};
 use crate::transfer::{
     build_http_client, download_tracks, existing_location_set, export_dest_path_checked,
@@ -18,6 +18,7 @@ use library_ipc_client::{track_hashes, unresolved_entries};
 use library_ipc_client::{ContentHash, PlaylistEntry, TrackInfo};
 use music_facts::MusicValue;
 use playlist_import::{format_write_outcome, write_playlist, LibraryTrackLookup};
+use rekordbox_roundtrip::Stars;
 use rekordbox_xml::{parse_xml, RekordboxTrack};
 use track_matcher::{CandidateTrack, MatchResult};
 
@@ -169,6 +170,7 @@ fn build_rekordbox_track(
         bitrate,
         sample_rate,
         location,
+        rating: Stars::from_energy(track.energy).to_rating(),
         position_marks,
     }
 }
@@ -208,7 +210,10 @@ fn playlist_locations(
 /// Export tracks to Rekordbox-compatible XML + audio files
 ///
 /// Pass one or more --playlist flags to export named playlists, or `-` to read
-/// hashes from stdin (stdin is read only for `-`). Exactly one of the two.
+/// hashes from stdin (stdin is read only for `-`). Exactly one of the two. The rating of
+/// each track is written from its energy (energy 7 is 4 stars). Run
+/// `mdma rekordbox import --enrich` before exporting: a rating changed in rekordbox
+/// and not yet imported is overwritten by the export.
 ///
 /// # Examples
 ///
@@ -455,6 +460,8 @@ pub(crate) fn export(args: RekordboxExportArgs, ctx: &Ctx) -> Result<()> {
     // Failed downloads are logged and dropped — a partial XML is worse than the
     // last-good XML, so we abort before writing if any download failed.
     let mut refreshed: Vec<rekordbox_xml::RefreshedTrack> = Vec::with_capacity(desired.len());
+    // What this export writes as the rating of each track: the base of the next import.
+    let mut exported: Vec<(ContentHash, Stars)> = Vec::with_capacity(desired.len());
     for (track, dest, ext) in &desired {
         let hash_str = track.content_hash.as_str().to_string();
         let location = rekordbox_xml::path_to_file_uri(dest);
@@ -476,6 +483,7 @@ pub(crate) fn export(args: RekordboxExportArgs, ctx: &Ctx) -> Result<()> {
                 .get_facts(&track.content_hash)
                 .map(|(_hash, facts)| facts)
                 .unwrap_or_default();
+            exported.push((track.content_hash.clone(), Stars::from_energy(track.energy)));
             refreshed.push(build_rekordbox_track(
                 track,
                 &actual_dest,
@@ -526,6 +534,14 @@ pub(crate) fn export(args: RekordboxExportArgs, ctx: &Ctx) -> Result<()> {
     let xml = merged.to_xml();
     std::fs::write(&xml_path, xml.as_bytes())
         .map_err(|e| eyre!("Failed to write rekordbox.xml: {}", e))?;
+
+    // The ratings just written are what was last exchanged (ADR-034).
+    rekordbox_exchange::record_export(
+        &rekordbox_exchange::state_file()?,
+        &rekordbox_exchange::node_key(ctx.node())?,
+        &exported,
+    )
+    .map_err(|e| eyre!("rekordbox.xml is written, but the exchange state is not: {e:#}"))?;
 
     eprintln!();
     let mode_prefix = if replace { "Replace" } else { "Sync" };
@@ -664,6 +680,18 @@ pub(crate) fn import(args: RekordboxImportArgs, ctx: &Ctx) -> Result<()> {
     // The writes (playlists, enrichment) go through the node too.
     let library = ctx.node().library()?;
 
+    // The exchange state is read before anything is written, so that a damaged file
+    // stops the import before it has changed anything (ADR-034).
+    let mut energy = if enrich {
+        Some(rekordbox_exchange::EnergySync::load(
+            &rekordbox_exchange::state_file()?,
+            &rekordbox_exchange::node_key(ctx.node())?,
+            dry_run,
+        )?)
+    } else {
+        None
+    };
+
     // 3. Print summary
     println!("Matched:   {:3} tracks", matched.len());
     println!(
@@ -783,11 +811,12 @@ pub(crate) fn import(args: RekordboxImportArgs, ctx: &Ctx) -> Result<()> {
         let mut skipped = 0usize;
         let mut errors = 0usize;
 
-        let source = rekordbox_source();
+        let source = library_ipc_client::rekordbox_source(env!("CARGO_PKG_VERSION"));
 
         for (rb_track, hash) in &matched {
             // Fetch current track facts; on failure fall back to writing (safe default).
-            let existing = library.get_track(hash).ok();
+            let fetched = library.get_track(hash);
+            let existing = fetched.as_ref().ok();
 
             // Write BPM if available
             if let Some(bpm_f32) = rb_track.average_bpm {
@@ -946,6 +975,10 @@ pub(crate) fn import(args: RekordboxImportArgs, ctx: &Ctx) -> Result<()> {
                     }
                 }
             }
+
+            if let Some(energy) = energy.as_mut() {
+                energy.track(&library, rb_track, hash, fetched.as_ref());
+            }
         }
 
         if !dry_run {
@@ -953,6 +986,22 @@ pub(crate) fn import(args: RekordboxImportArgs, ctx: &Ctx) -> Result<()> {
                 "Enriched {} fact(s), skipped {} (already up to date), {} error(s)",
                 enriched, skipped, errors
             );
+        }
+
+        // Rating ↔ energy (ADR-034): stdout gets the summary, stderr the conflicts.
+        if let Some(energy) = energy {
+            let report = energy.finish()?;
+            for line in &report.would {
+                println!("[dry-run] {line}");
+            }
+            println!("{}", report.summary(dry_run));
+            if !report.conflicts.is_empty() {
+                eprintln!();
+                eprintln!("Energy conflicts (kept MDMA):");
+                for conflict in &report.conflicts {
+                    eprintln!("{}", conflict.line());
+                }
+            }
         }
     }
 
@@ -1152,6 +1201,37 @@ mod tests {
         assert_eq!(playlist.name().as_str(), "My-Set");
     }
 
+    // ── rating ───────────────────────────────────────────────────────────────────
+
+    /// ADR-034: the export writes the stars of the energy as the rating (7 is 4 stars,
+    /// 204), and no energy is unrated.
+    #[test]
+    fn export_writes_the_energy_as_a_rating() {
+        let hash = format!("sha256:{}", "a".repeat(64));
+        for (energy, rating) in [(None, 0), (Some(1), 51), (Some(7), 204), (Some(10), 255)] {
+            let track = library_ipc_client::TrackInfo {
+                energy: energy.map(|n| library_ipc_client::EnergyLevel::new(n).unwrap()),
+                ..crate::test_support::track(&hash)
+            };
+            let built = super::build_rekordbox_track(
+                &track,
+                std::path::Path::new("/x/a.aiff"),
+                "aiff",
+                1,
+                &[],
+            );
+            assert_eq!(built.rating, rating, "energy {energy:?}");
+        }
+    }
+
+    #[test]
+    fn export_help_says_to_import_first() {
+        let help = crate::test_support::help(&["rekordbox", "export", "--help"]);
+        let help = help.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(help.contains("rekordbox import --enrich"), "{help}");
+        assert!(help.contains("before exporting"), "{help}");
+    }
+
     // ── playlist entries ─────────────────────────────────────────────────────────
 
     /// A playlist line stored short resolves, through the library, to the track's full
@@ -1263,6 +1343,7 @@ mod tests {
                 sample_rate: None,
                 location: loc_mixed.clone(),
                 tempo_anchor: None,
+                rating: 0,
                 position_marks: vec![],
             }],
             playlists: vec![],
@@ -1288,6 +1369,7 @@ mod tests {
             bitrate: None,
             sample_rate: None,
             location: loc_lower.clone(),
+            rating: 0,
             position_marks: vec![],
         };
 
