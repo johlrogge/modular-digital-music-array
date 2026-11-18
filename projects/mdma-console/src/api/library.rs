@@ -346,6 +346,9 @@ pub struct ApiFilterKey {
     pub key: ApiKey,
     pub note: &'static str,
     pub mode: ApiMode,
+    /// Whether the requested reach includes this key; absent from the plain list.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub included: Option<bool>,
 }
 
 impl From<Key> for ApiFilterKey {
@@ -354,16 +357,48 @@ impl From<Key> for ApiFilterKey {
             key: ApiKey::from(k),
             note: k.pitch().as_sharp(),
             mode: k.mode().into(),
+            included: None,
         }
     }
 }
 
-/// `GET /api/keys`: the 24 keys the filter sheet offers, in `Key::all()` order. They never change.
-pub async fn keys() -> impl axum::response::IntoResponse {
-    (
-        [(axum::http::header::CACHE_CONTROL, "public, max-age=86400")],
-        axum::Json(Key::all().map(ApiFilterKey::from).collect::<Vec<_>>()),
-    )
+#[derive(Debug, Default, Deserialize)]
+pub struct KeysParams {
+    /// A key query (`8A+-2d,+7`): marks the keys it includes.
+    pub reach: Option<String>,
+}
+
+/// `GET /api/keys`: the 24 keys the filter sheet offers, in wheel order (`Key::camelot_wheel`:
+/// 1A..12A, then 1B..12B, so the sheet's two rows line up and a relative pair shares a column).
+/// They never change, so the plain list is cached for a day; the browser asks with `?v=wheel`
+/// (ignored here) so a change of order gets a new URL. With `?reach=<key query>` every entry also says whether
+/// the query includes it (`KeyQuery::matches`, so the browser never works the wheel out itself);
+/// a query `parse_key_query` rejects is a 400.
+pub async fn keys(Query(params): Query<KeysParams>) -> Response {
+    use axum::{http::header::CACHE_CONTROL, response::IntoResponse, Json};
+    let reach = params
+        .reach
+        .as_deref()
+        .map(str::trim)
+        .filter(|r| !r.is_empty());
+    let Some(reach) = reach else {
+        let keys = Key::camelot_wheel()
+            .map(ApiFilterKey::from)
+            .collect::<Vec<_>>();
+        return ([(CACHE_CONTROL, "public, max-age=86400")], Json(keys)).into_response();
+    };
+    match library_search::parse_key_query(reach) {
+        Ok(query) => {
+            let keys = Key::camelot_wheel()
+                .map(|k| ApiFilterKey {
+                    included: Some(query.matches(k)),
+                    ..ApiFilterKey::from(k)
+                })
+                .collect::<Vec<_>>();
+            ([(CACHE_CONTROL, "private, max-age=60")], Json(keys)).into_response()
+        }
+        Err(e) => fail(StatusCode::BAD_REQUEST, e.to_string()),
+    }
 }
 
 /// One catalogue entry, as served by `GET /api/tracks`.
@@ -555,7 +590,7 @@ mod tests {
     }
 
     /// Every format the narrow bar sends (lanes M3): ranges with open ends as 0 or 999,
-    /// traditional key notation with and without the mix-well suffix (`+-1`), and `>date`.
+    /// traditional key notation with every reach `keyReach` writes, and `>date`.
     #[test]
     fn query_accepts_every_format_the_narrow_bar_sends() {
         let param = |bpm: Option<&str>, key: Option<&str>, added: Option<&str>| SearchParams {
@@ -573,7 +608,9 @@ mod tests {
             "C", "C#", "D", "Eb", "E", "F", "F#", "G", "Ab", "A", "Bb", "B",
         ] {
             for mode in ["", "m"] {
-                for suffix in ["", "+-1"] {
+                for suffix in [
+                    "", "+-1", "+-1d", "+-2", "+-3", "+-2d", "+-3d", ",+7", "+-1,+7", "+-3d,+7",
+                ] {
                     let key = format!("{note}{mode}{suffix}");
                     let q = track_query_from(&param(None, Some(&key), None))
                         .unwrap_or_else(|e| panic!("key {key}: {e}"));
@@ -872,6 +909,90 @@ mod tests {
             "note": "A#",
             "mode": "min",
         })));
+    }
+
+    #[tokio::test]
+    async fn plain_keys_are_cached_for_a_day_without_included() {
+        let res = send_get(test_app(), "/api/keys", None).await;
+        assert_eq!(
+            res.headers()[axum::http::header::CACHE_CONTROL],
+            "public, max-age=86400"
+        );
+        let keys = body_json(res).await;
+        assert!(keys
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|k| k.get("included").is_none()));
+    }
+
+    #[tokio::test]
+    async fn keys_come_minor_row_then_major_row_by_camelot_number() {
+        let res = send_get(test_app(), "/api/keys", None).await;
+        let keys = body_json(res).await;
+        let camelot: Vec<&str> = keys
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|k| k["camelot"].as_str().unwrap())
+            .collect();
+        let expected: Vec<String> = ["A", "B"]
+            .iter()
+            .flat_map(|l| (1..=12).map(move |n| format!("{n}{l}")))
+            .collect();
+        assert_eq!(camelot, expected);
+    }
+
+    #[tokio::test]
+    async fn keys_with_a_reach_mark_the_included_ones() {
+        // Straight at 2 from 8A: 6A 7A 9A 10A 8B, and the centre.
+        let res = send_get(test_app(), "/api/keys?reach=8A%2B-2", None).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let keys = body_json(res).await;
+        let mut included: Vec<&str> = keys
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|k| k["included"] == json!(true))
+            .map(|k| k["camelot"].as_str().unwrap())
+            .collect();
+        included.sort();
+        assert_eq!(included, ["10A", "6A", "7A", "8A", "8B", "9A"]);
+        assert_eq!(keys.as_array().unwrap().len(), 24);
+        assert!(keys
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|k| k["included"].is_boolean()));
+    }
+
+    #[tokio::test]
+    async fn keys_with_a_reach_are_not_cached_for_a_day() {
+        let res = send_get(test_app(), "/api/keys?reach=8A%2B-2", None).await;
+        assert_ne!(
+            res.headers()[axum::http::header::CACHE_CONTROL],
+            "public, max-age=86400"
+        );
+    }
+
+    #[tokio::test]
+    async fn keys_ignore_the_version_param() {
+        let res = send_get(test_app(), "/api/keys?v=wheel", None).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            res.headers()[axum::http::header::CACHE_CONTROL],
+            "public, max-age=86400"
+        );
+    }
+
+    #[tokio::test]
+    async fn keys_with_a_bad_reach_is_400_with_the_parse_error() {
+        let res = send_get(test_app(), "/api/keys?reach=8A%2B-2x", None).await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert!(body_json(res).await["error"]
+            .as_str()
+            .unwrap()
+            .contains("invalid key query"));
     }
 
     #[tokio::test]

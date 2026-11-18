@@ -5705,6 +5705,7 @@ dependencies = [
  "date-expression",
  "music-facts",
  "music-primitives",
+ "proptest",
  "regex",
  "rstest",
  "serde",

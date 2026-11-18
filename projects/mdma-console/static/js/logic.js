@@ -206,7 +206,7 @@ export function playlistRows(entries, trackOf) {
 }
 
 /**
- * Number of active filter groups in `f` ({ bmin, bmax, key, compat, added, mark }, all fields
+ * Number of active filter groups in `f` ({ bmin, bmax, key, steps, shape, jump, added, mark }, all fields
  * present): tempo, key, added and mark each count once.
  */
 export function filterGroups(f) {

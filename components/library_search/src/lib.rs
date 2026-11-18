@@ -35,6 +35,6 @@ pub use parse::{
     parse_string_query, ParseError,
 };
 pub use query::{
-    DatePrecision, DateQuery, DurationQuery, DurationUnit, KeyQuery, NumericQuery, Reach,
+    DatePrecision, DateQuery, DurationQuery, DurationUnit, KeyQuery, NumericQuery, Reach, Shape,
     StringQuery, TrackQuery,
 };

@@ -40,6 +40,13 @@ function restore() {
   } catch (e) {
     /* nothing to migrate */
   }
+  // The "keys that mix well" checkbox became a reach in steps: on meant one step.
+  for (const f of Object.values(store.f)) {
+    if (f && "compat" in f) {
+      if (f.compat && !f.steps) f.steps = 1;
+      delete f.compat;
+    }
+  }
 }
 
 function persist() {
@@ -79,7 +86,7 @@ const parseKeyFilter = (s) => {
 function loadKeys() {
   if (keysState === "asking" || keysState === "ready") return;
   keysState = "asking";
-  api("/api/keys").then(
+  api("/api/keys?v=wheel").then( // v names the order, so a changed order is a new URL for the day-long cache
     (keys) => {
       KEYS = keys;
       keysState = "ready";
@@ -95,6 +102,22 @@ function loadKeys() {
 }
 
 const keyFor = (note, mode) => KEYS.find((k) => k.note === note && k.mode === mode);
+
+// Which keys a reach includes, as the server says (GET /api/keys?reach=): key query -> Set of
+// camelot names, null while asked. Nothing about the wheel is worked out here.
+const reachMarks = new Map();
+
+function loadReach(query) {
+  if (reachMarks.has(query)) return;
+  reachMarks.set(query, null);
+  api("/api/keys?v=wheel&reach=" + encodeURIComponent(query)).then(
+    (keys) => {
+      reachMarks.set(query, new Set(keys.filter((k) => k.included).map((k) => k.camelot)));
+      if (draft && $("#fsheet").classList.contains("open")) paintFilters();
+    },
+    () => reachMarks.delete(query), // no highlight; asked again at the next paint
+  );
+}
 loadKeys(); // early, so the chips and the active key chip have them by the time they draw
 
 const BPM_PRESETS = [
@@ -104,7 +127,24 @@ const BPM_PRESETS = [
   ["Fast", "140", "180"],
 ];
 
-const emptyFilters = () => ({ bmin: "", bmax: "", key: "", compat: false, added: "any", mark: "" });
+// steps: how far round the key wheel mixes well (0 = the key alone), shape "straight" | "any" (any
+// path; only means something from 2 steps), jump: also the power jump (seven steps up).
+const emptyFilters = () => ({ bmin: "", bmax: "", key: "", steps: 0, shape: "straight", jump: false, added: "any", mark: "" });
+
+/**
+ * The key query for a key filter, in the grammar the server's parse_key_query reads ("8A+-2d,+7").
+ * Writing it is all the browser does with the grammar: what it includes is the server's to say.
+ */
+export function keyReach(note, mode, steps, shape, jump) {
+  const centre = note + (mode === "min" ? "m" : "");
+  return centre + (steps ? "+-" + steps + (shape === "any" ? "d" : "") : "") + (jump ? ",+7" : "");
+}
+
+/** The key query of filters `f` (their key and reach). */
+const reachOf = (f) => {
+  const { note, mode } = parseKeyFilter(f.key);
+  return keyReach(note, mode, f.steps, f.shape, f.jump);
+};
 
 /** A copy of the filters of view `key` (all off when it has none). Safe to hold and to edit. */
 export function filtersOf(key) {
@@ -122,10 +162,7 @@ export function matchQuery(f, text = "") {
   const q = String(text || "").trim();
   if (q) p.set("q", q);
   if (f.bmin || f.bmax) p.set("bpm", (f.bmin || "0") + ".." + (f.bmax || "999"));
-  if (f.key) {
-    const { note, mode } = parseKeyFilter(f.key);
-    p.set("key", note + (mode === "min" ? "m" : "") + (f.compat ? "+-1" : ""));
-  }
+  if (f.key) p.set("key", reachOf(f));
   if (f.added !== "any") {
     const days = Number(f.added);
     p.set("added", ">" + new Date(Date.now() - days * 864e5).toISOString().slice(0, 10));
@@ -287,7 +324,19 @@ function setValue(el, v) {
 function paintFilters() {
   setValue($("#f-bmin"), draft.bmin);
   setValue($("#f-bmax"), draft.bmax);
-  $("#f-compat").checked = draft.compat;
+  $("#f-jump").checked = draft.jump;
+  $$("#f-steps button").forEach((b) => {
+    b.setAttribute("aria-pressed", String(Number(b.dataset.steps) === draft.steps));
+    b.onclick = () => ((draft.steps = Number(b.dataset.steps)), paintFilters());
+  });
+  $$("#f-shape button").forEach((b) => {
+    b.disabled = draft.steps < 2; // the shapes are the same keys at one step
+    b.setAttribute("aria-pressed", String(b.dataset.shape === draft.shape));
+    b.onclick = () => ((draft.shape = b.dataset.shape), paintFilters());
+  });
+  const reach = draft.key && (draft.steps || draft.jump) ? reachOf(draft) : null;
+  if (reach) loadReach(reach);
+  const included = reach && reachMarks.get(reach);
 
   const pre = $("#f-bpm-presets");
   pre.innerHTML = "";
@@ -310,20 +359,10 @@ function paintFilters() {
     );
   }
 
-  const mode = draft.key ? parseKeyFilter(draft.key).mode : draft._mode || "min";
-  $$("#f-mode button").forEach((b) => {
-    b.setAttribute("aria-pressed", String(b.dataset.mode === mode));
-    b.onclick = () => {
-      draft._mode = b.dataset.mode;
-      if (draft.key) draft.key = keyFilter(parseKeyFilter(draft.key).note, b.dataset.mode);
-      paintFilters();
-    };
-  });
-
   const keys = $("#f-keys");
   keys.innerHTML = "";
   if (keysState === "failed") keys.appendChild(h("span", { class: "hint", text: "Keys unavailable" }));
-  for (const k of KEYS.filter((x) => x.mode === mode)) {
+  for (const k of KEYS) { // the server's order: the minor row, then the major row, a relative pair per column
     const val = keyFilter(k.note, k.mode); // what the filter stores and matchQuery turns into the key query, whatever is shown
     const on = draft.key === val;
     keys.appendChild(
@@ -333,6 +372,7 @@ function paintFilters() {
           class: "chip",
           "aria-pressed": String(on),
           "aria-label": keyText(k),
+          "data-included": !!included && included.has(k.camelot),
           onclick: () => {
             draft.key = on ? "" : val;
             paintFilters();
@@ -364,8 +404,8 @@ for (const [id, field] of [["#f-bmin", "bmin"], ["#f-bmax", "bmax"]]) {
     paintFilters();
   });
 }
-$("#f-compat").addEventListener("change", (e) => {
-  draft.compat = e.target.checked;
+$("#f-jump").addEventListener("change", (e) => {
+  draft.jump = e.target.checked;
   paintFilters();
 });
 $("#f-scrim").addEventListener("click", closeFilters);
@@ -375,7 +415,6 @@ $("#f-reset").addEventListener("click", () => {
   paintFilters();
 });
 $("#f-apply").addEventListener("click", () => {
-  delete draft._mode;
   store.f[sheetKey] = draft;
   persist();
   closeFilters();
@@ -454,7 +493,8 @@ function narrowBar(o) {
   }
   if (f.key) {
     const { note, mode } = parseKeyFilter(f.key);
-    chip((keyText(keyFor(note, mode)) || "Key") + (f.compat ? " + mixable" : ""), (x) => ((x.key = ""), (x.compat = false)));
+    const reach = (f.steps ? " ±" + f.steps : "") + (f.steps > 1 ? " · " + (f.shape === "any" ? "any path" : "straight") : "") + (f.jump ? " · +jump" : "");
+    chip((keyText(keyFor(note, mode)) || "Key") + reach, (x) => ((x.key = ""), (x.steps = 0), (x.shape = "straight"), (x.jump = false)));
   }
   if (f.added !== "any") {
     const a = ADDED.find((x) => x[0] === f.added);

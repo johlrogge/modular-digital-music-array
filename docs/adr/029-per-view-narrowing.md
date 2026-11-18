@@ -51,6 +51,12 @@ Related: ADR-009 §4, ADR-004, ADR-022 §4 (one fold).
   - Answers are cached per request string, so the cache is cleared when a mark changes.
 - **Marks as set algebra.** The Marked view's pool (which tracks carry the mark) comes from the catalogue's `marks`; text and filters narrow it through the server, and the browser only intersects, as in §3.
 
+## Amendment 2026-11-18: the key filter is a reach
+
+- **The key filter becomes steps, shape and jump.** The "keys that mix well" checkbox (`f.compat`) is replaced by `f.steps` (0 = the key alone, 1 to 3), `f.shape` (`straight` or `any`, only meaningful from 2 steps) and `f.jump` (the +7 power jump). Filters saved with `compat: true` are migrated to `steps: 1`. The browser writes the key query with one helper, `keyReach(...)`, e.g. `8A+-2d,+7`; the grammar and its meaning live in `library_search` (`docs/data-model.md`, "Key query grammar"). `8A+-2` changed meaning from any path to Straight (a T shape); `±1` is unaffected.
+- **Highlighting is the server's.** `GET /api/keys?reach=<key query>` marks each of the 24 keys `included` through `KeyQuery::matches`, so the browser never works the wheel out and the one-matcher rule holds. The plain list is in wheel order (`Key::camelot_wheel`, 1A..12A then 1B..12B) and the sheet shows it as two aligned rows.
+- **Wire semantics.** A new CLI talking to an old node silently gets the old any-path meaning for `8A+-2`, while `d` and `,+7` fail loudly as unparseable; acceptable under redeploy-together.
+
 ## Alternatives considered
 
 - Global filters with per-view overrides: two layers of state and a rule for which wins; clearing becomes ambiguous.

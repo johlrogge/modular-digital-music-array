@@ -132,7 +132,7 @@ mod tests {
         let s = state_with("", "8A+-1", None, "");
         let q = build_track_query(&s).unwrap();
         match q.key {
-            Some(KeyQuery::Steps { centre, reach }) => {
+            Some(KeyQuery::Steps { centre, reach, .. }) => {
                 assert_eq!(centre.to_camelot(), "8A");
                 assert_eq!(reach, Reach::Both(1));
             }

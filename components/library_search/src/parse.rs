@@ -1,5 +1,5 @@
 use crate::query::{
-    DatePrecision, DateQuery, DurationQuery, DurationUnit, KeyQuery, NumericQuery, Reach,
+    DatePrecision, DateQuery, DurationQuery, DurationUnit, KeyQuery, NumericQuery, Reach, Shape,
     StringQuery,
 };
 use chrono::NaiveDate;
@@ -14,9 +14,9 @@ pub enum ParseError {
     InvalidNumeric(String),
     #[error("invalid duration query '{0}': expected e.g. '7m15s', '7m', '>5m', '<8m', '6m..8m'")]
     InvalidDuration(String),
-    #[error("invalid key query '{0}': expected a key (8B, 1m, Am, C# major), steps (8A+-2, 8A+2, 8A-1) or a span (6A..10B)")]
+    #[error("invalid key query '{0}': expected a key (8B, 1m, Am, C# major), steps (8A+-2, 8A+2, 8A-1; add d for any path: 8A+-2d; extra moves: 8A+-1,+7) or a span (6A..10B)")]
     InvalidKey(String),
-    #[error("key query '{0}': the `~` suffix is gone; use steps like `8A+-2` (an A/B switch costs one step) or a span like `6A..10B`")]
+    #[error("key query '{0}': the `~` suffix is gone; use steps like `8A+-2` (round the wheel, or the relative key; `8A+-2d` for any path) or a span like `6A..10B`")]
     KeyTilde(String),
     #[error("invalid date query '{0}'")]
     InvalidDateQuery(String),
@@ -36,10 +36,10 @@ impl ParseError {
                 "expected a duration such as `7m15s`, `7m`, `>5m`, `<8m` or `6m..8m`"
             }
             Self::InvalidKey(_) => {
-                "expected a key (`8B`, `1m`, `Am`, `C# major`), steps (`8A+-2`, `8A+2`, `8A-1`) or a span (`6A..10B`)"
+                "expected a key (`8B`, `1m`, `Am`, `C# major`), steps (`8A+-2`, `8A+2`, `8A-1`; add `d` for any path: `8A+-2d`; extra moves: `8A+-1,+7`) or a span (`6A..10B`)"
             }
             Self::KeyTilde(_) => {
-                "the `~` suffix is gone; use steps like `8A+-2` (an A/B switch costs one step) or a span like `6A..10B`"
+                "the `~` suffix is gone; use steps like `8A+-2` (round the wheel, or the relative key; `8A+-2d` for any path) or a span like `6A..10B`"
             }
             Self::InvalidDateQuery(_) => {
                 "expected a date such as `2026`, `2026-02`, `>2026-02` or `2026-01..2026-06`, a date expression, or `N/A`"
@@ -262,9 +262,13 @@ fn parse_duration_parts(s: &str) -> Result<(u32, Option<DurationUnit>), ParseErr
 ///
 /// Formats:
 /// - `"8A"` → exact key (`down = up = 0`)
-/// - `"8A+-2"` (alias `"8A±2"`) → 2 steps either way
+/// - `"8A+-2"` (alias `"8A±2"`) → 2 steps either way, Straight: round the wheel in
+///   one letter, or exactly the relative (6A 7A 8A 9A 10A 8B)
 /// - `"8A+2"` → 2 steps clockwise; `"8A-1"` → 1 step counter-clockwise
-///   (an A/B switch costs one step)
+/// - `"8A+-2d"` → distance only, any path (a step or an A/B switch costs 1); the
+///   `d` suffix works on every step form
+/// - `"8A+-1,+7"` → plus exact moves from the centre, keeping the letter (`,+7`
+///   adds 3A); only after a steps term
 /// - `"6A..10B"` → numbers 6 to 10 clockwise, letters A or B
 ///
 /// The old `~` suffix is rejected with a pointer to the new syntax.
@@ -276,11 +280,39 @@ pub fn parse_key_query(s: &str) -> Result<KeyQuery, ParseError> {
         return Err(ParseError::KeyTilde(s.to_string()));
     }
 
-    if let Some((from, to)) = s.split_once("..") {
+    let (term, extra_moves) = match s.split_once(',') {
+        Some((term, rest)) => (term, Some(rest)),
+        None => (s, None),
+    };
+
+    if let Some((from, to)) = term.split_once("..") {
+        if extra_moves.is_some() {
+            return Err(invalid());
+        }
         let from = from.parse().map_err(|_| invalid())?;
         let to = to.parse().map_err(|_| invalid())?;
         return Ok(KeyQuery::Span { from, to });
     }
+
+    // Each extra move is a signed wheel offset: digits only, like the steps.
+    let jumps = extra_moves
+        .into_iter()
+        .flat_map(|rest| rest.split(','))
+        .map(|m| {
+            let digits = m.strip_prefix(['+', '-']).ok_or_else(invalid)?;
+            if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(invalid());
+            }
+            m.parse::<i8>().map_err(|_| invalid())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    // `,+7,+7` says one thing once.
+    let jumps = jumps.into_iter().fold(Vec::new(), |mut seen, j| {
+        if !seen.contains(&j) {
+            seen.push(j);
+        }
+        seen
+    });
 
     // `+-` must be tried before `+` and `-`.
     type Operator = (&'static str, fn(u8) -> Reach);
@@ -290,24 +322,39 @@ pub fn parse_key_query(s: &str) -> Result<KeyQuery, ParseError> {
         ("+", Reach::Up),
         ("-", Reach::Down),
     ];
-    let (base, reach) = match s.find(['+', '-', '±']) {
+    let (base, reach, shape) = match term.find(['+', '-', '±']) {
         Some(at) => {
-            let (base, op_and_steps) = s.split_at(at);
+            let (base, op_and_steps) = term.split_at(at);
             let (steps, reach) = STEP_OPERATORS
                 .iter()
                 .find_map(|(op, reach)| op_and_steps.strip_prefix(op).map(|steps| (steps, reach)))
                 .ok_or_else(invalid)?;
+            let (steps, any_path) = match steps.strip_suffix('d') {
+                Some(steps) => (steps, true),
+                None => (steps, false),
+            };
             // Digits only: `u8::from_str` would accept a second sign (`8A-+1`).
             if !steps.bytes().all(|b| b.is_ascii_digit()) {
                 return Err(invalid());
             }
             let steps: u8 = steps.parse().map_err(|_| invalid())?;
-            (base, reach(steps))
+            // At 0 steps there is no path to take: the exact key, written without a `d`.
+            let shape = if any_path && steps > 0 {
+                Shape::AnyPath
+            } else {
+                Shape::Straight
+            };
+            (base, reach(steps), shape)
         }
-        None => (s, Reach::Both(0)),
+        None => (term, Reach::Both(0), Shape::Straight),
     };
     let centre = base.parse().map_err(|_| invalid())?;
-    Ok(KeyQuery::Steps { centre, reach })
+    Ok(KeyQuery::Steps {
+        centre,
+        reach,
+        shape,
+        jumps,
+    })
 }
 
 /// Parse a CLI started/stopped date string into a `DateQuery`.
@@ -550,10 +597,9 @@ mod tests {
     /// Camelot names of every key the query matches, in wheel order (1A..12A, 1B..12B).
     fn matching(query: &str) -> Vec<String> {
         let q: KeyQuery = query.parse().unwrap();
-        ['A', 'B']
-            .into_iter()
-            .flat_map(|l| (1..=12).map(move |n| format!("{n}{l}")))
-            .filter(|k| q.matches(k.parse().unwrap()))
+        music_primitives::Key::camelot_wheel()
+            .filter(|k| q.matches(*k))
+            .map(|k| k.to_camelot())
             .collect()
     }
 
@@ -576,11 +622,170 @@ mod tests {
     }
 
     #[test]
-    fn key_steps_both_directions_with_mode_switch() {
+    fn key_steps_straight_is_a_t_shape() {
         assert_eq!(
             matching("8A+-2"),
+            names(&["6A", "7A", "8A", "9A", "10A", "8B"])
+        );
+    }
+
+    #[test]
+    fn key_steps_distance_adds_the_diagonals() {
+        assert_eq!(
+            matching("8A+-2d"),
             names(&["6A", "7A", "8A", "9A", "10A", "7B", "8B", "9B"])
         );
+    }
+
+    #[test]
+    fn key_steps_at_one_are_the_neighbours_and_the_relative() {
+        assert_eq!(matching("8A+-1"), names(&["7A", "8A", "9A", "8B"]));
+        assert_eq!(matching("8A+-1d"), names(&["7A", "8A", "9A", "8B"]));
+    }
+
+    #[test]
+    fn key_steps_shapes_are_equal_at_one_for_every_centre() {
+        for centre in all_keys() {
+            assert_eq!(
+                matching(&format!("{centre}+-1")),
+                matching(&format!("{centre}+-1d")),
+                "{centre}"
+            );
+        }
+    }
+
+    #[test]
+    fn key_steps_straight_is_within_distance_for_every_centre_and_reach() {
+        for centre in all_keys() {
+            for n in 0..=6 {
+                for op in ["+-", "+", "-"] {
+                    let straight = matching(&format!("{centre}{op}{n}"));
+                    let distance = matching(&format!("{centre}{op}{n}d"));
+                    assert!(
+                        straight.iter().all(|k| distance.contains(k)),
+                        "{centre}{op}{n}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn key_steps_straight_at_zero_is_the_exact_key() {
+        assert_eq!(matching("8A+-0"), names(&["8A"]));
+    }
+
+    #[test]
+    fn key_steps_plus_zero_is_exactly_the_centre() {
+        assert_eq!(matching("8A+0"), names(&["8A"]));
+        assert_eq!(matching("8A+0d"), names(&["8A"]));
+    }
+
+    #[test]
+    fn key_steps_distance_at_zero_is_the_plain_exact_key() {
+        let q: KeyQuery = "8A+-0d".parse().unwrap();
+        assert_eq!(q, "8A".parse().unwrap());
+        assert_eq!(q.to_string(), "8A");
+    }
+
+    /// `d` at 0 steps normalises away, so what Display writes parses back to the same query.
+    #[rstest]
+    #[case("8A+-0d", "8A")]
+    #[case("8A+0d", "8A+0")]
+    #[case("8A+-0d,+7", "8A,+7")]
+    fn key_distance_at_zero_round_trips_normalised(#[case] input: &str, #[case] shown: &str) {
+        let q: KeyQuery = input.parse().unwrap();
+        assert_eq!(q.to_string(), shown);
+        assert_eq!(shown.parse::<KeyQuery>().unwrap(), q);
+    }
+
+    #[test]
+    fn key_steps_clockwise_excludes_the_counter_clockwise_side() {
+        let m = matching("8A+2");
+        assert!(!m.contains(&"7A".to_string()));
+        assert!(!matching("8A-2").contains(&"9A".to_string()));
+    }
+
+    #[test]
+    fn key_steps_counter_clockwise_wraps_to_12a() {
+        assert_eq!(matching("1A-1"), names(&["12A", "1A", "1B"]));
+    }
+
+    #[test]
+    fn key_steps_b_centre_mirrors_the_a_centre() {
+        assert_eq!(
+            matching("8B+-2"),
+            names(&["6B", "7B", "8B", "9B", "10B", "8A"])
+        );
+        assert_eq!(
+            matching("8B+-2d"),
+            names(&["6B", "7B", "8B", "9B", "10B", "7A", "8A", "9A"])
+        );
+    }
+
+    #[test]
+    fn key_steps_b_centre_wraps_the_wheel() {
+        assert_eq!(matching("1B+-1"), names(&["12B", "1B", "2B", "1A"]));
+    }
+
+    #[test]
+    fn key_steps_straight_wraps_the_wheel_at_two() {
+        assert_eq!(
+            matching("12A+-2"),
+            names(&["10A", "11A", "12A", "1A", "2A", "12B"])
+        );
+    }
+
+    #[test]
+    fn key_jump_adds_only_the_power_jump() {
+        assert_eq!(matching("8A+-1,+7"), names(&["7A", "8A", "9A", "8B", "3A"]));
+    }
+
+    #[test]
+    fn key_jump_composes_with_the_distance_shape() {
+        assert_eq!(
+            matching("8A+-2d,+7"),
+            names(&["6A", "7A", "8A", "9A", "10A", "7B", "8B", "9B", "3A"])
+        );
+    }
+
+    #[test]
+    fn key_jump_keeps_the_letter() {
+        assert_eq!(matching("8B,+7"), names(&["8B", "3B"]));
+    }
+
+    #[test]
+    fn key_jump_may_go_down() {
+        // -7 is 5 steps clockwise round the wheel: 1A.
+        assert_eq!(matching("8A,-7"), names(&["8A", "1A"]));
+    }
+
+    #[test]
+    fn key_jump_wraps_the_wheel() {
+        assert_eq!(matching("12A,+7"), names(&["12A", "7A"]));
+    }
+
+    /// A whole turn of the wheel and no turn at all land on the centre, which every reach
+    /// already includes: both are accepted and add nothing.
+    #[rstest]
+    #[case("8A,+12")]
+    #[case("8A,+0")]
+    #[case("8A,-12")]
+    fn key_jump_of_a_whole_turn_or_none_is_the_centre(#[case] query: &str) {
+        assert_eq!(matching(query), names(&["8A"]));
+    }
+
+    #[test]
+    fn key_jumps_are_deduplicated() {
+        let q: KeyQuery = "8A,+7,+7".parse().unwrap();
+        assert_eq!(q.to_string(), "8A,+7");
+    }
+
+    /// Camelot names of the 24 keys, in wheel order.
+    fn all_keys() -> Vec<String> {
+        music_primitives::Key::camelot_wheel()
+            .map(|k| k.to_camelot())
+            .collect()
     }
 
     #[test]
@@ -589,17 +794,17 @@ mod tests {
     }
 
     #[test]
-    fn key_steps_mode_switch_costs_a_step() {
-        let m = matching("3A+-2");
-        for k in ["4B", "2B", "3B"] {
-            assert!(m.contains(&k.to_string()), "{k}");
-        }
-        assert!(!m.contains(&"5B".to_string()));
+    fn key_steps_distance_mode_switch_costs_a_step() {
+        assert_eq!(
+            matching("3A+-2d"),
+            names(&["1A", "2A", "3A", "4A", "5A", "2B", "3B", "4B"])
+        );
     }
 
     #[test]
     fn key_steps_clockwise_only() {
-        assert_eq!(matching("8A+2"), names(&["8A", "9A", "10A", "8B", "9B"]));
+        assert_eq!(matching("8A+2"), names(&["8A", "9A", "10A", "8B"]));
+        assert_eq!(matching("8A+2d"), names(&["8A", "9A", "10A", "8B", "9B"]));
     }
 
     #[test]
@@ -686,6 +891,18 @@ mod tests {
     #[case("8A++1")]
     #[case("8A+-+1")]
     #[case("8A+-1-1")]
+    #[case("8A+-2x")]
+    #[case("8A+-2D")]
+    #[case("8A+-d")]
+    #[case("8Ad")]
+    #[case("8A+-2dd")]
+    #[case("8A+-1,")]
+    #[case("8A+-1,7")]
+    #[case("8A+-1,+")]
+    #[case("8A+-1,+x")]
+    #[case("8A+-1,+-7")]
+    #[case("8A+-1,+7d")]
+    #[case("6A..10B,+7")]
     fn key_query_rejects_malformed(#[case] input: &str) {
         assert!(input.parse::<KeyQuery>().is_err(), "{input}");
     }
@@ -697,12 +914,64 @@ mod tests {
     #[case("8A-1")]
     #[case("8A+0")]
     #[case("8A-0")]
+    #[case("8A+-2d")]
+    #[case("8A+3d")]
+    #[case("8A-1d")]
+    #[case("8A+-1,+7")]
+    #[case("8A+-2d,+7")]
+    #[case("8A,+7,-7")]
     #[case("6A..10B")]
     #[case("1B..1A")]
     fn key_query_display_round_trips(#[case] input: &str) {
         let q: KeyQuery = input.parse().unwrap();
         assert_eq!(q.to_string(), input);
         assert_eq!(q.to_string().parse::<KeyQuery>().unwrap(), q);
+    }
+
+    mod round_trip {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// Any steps query in the shape the parser produces: no `d` at 0 steps, jumps once each.
+        fn steps_query() -> impl Strategy<Value = KeyQuery> {
+            (
+                0usize..24,
+                0u8..=12,
+                0u8..3,
+                any::<bool>(),
+                proptest::collection::vec(-12i8..=12, 0..4),
+            )
+                .prop_map(|(centre, n, direction, any_path, moves)| {
+                    let reach = match direction {
+                        0 => Reach::Both(n),
+                        1 => Reach::Up(n),
+                        _ => Reach::Down(n),
+                    };
+                    let mut jumps = Vec::new();
+                    for j in moves {
+                        if !jumps.contains(&j) {
+                            jumps.push(j);
+                        }
+                    }
+                    KeyQuery::Steps {
+                        centre: music_primitives::Key::camelot_wheel().nth(centre).unwrap(),
+                        reach,
+                        shape: if any_path && n > 0 {
+                            Shape::AnyPath
+                        } else {
+                            Shape::Straight
+                        },
+                        jumps,
+                    }
+                })
+        }
+
+        proptest! {
+            #[test]
+            fn display_parses_back_to_the_same_query(q in steps_query()) {
+                prop_assert_eq!(q.to_string().parse::<KeyQuery>().unwrap(), q);
+            }
+        }
     }
 
     #[rstest]
@@ -714,6 +983,8 @@ mod tests {
         let q = KeyQuery::Steps {
             centre: "8A".parse().unwrap(),
             reach,
+            shape: Shape::Straight,
+            jumps: vec![],
         };
         assert_eq!(q.to_string(), text);
         assert_eq!(text.parse::<KeyQuery>().unwrap(), q);
@@ -724,6 +995,7 @@ mod tests {
     #[case("\"8A\"")]
     #[case("\"8A+3\"")]
     #[case("\"8A-1\"")]
+    #[case("\"8A+-2d,+7\"")]
     #[case("\"6A..10B\"")]
     fn key_query_json_round_trips_as_its_string_form(#[case] json: &str) {
         let q: KeyQuery = serde_json::from_str(json).unwrap();

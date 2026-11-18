@@ -122,9 +122,11 @@
       <div class="chips" style="margin-top:var(--s-3)" id="f-bpm-presets"></div>
     </div>
     <div class="fgroup"><span class="kicker">Key</span>
-      <div class="seg" role="group" aria-label="Mode" id="f-mode" style="margin-bottom:var(--s-3)"><button aria-pressed="false" data-mode="min">Minor</button><button aria-pressed="false" data-mode="maj">Major</button></div>
       <div class="keys" id="f-keys"></div>
-      <label class="radio" style="padding:0;border:0;margin-top:var(--s-2)"><input type="checkbox" id="f-compat"><span class="ttl">Include keys that mix well<small style="display:block;color:var(--text-3);font-size:var(--fs-xs)">Neighbours on the key wheel and the relative major/minor</small></span></label>
+      <span class="kicker" style="display:block;margin-top:var(--s-3)">Keys that mix well · steps</span>
+      <div class="seg" role="group" aria-label="Steps" id="f-steps"><button aria-pressed="false" data-steps="0">Off</button><button aria-pressed="false" data-steps="1">1</button><button aria-pressed="false" data-steps="2">2</button><button aria-pressed="false" data-steps="3">3</button></div>
+      <div class="seg" role="group" aria-label="Shape" id="f-shape" style="margin-top:var(--s-2)"><button aria-pressed="false" data-shape="straight">Straight</button><button aria-pressed="false" data-shape="any">Any path</button></div>
+      <label class="radio" style="padding:0;border:0;margin-top:var(--s-2)"><input type="checkbox" id="f-jump"><span class="ttl">+ Power jump<small style="display:block;color:var(--text-3);font-size:var(--fs-xs)">Also seven steps up the wheel: one semitone higher</small></span></label>
     </div>
     <div class="fgroup"><span class="kicker">Added</span><div class="chips" id="f-added"></div></div>
     <div class="fgroup"><span class="kicker">Mark</span><div class="chips" id="f-mark"></div></div>
