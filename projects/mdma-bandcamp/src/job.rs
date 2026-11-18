@@ -3,7 +3,7 @@
 //! panicking or cancelled job into a reported failure.
 
 use parking_lot::Mutex;
-use source_protocol::{CheckJobStatus, ImportJobStatus, ImportPhase};
+use source_protocol::{CheckJobStatus, ImportJobStatus, ImportPhase, PlaylistSyncJobStatus};
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -24,6 +24,16 @@ impl JobStatus for ImportJobStatus {
             self.phase,
             ImportPhase::Done(_) | ImportPhase::Failed { .. }
         )
+    }
+}
+
+impl JobStatus for PlaylistSyncJobStatus {
+    fn job_id(&self) -> u64 {
+        self.job_id
+    }
+
+    fn is_running(&self) -> bool {
+        !self.phase.is_finished()
     }
 }
 

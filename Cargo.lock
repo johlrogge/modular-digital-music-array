@@ -6051,8 +6051,10 @@ dependencies = [
  "music-facts",
  "nng",
  "parking_lot",
+ "playlist-edit",
  "playlist-import",
  "pretty_assertions",
+ "private-file",
  "rstest",
  "sequence-merge",
  "serde",
@@ -9055,6 +9057,7 @@ dependencies = [
 name = "source-protocol"
 version = "0.10.1"
 dependencies = [
+ "library-ipc-protocol",
  "pretty_assertions",
  "serde",
  "serde_json",

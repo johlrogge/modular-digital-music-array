@@ -12,6 +12,7 @@ license = "MIT"
 interface = "source-protocol"
 
 [dependencies]
+library-ipc-protocol = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "1.0"

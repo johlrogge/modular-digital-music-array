@@ -24,6 +24,11 @@ pub mod playlists;
 pub mod timeline;
 
 /// All `/api/...` routes.
+///
+/// The rule: nothing static may sit directly under `/api/playlists/`, because `:name` there is a
+/// user's playlist name and a static segment would shadow the playlist of that name. Routes
+/// about no one playlist live elsewhere (`/api/bandcamp/...`, `/api/bin`); routes about one
+/// playlist are `/api/playlists/:name/...`.
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/api/tracks", get(library::tracks))
@@ -42,6 +47,10 @@ pub fn routes() -> Router<Arc<AppState>> {
             "/api/playlists/:name",
             get(library::playlist).delete(playlists::delete),
         )
+        .route("/api/bandcamp/playlist-links", get(playlists::links))
+        .route("/api/bandcamp/playlist-sync", get(playlists::sync_job))
+        .route("/api/playlists/:name/link", post(playlists::link))
+        .route("/api/playlists/:name/sync", post(playlists::sync))
         .route("/api/bin", get(bin::list).delete(bin::empty))
         .route("/api/bin/:id", delete(bin::purge))
         .route("/api/bin/:id/restore", post(bin::restore))
@@ -122,8 +131,43 @@ impl From<gateway_client::ClientError> for PlaybackFailure {
 /// - it refused the command, or answered something unexpected: 502.
 pub fn playback_failure_status(failure: &PlaybackFailure) -> StatusCode {
     match failure {
-        PlaybackFailure::Unreachable(_) => StatusCode::SERVICE_UNAVAILABLE,
+        PlaybackFailure::Unreachable(e) => gateway_failure_status(e),
         PlaybackFailure::Refused(_) | PlaybackFailure::Unexpected(_) => StatusCode::BAD_GATEWAY,
+    }
+}
+
+/// The one policy for a gateway call that failed in transit, whichever service it was for: the
+/// gateway answered with an error or refused: 502; it cannot be reached or its answer is
+/// unreadable: 503.
+pub fn gateway_failure_status(error: &gateway_client::ClientError) -> StatusCode {
+    use gateway_client::ClientError as E;
+    match error {
+        E::Service(_) | E::Refused(_) => StatusCode::BAD_GATEWAY,
+        E::Connection(_) | E::Nng(_) | E::Serialization(_) => StatusCode::SERVICE_UNAVAILABLE,
+    }
+}
+
+/// The one policy for a source that refused a request, shared by every source route:
+/// - not authenticated: 401; a job that is running, or a playlist that is not linked: 409;
+/// - rate limited: 429; no such item: 404;
+/// - a request the source cannot use (`InvalidRequest`): 422;
+/// - a source that failed (sync, download, check, internal) or does not support the request: 502.
+pub fn source_failure_status(error: &source_protocol::SourceError) -> StatusCode {
+    use source_protocol::SourceError as E;
+    match error {
+        E::NotAuthenticated { .. } => StatusCode::UNAUTHORIZED,
+        E::ImportInProgress { .. }
+        | E::CheckInProgress { .. }
+        | E::SyncInProgress { .. }
+        | E::PlaylistNotLinked { .. } => StatusCode::CONFLICT,
+        E::RateLimited { .. } => StatusCode::TOO_MANY_REQUESTS,
+        E::ItemNotFound { .. } => StatusCode::NOT_FOUND,
+        E::InvalidRequest { .. } => StatusCode::UNPROCESSABLE_ENTITY,
+        E::SyncFailed { .. }
+        | E::DownloadFailed { .. }
+        | E::Internal { .. }
+        | E::CheckFailed { .. }
+        | E::Unsupported { .. } => StatusCode::BAD_GATEWAY,
     }
 }
 
