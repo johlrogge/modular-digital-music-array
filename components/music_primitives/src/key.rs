@@ -172,6 +172,15 @@ impl Key {
         Self { pitch, mode }
     }
 
+    /// All 24 keys: the minor keys, then the major keys, each in chromatic order from C.
+    pub fn all() -> impl Iterator<Item = Key> {
+        [Mode::Minor, Mode::Major].into_iter().flat_map(|mode| {
+            PitchClass::ALL
+                .into_iter()
+                .map(move |pitch| Key::new(pitch, mode))
+        })
+    }
+
     /// Parse from traditional notation (e.g., "C Major", "A Minor", "Eb Major")
     ///
     /// # Examples
@@ -454,6 +463,16 @@ mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
     use rstest::rstest;
+
+    #[test]
+    fn all_lists_minor_then_major_in_chromatic_order() {
+        let keys: Vec<Key> = Key::all().collect();
+        assert_eq!(keys.len(), 24);
+        assert_eq!(keys[0], Key::new(PitchClass::C, Mode::Minor));
+        assert_eq!(keys[11], Key::new(PitchClass::B, Mode::Minor));
+        assert_eq!(keys[12], Key::new(PitchClass::C, Mode::Major));
+        assert_eq!(keys[23], Key::new(PitchClass::B, Mode::Major));
+    }
 
     #[rstest]
     #[case("C Major", PitchClass::C, Mode::Major)]

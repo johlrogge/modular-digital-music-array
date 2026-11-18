@@ -12,7 +12,7 @@ use axum::{
 };
 use gateway_client::{GatewayClient, LibraryRequest, LibraryResponse};
 use library_ipc_client::{
-    track_hashes, unresolved_entries, ClientError, Mark, PlaylistEntry, PlaylistName,
+    track_hashes, unresolved_entries, ClientError, Key, Mark, Mode, PlaylistEntry, PlaylistName,
     PlaylistSnapshot, PlaylistVersion, StringQuery, TrackInfo, TrackQuery,
 };
 use serde::{Deserialize, Serialize};
@@ -156,7 +156,7 @@ struct ApiPlaylistPage {
 }
 
 /// The playlist `name` from a path, or the 400 response for a name no playlist can have (the
-/// library is not asked). A bad name in a create body is planned as 422 instead (slice 3).
+/// library is not asked). A bad name in a create body is 422 instead.
 #[allow(clippy::result_large_err)]
 pub fn playlist_name(name: &str) -> Result<PlaylistName, Response> {
     PlaylistName::new(name).map_err(|e| fail(StatusCode::BAD_REQUEST, e.to_string()))
@@ -299,6 +299,73 @@ pub async fn library_match(
     )
 }
 
+/// A key in all three notations, so the browser picks one and never converts.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ApiKey {
+    /// `Key`'s Display form, e.g. "A Minor".
+    pub musical: String,
+    /// Camelot wheel, e.g. "8A".
+    pub camelot: String,
+    /// Open Key, e.g. "1m".
+    pub open_key: String,
+}
+
+impl From<Key> for ApiKey {
+    fn from(k: Key) -> Self {
+        Self {
+            musical: k.to_string(),
+            camelot: k.to_camelot(),
+            open_key: k.to_open_key(),
+        }
+    }
+}
+
+/// The mode as the filter stores it.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub enum ApiMode {
+    #[serde(rename = "min")]
+    Minor,
+    #[serde(rename = "maj")]
+    Major,
+}
+
+impl From<Mode> for ApiMode {
+    fn from(m: Mode) -> Self {
+        match m {
+            Mode::Minor => ApiMode::Minor,
+            Mode::Major => ApiMode::Major,
+        }
+    }
+}
+
+/// One key of the filter sheet: the three notations plus the `note` (sharp spelling) and `mode`
+/// the filter stores and sends on; `parse_key_query` takes them.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ApiFilterKey {
+    #[serde(flatten)]
+    pub key: ApiKey,
+    pub note: &'static str,
+    pub mode: ApiMode,
+}
+
+impl From<Key> for ApiFilterKey {
+    fn from(k: Key) -> Self {
+        Self {
+            key: ApiKey::from(k),
+            note: k.pitch().as_sharp(),
+            mode: k.mode().into(),
+        }
+    }
+}
+
+/// `GET /api/keys`: the 24 keys the filter sheet offers, in `Key::all()` order. They never change.
+pub async fn keys() -> impl axum::response::IntoResponse {
+    (
+        [(axum::http::header::CACHE_CONTROL, "public, max-age=86400")],
+        axum::Json(Key::all().map(ApiFilterKey::from).collect::<Vec<_>>()),
+    )
+}
+
 /// One catalogue entry, as served by `GET /api/tracks`.
 ///
 /// Absent facts are `null`, never omitted, so the JS can rely on every key being present.
@@ -313,8 +380,8 @@ pub struct ApiTrack {
     pub disc: Option<u32>,
     /// Beats per minute as a plain number (hundredths preserved), or null.
     pub bpm: Option<f32>,
-    /// Musical key in `Key`'s Display form, or null.
-    pub key: Option<String>,
+    /// The key in every notation the console can show, or null.
+    pub key: Option<ApiKey>,
     pub duration_secs: Option<u32>,
     /// When the track was added, as the library stores it (ISO 8601 / RFC 3339), or null.
     pub added: Option<String>,
@@ -334,7 +401,7 @@ impl From<&TrackInfo> for ApiTrack {
             track_number: t.track_number,
             disc: t.disc_number,
             bpm: t.bpm.map(|b| b.as_f32()),
-            key: t.key.map(|k| k.to_string()),
+            key: t.key.map(ApiKey::from),
             duration_secs: t.duration.map(|d| d.value()),
             added: t.added.clone(),
             has_cover: t.cover_art_path.is_some(),
@@ -347,7 +414,7 @@ impl From<&TrackInfo> for ApiTrack {
 mod tests {
     use super::*;
     use crate::test_support::bare_track as bare;
-    use library_ipc_client::{Bpm, DurationSeconds, Key};
+    use library_ipc_client::{Bpm, DurationSeconds};
 
     fn keys(v: &serde_json::Value) -> Vec<String> {
         let mut k: Vec<String> = v.as_object().unwrap().keys().cloned().collect();
@@ -393,11 +460,25 @@ mod tests {
         assert_eq!(json["track_number"], 3);
         assert_eq!(json["disc"], 2);
         assert_eq!(json["bpm"], 128.0);
-        assert_eq!(json["key"], t.key.unwrap().to_string());
         assert_eq!(json["duration_secs"], 180);
         assert_eq!(json["added"], "2026-11-01T10:00:00+00:00");
         assert_eq!(json["has_cover"], true);
         assert_eq!(json["marks"], json!(["liked", "banger"]));
+    }
+
+    #[test]
+    fn key_carries_all_three_notations() {
+        let mut t = bare("sha256:abc123");
+        t.key = Some(Key::from_traditional("A Minor").unwrap());
+        let json = serde_json::to_value(ApiTrack::from(&t)).unwrap();
+        assert_eq!(
+            json["key"],
+            json!({
+                "musical": "A Minor",
+                "camelot": "8A",
+                "open_key": "1m",
+            })
+        );
     }
 
     #[test]
@@ -772,6 +853,25 @@ mod tests {
         .await;
         assert_eq!(res.status(), StatusCode::OK);
         assert_eq!(body_json(res).await, json!(["sha256:a", "sha256:b"]));
+    }
+
+    #[tokio::test]
+    async fn keys_lists_the_24_filter_keys_in_every_notation() {
+        let gw = FakeGateway::start(|other| GatewayResponse::Error {
+            message: format!("unexpected {other:?}"),
+        });
+        let res = send_get(test_app_with(gw.addr()), "/api/keys", None).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let keys = body_json(res).await;
+        let keys = keys.as_array().unwrap();
+        assert_eq!(keys.len(), 24);
+        assert!(keys.contains(&json!({
+            "musical": "A# Minor",
+            "camelot": "3A",
+            "open_key": "8m",
+            "note": "A#",
+            "mode": "min",
+        })));
     }
 
     #[tokio::test]

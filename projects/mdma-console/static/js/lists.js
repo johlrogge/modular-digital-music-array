@@ -3,7 +3,7 @@
 // playback route. A plain tap on a row or card opens a menu or a page and NEVER plays; the one
 // exception is a preview row (opts.preview, the playlist workbench), which can always go Back.
 // Play now is offered only when logic.isIdle(store.player) (paused counts as playing).
-import { $$, h, icon, store, actions, setOf, enc, fmt, fmtTotal, plural, openMenu, on, onView, marksOf, macroForKey } from "./core.js";
+import { $$, h, icon, store, actions, setOf, enc, fmt, fmtTotal, plural, openMenu, on, onView, playlistHref, marksOf, macroForKey, keyText } from "./core.js";
 import { art } from "./art.js";
 import { isIdle, groupAlbums, trackTitle, sortTracks, placeholderTrack, coverOf, LIKED, markLabel } from "./logic.js";
 import { narrowedView, matchSet, setSort, SEARCH_FAILED_NOTE, FILTERS_EMPTY_NOTE } from "./narrow.js";
@@ -133,7 +133,7 @@ export function trackMenu(anchor, track, extra, opts) {
   if (track.album) nav.push(["disc", "Go to album", () => (location.hash = "#/album/" + enc(track.album))]);
   if (track.artist) nav.push(["user", "Go to artist", () => (location.hash = "#/artist/" + enc(track.artist))]);
   if (nav.length) items.push("-", ...nav);
-  const tech = [track.artist, track.bpm == null ? null : Math.round(track.bpm) + " BPM", track.key].filter(Boolean);
+  const tech = [track.artist, track.bpm == null ? null : Math.round(track.bpm) + " BPM", keyText(track.key)].filter(Boolean);
   openMenu(anchor, items, [label, tech.join(" · ")], opts);
 }
 
@@ -207,7 +207,7 @@ function resolvedRow(t, opts, index) {
   const now = store.player.now;
   const current = now === t.hash && !isIdle(store.player);
   const title = trackTitle(t);
-  const tech = [bpmOf(t), t.key].filter(Boolean).join(" · ");
+  const tech = [bpmOf(t), keyText(t.key)].filter(Boolean).join(" · ");
   const more = h("button", { class: "icon-btn more-btn", "aria-label": "Actions for " + title, tabindex: "-1" }, [icon("more", "sm")]);
   const qn = h("button", { class: "qa", title: "Queue next (N)", tabindex: "-1" }, [icon("next-up", "sm"), "Queue next"]);
   const ql = h("button", { class: "qa", title: "Queue last (L)", tabindex: "-1" }, [icon("plus", "sm"), "Queue last"]);
@@ -241,7 +241,7 @@ function resolvedRow(t, opts, index) {
       ]),
       h("span", { class: "c", text: t.album || "" }),
       h("span", { class: "c num", text: bpmOf(t) }),
-      h("span", { class: "c num", text: t.key || "" }),
+      h("span", { class: "c num", text: keyText(t.key) }),
       h("span", { class: "c num", text: dateOf(t.added) }),
       h("span", { class: "c num", text: t.duration_secs ? fmt(t.duration_secs) : "" }),
       h("div", { class: "end" }, [pv, ...(opts.end ? opts.end(t, index) : []), qn, ql, heart, more]),
@@ -650,7 +650,12 @@ export function albumCard(a) {
 /** Card for a playlist ({ name, hashes, unavailable }). */
 export function playlistCard(pl) {
   const tracks = playlistTracks(pl);
-  return card(pl.name, songCounts(pl.hashes.length, pl.unavailable), { cover: coverOf(tracks) }, () => playlistTracks(pl), "#/playlist/" + enc(pl.name));
+  return card(pl.name, songCounts(pl.hashes.length, pl.unavailable), { cover: coverOf(tracks) }, () => playlistTracks(pl), playlistHref(pl.name));
+}
+
+/** A link to a playlist's page: its art and its name (the Home quick tiles, the rail). `attrs` are added to the <a>. */
+export function playlistTile(pl, attrs) {
+  return h("a", { href: playlistHref(pl.name), ...attrs }, [art(pl.name, { cover: coverOf(playlistTracks(pl)) }), h("span", { class: "pl-name", text: pl.name })]);
 }
 
 /** Card for an artist as grouped by logic.groupArtists. */

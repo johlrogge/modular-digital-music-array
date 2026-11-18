@@ -25,12 +25,16 @@ pub mod timeline;
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/api/tracks", get(library::tracks))
+        .route("/api/keys", get(library::keys))
         .route("/api/tracks/match", get(library::tracks_match))
         .route("/api/tracks/:hash/timeline", get(timeline::timeline))
         .route("/api/library/match", get(library::library_match))
         .route("/api/marks", post(marks::marks))
         .route("/api/marks/config", get(marks::config))
-        .route("/api/playlists", get(library::playlists))
+        .route(
+            "/api/playlists",
+            get(library::playlists).post(playlists::create),
+        )
         .route(
             "/api/playlists/:name",
             get(library::playlist).delete(playlists::delete),
@@ -245,6 +249,7 @@ pub fn library_backend(state: &AppState) -> Result<LibraryBackend, Reply> {
 /// The one policy for a library call that failed, shared by every route:
 /// - transport (the gateway or library cannot be reached): 503;
 /// - no such playlist: 404;
+/// - a playlist that already exists: 409;
 /// - input the library refused (an unknown or ambiguous hash, ...): 422;
 /// - anything else (`InvalidRequest` from an old node, `Internal`): 502.
 ///
@@ -259,10 +264,10 @@ pub fn library_failure_status(error: &ClientError) -> StatusCode {
             | ProtocolError::HashNotCanonical { .. }
             | ProtocolError::TrackNotFound { .. }
             | ProtocolError::InboxFileNotFound { .. }
-            | ProtocolError::PlaylistAlreadyExists { .. }
             | ProtocolError::InvalidPlaylistName { .. }
             | ProtocolError::InvalidEdit { .. },
         ) => StatusCode::UNPROCESSABLE_ENTITY,
+        ClientError::Protocol(ProtocolError::PlaylistAlreadyExists { .. }) => StatusCode::CONFLICT,
         ClientError::Protocol(
             ProtocolError::IngestionFailed { .. }
             | ProtocolError::Internal { .. }

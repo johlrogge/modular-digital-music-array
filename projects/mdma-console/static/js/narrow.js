@@ -9,7 +9,7 @@
 // store.nb, store.f and store.sort persist in sessionStorage (so they are gone when the tab
 // closes). Changing the filters of a view emits "filters" with its key; changing the sort emits
 // "sort"; typing only calls the bar's onChange.
-import { $, $$, h, icon, store, api, emit, on, openMenu, toast } from "./core.js";
+import { $, $$, h, icon, store, api, emit, on, openMenu, toast, keyText, renderRoute } from "./core.js";
 import { filterGroups, isNarrowedBy, LIKED, markLabel } from "./logic.js";
 
 /** Key of the Library view's narrowing state. */
@@ -64,7 +64,39 @@ export const ADDED = [
   ["365", "Last 12 months"],
 ];
 
-const NOTES = ["C", "C#", "D", "Eb", "E", "F", "F#", "G", "Ab", "A", "Bb", "B"];
+// The keys the filter sheet offers ([{ musical, camelot, open_key, note, mode }], chip order), asked
+// of the server once. The filter stores "<note> <mode>"; keyText says how a key is shown.
+let KEYS = [];
+let keysState = "idle"; // idle | asking | ready | failed
+
+/** The one format of a stored key filter: "<note> <mode>" ("A# min"), the note and mode of a /api/keys entry. */
+const keyFilter = (note, mode) => note + " " + mode;
+const parseKeyFilter = (s) => {
+  const [note, mode] = s.split(" ");
+  return { note, mode };
+};
+
+function loadKeys() {
+  if (keysState === "asking" || keysState === "ready") return;
+  keysState = "asking";
+  api("/api/keys").then(
+    (keys) => {
+      KEYS = keys;
+      keysState = "ready";
+      // Bars drawn before the answer show a placeholder for an active key: draw them again.
+      if (Object.values(store.f).some((f) => f && f.key)) renderRoute();
+      if (draft && $("#fsheet").classList.contains("open")) paintFilters();
+    },
+    () => {
+      keysState = "failed"; // asked again when the sheet next opens
+      if (draft && $("#fsheet").classList.contains("open")) paintFilters();
+    },
+  );
+}
+
+const keyFor = (note, mode) => KEYS.find((k) => k.note === note && k.mode === mode);
+loadKeys(); // early, so the chips and the active key chip have them by the time they draw
+
 const BPM_PRESETS = [
   ["Slow", "60", "100"],
   ["House", "118", "126"],
@@ -91,7 +123,7 @@ export function matchQuery(f, text = "") {
   if (q) p.set("q", q);
   if (f.bmin || f.bmax) p.set("bpm", (f.bmin || "0") + ".." + (f.bmax || "999"));
   if (f.key) {
-    const [note, mode] = f.key.split(" ");
+    const { note, mode } = parseKeyFilter(f.key);
     p.set("key", note + (mode === "min" ? "m" : "") + (f.compat ? "+-1" : ""));
   }
   if (f.added !== "any") {
@@ -236,6 +268,7 @@ let sheetKey = null; // the view whose filters the sheet is editing
 function openFilters(key) {
   sheetKey = key;
   draft = filtersOf(key);
+  if (keysState === "failed") loadKeys();
   paintFilters();
   $("#fsheet").classList.add("open");
   $("#f-scrim").classList.add("on");
@@ -277,20 +310,21 @@ function paintFilters() {
     );
   }
 
-  const mode = draft.key ? draft.key.split(" ")[1] : draft._mode || "min";
+  const mode = draft.key ? parseKeyFilter(draft.key).mode : draft._mode || "min";
   $$("#f-mode button").forEach((b) => {
     b.setAttribute("aria-pressed", String(b.dataset.mode === mode));
     b.onclick = () => {
       draft._mode = b.dataset.mode;
-      if (draft.key) draft.key = draft.key.split(" ")[0] + " " + b.dataset.mode;
+      if (draft.key) draft.key = keyFilter(parseKeyFilter(draft.key).note, b.dataset.mode);
       paintFilters();
     };
   });
 
   const keys = $("#f-keys");
   keys.innerHTML = "";
-  for (const n of NOTES) {
-    const val = n + " " + mode;
+  if (keysState === "failed") keys.appendChild(h("span", { class: "hint", text: "Keys unavailable" }));
+  for (const k of KEYS.filter((x) => x.mode === mode)) {
+    const val = keyFilter(k.note, k.mode); // what the filter stores and matchQuery turns into the key query, whatever is shown
     const on = draft.key === val;
     keys.appendChild(
       h(
@@ -298,13 +332,13 @@ function paintFilters() {
         {
           class: "chip",
           "aria-pressed": String(on),
-          "aria-label": n + (mode === "min" ? " minor" : " major"),
+          "aria-label": keyText(k),
           onclick: () => {
             draft.key = on ? "" : val;
             paintFilters();
           },
         },
-        [n + (mode === "min" ? "m" : "")],
+        [keyText(k)],
       ),
     );
   }
@@ -419,8 +453,8 @@ function narrowBar(o) {
     chip((f.bmin || "…") + "–" + (f.bmax || "…") + " BPM", (x) => (x.bmin = x.bmax = ""));
   }
   if (f.key) {
-    const [note, mode] = f.key.split(" ");
-    chip(note + (mode === "min" ? " minor" : " major") + (f.compat ? " + mixable" : ""), (x) => ((x.key = ""), (x.compat = false)));
+    const { note, mode } = parseKeyFilter(f.key);
+    chip((keyText(keyFor(note, mode)) || "Key") + (f.compat ? " + mixable" : ""), (x) => ((x.key = ""), (x.compat = false)));
   }
   if (f.added !== "any") {
     const a = ADDED.find((x) => x[0] === f.added);

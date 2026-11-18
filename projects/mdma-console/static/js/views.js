@@ -3,10 +3,11 @@
 // lists.js and narrow.js supply the rows, cards and the narrowing bar.
 import { h, icon, route, routeFallback, appInfo, store, catalogue, onView, enc, plural } from "./core.js";
 import { art } from "./art.js";
-import { groupAlbums, groupArtists, sortTracks, collate, visiblePlaylists, coverOf, LIKED, markLabel } from "./logic.js";
-import { pagedList, thead, bulkBar, emptyNote, albumCard, artistCard, playlistCard, playlistTracks, recentAlbums, narrowedTracks } from "./lists.js";
+import { groupAlbums, groupArtists, sortTracks, collate, visiblePlaylists, LIKED, markLabel } from "./logic.js";
+import { pagedList, thead, bulkBar, emptyNote, albumCard, artistCard, playlistCard, playlistTile, recentAlbums, narrowedTracks } from "./lists.js";
 import { narrowedView, matchLibrary, filterCount, setSort, LIBRARY_KEY, SEARCH_FAILED_NOTE, FILTERS_EMPTY_NOTE } from "./narrow.js";
 import { backLink, NONE } from "./collections.js";
+import { askNewPlaylist } from "./playlist.js";
 
 const GRID_LIMIT = 120;
 
@@ -59,7 +60,7 @@ function viewHome(root) {
     const playlists = store.playlists;
     const quick = h("div", { class: "quick hello", style: "margin-top:var(--s-4)" });
     for (const p of playlists.slice(0, 4)) {
-      quick.appendChild(h("a", { href: "#/playlist/" + enc(p.name), style: "text-decoration:none;color:inherit" }, [art(p.name, { cover: coverOf(playlistTracks(p)) }), h("span", { text: p.name })]));
+      quick.appendChild(playlistTile(p, { style: "text-decoration:none;color:inherit" }));
     }
     for (const a of albums.slice(0, 4)) {
       quick.appendChild(h("a", { href: "#/album/" + enc(a.name), style: "text-decoration:none;color:inherit" }, [art(a.name, { cover: a.cover }), h("span", { text: a.name })]));
@@ -182,6 +183,12 @@ function viewLibrary(root, params, query) {
   });
   root.appendChild(view.el);
   root.appendChild(segWrap);
+  if (tab === "playlists") {
+    // Outside draw(), so the name being typed survives the redraws a player or playlists event brings.
+    const ask = h("div");
+    const opener = h("button", { class: "btn", "aria-expanded": "false", onclick: () => askNewPlaylist(ask, opener) }, [icon("plus", "sm"), "New playlist"]);
+    root.appendChild(h("div", { class: "newpl-bar" }, [opener, ask]));
+  }
   root.appendChild(region);
 
   view.refresh({ bar: true });

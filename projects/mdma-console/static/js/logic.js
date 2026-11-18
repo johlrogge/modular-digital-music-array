@@ -3,7 +3,7 @@
 // Track shape: the ApiTrack JSON of GET /api/tracks (src/api/library.rs, pinned by a Rust test).
 // Every key is always present; absent facts are null:
 //   { hash, title, artist, album, track_number, disc, bpm, key, duration_secs, added, has_cover, marks }
-//   hash "sha256:..."; bpm number|null; key string|null; added ISO 8601 string|null; has_cover bool;
+//   hash "sha256:..."; bpm number|null; key { musical, camelot, open_key }|null (core.js keyText picks one); added ISO 8601 string|null; has_cover bool;
 //   marks [string]: the marks it carries live, "liked" for the default one.
 // Player shape: GET /api/player is { state: "idle"|"playing"|"paused", now: hash|null, queue: [hash],
 //   output: "absent"|"starting"|"running"|"stalled"|null } (null: the node cannot say).

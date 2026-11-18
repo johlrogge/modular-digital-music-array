@@ -120,8 +120,49 @@ export function fmtTotal(tracks) {
   return m >= 60 ? Math.floor(m / 60) + " h " + (m % 60) + " min" : m + " min";
 }
 
+/* ------------------------------------------------------------ key notation */
+
+// Per-device preference, kept in localStorage like the theme. The server sends every key in all three
+// notations ({ musical, camelot, open_key }); the browser only picks one and never converts.
+export const KEY_NOTATIONS = [
+  ["musical", "Musical"],
+  ["camelot", "Camelot"],
+  ["open_key", "Open Key"],
+];
+const KEY_NOTATION_KEY = "mdma-key-notation";
+const DEFAULT_KEY_NOTATION = "musical";
+
+function readKeyNotation() {
+  try {
+    const n = localStorage.getItem(KEY_NOTATION_KEY);
+    return KEY_NOTATIONS.some(([id]) => id === n) ? n : DEFAULT_KEY_NOTATION;
+  } catch (e) {
+    return DEFAULT_KEY_NOTATION;
+  }
+}
+
+let keyNotation = readKeyNotation();
+
+export const getKeyNotation = () => keyNotation;
+
+/** Choose the notation keys are shown in and draw the current view again. */
+export function setKeyNotation(n) {
+  keyNotation = n;
+  try {
+    localStorage.setItem(KEY_NOTATION_KEY, n);
+  } catch (e) {
+    /* storage is off: the choice lasts until the page reloads */
+  }
+  renderRoute();
+}
+
+/** A track's key ({ musical, camelot, open_key } or null) in the chosen notation; "" when it has none. */
+export const keyText = (k) => (k && k[keyNotation]) || "";
+
 export const plural = (n, w) => n + " " + w + (n === 1 ? "" : "s");
 export const enc = (s) => encodeURIComponent(s);
+/** The address of playlist `name`'s page, or of its sub page (`sub`: "edit"). */
+export const playlistHref = (name, sub) => "#/playlist/" + enc(name) + (sub ? "/" + sub : "");
 
 /* ============================================================ toast + confirm */
 

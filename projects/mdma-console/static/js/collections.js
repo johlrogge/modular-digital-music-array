@@ -14,7 +14,7 @@ export const LIBRARY_LINK = { href: "#/library", text: "Back to Library" };
 /**
  * Header of a collection page.
  * cfg: { label (kicker), name, art: { round, cover(all) -> hash|null }, byline(all) -> node|text|null,
- * stats(all) -> text, queueSet(rows, narrowed) -> set }. `all`: every track of the collection (for
+ * stats(all) -> text, queueSet(rows, narrowed) -> set, actions() -> fresh buttons that end the button row }. `all`: every track of the collection (for
  * the facts). `rows`: the tracks displayed, in displayed order. `narrowed`: rows are a subset.
  * The buttons act on `queueSet(rows, narrowed)`, by default exactly the displayed rows.
  */
@@ -23,6 +23,7 @@ export function collectionHeader(cfg, all, rows, narrowed) {
   const subject = narrowed ? plural(rows.length, "song") + " from " + cfg.name : cfg.name;
   const set = (cfg.queueSet || setOf)(rows, narrowed);
   const btns = rows.length ? queueButtons(set, subject, { suffix: narrowed ? " · " + rows.length : "" }) : h("div", { class: "btn-row" });
+  for (const a of cfg.actions ? cfg.actions() : []) btns.appendChild(a);
   const byline = cfg.byline ? cfg.byline(all) : null;
   return h("div", { class: "coll" }, [
     art(cfg.name, { round: cfg.art && cfg.art.round, cover: cfg.art && cfg.art.cover ? cfg.art.cover(all) : null }),
@@ -41,19 +42,19 @@ export const backLink = (href, text) => h("a", { class: "back", href }, [icon("l
 
 /**
  * A collection page drawn into `root`: back link, header, pane. Returns the router's cleanup.
- * o.back: { href, text }. o.tools: nodes shown at the right end of the back link's row, if any.
- * o.header: collectionHeader's cfg. o.pane: narrowedTracks' options (the page adds onChange,
- * which redraws the header from the pane's displayed rows).
+ * o.back: { href, text }. o.header: collectionHeader's cfg. o.headerWhenEmpty(): true to draw the
+ * header for a collection with no tracks (its actions are still needed). o.pane: narrowedTracks'
+ * options (the page adds onChange, which redraws the header from the pane's displayed rows).
  */
 export function collectionPage(root, o) {
-  root.appendChild(h("div", { class: "coll-bar" }, [backLink(o.back.href, o.back.text), ...(o.tools || [])]));
+  root.appendChild(h("div", { class: "coll-bar" }, [backLink(o.back.href, o.back.text)]));
   const head = h("div");
   root.appendChild(head);
   const pane = narrowedTracks({
     ...o.pane,
     onChange: ({ all, rows, narrowed }) => {
       head.innerHTML = "";
-      if (all.length) head.appendChild(collectionHeader(o.header, all, rows, narrowed));
+      if (all.length || (o.headerWhenEmpty && o.headerWhenEmpty())) head.appendChild(collectionHeader(o.header, all, rows, narrowed));
     },
   });
   root.appendChild(pane.el);

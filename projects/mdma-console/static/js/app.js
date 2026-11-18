@@ -6,6 +6,7 @@ import "./queue.js";
 import "./lists.js";
 import "./narrow.js";
 import "./views.js";
+import "./rail.js";
 import "./collections.js";
 import "./playlist.js";
 import "./workbench.js";

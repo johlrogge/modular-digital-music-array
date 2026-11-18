@@ -22,7 +22,7 @@
 // the toast's Back action ends it. What a preview holds and goes back to is the node's (ADR-031),
 // and so is which track is the preview: every row of it shows as previewing. The previewing row
 // expands into a timeline (timeline.js): seek, cues, bar lines and beat steps.
-import { $, $$, h, icon, route, store, api, enc, plural, toast, catalogue, loadPlaylists, actions } from "./core.js";
+import { $, $$, h, icon, route, store, api, enc, playlistHref, plural, toast, catalogue, loadPlaylists, actions } from "./core.js";
 import { trackTitle } from "./logic.js";
 import { narrowedTracks, emptyNote, dragList } from "./lists.js";
 import { NO_MUSIC, NONE, backLink } from "./collections.js";
@@ -312,7 +312,7 @@ function viewWorkbench(root, params) {
     return [h("div", { class: "wb-bar" }, [tabs, undoBtn.el, redoBtn.el]), wb];
   }
 
-  root.appendChild(backLink("#/playlist/" + enc(name), "Playlist"));
+  root.appendChild(backLink(playlistHref(name), "Playlist"));
   root.appendChild(h("div", { class: "wb-head" }, [h("span", { class: "kicker", text: "Editing playlist" }), h("h1", { text: name })]));
   root.appendChild(h("div", { class: "kicker wb-tip", text: "Click a track to preview · click again to pause · Back returns to what was playing" }));
   const body = h("div", {}, [emptyNote(...notes(name).loading())]);

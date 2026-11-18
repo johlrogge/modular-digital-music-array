@@ -9,7 +9,7 @@ pub use music_facts::{
     Bpm, ContentHash, CueKind, DurationSeconds, FactKind, FactSource, Key, Mark, MarkFilter,
     MarkName, MarkNameError, MusicValue,
 };
-pub use music_primitives::{BeatGrid, CanonicalHash, EnergyLevel, TrackRole};
+pub use music_primitives::{BeatGrid, CanonicalHash, EnergyLevel, Mode, TrackRole};
 // Re-export query types so clients can use them without depending on library-search directly
 pub use library_search::{
     DurationQuery, DurationUnit, KeyQuery, NumericQuery, StringQuery, TrackQuery,

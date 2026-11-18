@@ -1,15 +1,17 @@
-//! Playlist writes for the new web UI (ADR-027 §9): edit, revert (undo) and delete, each sent to
+//! Playlist writes for the new web UI (ADR-027 §9): create, edit, revert (undo) and delete, each sent to
 //! the library with the version the browser last read. The console decides nothing about a
 //! playlist: it forwards the ops and the version, and answers with what the library answered.
 //!
 //! - 200: applied (`{snapshot, skipped, previous}`; `previous` only when the edit wrote, so Undo
 //!   exists exactly then) or deleted (`{deleted: true}`);
+//! - 201: created (`{name}`), by `POST /api/playlists {name}`;
 //! - 409: the version was stale, nothing was written (`{current}`, the playlist as it is now);
+//!   or, for a create, the playlist already exists (`{error}`);
 //! - every other failure is classified by `library_failure_status`, the one policy of ADR-026 A7.
 //!   There is no fallback to PlaylistReplace: an old node answers 502.
 
 use super::library::{playlist_name, ApiSnapshot};
-use super::{gw, library, library_failed, respond, unexpected_library_response, Reply};
+use super::{fail, gw, lib, library, library_failed, respond, unexpected_library_response, Reply};
 use crate::AppState;
 use axum::{
     extract::{Path, Query, State},
@@ -167,6 +169,38 @@ pub async fn delete(
         }
     })
     .await
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateRequest {
+    name: String,
+}
+
+/// `POST /api/playlists {name}`: create an empty playlist (`PlaylistNew`, ADR-027 §6: the library
+/// checks that it does not exist and writes it atomically). 201 `{name}`; 422 for a name no
+/// playlist can have (the library is not asked); every library failure, 409 for a playlist that
+/// exists included, by `library_failed`.
+pub async fn create(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<CreateRequest>,
+) -> Response {
+    let name = match PlaylistName::new(&req.name) {
+        Ok(n) => n,
+        Err(e) => return fail(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()),
+    };
+    respond(
+        lib(&state, move |l| {
+            l.playlist_new(&name, String::new()).map(|()| name)
+        })
+        .await
+        .map(|created| match created {
+            Ok(name) => (
+                StatusCode::CREATED,
+                serde_json::json!({ "name": name.as_str() }),
+            ),
+            Err(e) => library_failed(&e),
+        }),
+    )
 }
 
 #[cfg(test)]
@@ -530,6 +564,95 @@ mod tests {
             assert_eq!(res.status(), StatusCode::BAD_REQUEST, "{path}");
         }
         assert!(gw.requests().is_empty());
+    }
+
+    // ---- POST /api/playlists (create) ----
+
+    fn create_gateway(answer: LibraryResponse) -> FakeGateway {
+        FakeGateway::start(move |req| match req {
+            GatewayRequest::Library {
+                request: LibraryRequest::PlaylistNew { .. },
+            } => library_ok(answer.clone()),
+            other => GatewayResponse::Error {
+                message: format!("unexpected {other:?}"),
+            },
+        })
+    }
+
+    async fn create(app: axum::Router, name: &str) -> axum::response::Response {
+        send_json(
+            app,
+            "POST",
+            "/api/playlists",
+            Some(&json!({ "name": name })),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_created_playlist_is_201_with_its_name() {
+        let gw = create_gateway(LibraryResponse::PlaylistContent(String::new()));
+        let res = create(test_app_with(gw.addr()), "friday").await;
+        assert_eq!(res.status(), StatusCode::CREATED);
+        assert_eq!(body_json(res).await, json!({"name": "friday"}));
+    }
+
+    #[tokio::test]
+    async fn a_created_playlist_is_sent_to_the_library_empty() {
+        let gw = create_gateway(LibraryResponse::PlaylistContent(String::new()));
+        create(test_app_with(gw.addr()), "friday").await;
+        match &gw.requests()[..] {
+            [GatewayRequest::Library {
+                request: LibraryRequest::PlaylistNew { name, content },
+            }] => {
+                assert_eq!(name.as_str(), "friday");
+                assert_eq!(content, "");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn creating_a_playlist_that_exists_is_409() {
+        let gw = create_gateway(LibraryResponse::Error(
+            ProtocolError::PlaylistAlreadyExists {
+                name: "friday".into(),
+            },
+        ));
+        let res = create(test_app_with(gw.addr()), "friday").await;
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+        assert!(body_json(res).await["error"].is_string());
+    }
+
+    #[tokio::test]
+    async fn creating_a_playlist_with_an_invalid_name_is_422_and_the_library_is_not_asked() {
+        let gw = create_gateway(LibraryResponse::PlaylistContent(String::new()));
+        let res = create(test_app_with(gw.addr()), "bad name").await;
+        assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(body_json(res).await["error"].is_string());
+        assert!(gw.requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn creating_a_playlist_when_the_library_refuses_is_502() {
+        let gw = FakeGateway::start(|_| GatewayResponse::Error {
+            message: "library unavailable".into(),
+        });
+        let res = create(test_app_with(gw.addr()), "friday").await;
+        assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn creating_a_playlist_without_a_gateway_is_503() {
+        let res = create(test_app(), "friday").await;
+        assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn creating_a_playlist_when_the_library_answers_something_else_is_502() {
+        let gw = create_gateway(LibraryResponse::Pong);
+        let res = create(test_app_with(gw.addr()), "friday").await;
+        assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
     }
 
     #[tokio::test]

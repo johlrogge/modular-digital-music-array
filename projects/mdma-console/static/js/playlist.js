@@ -6,7 +6,7 @@
 // a track. A line the library resolved but the console's catalogue lacks is a placeholder track
 // (logic.js placeholderTrack). The page is read-only; its Edit link opens the workbench
 // (workbench.js), which uses the server's edit routes (ADR-027 §9).
-import { h, icon, route, store, api, enc, ofPlaylist, setOf } from "./core.js";
+import { h, icon, route, store, api, enc, playlistHref, toast, loadPlaylists, ofPlaylist, setOf } from "./core.js";
 import { playlistRows, coverOf } from "./logic.js";
 import { songCounts } from "./lists.js";
 import { collectionPage, missing, LIBRARY_LINK, NO_MUSIC, NONE } from "./collections.js";
@@ -44,8 +44,10 @@ export const notes = (name) => ({
 function drawPlaylist(root, name, state) {
   return collectionPage(root, {
     back: { href: "#/library/playlists", text: "Library" },
-    tools: state.status === "ready" ? [h("a", { class: "btn", href: "#/playlist/" + enc(name) + "/edit" }, [icon("wrench", "sm"), "Edit"])] : [],
+    headerWhenEmpty: () => state.status === "ready" && store.order.length > 0,
     header: {
+      // Built afresh for every header the pane draws, so no node moves from one header to the next.
+      actions: () => (state.status === "ready" ? [h("a", { class: "btn", href: playlistHref(name, "edit"), style: "text-decoration:none" }, [icon("wrench", "sm"), "Edit"])] : []),
       label: "Playlist",
       name,
       art: { round: false, cover: coverOf },
@@ -67,6 +69,68 @@ function drawPlaylist(root, name, state) {
       empty: { missing: notes(name)[state.status], none: NONE },
     },
   });
+}
+
+/**
+ * Ask for the name of a new playlist with an input in `slot` (no browser prompt); `opener` is the
+ * button that asked (it shows aria-expanded and gets the focus back on Esc). Enter creates it
+ * (POST /api/playlists), reloads the playlists and opens the new one in the workbench; Esc, or
+ * leaving the field empty, cancels. A name the field's pattern refuses is reported by the field;
+ * any other refusal shows as a toast with the server's message, and the input stays.
+ */
+export function askNewPlaylist(slot, opener) {
+  const open = slot.querySelector("input");
+  if (open) {
+    open.focus();
+    return;
+  }
+  let busy = false;
+  const close = (refocus) => {
+    slot.replaceChildren();
+    opener.setAttribute("aria-expanded", "false");
+    if (refocus) opener.focus();
+  };
+  const input = h("input", {
+    class: "newpl",
+    type: "text",
+    placeholder: "New playlist name",
+    title: "Letters, digits, _ and - only",
+    pattern: "[A-Za-z0-9_\\-]+",
+    "aria-label": "New playlist name",
+    autocomplete: "off",
+    spellcheck: "false",
+  });
+  async function create() {
+    const name = input.value.trim();
+    if (!name || busy || !input.reportValidity()) return;
+    busy = true;
+    try {
+      const made = await api("/api/playlists", { body: { name } });
+      close(false);
+      await loadPlaylists();
+      location.hash = playlistHref(made.name, "edit");
+    } catch (e) {
+      toast(e.message);
+    } finally {
+      busy = false;
+    }
+  }
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      create();
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      e.stopPropagation();
+      close(true);
+    }
+  });
+  input.addEventListener("blur", () => {
+    if (!busy && !input.value) close(false);
+  });
+  slot.replaceChildren(input);
+  opener.setAttribute("aria-expanded", "true");
+  input.focus();
 }
 
 function viewPlaylist(root, params) {

@@ -82,12 +82,13 @@ main{padding:0 var(--gutter) calc(var(--tabbar-h) + var(--bar-h) + 40px + env(sa
   .brand-mark{width:22px;height:22px;border-radius:var(--r-xs);background:repeating-linear-gradient(90deg,var(--text) 0 3px,transparent 3px 6px);display:block}
   .rail a{display:flex;align-items:center;gap:var(--s-3);padding:10px var(--s-3);border-radius:var(--r-sm);color:var(--text-2);text-decoration:none;font-weight:500}
   .rail a:hover{background:var(--surface-2);color:var(--text)}
-  .rail a[aria-current="page"]{background:var(--surface-2);color:var(--text);box-shadow:inset 2px 0 0 var(--accent-strong)}
+  .rail a[aria-current="page"],.rail .pl a[aria-current="true"]{background:var(--surface-2);color:var(--text);box-shadow:inset 2px 0 0 var(--accent-strong)}
   .rail a[aria-current="page"] svg{color:var(--text)}
   .rail h2{font-family:var(--font-mono);font-size:var(--fs-xs);font-weight:500;text-transform:uppercase;color:var(--text-3);margin:var(--s-5) var(--s-3) var(--s-2);letter-spacing:.1em}
   .rail .pl{overflow:auto;flex:1;display:flex;flex-direction:column;gap:2px}
   .rail .pl a{padding:6px var(--s-3);font-size:var(--fs-sm);font-weight:400}
   .rail .pl .art{width:28px;height:28px;border-radius:var(--r-xs);font-size:0;padding:0}
+  .rail .pl a .pl-name{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .rail .settings-link{margin-top:auto}
   .topbar .mobile-only{display:none}
   main{padding-bottom:calc(var(--bar-h) + var(--s-7));width:100%;min-width:0}
@@ -329,8 +330,8 @@ details.more summary{cursor:pointer;min-height:44px;display:flex;align-items:cen
 @keyframes fade{from{opacity:0;transform:translateY(4px)}}
 .hello{margin-top:var(--s-2)}
 .field{display:flex;flex-direction:column;gap:6px;font-size:var(--fs-sm);color:var(--text-2)}
-.field input,.field select{height:44px;border-radius:var(--r-sm);border:1px solid var(--line);background:var(--surface);padding:0 12px;color:var(--text);min-width:0}
-.field input:focus,.field select:focus{outline:2px solid var(--accent-strong);outline-offset:1px}
+.field input,.field select,.newpl{height:44px;border-radius:var(--r-sm);border:1px solid var(--line);background:var(--surface);padding:0 12px;color:var(--text);min-width:0}
+.field input:focus,.field select:focus,.newpl:focus{outline:2px solid var(--accent-strong);outline-offset:1px}
 .fgroup{margin-top:var(--s-5)}
 .fgroup > .kicker{display:block;margin-bottom:var(--s-2)}
 .range2 .field{min-width:0}
@@ -469,6 +470,11 @@ details.more summary{cursor:pointer;min-height:44px;display:flex;align-items:cen
 /* == narrow == */
 /* == collections == */
 .coll-bar{display:flex;align-items:center;justify-content:space-between;gap:var(--s-2)}
+/* New playlist: the + beside the rail's headline, the bar on the Playlists tab, and the name input both open */
+.rail-head{display:flex;align-items:center;justify-content:space-between}
+.newpl-bar{display:flex;align-items:center;flex-wrap:wrap;gap:var(--s-2);margin-top:var(--s-4)}
+.newpl{box-sizing:border-box;width:100%;max-width:320px}
+#rail-new-ask:not(:empty){padding:0 var(--s-3) var(--s-2)}
 /* == settings == */
 /* == workbench == */
 .wb-head{margin:var(--s-2) 0 var(--s-3)}
