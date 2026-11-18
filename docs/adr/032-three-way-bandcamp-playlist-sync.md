@@ -91,6 +91,10 @@ Undo reverts the file but keeps the new base. Undone additions therefore count a
 - the merge is idempotent: `merge3(base, theirs, merge3(base, theirs, ours))` equals `merge3(base, theirs, ours)`. This holds for unique keys. With duplicates occurrences are renumbered from the result's order and it can fail;
 - every result item is in ours union theirs.
 
+## Amendment 2026-11-18: delete bins (ADR-033)
+
+§8 changes for delete. A deleted playlist goes to the Bin, and its link stays but is inactive and cannot sync. Restore re-activates the link; restoring under a new name counts as a rename and updates the link. Purge drops the link. Rename is unchanged. See ADR-033.
+
 ## Phased plan
 
 0. This ADR plus the ROADMAP entry.

@@ -151,6 +151,10 @@ The TUI, and CLI `playlist` edits, keep PlaylistReplace for now. Later the TUI r
 - **A per-playlist counter stored next to the file.** Rejected: hand edits and old writers would not bump it. Hashing the bytes catches every change.
 - **Fail the whole queue batch on the first unavailable line** (ADR-026 A4 as first written). Rejected by Joakim: one lost track should not block the rest of the playlist.
 
+## Amendment 2026-11-18: delete bins (ADR-033)
+
+§6.1 no longer unlinks. `PlaylistDelete` and `PlaylistRemove` now move the file to `playlists/.bin/` on the server, and the new `PlaylistBin { name, version }` does the same with the CAS check. Only `BinPurge` and `BinEmpty` unlink files. `PlaylistRemove` stays unconditional but loses nothing. See ADR-033.
+
 ## Amendment 2026-11-17: queue actions in the console
 
 Settles how the console queues a playlist or a list of tracks. It refines §10 and ADR-026 A4's amendment.
