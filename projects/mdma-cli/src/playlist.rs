@@ -423,21 +423,31 @@ pub(crate) fn edit(name: PlaylistArg, ctx: &Ctx) -> Result<()> {
     Ok(())
 }
 
-/// Remove a playlist
-#[hicli::command]
+/// Move a playlist to the bin
+///
+/// Nothing is deleted: the playlist can be brought back with
+/// `mdma playlist bin restore <id>` (see `mdma playlist bin ls`). Prints the id
+/// the playlist is in the bin under.
+///
+/// # Examples
+///
+/// ```sh
+/// mdma playlist rm friday
+/// id=$(mdma playlist rm friday)
+/// ```
+#[hicli::command(alias = "rm")]
 pub(crate) fn remove(name: PlaylistArg, ctx: &Ctx) -> Result<()> {
-    use library_ipc_client::LibraryRequest;
     let library = ctx.node().library()?;
     let PlaylistArg(pname) = name;
-    interpret_library(
-        library.request(&LibraryRequest::PlaylistRemove {
-            name: pname.clone(),
-        }),
-        accept_pong,
-    )?;
-    eprintln!("Removed playlist '{}'", pname);
+    let id = bin::bin_playlist(&library, &pname)?;
+    eprintln!("{}", bin::binned_message(&pname, &id));
+    println!("{id}");
     Ok(())
 }
+
+/// Playlists in the bin: list, restore, purge or empty them
+#[hicli::group]
+mod bin;
 
 /// Rename a playlist
 #[hicli::command]

@@ -6144,6 +6144,7 @@ dependencies = [
  "libc",
  "library-ipc-client",
  "library-search",
+ "library-service-stub",
  "mdma-client",
  "music-facts",
  "nng",

@@ -145,6 +145,9 @@ pub(crate) struct Setup<'a> {
     pub(crate) resumed: Option<mdma_client::ContentHash>,
     /// The beat grid every track of the fake library has.
     pub(crate) grid: Option<library_ipc_client::BeatGridInfo>,
+    /// How the fake library answers every request. When unset it answers `GetTrack`
+    /// for `tracks` and refuses everything else.
+    pub(crate) library: Option<LibraryHandler>,
 }
 
 impl FakeServices {
@@ -171,52 +174,20 @@ impl FakeServices {
             seeked,
             resumed,
             grid,
+            library,
         } = setup;
         let dir = tempfile::tempdir().expect("temp dir");
         let library_addr = format!("ipc://{}/library.sock", dir.path().display());
         let playback_addr = format!("ipc://{}/playback.sock", dir.path().display());
         let tracks: Vec<String> = tracks.iter().map(|t| t.to_string()).collect();
         let queue: Vec<ContentHash> = queue.iter().map(|h| ContentHash::new(*h)).collect();
+        let answer: LibraryHandler = library.unwrap_or_else(|| {
+            Box::new(move |request| resolve_get_track(&tracks, grid.as_ref(), request))
+        });
         serve(&library_addr, move |request| {
-            let error = |message: String| {
-                serde_json::to_vec(&library_ipc_client::LibraryResponse::Error(
-                    library_ipc_client::ProtocolError::Internal { message },
-                ))
-                .expect("a response")
-            };
-            let request: library_ipc_client::LibraryRequest = match serde_json::from_slice(request)
-            {
-                Ok(request) => request,
-                Err(e) => return error(format!("the fake library cannot read the request: {e}")),
-            };
-            let hash = match request {
-                library_ipc_client::LibraryRequest::GetTrack { hash } => hash,
-                other => {
-                    return error(format!(
-                        "the fake library only answers GetTrack, got {other:?}"
-                    ))
-                }
-            };
-            let wanted = hash.as_str().trim_start_matches("sha256:");
-            let found: Vec<&String> = tracks
-                .iter()
-                .filter(|t| t.trim_start_matches("sha256:").starts_with(wanted))
-                .collect();
-            let response = match found.as_slice() {
-                [one] => library_ipc_client::LibraryResponse::Track(Box::new(TrackInfo {
-                    beat_grid: grid.clone(),
-                    ..track(one)
-                })),
-                [] => library_ipc_client::LibraryResponse::Error(
-                    library_ipc_client::ProtocolError::TrackNotFound {
-                        hash: hash.to_string(),
-                    },
-                ),
-                _ => library_ipc_client::LibraryResponse::Error(
-                    library_ipc_client::ProtocolError::Internal {
-                        message: format!("ambiguous hash prefix: {hash}"),
-                    },
-                ),
+            let response = match serde_json::from_slice(request) {
+                Ok(request) => answer(request),
+                Err(e) => internal_error(format!("the fake library cannot read the request: {e}")),
             };
             serde_json::to_vec(&response).expect("a response")
         });
@@ -269,6 +240,49 @@ impl FakeServices {
     /// The playback commands received so far, as JSON, in order.
     pub(crate) fn sent(&self) -> Vec<serde_json::Value> {
         self.sent.lock().unwrap().clone()
+    }
+}
+
+/// How a fake library answers a request.
+pub(crate) type LibraryHandler =
+    Box<dyn Fn(library_ipc_client::LibraryRequest) -> library_ipc_client::LibraryResponse + Send>;
+
+fn internal_error(message: String) -> library_ipc_client::LibraryResponse {
+    library_ipc_client::LibraryResponse::Error(library_ipc_client::ProtocolError::Internal {
+        message,
+    })
+}
+
+/// The default fake library: it answers `GetTrack` for the tracks it holds, and
+/// refuses every other request.
+fn resolve_get_track(
+    tracks: &[String],
+    grid: Option<&library_ipc_client::BeatGridInfo>,
+    request: library_ipc_client::LibraryRequest,
+) -> library_ipc_client::LibraryResponse {
+    use library_ipc_client::{LibraryRequest, LibraryResponse, ProtocolError};
+    let hash = match request {
+        LibraryRequest::GetTrack { hash } => hash,
+        other => {
+            return internal_error(format!(
+                "the fake library only answers GetTrack, got {other:?}"
+            ))
+        }
+    };
+    let wanted = hash.as_str().trim_start_matches("sha256:");
+    let found: Vec<&String> = tracks
+        .iter()
+        .filter(|t| t.trim_start_matches("sha256:").starts_with(wanted))
+        .collect();
+    match found.as_slice() {
+        [one] => LibraryResponse::Track(Box::new(TrackInfo {
+            beat_grid: grid.cloned(),
+            ..track(one)
+        })),
+        [] => LibraryResponse::Error(ProtocolError::TrackNotFound {
+            hash: hash.to_string(),
+        }),
+        _ => internal_error(format!("ambiguous hash prefix: {hash}")),
     }
 }
 

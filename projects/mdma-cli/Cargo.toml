@@ -48,4 +48,5 @@ libc = { workspace = true }
 client-facts = { workspace = true, features = ["test-support"] }
 fact-replica = { workspace = true, features = ["test-support"] }
 pretty_assertions = "1"
+library-service-stub = { workspace = true }
 mdma-client = { workspace = true, features = ["test-support"] }
