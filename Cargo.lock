@@ -5714,6 +5714,7 @@ dependencies = [
  "library-ipc-protocol",
  "library-projection",
  "library-search",
+ "lofty",
  "music-facts",
  "music-primitives",
  "nng",

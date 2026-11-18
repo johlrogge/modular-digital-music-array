@@ -49,3 +49,5 @@ rstest = "0.26"
 tempfile = "3"
 playlist-edit = { workspace = true, features = ["test-support"] }
 acid-service = { workspace = true }
+# Tags the fixture blobs of the cover heal tests with a picture
+lofty = "0.18"
