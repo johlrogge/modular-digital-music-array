@@ -154,6 +154,7 @@ export function collMenu(anchor, tracks, label) {
 
 const dateOf = (added) => (added ? String(added).slice(0, 10) : "");
 const bpmOf = (t) => (t.bpm == null ? "" : String(Math.round(t.bpm)));
+const energyOf = (t) => (t.energy == null ? "" : String(t.energy));
 
 /**
  * A playlist line the library could not resolve ({ kind: "unresolved", at, token, reason }), in
@@ -171,7 +172,7 @@ function unavailableRow(t, opts, index) {
       [
         h("span", { class: "no", text: numbered ? String(opts.number(t)) : "" }),
         h("div", { style: "min-width:0" }, [h("div", { class: "t", text: title }), h("div", { class: "m", text: t.reason })]),
-        ...Array.from({ length: 5 }, () => h("span", { class: "c" })),
+        ...Array.from({ length: 6 }, () => h("span", { class: "c" })),
         h("div", { class: "end" }, opts.end ? opts.end(t, index) : []),
       ],
     ),
@@ -243,6 +244,7 @@ function resolvedRow(t, opts, index) {
       h("span", { class: "c", text: t.album || "" }),
       h("span", { class: "c num", text: bpmOf(t) }),
       h("span", { class: "c num", text: keyText(t.key) }),
+      h("span", { class: "c num", text: energyOf(t) }),
       h("span", { class: "c num", text: dateOf(t.added) }),
       h("span", { class: "c num", text: t.duration_secs ? fmt(t.duration_secs) : "" }),
       h("div", { class: "end" }, [pv, ...(opts.end ? opts.end(t, index) : []), qn, ql, heart, more]),
@@ -366,7 +368,7 @@ function resolvedRow(t, opts, index) {
 
 /**
  * Desktop column header for a track list. opts: sortable (headers sort via onSort(by)), numbered.
- * `sort` is store.sort; Title and BPM and Added sort, the rest are plain labels.
+ * `sort` is store.sort; Title, BPM, Energy and Added sort, the rest are plain labels.
  */
 export function thead(opts = {}) {
   const cols = [
@@ -375,6 +377,7 @@ export function thead(opts = {}) {
     ["Album", null],
     ["BPM", "bpm"],
     ["Key", null],
+    ["Energy", "energy"],
     ["Added", "added"],
     ["Time", null],
     ["", null],

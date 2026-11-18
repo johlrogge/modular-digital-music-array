@@ -113,13 +113,20 @@
   <div class="grab" aria-hidden="true"></div>
   <header><h2 id="f-h">Filters</h2><button class="icon-btn" data-close-filters aria-label="Close"><svg class="i"><use href="#i-close"/></svg></button></header>
   <div class="q-scroll" style="padding:0 var(--s-5) var(--s-4)">
-    <div class="fgroup" style="margin-top:0"><span class="kicker">Tempo · BPM</span>
+    <div class="fgroup" style="margin-top:0" role="group" aria-labelledby="f-bpm-h"><span class="kicker" id="f-bpm-h">Tempo · BPM</span>
       <div class="range2">
         <label class="field">From<input id="f-bmin" class="num" inputmode="numeric" placeholder="60" maxlength="3"></label>
         <span class="num" style="padding-bottom:12px;color:var(--text-3)">—</span>
         <label class="field">To<input id="f-bmax" class="num" inputmode="numeric" placeholder="180" maxlength="3"></label>
       </div>
       <div class="chips" style="margin-top:var(--s-3)" id="f-bpm-presets"></div>
+    </div>
+    <div class="fgroup" role="group" aria-labelledby="f-energy-h"><span class="kicker" id="f-energy-h">Energy · 1–10</span>
+      <div class="range2">
+        <label class="field">From<input id="f-emin" class="num" inputmode="numeric" placeholder="1" maxlength="2"></label>
+        <span class="num" style="padding-bottom:12px;color:var(--text-3)">—</span>
+        <label class="field">To<input id="f-emax" class="num" inputmode="numeric" placeholder="10" maxlength="2"></label>
+      </div>
     </div>
     <div class="fgroup"><span class="kicker">Key</span>
       <div class="keys" id="f-keys"></div>

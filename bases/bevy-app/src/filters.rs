@@ -1,5 +1,5 @@
 use bevy::prelude::*;
-use library_search::{parse_key_query, parse_numeric_query, TrackQuery};
+use library_search::{parse_energy_query, parse_key_query, parse_numeric_query, TrackQuery};
 use music_primitives::TrackRole;
 
 /// Filter input state for the DJ Workspace side panel.
@@ -39,7 +39,11 @@ pub fn build_track_query(state: &FilterState) -> Result<TrackQuery, String> {
     let energy = if state.energy_text.trim().is_empty() {
         None
     } else {
-        Some(parse_numeric_query(state.energy_text.trim()).map_err(|e| format!("Energy: {e}"))?)
+        Some(
+            parse_energy_query(state.energy_text.trim())
+                .map_err(|e| format!("Energy: {e}"))?
+                .0,
+        )
     };
 
     let role = state.role;

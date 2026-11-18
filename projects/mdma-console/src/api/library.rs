@@ -26,6 +26,8 @@ pub struct SearchParams {
     pub artist: Option<String>,
     pub bpm: Option<String>,
     pub key: Option<String>,
+    /// Energy level 1-10 (`7`, `5..8`, `7+-2`).
+    pub energy: Option<String>,
     pub added: Option<String>,
     /// A mark's name: "liked" is the default mark.
     pub mark: Option<String>,
@@ -49,6 +51,13 @@ pub fn track_query_from(params: &SearchParams) -> Result<TrackQuery, String> {
     }
     if let Some(bpm) = given(&params.bpm) {
         query.bpm = Some(library_search::parse_numeric_query(&bpm).map_err(|e| e.to_string())?);
+    }
+    if let Some(energy) = given(&params.energy) {
+        query.energy = Some(
+            library_search::parse_energy_query(&energy)
+                .map_err(|e| e.to_string())?
+                .0,
+        );
     }
     if let Some(key) = given(&params.key) {
         query.key = Some(library_search::parse_key_query(&key).map_err(|e| e.to_string())?);
@@ -203,7 +212,7 @@ pub async fn playlist(State(state): State<Arc<AppState>>, Path(name): Path<Strin
     )
 }
 
-/// `GET /api/tracks/match?bpm=&key=&added=&q=&artist=`: hashes of the tracks the library says
+/// `GET /api/tracks/match?bpm=&energy=&key=&added=&mark=&q=&artist=`: hashes of the tracks the library says
 /// match. 400 for a filter the library cannot parse, and for no filter at all (an empty match
 /// would otherwise look like "nothing matches").
 pub async fn tracks_match(
@@ -260,7 +269,7 @@ struct LibraryMatch {
     playlists: Option<Vec<String>>,
 }
 
-/// `GET /api/library/match?q=&bpm=&key=&added=&artist=`: everything the Library view needs for
+/// `GET /api/library/match?q=&bpm=&energy=&key=&added=&mark=&artist=`: everything the Library view needs for
 /// one narrowing state, over one gateway connection: the matching tracks, the tracks passing the
 /// filters alone (only when text and filters are both given) and the playlists whose name
 /// matches the text (only with text). 400 for a filter the library cannot parse and for no
@@ -417,6 +426,8 @@ pub struct ApiTrack {
     pub bpm: Option<f32>,
     /// The key in every notation the console can show, or null.
     pub key: Option<ApiKey>,
+    /// Energy level 1-10 as a plain number, or null.
+    pub energy: Option<u8>,
     pub duration_secs: Option<u32>,
     /// When the track was added, as the library stores it (ISO 8601 / RFC 3339), or null.
     pub added: Option<String>,
@@ -437,6 +448,7 @@ impl From<&TrackInfo> for ApiTrack {
             disc: t.disc_number,
             bpm: t.bpm.map(|b| b.as_f32()),
             key: t.key.map(ApiKey::from),
+            energy: t.energy.map(|e| e.value()),
             duration_secs: t.duration.map(|d| d.value()),
             added: t.added.clone(),
             has_cover: t.cover_art_path.is_some(),
@@ -458,13 +470,14 @@ mod tests {
     }
 
     /// The JS contract (static/js/logic.js): exactly these keys, always all present.
-    const KEYS: [&str; 12] = [
+    const KEYS: [&str; 13] = [
         "added",
         "album",
         "artist",
         "bpm",
         "disc",
         "duration_secs",
+        "energy",
         "has_cover",
         "hash",
         "key",
@@ -483,6 +496,7 @@ mod tests {
         t.bpm = Some(Bpm::from_u32(128).unwrap());
         t.key = Some(Key::from_traditional("C Major").unwrap());
         t.cover_art_path = Some("cover-art/abc123.jpg".into());
+        t.energy = Some(library_ipc_client::EnergyLevel::new(7).unwrap());
         t.track_number = Some(3);
         t.disc_number = Some(2);
         t.added = Some("2026-11-01T10:00:00+00:00".into());
@@ -495,6 +509,7 @@ mod tests {
         assert_eq!(json["track_number"], 3);
         assert_eq!(json["disc"], 2);
         assert_eq!(json["bpm"], 128.0);
+        assert_eq!(json["energy"], 7);
         assert_eq!(json["duration_secs"], 180);
         assert_eq!(json["added"], "2026-11-01T10:00:00+00:00");
         assert_eq!(json["has_cover"], true);
@@ -620,6 +635,25 @@ mod tests {
         }
         let q = track_query_from(&param(None, None, Some(">2026-10-01"))).unwrap();
         assert!(q.added.is_some());
+        for energy in ["7", "1..10", "5..8", "1..6", "6..10", "7+-2"] {
+            let q = track_query_from(&SearchParams {
+                energy: Some(energy.into()),
+                ..Default::default()
+            })
+            .unwrap_or_else(|e| panic!("energy {energy}: {e}"));
+            assert!(q.energy.is_some(), "energy {energy}");
+        }
+    }
+
+    #[test]
+    fn energy_out_of_range_or_garbage_is_rejected() {
+        for bad in ["0", "11", "0..5", "5..11", "loud", "7.5"] {
+            let r = track_query_from(&SearchParams {
+                energy: Some(bad.into()),
+                ..Default::default()
+            });
+            assert!(r.is_err(), "energy {bad}");
+        }
     }
 
     // ---- handlers, against a fake gateway ----
@@ -890,6 +924,38 @@ mod tests {
         .await;
         assert_eq!(res.status(), StatusCode::OK);
         assert_eq!(body_json(res).await, json!(["sha256:a", "sha256:b"]));
+    }
+
+    #[tokio::test]
+    async fn match_forwards_the_energy_filter_and_rejects_a_bad_one() {
+        let gw = FakeGateway::start(|req| match req {
+            GatewayRequest::Library {
+                request: LibraryRequest::Search { query },
+            } if query.energy.is_some() => {
+                library_ok(LibraryResponse::SearchResults(vec![bare("sha256:calm")]))
+            }
+            other => GatewayResponse::Error {
+                message: format!("unexpected {other:?}"),
+            },
+        });
+        let res = send_get(
+            test_app_with(gw.addr()),
+            "/api/tracks/match?energy=5..8",
+            None,
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(body_json(res).await, json!(["sha256:calm"]));
+
+        let before = gw.requests().len();
+        let res = send_get(
+            test_app_with(gw.addr()),
+            "/api/tracks/match?energy=11",
+            None,
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(gw.requests().len(), before);
     }
 
     #[tokio::test]
