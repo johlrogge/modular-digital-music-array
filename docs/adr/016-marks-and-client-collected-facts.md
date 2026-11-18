@@ -236,7 +236,7 @@ The console also writes scalar facts, starting with Energy, directly to the node
 
 - `POST /api/energy {hashes, level: 1..10 | null}` (`api/energy.rs`): a set operation like marks, with the same `{changed, tracks}` reply and the same status policy (400 without hashes, 422 for a level outside 1..10 or an unknown hash with nothing written, 207 partway, 502/503 per the library failure policy). A track already showing that level, or showing no energy to clear, is not in `changed`.
   - Setting writes the level. The last live energy of any source is the one shown, so the new write wins.
-  - Clearing retracts every level the user asserted, so an older user value does not surface again. How energy from imports and user values combine, and what clear means across sources, is decided before the Rekordbox import lands (follow-up ADR). The clear semantics stay as they are for now.
+  - Clearing retracts every level the user asserted, so an older user value does not surface again. How energy from imports and user values combine, and what clear means across sources, is decided before the Rekordbox import lands (follow-up ADR). The clear semantics stay as they are for now. See ADR-034 (Rekordbox rating ↔ energy three-way sync).
 - The browser offers Undo by setting each changed track back to the energy `ApiTrack` showed before, or clearing it.
 - Offline push of energy is still deferred: like marks, the console writes online only, and an offline edit outbox for energy comes with the later phases of this ADR.
 
