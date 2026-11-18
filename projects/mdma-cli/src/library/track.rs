@@ -37,7 +37,7 @@ pub(crate) struct ReplaceArgs {
 /// ```
 #[hicli::command]
 pub(crate) fn delete(hash: HashInput, ctx: &Ctx) -> Result<hicli::Success> {
-    let library = ctx.library()?;
+    let library = ctx.node().library()?;
     let hashes = dedup_hashes(hashes_of_input(hash)?);
     for_each_track(hashes, |ch| {
         library
@@ -60,7 +60,7 @@ pub(crate) fn delete(hash: HashInput, ctx: &Ctx) -> Result<hicli::Success> {
 /// ```
 #[hicli::command]
 pub(crate) fn restore(hash: HashInput, ctx: &Ctx) -> Result<hicli::Success> {
-    let library = ctx.library()?;
+    let library = ctx.node().library()?;
     let hashes = dedup_hashes(hashes_of_input(hash)?);
     for_each_track(hashes, |ch| {
         library
@@ -86,7 +86,7 @@ pub(crate) fn replace(args: ReplaceArgs, ctx: &Ctx) -> Result<()> {
         old_hash: OldHashArg(TrackArg(old_hash)),
         new_file: NewFileArg(new_file),
     } = args;
-    let library = ctx.library()?;
+    let library = ctx.node().library()?;
     let (new_hash, playlists) = library
         .track_replace(&old_hash, &new_file)
         .map_err(display_error)?;
@@ -103,7 +103,7 @@ pub(crate) fn replace(args: ReplaceArgs, ctx: &Ctx) -> Result<()> {
 pub(crate) fn orphans(ctx: &Ctx) -> Result<()> {
     use library_ipc_client::OrphanReason;
 
-    let library = ctx.library()?;
+    let library = ctx.node().library()?;
     let orphans = library.track_orphans().map_err(display_error)?;
     if orphans.is_empty() {
         println!("no hidden tracks");

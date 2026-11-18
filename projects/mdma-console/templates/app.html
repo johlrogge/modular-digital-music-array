@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<title>MDMA Player</title>
+<script>try{if(localStorage.getItem("mdma-theme")==="light")document.documentElement.dataset.theme="light"}catch(e){}</script>
+<link rel="stylesheet" href="/static/{{ asset_tag }}/app.css">
+<script type="module" src="/static/{{ asset_tag }}/js/app.js"></script>
+</head>
+<body>
+
+{% include "icons.svg" %}
+
+<div class="app" id="app" data-node="{{ node }}" data-version="{{ version }}" data-asset-tag="{{ asset_tag }}">
+
+  <!-- Desktop rail -->
+  <nav class="rail" aria-label="Main">
+    <div class="brand"><span class="brand-mark" aria-hidden="true"></span>MDMA</div>
+    <a href="#/home" data-nav="home"><svg class="i"><use href="#i-home"/></svg>Home</a>
+    <a href="#/library/tracks" data-nav="library"><svg class="i"><use href="#i-library"/></svg>Library</a>
+    <a href="#/queue" data-nav="queue"><svg class="i"><use href="#i-queue"/></svg>Up next<span class="cnt" data-qcount hidden></span></a>
+    <div class="rail-head"><h2>Playlists</h2><button class="icon-btn" id="rail-new" aria-expanded="false" aria-label="New playlist" title="New playlist"><svg class="i sm"><use href="#i-plus"/></svg></button></div>
+    <div id="rail-new-ask"></div>
+    <div class="pl" id="rail-playlists"></div>
+    <a href="#/settings" data-nav="settings" class="settings-link"><svg class="i"><use href="#i-gear"/></svg>Settings</a>
+  </nav>
+
+  <main id="main">
+    <section class="view on" id="view" aria-live="off"></section>
+  </main>
+
+  <!-- Now-playing bar -->
+  <div class="npbar" id="npbar" role="region" aria-label="Now playing" hidden>
+    <div class="now" data-open-player>
+      <div class="art" id="bar-art"></div>
+      <div class="info"><div class="k" id="bar-kick" hidden>Previewing</div><div class="t" id="bar-title"></div><div class="m" id="bar-artist"></div></div>
+    </div>
+    <div class="mob ctl">
+      <button class="icon-btn" data-like-now aria-label="Like" hidden><svg class="i"><use href="#i-heart"/></svg></button>
+      <button class="icon-btn pp" data-pp aria-label="Pause"><svg class="i fill"><use href="#i-pause"/></svg></button>
+      <button class="icon-btn" data-next aria-label="Next song"><svg class="i fill"><use href="#i-next"/></svg></button><button class="icon-btn" data-back aria-label="Back" aria-keyshortcuts="B" hidden><svg class="i"><use href="#i-undo"/></svg></button>
+    </div>
+    <div class="desk center ctl">
+      <div class="transport">
+        <button class="icon-btn" disabled aria-label="Previous (coming later)"><svg class="i fill sm"><use href="#i-prev"/></svg></button>
+        <button class="pp-big pp" data-pp aria-label="Pause"><svg class="i fill sm"><use href="#i-pause"/></svg></button>
+        <button class="icon-btn" data-next aria-label="Next song"><svg class="i fill sm"><use href="#i-next"/></svg></button><button class="icon-btn" data-back aria-label="Back" aria-keyshortcuts="B" hidden><svg class="i"><use href="#i-undo"/></svg></button>
+      </div>
+      <div class="seek num"><span data-el>0:00</span><input class="slider" type="range" min="0" max="1000" value="0" data-seek aria-label="Seek" disabled><span data-rem>-0:00</span></div>
+    </div>
+    <div class="desk right ctl">
+      <button class="icon-btn" data-like-now aria-label="Like" hidden><svg class="i"><use href="#i-heart"/></svg></button>
+      <button class="icon-btn" data-open-queue aria-label="Up next"><svg class="i"><use href="#i-queue"/></svg></button>
+      <a class="icon-btn" href="#/settings/speakers" aria-label="Speakers"><svg class="i"><use href="#i-speaker"/></svg></a>
+    </div>
+    <div class="mini-progress"><i id="mini-prog"></i></div>
+  </div>
+
+  <!-- Bottom tabs (mobile) -->
+  <nav class="tabbar" aria-label="Main">
+    <a href="#/home" data-nav="home"><svg class="i"><use href="#i-home"/></svg>Home</a>
+    <a href="#/library/tracks" data-nav="library"><svg class="i"><use href="#i-library"/></svg>Library</a>
+    <a href="#/queue" data-nav="queue"><svg class="i"><use href="#i-queue"/></svg>Up next<span class="cnt" data-qcount hidden></span></a>
+  </nav>
+</div>
+
+<!-- Full player -->
+<div class="scrim" id="scrim"></div>
+<div class="player" id="player" tabindex="-1" role="dialog" aria-modal="true" aria-label="Player">
+  <div class="bgtint" id="p-tint"></div>
+  <div class="inner">
+    <div class="head">
+      <button class="icon-btn" data-close-player aria-label="Close player"><svg class="i"><use href="#i-down"/></svg></button>
+      <div class="lbl"><span id="p-kick">Playing from</span><b id="p-from"></b></div>
+      <button class="icon-btn" data-menu-current aria-label="More"><svg class="i"><use href="#i-more"/></svg></button>
+    </div>
+    <div class="banner" role="status"><svg class="i sm"><use href="#i-wifi-off"/></svg>Lost connection to your player. Reconnecting…</div>
+    <div class="grid2">
+      <div class="body">
+        <div class="art big-art" id="p-art"></div>
+        <div>
+          <div class="meta">
+            <div style="min-width:0"><h2 id="p-title"></h2><a class="a" href="#/library" id="p-artist"></a></div>
+            <button class="icon-btn" data-like-now aria-label="Like" hidden><svg class="i"><use href="#i-heart"/></svg></button>
+          </div>
+          <div class="chips pmarks" id="p-marks" role="group" aria-label="Marks"></div>
+          <div class="seek num" style="margin-top:var(--s-4)"><span data-el>0:00</span><input class="slider" type="range" min="0" max="1000" value="0" data-seek aria-label="Seek" disabled><span data-rem>-0:00</span></div>
+          <div class="kicker p-seek-hint">Snaps to the beat when there is one · hold Alt to place freely</div>
+        </div>
+        <div class="transport ctl">
+          <button class="icon-btn" disabled aria-label="Previous (coming later)"><svg class="i fill"><use href="#i-prev"/></svg></button>
+          <button class="pp-huge pp" data-pp aria-label="Pause"><svg class="i fill"><use href="#i-pause"/></svg></button>
+          <button class="icon-btn" data-next aria-label="Next song"><svg class="i fill"><use href="#i-next"/></svg></button><button class="icon-btn" data-back aria-label="Back" aria-keyshortcuts="B" hidden><svg class="i"><use href="#i-undo"/></svg></button>
+        </div>
+        <div class="sec">
+          <a class="icon-btn" href="#/settings/speakers" data-close-player aria-label="Speakers"><svg class="i"><use href="#i-speaker"/></svg></a>
+          <button class="icon-btn q-btn" data-open-queue aria-label="Up next"><svg class="i"><use href="#i-queue"/></svg></button>
+        </div>
+      </div>
+      <aside class="side" aria-label="Up next">
+        <div style="display:flex;justify-content:space-between;align-items:center"><h3 style="margin:0;font-size:var(--fs-lg)">Up next</h3><button class="btn ghost" data-clear>Clear</button></div>
+        <div class="q-scroll" data-queue></div>
+      </aside>
+    </div>
+  </div>
+</div>
+
+<!-- Filters sheet -->
+<div class="sheet-scrim" id="f-scrim"></div>
+<div class="sheet" id="fsheet" role="dialog" aria-modal="true" aria-labelledby="f-h">
+  <div class="grab" aria-hidden="true"></div>
+  <header><h2 id="f-h">Filters</h2><button class="icon-btn" data-close-filters aria-label="Close"><svg class="i"><use href="#i-close"/></svg></button></header>
+  <div class="q-scroll" style="padding:0 var(--s-5) var(--s-4)">
+    <div class="fgroup" style="margin-top:0"><span class="kicker">Tempo · BPM</span>
+      <div class="range2">
+        <label class="field">From<input id="f-bmin" class="num" inputmode="numeric" placeholder="60" maxlength="3"></label>
+        <span class="num" style="padding-bottom:12px;color:var(--text-3)">—</span>
+        <label class="field">To<input id="f-bmax" class="num" inputmode="numeric" placeholder="180" maxlength="3"></label>
+      </div>
+      <div class="chips" style="margin-top:var(--s-3)" id="f-bpm-presets"></div>
+    </div>
+    <div class="fgroup"><span class="kicker">Key</span>
+      <div class="keys" id="f-keys"></div>
+      <span class="kicker" style="display:block;margin-top:var(--s-3)">Keys that mix well · steps</span>
+      <div class="seg" role="group" aria-label="Steps" id="f-steps"><button aria-pressed="false" data-steps="0">Off</button><button aria-pressed="false" data-steps="1">1</button><button aria-pressed="false" data-steps="2">2</button><button aria-pressed="false" data-steps="3">3</button></div>
+      <div class="seg" role="group" aria-label="Shape" id="f-shape" style="margin-top:var(--s-2)"><button aria-pressed="false" data-shape="straight">Straight</button><button aria-pressed="false" data-shape="any">Any path</button></div>
+      <label class="radio" style="padding:0;border:0;margin-top:var(--s-2)"><input type="checkbox" id="f-jump"><span class="ttl">+ Power jump<small style="display:block;color:var(--text-3);font-size:var(--fs-xs)">Also seven steps up the wheel: one semitone higher</small></span></label>
+    </div>
+    <div class="fgroup"><span class="kicker">Added</span><div class="chips" id="f-added"></div></div>
+    <div class="fgroup"><span class="kicker">Mark</span><div class="chips" id="f-mark"></div></div>
+  </div>
+  <div class="foot"><button class="btn ghost" id="f-reset">Reset</button><button class="btn primary" id="f-apply">Show results</button></div>
+</div>
+
+<div class="menu-scrim" id="menu-scrim"></div>
+<div class="menu" id="menu" role="menu"></div>
+<div class="confirm" id="confirm" role="alertdialog" aria-modal="true" aria-labelledby="cf-t" aria-describedby="cf-p">
+  <div class="box"><h3 id="cf-t"></h3><p id="cf-p"></p><div class="btn-row"><button class="btn ghost" id="cf-cancel">Cancel</button><button class="btn danger" id="cf-ok">OK</button></div></div>
+</div>
+<div class="toast" id="toast" role="status" aria-live="polite"><span id="toast-msg"></span><button id="toast-act" hidden>Undo</button></div>
+
+</body>
+</html>

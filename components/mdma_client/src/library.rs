@@ -1,18 +1,23 @@
 //! Library backend abstraction — works in both gateway and direct mode.
 
 use crate::error::map_gw_to_lib_error;
+use crate::queue_resolve::{combine, queue_entries, resolve_queue_entry, Outcome};
 use library_ipc_client::{
     content_to_hashes, interpret_archive_emptied, interpret_archive_listing,
     interpret_dedup_merged, interpret_dedup_scan, interpret_identity_backfill,
-    interpret_identity_backfill_status, ArchiveEmptyReport, ArchiveListing, ClientError,
+    interpret_identity_backfill_status, interpret_playlist_entries, resolve_full_hash,
+    resolve_full_hashes, ArchiveEmptyReport, ArchiveListing, CanonicalHash, ClientError,
     ContentHash, DedupApplyReport, DedupScanReport, FactSource, FactType, IdentityBackfillStart,
     IdentityBackfillStatus, InboxPath, IngestAllItem, IngestResult, IngestSource, LibraryClient,
     LibraryRequest, LibraryResponse, Mark, MarkFilter, MarkWrite, MusicValue, OrphanInfo,
-    PlaylistName, ProtocolError, ServiceStatus, TrackInfo, TrackQuery, Unmark,
+    PlaylistEntry, PlaylistName, ProtocolError, ResolveError, ServiceStatus, TrackInfo, TrackQuery,
+    Unmark,
 };
 use playlist_import::PlaylistWriteOps;
 
 /// Abstraction for library requests, works in both gateway and direct mode.
+/// A clone shares the connection.
+#[derive(Clone)]
 pub enum LibraryBackend {
     Direct(LibraryClient),
     Gateway(gateway_client::GatewayClient),
@@ -36,6 +41,15 @@ impl LibraryBackend {
         match gateway {
             Some(gw) => Self::connect_gateway(gw),
             None => Self::connect_direct(socket),
+        }
+    }
+
+    /// Why a request on this connection found the node unreachable since this was
+    /// last asked, if one did. The `Node` asks, and drops a connection that went dead.
+    pub fn take_unreachable(&self) -> Option<String> {
+        match self {
+            LibraryBackend::Direct(c) => c.take_unreachable(),
+            LibraryBackend::Gateway(gw) => gw.take_unreachable(),
         }
     }
 
@@ -79,6 +93,39 @@ impl LibraryBackend {
                 interpret_track(self.request(&LibraryRequest::GetTrack { hash: hash.clone() })?)
             }
         }
+    }
+
+    /// The canonical hash of each of `hashes`, which playback needs (ADR-026).
+    /// See [`library_ipc_client::resolve_full_hashes`].
+    pub fn resolve_for_playback(
+        &self,
+        hashes: &[ContentHash],
+    ) -> Result<Vec<CanonicalHash>, ResolveError> {
+        resolve_full_hashes(hashes, |hash| self.get_track(hash))
+    }
+
+    /// The canonical hash of each of `hashes`, for making them the whole `queue`
+    /// (an edit or a replace): every hash is resolved against what `queue` already
+    /// holds and against the library, and the two answers are combined (see
+    /// [`combine`]). So an entry whose track has left the library survives, a new
+    /// entry must exist in the library, and a hash that names different tracks in
+    /// the two is refused rather than silently taken from one.
+    pub fn resolve_for_queue_replace(
+        &self,
+        queue: &[ContentHash],
+        hashes: &[ContentHash],
+    ) -> Result<Vec<CanonicalHash>, ResolveError> {
+        let entries = queue_entries(queue);
+        hashes
+            .iter()
+            .map(|hash| {
+                combine(
+                    hash,
+                    Outcome::of_queue(resolve_queue_entry(&entries, hash)),
+                    Outcome::of_library(resolve_full_hash(hash, |hash| self.get_track(hash))),
+                )
+            })
+            .collect()
     }
 
     pub fn get_facts(
@@ -202,6 +249,16 @@ impl LibraryBackend {
             LibraryBackend::Direct(c) => c.playlist_get(name),
             LibraryBackend::Gateway(_) => interpret_playlist_content(
                 self.request(&LibraryRequest::PlaylistGet { name: name.clone() })?,
+            ),
+        }
+    }
+
+    /// A playlist's entries resolved to full hashes, in file order.
+    pub fn playlist_entries(&self, name: &PlaylistName) -> Result<Vec<PlaylistEntry>, ClientError> {
+        match self {
+            LibraryBackend::Direct(c) => c.playlist_entries(name),
+            LibraryBackend::Gateway(_) => interpret_playlist_entries(
+                self.request(&LibraryRequest::PlaylistEntries { name: name.clone() })?,
             ),
         }
     }

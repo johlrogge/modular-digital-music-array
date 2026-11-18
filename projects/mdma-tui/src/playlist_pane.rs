@@ -1,25 +1,52 @@
 #![allow(dead_code)]
+use crate::link::{Link, ReadError};
 use crate::pane::{AddPlayingTarget, Pane, PaneAction, PaneKind};
+use crate::rows::{row_for_lookup, rows_content_for_write, rows_for_hashes, ListRow};
 use crate::selection::SelectionState;
 use crate::theme::MUTED;
 use crate::track_list::render_track_list;
 use crossterm::event::{KeyCode, KeyEvent};
-use mdma_client::{ContentHash, LibraryBackend, PlaylistName, TrackInfo};
+use mdma_client::{
+    entry_tracks, ContentHash, EntryTrackError, PlaylistEntry, PlaylistName, TrackInfo,
+};
 use ratatui::{
     layout::Rect,
     style::Style,
     widgets::{Block, Borders},
     Frame,
 };
-use std::rc::Rc;
-use track_formatter::format_playlist_content;
 
-/// Build formatted playlist content from a slice of track info.
+/// Turn library entries into rows, keeping every entry at its position.
 ///
-/// Produces the canonical `{8hash}  {Artist} - {Title}  [{duration}]` format
-/// used by all playlist write paths in the TUI.
-pub(crate) fn playlist_content_for_write(tracks: &[TrackInfo]) -> String {
-    format_playlist_content(tracks)
+/// An entry the library could not resolve becomes an unresolved row, and so
+/// does one whose track lookup answers "track not found". Any other failed
+/// lookup fails the whole load: it is not an answer about the entry, so it
+/// must not be shown as one.
+fn rows_from_entries(
+    entries: &[PlaylistEntry],
+    get_track: impl FnMut(&ContentHash) -> Result<TrackInfo, ReadError>,
+) -> Result<Vec<ListRow>, ReadError> {
+    entry_tracks(entries, get_track)
+        .map(|entry| match entry {
+            Ok(track) => Ok(ListRow::Track(track)),
+            Err(EntryTrackError::Unresolved(error)) => Ok(ListRow::Unresolved(error)),
+            Err(EntryTrackError::Lookup { hash, source }) => {
+                row_for_lookup(hash.as_content_hash(), Err(source))
+            }
+        })
+        .collect()
+}
+
+/// The rows of playlist `name`: its entries from the node, each row's metadata
+/// from the facts. The error is the text to show.
+fn load_rows(link: &Link, name: &PlaylistName) -> Result<Vec<ListRow>, String> {
+    let entries = link
+        .library()
+        .map_err(|e| e.to_string())?
+        .playlist_entries(name)
+        .map_err(|e| e.to_string())?;
+    // From the node, not the replica: these rows are written back to the playlist.
+    rows_from_entries(&entries, |h| link.node_track(h)).map_err(|e| e.to_string())
 }
 
 /// Maximum number of undo snapshots retained per playlist pane.
@@ -28,18 +55,16 @@ const UNDO_DEPTH: usize = 50;
 /// Snapshot of a playlist pane's mutable state, used for undo.
 #[derive(Clone)]
 struct PlaylistSnapshot {
-    hashes: Vec<ContentHash>,
-    tracks: Vec<TrackInfo>,
+    rows: Vec<ListRow>,
     cursor: usize,
 }
 
 /// A pane that displays the contents of a named playlist.
 pub struct PlaylistPane {
     name: PlaylistName,
-    hashes: Vec<ContentHash>,
-    tracks: Vec<TrackInfo>,
+    rows: Vec<ListRow>,
     selection: SelectionState,
-    library: Rc<LibraryBackend>,
+    link: Link,
     title: String,
     undo_stack: Vec<PlaylistSnapshot>,
 }
@@ -48,10 +73,9 @@ impl Clone for PlaylistPane {
     fn clone(&self) -> Self {
         PlaylistPane {
             name: self.name.clone(),
-            hashes: self.hashes.clone(),
-            tracks: self.tracks.clone(),
+            rows: self.rows.clone(),
             selection: self.selection.clone(),
-            library: Rc::clone(&self.library),
+            link: self.link.clone(),
             title: self.title.clone(),
             // Undo history is intentionally not carried over to tab clones —
             // each tab is an independent view.
@@ -61,29 +85,19 @@ impl Clone for PlaylistPane {
 }
 
 impl PlaylistPane {
-    /// Open a playlist pane by loading the playlist from the library backend.
+    /// Open a playlist pane by loading the playlist from the node.
     ///
-    /// Hashes that fail to resolve are skipped (logged at warn level).
-    pub fn open(name: PlaylistName, library: Rc<LibraryBackend>) -> color_eyre::Result<Self> {
-        let hashes = library.playlist_get(&name)?;
-        let tracks: Vec<TrackInfo> = hashes
-            .iter()
-            .filter_map(|h| match library.get_track(h) {
-                Ok(t) => Some(t),
-                Err(e) => {
-                    tracing::warn!("Failed to resolve hash {}: {}", h.as_str(), e);
-                    None
-                }
-            })
-            .collect();
-        let total = tracks.len();
+    /// Entries that do not resolve stay as rows at their position, shown as
+    /// unavailable.
+    pub fn open(name: PlaylistName, link: Link) -> color_eyre::Result<Self> {
+        let rows = load_rows(&link, &name).map_err(|e| color_eyre::eyre::eyre!("{e}"))?;
+        let total = rows.len();
         let title = format!("Playlist: {}", name);
         Ok(PlaylistPane {
             name,
-            hashes,
-            tracks,
+            rows,
             selection: SelectionState::new(total),
-            library,
+            link,
             title,
             undo_stack: Vec::new(),
         })
@@ -95,8 +109,7 @@ impl PlaylistPane {
     fn push_undo_snapshot(&mut self) {
         let cursor = self.selection.list_state.selected().unwrap_or(0);
         let snap = PlaylistSnapshot {
-            hashes: self.hashes.clone(),
-            tracks: self.tracks.clone(),
+            rows: self.rows.clone(),
             cursor,
         };
         self.undo_stack.push(snap);
@@ -105,19 +118,42 @@ impl PlaylistPane {
         }
     }
 
-    /// Reorder: move the track at `from` to `to` (adjacent swap).
-    fn swap_tracks(&mut self, from: usize, to: usize) {
-        self.hashes.swap(from, to);
-        self.tracks.swap(from, to);
+    /// The hash of every row, in order (the stored token for unresolved rows).
+    fn hashes(&self) -> Vec<ContentHash> {
+        self.rows.iter().map(ListRow::hash).collect()
     }
 
-    /// Persist the current hash order to the backend with canonical formatting.
+    /// Reorder: move the row at `from` to `to` (adjacent swap).
+    fn swap_tracks(&mut self, from: usize, to: usize) {
+        self.rows.swap(from, to);
+    }
+
+    /// Persist the current row order to the backend with canonical formatting.
     ///
-    /// Writes `{8hash}  {Artist} - {Title}  [{duration}]` lines so the on-disk
+    /// Writes `{12hash}  {Artist} - {Title}  [{duration}]` lines so the on-disk
     /// playlist file is human-readable and matches `mdma search` output.
-    fn persist_order(&self) -> Result<(), mdma_client::LibraryClientError> {
-        let content = playlist_content_for_write(&self.tracks);
-        self.library.playlist_replace(&self.name, content)
+    /// Unresolved rows are written back as their own token followed by the
+    /// reason as a trailing comment, never dropped.
+    fn persist_order(&self) -> Result<(), String> {
+        self.replace_content(rows_content_for_write(&self.rows))
+    }
+
+    /// Replace the playlist on the node with `content`. The error is the text to show.
+    fn replace_content(&self, content: String) -> Result<(), String> {
+        self.link
+            .library()
+            .map_err(|e| e.to_string())?
+            .playlist_replace(&self.name, content)
+            .map_err(|e| e.to_string())
+    }
+
+    /// Append `content` to the playlist on the node. The error is the text to show.
+    fn append_content(&self, content: String) -> Result<(), String> {
+        self.link
+            .library()
+            .map_err(|e| e.to_string())?
+            .playlist_append(&self.name, content)
+            .map_err(|e| e.to_string())
     }
 
     /// Undo the most recent mutation by restoring the last snapshot.
@@ -129,21 +165,19 @@ impl PlaylistPane {
             return PaneAction::Info("Nothing to undo".to_string());
         };
 
-        let prior_hashes = std::mem::replace(&mut self.hashes, snap.hashes);
-        let prior_tracks = std::mem::replace(&mut self.tracks, snap.tracks);
+        let prior_rows = std::mem::replace(&mut self.rows, snap.rows);
 
         match self.persist_order() {
             Ok(()) => {
-                self.selection.set_total_items(self.hashes.len());
+                self.selection.set_total_items(self.rows.len());
                 self.selection
                     .list_state
-                    .select(Some(snap.cursor.min(self.hashes.len().saturating_sub(1))));
+                    .select(Some(snap.cursor.min(self.rows.len().saturating_sub(1))));
                 PaneAction::Info("Undone".to_string())
             }
             Err(e) => {
                 // Revert the undo if persist failed
-                self.hashes = prior_hashes;
-                self.tracks = prior_tracks;
+                self.rows = prior_rows;
                 PaneAction::Error(format!("Undo failed: {e}"))
             }
         }
@@ -151,38 +185,34 @@ impl PlaylistPane {
 
     /// Paste `hashes` after the current cursor position.
     ///
-    /// Updates `self.hashes`, `self.tracks`, and the selection state, then
-    /// persists to the backend. On backend failure the operation is reverted.
+    /// Updates `self.rows` and the selection state, then persists to the
+    /// backend. On backend failure the operation is reverted.
     /// Returns a `PaneAction` describing the outcome.
     pub fn paste_after_cursor(&mut self, hashes: Vec<ContentHash>) -> PaneAction {
         if hashes.is_empty() {
             return PaneAction::Info("Clipboard is empty".to_string());
         }
 
-        let (new_hashes, new_cursor) =
-            paste_after_cursor_into(&self.hashes, &self.selection, &hashes);
+        let pasted = match rows_for_hashes(&hashes, |h| self.link.node_track(h)) {
+            Ok(rows) => rows,
+            Err(e) => return PaneAction::Error(format!("Paste failed: {e}")),
+        };
 
-        // Resolve TrackInfo for the pasted hashes (skip failures silently).
-        let new_tracks: Vec<TrackInfo> = new_hashes
-            .iter()
-            .filter_map(|h| self.library.get_track(h).ok())
-            .collect();
+        let (new_rows, new_cursor) = paste_after_cursor_into(&self.rows, &self.selection, &pasted);
 
         self.push_undo_snapshot();
 
-        let old_hashes = std::mem::replace(&mut self.hashes, new_hashes.clone());
-        let old_tracks = std::mem::replace(&mut self.tracks, new_tracks);
+        let old_rows = std::mem::replace(&mut self.rows, new_rows);
 
         match self.persist_order() {
             Ok(()) => {
-                self.selection.set_total_items(self.hashes.len());
+                self.selection.set_total_items(self.rows.len());
                 self.selection.list_state.select(Some(new_cursor));
-                PaneAction::Info(format!("Pasted {} track(s)", hashes.len()))
+                PaneAction::Info(format!("Pasted {} track(s)", pasted.len()))
             }
             Err(e) => {
                 // Revert state and discard the snapshot (persist never succeeded)
-                self.hashes = old_hashes;
-                self.tracks = old_tracks;
+                self.rows = old_rows;
                 self.undo_stack.pop();
                 PaneAction::Error(format!("Paste failed: {e}"))
             }
@@ -192,7 +222,7 @@ impl PlaylistPane {
 
 impl Pane for PlaylistPane {
     fn render(&self, f: &mut Frame, area: Rect) {
-        if self.tracks.is_empty() {
+        if self.rows.is_empty() {
             let placeholder = ratatui::widgets::Paragraph::new("Playlist is empty")
                 .style(Style::default().fg(MUTED));
             f.render_widget(placeholder, area);
@@ -200,7 +230,7 @@ impl Pane for PlaylistPane {
         }
 
         let block = Block::default().borders(Borders::NONE);
-        render_track_list(f, area, &self.tracks, &self.selection, block);
+        render_track_list(f, area, &self.rows, &self.selection, block);
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> PaneAction {
@@ -238,12 +268,11 @@ impl Pane for PlaylistPane {
                     Err(msg) => PaneAction::Info(msg),
                     Ok(selected) if selected.is_empty() => PaneAction::Consumed,
                     Ok(selected) => {
-                        match move_block_down(&self.hashes, &self.tracks, &selected) {
+                        match move_block_down(&self.rows, &selected) {
                             None => PaneAction::Consumed, // at bottom, no-op
-                            Some((new_hashes, new_tracks, new_selected)) => {
+                            Some((new_rows, new_selected)) => {
                                 self.push_undo_snapshot();
-                                let old_hashes = std::mem::replace(&mut self.hashes, new_hashes);
-                                let old_tracks = std::mem::replace(&mut self.tracks, new_tracks);
+                                let old_rows = std::mem::replace(&mut self.rows, new_rows);
                                 match self.persist_order() {
                                     Ok(()) => {
                                         let new_cursor = *new_selected.last().unwrap_or(&0);
@@ -257,8 +286,7 @@ impl Pane for PlaylistPane {
                                     }
                                     Err(e) => {
                                         // Revert and discard snapshot
-                                        self.hashes = old_hashes;
-                                        self.tracks = old_tracks;
+                                        self.rows = old_rows;
                                         self.undo_stack.pop();
                                         PaneAction::Error(format!("Reorder failed: {e}"))
                                     }
@@ -275,12 +303,11 @@ impl Pane for PlaylistPane {
                     Err(msg) => PaneAction::Info(msg),
                     Ok(selected) if selected.is_empty() => PaneAction::Consumed,
                     Ok(selected) => {
-                        match move_block_up(&self.hashes, &self.tracks, &selected) {
+                        match move_block_up(&self.rows, &selected) {
                             None => PaneAction::Consumed, // at top, no-op
-                            Some((new_hashes, new_tracks, new_selected)) => {
+                            Some((new_rows, new_selected)) => {
                                 self.push_undo_snapshot();
-                                let old_hashes = std::mem::replace(&mut self.hashes, new_hashes);
-                                let old_tracks = std::mem::replace(&mut self.tracks, new_tracks);
+                                let old_rows = std::mem::replace(&mut self.rows, new_rows);
                                 match self.persist_order() {
                                     Ok(()) => {
                                         let new_cursor = *new_selected.first().unwrap_or(&0);
@@ -294,8 +321,7 @@ impl Pane for PlaylistPane {
                                     }
                                     Err(e) => {
                                         // Revert and discard snapshot
-                                        self.hashes = old_hashes;
-                                        self.tracks = old_tracks;
+                                        self.rows = old_rows;
                                         self.undo_stack.pop();
                                         PaneAction::Error(format!("Reorder failed: {e}"))
                                     }
@@ -313,28 +339,21 @@ impl Pane for PlaylistPane {
                 // Cut selected tracks (or cursor track if nothing selected) into
                 // the App clipboard.  The caller (`dispatch_pane_action`) writes
                 // the returned hashes into `app.clipboard`.
-                let (cut_hashes, remaining_hashes) =
-                    collect_cut_targets(&self.hashes, &self.selection);
+                let (cut_rows, remaining_rows) = collect_cut_targets(&self.rows, &self.selection);
 
-                if cut_hashes.is_empty() {
+                if cut_rows.is_empty() {
                     return PaneAction::Consumed;
                 }
 
                 self.push_undo_snapshot();
 
-                // Compute remaining tracks before writing so we can format the content.
-                let remaining_tracks: Vec<TrackInfo> = remaining_hashes
-                    .iter()
-                    .filter_map(|h| self.library.get_track(h).ok())
-                    .collect();
-                let content = playlist_content_for_write(&remaining_tracks);
+                let content = rows_content_for_write(&remaining_rows);
 
-                match self.library.playlist_replace(&self.name, content) {
+                match self.replace_content(content) {
                     Ok(()) => {
-                        self.hashes = remaining_hashes;
-                        self.tracks = remaining_tracks;
+                        self.rows = remaining_rows;
                         // Clamp cursor to new length
-                        let new_len = self.hashes.len();
+                        let new_len = self.rows.len();
                         let new_cursor = self
                             .selection
                             .cursor_position()
@@ -344,7 +363,7 @@ impl Pane for PlaylistPane {
                         if new_len > 0 {
                             self.selection.list_state.select(Some(new_cursor));
                         }
-                        PaneAction::Cut(cut_hashes)
+                        PaneAction::Cut(cut_rows.iter().map(ListRow::hash).collect())
                     }
                     Err(e) => {
                         // Discard snapshot since persist never succeeded
@@ -358,7 +377,7 @@ impl Pane for PlaylistPane {
     }
 
     fn accept_tracks(&mut self, hashes: &[ContentHash]) -> PaneAction {
-        let new_hashes: Vec<ContentHash> = deduplicate_hashes(hashes, &self.hashes)
+        let new_hashes: Vec<ContentHash> = deduplicate_hashes(hashes, &self.hashes())
             .into_iter()
             .cloned()
             .collect();
@@ -367,18 +386,17 @@ impl Pane for PlaylistPane {
             return PaneAction::Info("All selected tracks already in playlist".to_string());
         }
 
-        let new_tracks: Vec<TrackInfo> = new_hashes
-            .iter()
-            .filter_map(|h| self.library.get_track(h).ok())
-            .collect();
+        let new_rows = match rows_for_hashes(&new_hashes, |h| self.link.node_track(h)) {
+            Ok(rows) => rows,
+            Err(e) => return PaneAction::Error(format!("Failed to add tracks: {e}")),
+        };
 
-        let content = playlist_content_for_write(&new_tracks);
-        match self.library.playlist_append(&self.name, content) {
+        let content = rows_content_for_write(&new_rows);
+        match self.append_content(content) {
             Ok(()) => {
-                let added = new_hashes.len();
-                self.hashes.extend(new_hashes);
-                self.tracks.extend(new_tracks);
-                self.selection.set_total_items(self.tracks.len());
+                let added = new_rows.len();
+                self.rows.extend(new_rows);
+                self.selection.set_total_items(self.rows.len());
                 PaneAction::Info(format!("Added {} track(s)", added))
             }
             Err(e) => PaneAction::Error(format!("Failed to add tracks: {e}")),
@@ -390,7 +408,7 @@ impl Pane for PlaylistPane {
             .effective_selection()
             .into_iter()
             .filter_map(|vis_idx| self.selection.visible_index_to_data(vis_idx))
-            .map(|data_idx| self.hashes[data_idx].clone())
+            .map(|data_idx| self.rows[data_idx].hash())
             .collect()
     }
 
@@ -407,7 +425,7 @@ impl Pane for PlaylistPane {
     }
 
     fn item_count(&self) -> usize {
-        self.tracks.len()
+        self.rows.len()
     }
 
     fn pane_kind(&self) -> PaneKind {
@@ -419,11 +437,7 @@ impl Pane for PlaylistPane {
     }
 
     fn display_string(&self, data_idx: usize) -> Option<String> {
-        let track = self.tracks.get(data_idx)?;
-        let artist = track.artist.as_deref().unwrap_or("");
-        let title = track.title.as_deref().unwrap_or("");
-        let album = track.album.as_deref().unwrap_or("");
-        Some(format!("{} {} {}", artist, title, album))
+        Some(self.rows.get(data_idx)?.display_text())
     }
 
     fn add_playing_target(&self) -> AddPlayingTarget {
@@ -431,21 +445,10 @@ impl Pane for PlaylistPane {
     }
 
     fn refresh(&mut self) -> PaneAction {
-        match self.library.playlist_get(&self.name) {
-            Ok(hashes) => {
-                let tracks: Vec<TrackInfo> = hashes
-                    .iter()
-                    .filter_map(|h| match self.library.get_track(h) {
-                        Ok(t) => Some(t),
-                        Err(e) => {
-                            tracing::warn!("Failed to resolve hash {}: {}", h.as_str(), e);
-                            None
-                        }
-                    })
-                    .collect();
-                self.hashes = hashes;
-                self.tracks = tracks;
-                self.selection.set_total_items(self.tracks.len());
+        match load_rows(&self.link, &self.name) {
+            Ok(rows) => {
+                self.rows = rows;
+                self.selection.set_total_items(self.rows.len());
                 PaneAction::Consumed
             }
             Err(e) => PaneAction::Error(format!("Failed to refresh playlist: {e}")),
@@ -487,18 +490,18 @@ pub(crate) fn deduplicate_hashes<'a>(
         .collect()
 }
 
-/// Collect the hashes to cut from the playlist, based on the current selection.
+/// Collect the items to cut from the playlist, based on the current selection.
 ///
 /// - If `selection.selected` is non-empty, those visible indices are used.
 /// - Otherwise the cursor track is used.
 /// - If the playlist is empty or no cursor exists, returns two empty vecs.
 ///
-/// Returns `(cut_hashes, remaining_hashes)` where `cut_hashes` are the items
-/// removed and `remaining_hashes` is the new playlist order.
-pub(crate) fn collect_cut_targets(
-    hashes: &[ContentHash],
+/// Returns `(cut, remaining)` where `cut` are the items removed and
+/// `remaining` is the new playlist order.
+pub(crate) fn collect_cut_targets<T: Clone>(
+    hashes: &[T],
     selection: &SelectionState,
-) -> (Vec<ContentHash>, Vec<ContentHash>) {
+) -> (Vec<T>, Vec<T>) {
     let to_remove: std::collections::BTreeSet<usize> = if !selection.selected.is_empty() {
         selection
             .selected
@@ -515,14 +518,14 @@ pub(crate) fn collect_cut_targets(
         return (vec![], vec![]);
     };
 
-    let cut: Vec<ContentHash> = hashes
+    let cut: Vec<T> = hashes
         .iter()
         .enumerate()
         .filter(|(i, _)| to_remove.contains(i))
         .map(|(_, h)| h.clone())
         .collect();
 
-    let remaining: Vec<ContentHash> = hashes
+    let remaining: Vec<T> = hashes
         .iter()
         .enumerate()
         .filter(|(i, _)| !to_remove.contains(i))
@@ -532,18 +535,18 @@ pub(crate) fn collect_cut_targets(
     (cut, remaining)
 }
 
-/// Compute the new hash order after pasting `clipboard` after the cursor.
+/// Compute the new order after pasting `clipboard` after the cursor.
 ///
-/// Inserts `clipboard` hashes immediately after the current cursor's visible
-/// position. Returns `(new_hashes, new_cursor_index)` where `new_cursor_index`
+/// Inserts `clipboard` items immediately after the current cursor's visible
+/// position. Returns `(new_items, new_cursor_index)` where `new_cursor_index`
 /// is the (data) index of the last pasted item.
 ///
-/// If the playlist is empty, the clipboard hashes are placed at the start.
-pub(crate) fn paste_after_cursor_into(
-    hashes: &[ContentHash],
+/// If the playlist is empty, the clipboard items are placed at the start.
+pub(crate) fn paste_after_cursor_into<T: Clone>(
+    hashes: &[T],
     selection: &SelectionState,
-    clipboard: &[ContentHash],
-) -> (Vec<ContentHash>, usize) {
+    clipboard: &[T],
+) -> (Vec<T>, usize) {
     if clipboard.is_empty() {
         let cursor = selection.cursor_position().unwrap_or(0);
         return (hashes.to_vec(), cursor);
@@ -624,50 +627,45 @@ pub(crate) fn effective_data_indices_for_move(
     Ok(data_indices)
 }
 
-/// Move a contiguous block of items in `hashes` (and parallel `tracks`) down
-/// by one position. `selected` must be sorted and contiguous.
+/// Move a contiguous block of `items` down by one position. `selected` must
+/// be sorted and contiguous.
 ///
-/// Returns `(new_hashes, new_tracks, new_selection_indices)` where
-/// `new_selection_indices` are the data indices the block now occupies.
+/// Returns `(new_items, new_selection_indices)` where `new_selection_indices`
+/// are the data indices the block now occupies.
 /// Returns `None` when the block is already at the bottom.
 pub(crate) fn move_block_down<T: Clone>(
-    hashes: &[ContentHash],
-    tracks: &[T],
+    items: &[T],
     selected: &[usize],
-) -> Option<(Vec<ContentHash>, Vec<T>, Vec<usize>)> {
+) -> Option<(Vec<T>, Vec<usize>)> {
     if selected.is_empty() {
         return None;
     }
     let top = selected[0];
     let bottom = *selected.last().unwrap();
-    if bottom + 1 >= hashes.len() {
+    if bottom + 1 >= items.len() {
         return None; // already at bottom
     }
 
-    let mut new_hashes = hashes.to_vec();
-    let mut new_tracks = tracks.to_vec();
+    let mut new_items = items.to_vec();
 
     // Rotate: remove item at bottom+1 and insert at top
-    let moved_hash = new_hashes.remove(bottom + 1);
-    new_hashes.insert(top, moved_hash);
-    let moved_track = new_tracks.remove(bottom + 1);
-    new_tracks.insert(top, moved_track);
+    let moved = new_items.remove(bottom + 1);
+    new_items.insert(top, moved);
 
     // Selection shifts +1
     let new_selection: Vec<usize> = selected.iter().map(|&i| i + 1).collect();
-    Some((new_hashes, new_tracks, new_selection))
+    Some((new_items, new_selection))
 }
 
-/// Move a contiguous block of items in `hashes` (and parallel `tracks`) up
-/// by one position. `selected` must be sorted and contiguous.
+/// Move a contiguous block of `items` up by one position. `selected` must be
+/// sorted and contiguous.
 ///
-/// Returns `(new_hashes, new_tracks, new_selection_indices)`.
+/// Returns `(new_items, new_selection_indices)`.
 /// Returns `None` when the block is already at the top.
 pub(crate) fn move_block_up<T: Clone>(
-    hashes: &[ContentHash],
-    tracks: &[T],
+    items: &[T],
     selected: &[usize],
-) -> Option<(Vec<ContentHash>, Vec<T>, Vec<usize>)> {
+) -> Option<(Vec<T>, Vec<usize>)> {
     if selected.is_empty() {
         return None;
     }
@@ -677,23 +675,22 @@ pub(crate) fn move_block_up<T: Clone>(
         return None; // already at top
     }
 
-    let mut new_hashes = hashes.to_vec();
-    let mut new_tracks = tracks.to_vec();
+    let mut new_items = items.to_vec();
 
     // Rotate: remove item at top-1 and insert at bottom+1
-    let moved_hash = new_hashes.remove(top - 1);
-    new_hashes.insert(bottom, moved_hash); // insert at bottom (old bottom, after removal offset)
-    let moved_track = new_tracks.remove(top - 1);
-    new_tracks.insert(bottom, moved_track);
+    let moved = new_items.remove(top - 1);
+    new_items.insert(bottom, moved); // insert at bottom (old bottom, after removal offset)
 
     // Selection shifts -1
     let new_selection: Vec<usize> = selected.iter().map(|&i| i - 1).collect();
-    Some((new_hashes, new_tracks, new_selection))
+    Some((new_items, new_selection))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rows::{make_track_info, not_found, transport_error};
+    use mdma_client::EntryError;
 
     fn hash(s: &str) -> ContentHash {
         ContentHash::new(s)
@@ -887,13 +884,19 @@ mod tests {
 
     /// Helper: build a minimal PlaylistSnapshot for testing.
     ///
-    /// Uses empty `tracks` vec — undo stack tests only care about hashes + cursor.
+    /// Undo stack tests only care about the row hashes + cursor.
     fn make_snapshot(hashes: Vec<ContentHash>, cursor: usize) -> PlaylistSnapshot {
         PlaylistSnapshot {
-            tracks: Vec::new(),
-            hashes,
+            rows: hashes
+                .into_iter()
+                .map(|hash| ListRow::Unresolved(EntryError::Unknown { hash }))
+                .collect(),
             cursor,
         }
+    }
+
+    fn snapshot_hashes(snap: &PlaylistSnapshot) -> Vec<ContentHash> {
+        snap.rows.iter().map(ListRow::hash).collect()
     }
 
     /// push_undo_snapshot helper: verify snapshot is pushed and capped.
@@ -915,7 +918,7 @@ mod tests {
         );
         // Oldest (index 0 in original sequence) should be gone; snapshot 10 is oldest remaining.
         assert_eq!(
-            stack[0].hashes[0],
+            snapshot_hashes(&stack[0])[0],
             hash(&format!("sha256:{:04x}", 60 - UNDO_DEPTH)),
             "oldest entry should be dropped"
         );
@@ -945,7 +948,7 @@ mod tests {
     fn playlist_snapshot_clone_is_independent() {
         let snap = make_snapshot(vec![hash("sha256:aaa"), hash("sha256:bbb")], 1);
         let cloned = snap.clone();
-        assert_eq!(snap.hashes, cloned.hashes);
+        assert_eq!(snapshot_hashes(&snap), snapshot_hashes(&cloned));
         assert_eq!(snap.cursor, cloned.cursor);
     }
 
@@ -960,7 +963,8 @@ mod tests {
 
         let popped = stack.pop().unwrap();
         assert_eq!(
-            popped.hashes, snap_b.hashes,
+            snapshot_hashes(&popped),
+            snapshot_hashes(&snap_b),
             "last pushed snapshot should be first popped"
         );
     }
@@ -1004,13 +1008,10 @@ mod tests {
         let indices = effective_data_indices_for_move(&sel).unwrap();
         assert_eq!(indices, vec![1]);
 
-        let (new_hashes, new_tracks, new_sel) =
-            move_block_down(&hashes, &hashes, &indices).unwrap();
+        let (new_hashes, new_sel) = move_block_down(&hashes, &indices).unwrap();
 
         assert_eq!(new_hashes, vec![hash("a"), hash("c"), hash("b"), hash("d")]);
         assert_eq!(new_sel, vec![2]);
-        // tracks parallel
-        assert_eq!(new_tracks, new_hashes);
     }
 
     /// Shift+J on selection block 1..=2 in [a,b,c,d,e] → [a,d,b,c,e]; selection 2..=3.
@@ -1026,7 +1027,7 @@ mod tests {
         let indices = effective_data_indices_for_move(&sel).unwrap();
         assert_eq!(indices, vec![1, 2]);
 
-        let (new_hashes, _, new_sel) = move_block_down(&hashes, &hashes, &indices).unwrap();
+        let (new_hashes, new_sel) = move_block_down(&hashes, &indices).unwrap();
 
         assert_eq!(
             new_hashes,
@@ -1043,7 +1044,7 @@ mod tests {
         sel.list_state.select(Some(2)); // cursor at last
 
         let indices = effective_data_indices_for_move(&sel).unwrap();
-        let result = move_block_down(&hashes, &hashes, &indices);
+        let result = move_block_down(&hashes, &indices);
         assert!(
             result.is_none(),
             "move_block_down at bottom should return None"
@@ -1062,7 +1063,7 @@ mod tests {
         sel.list_state.select(Some(2)); // cursor at c
 
         let indices = effective_data_indices_for_move(&sel).unwrap();
-        let (new_hashes, _, new_sel) = move_block_up(&hashes, &hashes, &indices).unwrap();
+        let (new_hashes, new_sel) = move_block_up(&hashes, &indices).unwrap();
 
         assert_eq!(new_hashes, vec![hash("a"), hash("c"), hash("b"), hash("d")]);
         assert_eq!(new_sel, vec![1]);
@@ -1076,7 +1077,7 @@ mod tests {
         sel.list_state.select(Some(0)); // cursor at first
 
         let indices = effective_data_indices_for_move(&sel).unwrap();
-        let result = move_block_up(&hashes, &hashes, &indices);
+        let result = move_block_up(&hashes, &indices);
         assert!(result.is_none(), "move_block_up at top should return None");
     }
 
@@ -1097,87 +1098,6 @@ mod tests {
         assert!(
             msg.contains("Non-contiguous"),
             "error message should mention non-contiguous: {msg}"
-        );
-    }
-
-    // -------------------------------------------------------------------------
-    // Regression lock: playlist write format
-    //
-    // Verify that the TUI write path produces the canonical formatted lines
-    // (`{8hash}  {Artist} - {Title}  [{duration}]`) and NOT bare sha256 hashes.
-    // This test MUST fail before the fix and pass after it.
-    // -------------------------------------------------------------------------
-
-    fn make_track_info(hash: &str, artist: &str, title: &str, duration_secs: u32) -> TrackInfo {
-        use library_ipc_protocol::DurationSeconds;
-        TrackInfo {
-            content_hash: ContentHash::new(hash),
-            title: Some(title.to_string()),
-            artist: Some(artist.to_string()),
-            album: None,
-            duration: Some(DurationSeconds::new(duration_secs)),
-            bpm: None,
-            key: None,
-            blob_path: None,
-            cover_art_path: None,
-            track_number: None,
-            disc_number: None,
-            added: None,
-            started: None,
-            stopped: None,
-            memory_cues: vec![],
-            beat_grid: None,
-            role: None,
-            energy: None,
-        }
-    }
-
-    /// The TUI playlist write path must produce canonical formatted lines, not bare hashes.
-    ///
-    /// Regression lock: if this test fails, the TUI is writing raw hashes to disk.
-    #[test]
-    fn playlist_write_produces_canonical_formatted_lines() {
-        let tracks = vec![
-            make_track_info(
-                "sha256:8d4e7b2cabc12345",
-                "Artist Name",
-                "Track Title",
-                225, // 3:45
-            ),
-            make_track_info(
-                "sha256:a3f91e0dabc12345",
-                "Other Artist",
-                "Other Title",
-                252, // 4:12
-            ),
-        ];
-        // This calls the function that the TUI must use when persisting playlists.
-        // Before the fix this function does not exist — the test fails to compile.
-        // After the fix it exists and produces formatted lines.
-        let content = playlist_content_for_write(&tracks);
-
-        let lines: Vec<&str> = content.lines().collect();
-        assert_eq!(lines.len(), 2, "expected 2 lines, one per track");
-
-        // Verify lines match canonical format, NOT bare hashes
-        assert_eq!(
-            lines[0], "8d4e7b2cabc1  Artist Name - Track Title  [3:45]",
-            "line 0 must be canonical formatted, not a bare hash"
-        );
-        assert_eq!(
-            lines[1], "a3f91e0dabc1  Other Artist - Other Title  [4:12]",
-            "line 1 must be canonical formatted, not a bare hash"
-        );
-
-        // Extra: assert that bare hash format is NOT present
-        assert!(
-            !lines[0].starts_with("sha256:"),
-            "line must not start with 'sha256:' prefix"
-        );
-        // A bare hash would be pure hex with no spaces; formatted lines always contain spaces.
-        assert!(
-            lines[0].contains("  "),
-            "line must contain double-space separator (canonical format), not a bare hash"
         );
     }
 
@@ -1218,12 +1138,153 @@ mod tests {
         let indices = effective_data_indices_for_move(&sel).unwrap();
         assert_eq!(indices, vec![2, 3]);
 
-        let (new_hashes, _, new_sel) = move_block_up(&hashes, &hashes, &indices).unwrap();
+        let (new_hashes, new_sel) = move_block_up(&hashes, &indices).unwrap();
 
         assert_eq!(
             new_hashes,
             vec![hash("a"), hash("c"), hash("d"), hash("b"), hash("e")]
         );
         assert_eq!(new_sel, vec![1, 2]);
+    }
+
+    // -------------------------------------------------------------------------
+    // Unresolved rows: open keeps them aligned, save never drops them
+    // -------------------------------------------------------------------------
+
+    fn full_hash(c: char) -> String {
+        format!("sha256:{}", c.to_string().repeat(64))
+    }
+
+    fn canonical(c: char) -> mdma_client::CanonicalHash {
+        mdma_client::CanonicalHash::try_from(hash(&full_hash(c))).unwrap()
+    }
+
+    fn unknown(token: &str) -> ListRow {
+        ListRow::Unresolved(EntryError::Unknown { hash: hash(token) })
+    }
+
+    /// An unresolved entry stays a row at its position, so the hashes line up
+    /// with the entries and a swap moves the same indices.
+    #[test]
+    fn playlist_pane_open_keeps_unresolved_rows_aligned() {
+        let entries = vec![
+            PlaylistEntry::Track {
+                hash: canonical('a'),
+            },
+            PlaylistEntry::Unresolved {
+                error: EntryError::Unknown { hash: hash("dead") },
+            },
+            PlaylistEntry::Track {
+                hash: canonical('b'),
+            },
+        ];
+
+        let mut rows = rows_from_entries(&entries, |h| {
+            Ok(make_track_info(h.as_str(), "Artist", "Title", 60))
+        })
+        .unwrap();
+
+        let hashes: Vec<ContentHash> = rows.iter().map(ListRow::hash).collect();
+        assert_eq!(
+            hashes,
+            vec![hash(&full_hash('a')), hash("dead"), hash(&full_hash('b'))]
+        );
+        assert!(matches!(rows[1], ListRow::Unresolved(_)));
+
+        // Moving the unresolved row moves its hash with it.
+        let (moved, new_sel) = move_block_down(&rows, &[1]).unwrap();
+        rows = moved;
+        assert_eq!(new_sel, vec![2]);
+        assert_eq!(rows[2].hash(), hash("dead"));
+        assert_eq!(rows[1].hash(), hash(&full_hash('b')));
+    }
+
+    /// A resolved entry whose track cannot be fetched fails the load; it is
+    /// not shown as an unknown row.
+    #[test]
+    fn playlist_pane_open_fails_when_a_resolved_entry_lookup_fails() {
+        let entries = vec![PlaylistEntry::Track {
+            hash: canonical('a'),
+        }];
+
+        let result = rows_from_entries(&entries, |_| Err(transport_error()));
+
+        assert!(matches!(
+            result,
+            Err(ReadError::Facts(client_facts::FactsError::Transport(_)))
+        ));
+    }
+
+    /// A playlist is written back as the rows show it, so its rows are the node's.
+    /// With no replica at all and the node up, it opens; with a replica that has
+    /// other ideas about the track, the node's answer is still what is shown.
+    #[test]
+    fn a_playlist_opens_with_the_rows_of_the_node_when_there_is_no_replica() {
+        use crate::test_support::{node_hash, Services, World};
+        let world = World::new(None);
+        let _services = Services::start(&world);
+
+        let pane = PlaylistPane::open(PlaylistName::new("set").unwrap(), world.link())
+            .expect("the node has the playlist and its track");
+
+        assert_eq!(pane.item_count(), 1);
+        assert_eq!(pane.resolve_selection(), [node_hash()]);
+        assert!(
+            matches!(&pane.rows[0], ListRow::Track(t) if t.title.as_deref() == Some("Node Title"))
+        );
+    }
+
+    #[test]
+    fn a_playlist_on_a_dead_node_does_not_open() {
+        use crate::test_support::{catalog, World};
+        let world = World::new(Some(catalog()));
+
+        let opened = PlaylistPane::open(PlaylistName::new("set").unwrap(), world.link());
+
+        let text = opened.err().expect("the node is dead").to_string();
+        assert!(text.contains("needs the node"), "{text}");
+    }
+
+    /// A resolved entry whose track the library then reports as not found
+    /// stays at its position as an unavailable row.
+    #[test]
+    fn playlist_pane_open_keeps_an_entry_the_library_has_no_track_for() {
+        let entries = vec![
+            PlaylistEntry::Track {
+                hash: canonical('a'),
+            },
+            PlaylistEntry::Track {
+                hash: canonical('b'),
+            },
+        ];
+        let gone = hash(&full_hash('a'));
+
+        let rows = rows_from_entries(&entries, |h| {
+            if *h == gone {
+                Err(not_found(h))
+            } else {
+                Ok(make_track_info(h.as_str(), "A", "T", 60))
+            }
+        })
+        .unwrap();
+
+        assert!(matches!(rows[0], ListRow::Unresolved(_)));
+        assert_eq!(rows[0].hash(), gone);
+        assert!(matches!(rows[1], ListRow::Track(_)));
+    }
+
+    /// A cut unresolved row pasted back (its token no longer resolves) is
+    /// kept as a row and saved as its own token with the reason.
+    #[test]
+    fn paste_of_a_cut_unresolved_row_keeps_it_as_its_token() {
+        let cut = unknown("dead").hash();
+
+        let rows = rows_for_hashes(&[cut], |h| Err(not_found(h))).unwrap();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows_content_for_write(&rows),
+            "dead  # unknown track dead\n"
+        );
     }
 }

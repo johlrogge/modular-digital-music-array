@@ -34,4 +34,4 @@ dj-workspace is excluded from the Pi cross-compilation targets. Run it as a nati
 
 ## Architecture
 
-Built on the `bevy-app` Polylith base (Bevy + bevy_egui). The `client` base provides `ClientConfig` for deriving gateway and library socket addresses from `--node`. The app talks to the library over the gateway — no direct Pi IPC required.
+Built on the `bevy-app` Polylith base (Bevy + bevy_egui). The `mdma_client` component provides `ClientConfig` for deriving gateway and library socket addresses from `--node`. The app talks to the library over the gateway — no direct Pi IPC required.

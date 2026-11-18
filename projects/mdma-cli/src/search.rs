@@ -1,18 +1,19 @@
 use crate::args::{value_and_dash, StdinDash};
 use crate::ctx::Ctx;
 use crate::local_complete::{
-    complete_albums, complete_artists, complete_genres, complete_labels, complete_query,
-    complete_sources, complete_styles, complete_titles, merge_unlisted,
+    complete_albums, complete_artists, complete_genres, complete_labels, complete_marks,
+    complete_query, complete_sources, complete_styles, complete_titles, merge_unlisted,
 };
-use crate::output::{library_error, print_tracks};
+use crate::output::print_tracks;
 use crate::stdin::hashes_if_dash;
 use bpaf::{construct, long, Parser};
+use client_facts::Facts;
 use color_eyre::Result;
 use hicli::{Arg, Candidate, Choice};
 use library_ipc_client::{ContentHash, TrackInfo};
 use library_search::{DateQuery, DurationQuery, KeyQuery, NumericQuery, StringQuery, TrackQuery};
-use mdma_client::LibraryBackend;
-use music_facts::{EnergyLevel, TrackRole};
+use mdma_client::Node;
+use music_facts::{EnergyLevel, Mark, TrackRole};
 use std::str::FromStr;
 
 // Every filter is its own argument type and takes its help from its doc comment.
@@ -35,6 +36,7 @@ pub(crate) struct SearchArgs {
     played: Option<PlayedFilter>,
     role: Option<RoleArg>,
     energy: Option<EnergyArg>,
+    mark: Option<MarkedArg>,
     not: Invert,
     input: SearchInput,
 }
@@ -239,6 +241,11 @@ impl FromStr for EnergyArg {
     }
 }
 
+/// Filter by mark (`liked` is the default mark; any other name is a named mark, e.g. banger)
+#[derive(Debug, Clone, Arg)]
+#[arg(long = "mark", metavar = "MARK", complete = complete_marks)]
+pub(crate) struct MarkedArg(pub Mark);
+
 /// Filter by BPM (formats: 128  128+-4  124..132  128+2  128-2)
 #[derive(Debug, Clone, Arg)]
 #[arg(long = "bpm", metavar = "BPM")]
@@ -249,7 +256,7 @@ pub(crate) struct BpmArg(pub NumericQuery);
 #[arg(long = "year", metavar = "YEAR")]
 pub(crate) struct YearArg(pub NumericQuery);
 
-/// Filter by musical key (formats: Am  "A minor"  8B  8B+-1  8B+-1~)
+/// Filter by musical key (formats: 8B  1m  Am  "A minor"  8B+-2  8B+2  8B-1  8B+-2d  8B+-1,+7  6A..10B)
 #[derive(Debug, Clone, Arg)]
 #[arg(long = "key", metavar = "KEY")]
 pub(crate) struct KeyArg(pub KeyQuery);
@@ -262,10 +269,10 @@ pub(crate) struct DurationArg(pub DurationQuery);
 /// Search for tracks by filter or free text
 #[hicli::command(default)]
 pub(crate) fn query(args: SearchArgs, ctx: &Ctx) -> Result<()> {
-    let library = ctx.library()?;
     let stdin = args.input.stdin;
     let track_query = build_track_query(args);
-    search_tracks(&library, &track_query, hashes_if_dash(stdin))
+    // The facts are opened (the node resolved, or the replica folded) before stdin is read.
+    ctx.read(|facts| search_tracks(facts, &track_query, hashes_if_dash(stdin)))
 }
 
 /// Filter by playback history (takes precedence over --started); `never` matches
@@ -299,6 +306,7 @@ fn build_track_query(args: SearchArgs) -> TrackQuery {
         played,
         role,
         energy,
+        mark,
         not,
         input: SearchInput {
             query: any_text, ..
@@ -328,6 +336,7 @@ fn build_track_query(args: SearchArgs) -> TrackQuery {
         added: added.map(|AddedFilter(q)| q),
         role: role.map(TrackRole::from),
         energy: energy.map(|EnergyArg(q)| q),
+        mark: mark.map(|MarkedArg(m)| m),
         not: not.0,
     }
 }
@@ -369,7 +378,7 @@ fn apply_stdin_filter(
 /// Search the library; `stdin_filter` holds the hashes read from stdin (asked for
 /// with `-`), if any, as an intersection filter.
 fn search_tracks(
-    library: &LibraryBackend,
+    facts: &Facts<&Node>,
     query: &TrackQuery,
     stdin_filter: Option<Vec<ContentHash>>,
 ) -> Result<()> {
@@ -385,7 +394,7 @@ fn search_tracks(
         effective_query.not = false;
     }
 
-    let tracks = library.search(&effective_query).map_err(library_error)?;
+    let tracks = facts.search(&effective_query)?;
     let tracks = apply_stdin_filter(tracks, stdin_filter.as_deref(), effective_not);
 
     if tracks.is_empty() && std::io::stdout().is_terminal() {
@@ -412,27 +421,26 @@ fn search_tracks(
 pub(crate) fn fact_values_for(fact_type: FactTypeArg, ctx: &Ctx) -> Result<()> {
     use std::io::IsTerminal;
     let FactTypeArg(fact_type) = fact_type;
-    let library = ctx.library()?;
-    let values = library
-        .get_fact_values(fact_type.as_str())
-        .map_err(library_error)?;
-    if std::io::stdout().is_terminal() {
-        if values.is_empty() {
-            println!("No values found for fact type '{}'", fact_type);
-            return Ok(());
+    ctx.read(|facts| {
+        let values = facts.fact_values(&fact_type)?;
+        if std::io::stdout().is_terminal() {
+            if values.is_empty() {
+                println!("No values found for fact type '{}'", fact_type);
+                return Ok(());
+            }
+            println!("Values for '{}' ({} distinct):", fact_type, values.len());
+            println!("{}", "=".repeat(65));
+            for v in values {
+                println!("  {}", v);
+            }
+        } else {
+            // Pipe mode: one value per line — composable with dmenu, grep, etc.
+            for v in values {
+                println!("{}", v);
+            }
         }
-        println!("Values for '{}' ({} distinct):", fact_type, values.len());
-        println!("{}", "=".repeat(65));
-        for v in values {
-            println!("  {}", v);
-        }
-    } else {
-        // Pipe mode: one value per line — composable with dmenu, grep, etc.
-        for v in values {
-            println!("{}", v);
-        }
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 #[cfg(test)]
@@ -718,6 +726,19 @@ mod tests {
     }
 
     #[test]
+    fn search_mark_parses_a_named_mark_and_liked_is_the_default_mark() {
+        let mark = |value: &str| build_track_query(parse_search(&["--mark", value]).unwrap()).mark;
+        assert_eq!(mark("Banger"), Some("banger".parse().unwrap()));
+        assert_eq!(mark("liked"), Some(Mark::Default));
+        assert_eq!(build_track_query(SearchArgs::default()).mark, None);
+    }
+
+    #[test]
+    fn search_mark_rejects_an_invalid_name() {
+        assert!(parse_search(&["--mark", " "]).is_err());
+    }
+
+    #[test]
     fn search_energy_accepts_values_in_range() {
         for v in ["1", "7", "10", "5..8", "1..10", "7+-2"] {
             assert!(parse_search(&["--energy", v]).is_ok(), "rejected {v}");
@@ -790,7 +811,7 @@ mod tests {
     #[test]
     fn search_key_invalid_is_parse_error() {
         let err = parse_search(&["--key", "H#"]).unwrap_err();
-        assert!(err.contains("`--key`: expected a Camelot key"), "{err}");
+        assert!(err.contains("`--key`: expected a key"), "{err}");
     }
 
     #[test]

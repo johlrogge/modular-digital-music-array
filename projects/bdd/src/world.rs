@@ -86,6 +86,22 @@ impl MdmaWorld {
         &self.env.as_ref().unwrap().library
     }
 
+    /// The full hash the library gives the track `token` names (a prefix or the
+    /// full hash). Playback takes only full hashes, so scenarios that queue a
+    /// track say which one with a token and queue what the library returns.
+    /// Panics when the library does not know the track.
+    pub fn library_hash(&mut self, token: &str) -> ContentHash {
+        let resolved = self
+            .library()
+            .resolve_for_playback(&[ContentHash::new(token)])
+            .unwrap_or_else(|e| panic!("{e}"));
+        resolved
+            .into_iter()
+            .next()
+            .map(Into::into)
+            .expect("one hash in, one out")
+    }
+
     /// Get a reference to the playback client. Panics if env not booted.
     pub fn playback(&mut self) -> &PlaybackBackend {
         self.ensure_env();
@@ -105,15 +121,27 @@ impl MdmaWorld {
     /// Build a `Command` with the common CLI setup:
     /// binary path, `--socket` / `--playback-socket` flags, user-provided args,
     /// and removal of env vars that would interfere with the test harness.
+    /// Reads of facts ask the service under test (`--facts=node`): there is no
+    /// replica of it. The cache and the config are under the world's temp dir, so a
+    /// scenario never reads the real cache or the remembered node of whoever runs it,
+    /// and never syncs against a real node: a fresh attempt at a first sync is
+    /// recorded in that cache through the real throttle, so no command asks for one
+    /// and no scenario spawns a detached `mdma replica sync` that outlives it.
     fn base_command(&self, args: &[&str]) -> std::process::Command {
         let binary = cli_binary_path();
+        let home = self.env.as_ref().expect("env not booted")._temp_dir.path();
+        client_facts::test_support::decline_first_sync(home);
         let mut cmd = std::process::Command::new(&binary);
-        cmd.arg("--socket")
+        cmd.arg("--facts=node")
+            .arg("--socket")
             .arg(self.library_addr())
             .arg("--playback-socket")
             .arg(self.playback_addr())
             .env_remove("MDMA_GATEWAY")
             .env_remove("MDMA_NODE")
+            .env_remove("MDMA_FACTS")
+            .env("XDG_CACHE_HOME", home.join("cache"))
+            .env("XDG_CONFIG_HOME", home.join("config"))
             .env_remove("MDMA_LIBRARY_SOCKET")
             .env_remove("MDMA_PLAYBACK_SOCKET");
         cmd.args(args);

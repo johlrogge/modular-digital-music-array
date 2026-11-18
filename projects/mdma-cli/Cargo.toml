@@ -11,18 +11,13 @@ name = "mdma"
 path = "src/main.rs"
 
 [dependencies]
-acid-protocol = { workspace = true }
-client = { path = "../../bases/client" }
-fact-replica = { workspace = true }
-library-projection = { workspace = true }
-private-file = { workspace = true }
-serde = { workspace = true }
+client-facts = { workspace = true }
 hicli = "0.7.0"
 bpaf = { version = "0.9", features = ["derive"] }
 color-eyre = "0.6"
 event-protocol = { path = "../../components/event_protocol" }
 inbox-utils = { path = "../../components/inbox_utils" }
-mdma-client = { path = "../../components/mdma_client" }
+mdma-client = { workspace = true }
 tempfile = "3"
 nng = "1.0"
 nng-transport = { path = "../../components/nng_transport" }
@@ -46,8 +41,11 @@ dirs = "6"
 colored = "2.0"
 terminal_size = "0.4"
 unicode-normalization = { workspace = true }
-libc = { workspace = true }
+cli-base = { path = "../../bases/cli" }
 
 [dev-dependencies]
+libc = { workspace = true }
+client-facts = { workspace = true, features = ["test-support"] }
 fact-replica = { workspace = true, features = ["test-support"] }
 pretty_assertions = "1"
+mdma-client = { workspace = true, features = ["test-support"] }

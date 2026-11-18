@@ -6,13 +6,13 @@
 
 // Re-export types used in the protocol so clients don't need to depend on music-facts
 pub use music_facts::{
-    Bpm, ContentHash, CueKind, DurationSeconds, FactSource, Key, Mark, MarkFilter, MarkName,
-    MarkNameError, MusicValue,
+    Bpm, ContentHash, CueKind, DurationSeconds, FactKind, FactSource, Key, Mark, MarkFilter,
+    MarkName, MarkNameError, MusicValue,
 };
-pub use music_primitives::{EnergyLevel, TrackRole};
+pub use music_primitives::{BeatGrid, CanonicalHash, EnergyLevel, Mode, TrackRole};
 // Re-export query types so clients can use them without depending on library-search directly
 pub use library_search::{
-    CamelotLetter, DurationQuery, DurationUnit, KeyQuery, NumericQuery, StringQuery, TrackQuery,
+    DurationQuery, DurationUnit, KeyQuery, NumericQuery, StringQuery, TrackQuery,
 };
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -63,7 +63,7 @@ pub enum AttributeListError {
 /// is already known to name something (a typo would otherwise retract nothing).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "Vec<FactType>", into = "Vec<FactType>")]
-pub struct AttributeList(Vec<FactType>);
+pub struct AttributeList(Vec<FactKind>);
 
 impl AttributeList {
     pub fn try_new<S: AsRef<str>>(
@@ -79,10 +79,10 @@ impl AttributeList {
 
     /// Whether `value` is of one of the listed attributes.
     pub fn contains(&self, value: &MusicValue) -> bool {
-        self.0.iter().any(|a| a.as_str() == value.display_name())
+        self.0.contains(&value.kind())
     }
 
-    pub fn as_slice(&self) -> &[FactType] {
+    pub fn as_slice(&self) -> &[FactKind] {
         &self.0
     }
 }
@@ -94,19 +94,21 @@ impl TryFrom<Vec<FactType>> for AttributeList {
         if names.is_empty() {
             return Err(AttributeListError::Empty);
         }
-        if let Some(unknown) = names
+        let kinds = names
             .iter()
-            .find(|n| !MusicValue::ATTRIBUTE_NAMES.contains(&n.as_str()))
-        {
-            return Err(AttributeListError::Unknown(unknown.to_string()));
-        }
-        Ok(Self(names))
+            .map(|n| {
+                n.as_str()
+                    .parse::<FactKind>()
+                    .map_err(|_| AttributeListError::Unknown(n.to_string()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self(kinds))
     }
 }
 
 impl From<AttributeList> for Vec<FactType> {
     fn from(list: AttributeList) -> Self {
-        list.0
+        list.0.iter().map(|k| FactType::new(k.as_str())).collect()
     }
 }
 
@@ -243,6 +245,193 @@ impl std::fmt::Display for PlaylistName {
 }
 
 // ============================================================================
+// Playlist Entries
+// ============================================================================
+
+/// The hash tokens of a playlist file, in order, duplicates kept.
+///
+/// Skips blank lines and `#` comments; a line's hash is its first whitespace
+/// token. The one reader of the playlist line format, so every consumer
+/// agrees on which lines are entries.
+pub fn playlist_hashes(content: &str) -> impl Iterator<Item = &str> {
+    // The same split as the playlist editor's parse: at '\n', so a '\r' stays
+    // in its line (and is trimmed away by the entry rule).
+    content.split('\n').filter_map(entry_token)
+}
+
+/// Whether a playlist line is an entry: not blank and not a `#` comment.
+///
+/// The one definition of the rule, shared by [`playlist_hashes`] and by the
+/// playlist editor, so they always agree on which lines are entries.
+pub fn is_entry_line(line: &str) -> bool {
+    let line = line.trim();
+    !line.is_empty() && !line.starts_with('#')
+}
+
+/// The hash token of an entry line (its first whitespace token); `None` for
+/// a line that is not an entry.
+pub fn entry_token(line: &str) -> Option<&str> {
+    if is_entry_line(line) {
+        line.split_whitespace().next()
+    } else {
+        None
+    }
+}
+
+// ============================================================================
+// Playlist Edits (ADR-027)
+// ============================================================================
+
+/// The version of a playlist file: the sha256 of its bytes as stored, as hex.
+/// Opaque to clients, which only compare it for equality.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct PlaylistVersion(String);
+
+impl PlaylistVersion {
+    /// The version of a file holding `bytes`.
+    pub fn of(bytes: &[u8]) -> Self {
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(bytes);
+        Self(digest.iter().map(|b| format!("{b:02x}")).collect())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for PlaylistVersion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+/// A playlist's entries together with the version they were read at.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlaylistSnapshot {
+    pub version: PlaylistVersion,
+    pub entries: Vec<PlaylistEntry>,
+}
+
+/// Whether an insert leaves out hashes the playlist already holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Duplicates {
+    /// Leave out hashes already in the playlist, and repeats within the insert.
+    Skip,
+    /// Insert every hash ("Add again").
+    Keep,
+}
+
+/// One edit of a playlist. Positions are 0-based indices among the entry
+/// lines, in the state left by the ops before it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "op")]
+pub enum EditOp {
+    /// Insert the tracks named by `hashes` before entry `at` (`at == len` appends).
+    Insert {
+        at: usize,
+        hashes: Vec<ContentHash>,
+        duplicates: Duplicates,
+    },
+    /// Remove entry `at`.
+    Remove { at: usize },
+    /// Move entry `from` so that it ends up at `to`.
+    Move { from: usize, to: usize },
+}
+
+/// The exact text of a playlist file. Written verbatim, so a revert puts back
+/// the bytes it was given.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct StoredPlaylist(String);
+
+impl StoredPlaylist {
+    pub fn new(text: impl Into<String>) -> Self {
+        Self(text.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// A hash an `Insert` left out because the playlist already holds it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Skipped {
+    pub hash: ContentHash,
+    /// 0-based position of the entry that already holds it, in the state after
+    /// the same op (not after the whole edit).
+    pub existing_at: usize,
+}
+
+/// The result of `PlaylistEdit` and `PlaylistRevert`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EditOutcome {
+    /// The edit was applied (or changed nothing, with the version unchanged).
+    /// `previous` is present exactly when the file was written: the file as it
+    /// was before, for a `PlaylistRevert` that undoes the edit (and whose own
+    /// `previous` redoes it). `None` means nothing changed, so there is nothing
+    /// to undo.
+    Applied {
+        snapshot: PlaylistSnapshot,
+        skipped: Vec<Skipped>,
+        previous: Option<StoredPlaylist>,
+    },
+    /// The version did not match; nothing was written.
+    Conflict { current: PlaylistSnapshot },
+}
+
+/// One playlist line as the library resolved it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status")]
+pub enum PlaylistEntry {
+    /// The line names this track.
+    Track { hash: CanonicalHash },
+    /// The line could not be resolved to one track.
+    Unresolved { error: EntryError },
+}
+
+/// Why a playlist line did not resolve to a track. `hash` is the stored token.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Error)]
+pub enum EntryError {
+    #[error("unknown track {hash}")]
+    Unknown { hash: ContentHash },
+
+    #[error("ambiguous hash {hash}: {}", join_hashes(.candidates))]
+    Ambiguous {
+        hash: ContentHash,
+        candidates: Vec<ContentHash>,
+    },
+
+    #[error("library holds only a non-full hash {found} for {hash}")]
+    NotCanonical {
+        hash: ContentHash,
+        found: ContentHash,
+    },
+}
+
+/// The hashes as one space-separated list, for error messages.
+fn join_hashes(hashes: &[ContentHash]) -> String {
+    hashes
+        .iter()
+        .map(ContentHash::as_str)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+impl EntryError {
+    /// The stored token this error is about.
+    pub fn hash(&self) -> &ContentHash {
+        match self {
+            EntryError::Unknown { hash }
+            | EntryError::Ambiguous { hash, .. }
+            | EntryError::NotCanonical { hash, .. } => hash,
+        }
+    }
+}
+
+// ============================================================================
 // Protocol Errors
 // ============================================================================
 
@@ -251,6 +440,19 @@ impl std::fmt::Display for PlaylistName {
 pub enum ProtocolError {
     #[error("track not found: {hash}")]
     TrackNotFound { hash: String },
+
+    /// A partial hash that starts several different tracks: the hash as given and
+    /// the full hash of every track it matches.
+    #[error("ambiguous hash '{hash}' matches {} tracks: {}", .candidates.len(), .candidates.join(", "))]
+    AmbiguousHash {
+        hash: String,
+        candidates: Vec<String>,
+    },
+
+    /// A hash that resolves to a track the library holds only under a
+    /// non-full hash: `hash` as given, `found` as stored.
+    #[error("library holds only a non-full hash {found} for {hash}")]
+    HashNotCanonical { hash: String, found: String },
 
     #[error("inbox file not found: {path}")]
     InboxFileNotFound { path: String },
@@ -273,6 +475,24 @@ pub enum ProtocolError {
     /// The request bytes could not be parsed as a `LibraryRequest`.
     #[error("invalid request: {message}")]
     InvalidRequest { message: String },
+
+    /// A `PlaylistEdit` that cannot be applied; `op` is the 0-based index of
+    /// the offending op.
+    #[error("invalid edit (op {op}): {reason}")]
+    InvalidEdit { op: usize, reason: String },
+}
+
+impl ProtocolError {
+    /// `hash` starts every one of `candidates`, which are different tracks. The
+    /// candidates are sorted, so the text does not depend on the order of the index.
+    pub fn ambiguous_hash<'a>(hash: &str, candidates: impl IntoIterator<Item = &'a str>) -> Self {
+        let mut candidates: Vec<String> = candidates.into_iter().map(str::to_owned).collect();
+        candidates.sort();
+        ProtocolError::AmbiguousHash {
+            hash: hash.to_owned(),
+            candidates,
+        }
+    }
 }
 
 /// Parse one raw request. Bytes that do not parse give
@@ -388,8 +608,39 @@ pub enum LibraryRequest {
     /// List all playlist names.
     PlaylistList,
 
+    /// Search playlists by name with the library's text rules (the same matcher as the track
+    /// search). Answered with `LibraryResponse::PlaylistNames`, sorted by name.
+    PlaylistSearch { query: StringQuery },
+
     /// Get playlist content verbatim.
     PlaylistGet { name: PlaylistName },
+
+    /// Get a playlist's entries resolved to full hashes, in file order.
+    PlaylistEntries { name: PlaylistName },
+
+    /// Get a playlist's entries with the version they were read at.
+    PlaylistSnapshot { name: PlaylistName },
+
+    /// Apply edits to a playlist if it is still at `version`.
+    PlaylistEdit {
+        name: PlaylistName,
+        version: PlaylistVersion,
+        ops: Vec<EditOp>,
+    },
+
+    /// Put `content` back as the playlist if it is still at `version` (undo).
+    /// Answers like `PlaylistEdit`.
+    PlaylistRevert {
+        name: PlaylistName,
+        version: PlaylistVersion,
+        content: StoredPlaylist,
+    },
+
+    /// Remove a playlist if it is still at `version`.
+    PlaylistDelete {
+        name: PlaylistName,
+        version: PlaylistVersion,
+    },
 
     /// Create a new playlist (fails if it already exists).
     PlaylistNew { name: PlaylistName, content: String },
@@ -609,6 +860,23 @@ pub enum LibraryResponse {
     /// Verbatim playlist content.
     PlaylistContent(String),
 
+    /// A playlist's entries in file order, duplicates kept; the position is
+    /// the index.
+    PlaylistEntries(Vec<PlaylistEntry>),
+
+    /// Answer to `PlaylistSnapshot`.
+    PlaylistSnapshot(PlaylistSnapshot),
+
+    /// Answer to `PlaylistEdit`.
+    PlaylistEdited(EditOutcome),
+
+    /// Answer to `PlaylistDelete`: the playlist is gone.
+    PlaylistDeleted,
+
+    /// Answer to `PlaylistDelete` when the version did not match; nothing was
+    /// removed.
+    PlaylistDeleteConflict { current: PlaylistSnapshot },
+
     /// Bookmark written successfully.
     BookmarkWritten,
 
@@ -701,6 +969,19 @@ pub struct BeatGridInfo {
     pub beats_per_bar: u8,
 }
 
+impl BeatGridInfo {
+    /// The grid to snap and step with. The beat arithmetic lives in
+    /// `music_primitives::BeatGrid`; this is only the way from the wire form.
+    /// `None` for a grid of zero beats per bar, which is not a grid.
+    pub fn grid(&self) -> Option<BeatGrid> {
+        Some(BeatGrid::new(
+            self.first_beat_ms,
+            self.bpm,
+            std::num::NonZeroU8::new(self.beats_per_bar)?,
+        ))
+    }
+}
+
 /// Track information for display.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrackInfo {
@@ -739,6 +1020,23 @@ pub struct TrackInfo {
     /// Energy level 1–10. None when not set.
     #[serde(default)]
     pub energy: Option<EnergyLevel>,
+    /// Main genre (the `MainGenre` fact). None when not set. Absent on the wire from
+    /// nodes that predate it, so old nodes and clients still decode.
+    #[serde(default)]
+    pub genre: Option<String>,
+    /// Label (the `Label` fact). None when not set. Absent on the wire from nodes
+    /// that predate it (ADR-022 0a).
+    #[serde(default)]
+    pub label: Option<String>,
+    /// Style descriptors (the `StyleDescriptor` facts). Empty when none. Absent on
+    /// the wire from nodes that predate it (ADR-022 0a).
+    #[serde(default)]
+    pub styles: Vec<String>,
+    /// The marks the track holds live: the default mark first, then named ones by name.
+    /// Legacy free-text scopes are left out. Absent on the wire from nodes that
+    /// predate it (ADR-016 amendment 2026-11-17), which reads as unmarked.
+    #[serde(default)]
+    pub marks: Vec<Mark>,
 }
 
 /// Service status information.
@@ -1011,11 +1309,244 @@ mod tests {
     use pretty_assertions::assert_eq;
     use rstest::rstest;
 
+    #[test]
+    fn beat_grid_info_gives_the_grid_with_the_same_anchor_tempo_and_bar() {
+        let info = BeatGridInfo {
+            first_beat_ms: 250,
+            bpm: Bpm::from_u32(120).unwrap(),
+            beats_per_bar: 4,
+        };
+        let grid = info.grid().expect("a grid");
+        assert_eq!(grid.first_beat_ms(), 250);
+        assert_eq!(grid.bpm(), info.bpm);
+        assert_eq!(grid.beats_per_bar().get(), 4);
+        assert_eq!(grid.beat_ms(2), 1_250);
+    }
+
+    #[test]
+    fn a_grid_of_zero_beats_per_bar_is_no_grid() {
+        let info = BeatGridInfo {
+            first_beat_ms: 0,
+            bpm: Bpm::from_u32(120).unwrap(),
+            beats_per_bar: 0,
+        };
+        assert_eq!(info.grid(), None);
+    }
+
     fn invalid_message(result: Result<LibraryRequest, ProtocolError>) -> String {
         match result {
             Err(ProtocolError::InvalidRequest { message }) => message,
             other => panic!("expected InvalidRequest, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn playlist_hashes_skip_comments_and_blanks_and_take_first_token() {
+        let content = "# a comment\n\nsha256:aaa  Artist - Title\n   \n  bbb\t# trailing\n#sha256:ccc\nsha256:aaa\n";
+        let hashes: Vec<&str> = playlist_hashes(content).collect();
+        assert_eq!(hashes, vec!["sha256:aaa", "bbb", "sha256:aaa"]);
+    }
+
+    #[test]
+    fn playlist_entries_response_roundtrips_json() {
+        let full = CanonicalHash::try_from(ContentHash::new(format!("sha256:{}", "ab".repeat(32))))
+            .unwrap();
+        let entries = vec![
+            PlaylistEntry::Track { hash: full },
+            PlaylistEntry::Unresolved {
+                error: EntryError::Unknown {
+                    hash: ContentHash::new("dead"),
+                },
+            },
+            PlaylistEntry::Unresolved {
+                error: EntryError::Ambiguous {
+                    hash: ContentHash::new("9f"),
+                    candidates: vec![
+                        ContentHash::new("sha256:9f1"),
+                        ContentHash::new("sha256:9f2"),
+                    ],
+                },
+            },
+            PlaylistEntry::Unresolved {
+                error: EntryError::NotCanonical {
+                    hash: ContentHash::new("9fb4"),
+                    found: ContentHash::new("9fb4105e"),
+                },
+            },
+        ];
+        let json =
+            serde_json::to_string(&LibraryResponse::PlaylistEntries(entries.clone())).unwrap();
+        let decoded: LibraryResponse = serde_json::from_str(&json).unwrap();
+        match decoded {
+            LibraryResponse::PlaylistEntries(back) => assert_eq!(back, entries),
+            other => panic!("expected PlaylistEntries, got {other:?}"),
+        }
+        assert!(json.contains(r#""status":"Track""#), "{json}");
+    }
+
+    fn roundtrip<T>(value: &T) -> T
+    where
+        T: Serialize + serde::de::DeserializeOwned,
+    {
+        serde_json::from_str(&serde_json::to_string(value).unwrap()).unwrap()
+    }
+
+    fn snapshot() -> PlaylistSnapshot {
+        PlaylistSnapshot {
+            version: PlaylistVersion::of(b"x\n"),
+            entries: vec![PlaylistEntry::Unresolved {
+                error: EntryError::Unknown {
+                    hash: ContentHash::new("dead"),
+                },
+            }],
+        }
+    }
+
+    fn all_ops() -> Vec<EditOp> {
+        vec![
+            EditOp::Insert {
+                at: 2,
+                hashes: vec![ContentHash::new("9fb4105e")],
+                duplicates: Duplicates::Skip,
+            },
+            EditOp::Insert {
+                at: 0,
+                hashes: vec![],
+                duplicates: Duplicates::Keep,
+            },
+            EditOp::Remove { at: 1 },
+            EditOp::Move { from: 0, to: 3 },
+        ]
+    }
+
+    #[test]
+    fn is_entry_line_rejects_blank_and_comment_lines() {
+        assert!(is_entry_line("sha256:aaa  Artist - Title"));
+        assert!(is_entry_line("  aaa\r"));
+        assert!(!is_entry_line(""));
+        assert!(!is_entry_line("  \t\r"));
+        assert!(!is_entry_line("  # comment"));
+        assert_eq!(entry_token("  aaa  # why"), Some("aaa"));
+        assert_eq!(entry_token("# aaa"), None);
+    }
+
+    #[test]
+    fn playlist_version_is_the_hex_sha256_of_the_bytes() {
+        assert_eq!(
+            PlaylistVersion::of(b"").as_str(),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_ne!(PlaylistVersion::of(b"a"), PlaylistVersion::of(b"a\n"));
+        assert_eq!(
+            serde_json::to_string(&PlaylistVersion::of(b"")).unwrap(),
+            "\"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\""
+        );
+    }
+
+    #[test]
+    fn hash_not_canonical_error_roundtrips_and_names_both_hashes() {
+        let error = ProtocolError::HashNotCanonical {
+            hash: "9f".to_string(),
+            found: "9fb4105e".to_string(),
+        };
+        let back: ProtocolError = roundtrip(&error);
+        assert!(matches!(
+            &back,
+            ProtocolError::HashNotCanonical { hash, found } if hash == "9f" && found == "9fb4105e"
+        ));
+        assert_eq!(
+            error.to_string(),
+            "library holds only a non-full hash 9fb4105e for 9f"
+        );
+    }
+
+    #[test]
+    fn edit_ops_roundtrip_json() {
+        let ops = all_ops();
+        assert_eq!(roundtrip(&ops), ops);
+        let json = serde_json::to_string(&ops[2]).unwrap();
+        assert_eq!(json, r#"{"op":"Remove","at":1}"#);
+    }
+
+    #[test]
+    fn snapshot_and_edit_requests_roundtrip_json() {
+        let name = PlaylistName::new("friday").unwrap();
+        let version = PlaylistVersion::of(b"abc");
+        let requests = [
+            LibraryRequest::PlaylistSnapshot { name: name.clone() },
+            LibraryRequest::PlaylistEdit {
+                name: name.clone(),
+                version: version.clone(),
+                ops: all_ops(),
+            },
+            LibraryRequest::PlaylistRevert {
+                name: name.clone(),
+                version: version.clone(),
+                content: StoredPlaylist::new("# a\r\n9fb4  # unknown track"),
+            },
+            LibraryRequest::PlaylistDelete { name, version },
+        ];
+        for request in requests {
+            let json = serde_json::to_string(&request).unwrap();
+            let back = parse_request(json.as_bytes()).unwrap();
+            assert_eq!(serde_json::to_string(&back).unwrap(), json);
+        }
+    }
+
+    #[test]
+    fn edit_responses_roundtrip_json() {
+        let applied = EditOutcome::Applied {
+            snapshot: snapshot(),
+            skipped: vec![Skipped {
+                hash: ContentHash::new("sha256:aaa"),
+                existing_at: 4,
+            }],
+            previous: Some(StoredPlaylist::new("aaa\n# c\n")),
+        };
+        let unchanged = EditOutcome::Applied {
+            snapshot: snapshot(),
+            skipped: Vec::new(),
+            previous: None,
+        };
+        let conflict = EditOutcome::Conflict {
+            current: snapshot(),
+        };
+        for outcome in [applied, unchanged, conflict] {
+            match roundtrip(&LibraryResponse::PlaylistEdited(outcome.clone())) {
+                LibraryResponse::PlaylistEdited(back) => assert_eq!(back, outcome),
+                other => panic!("expected PlaylistEdited, got {other:?}"),
+            }
+        }
+        match roundtrip(&LibraryResponse::PlaylistSnapshot(snapshot())) {
+            LibraryResponse::PlaylistSnapshot(back) => assert_eq!(back, snapshot()),
+            other => panic!("expected PlaylistSnapshot, got {other:?}"),
+        }
+        assert!(matches!(
+            roundtrip(&LibraryResponse::PlaylistDeleted),
+            LibraryResponse::PlaylistDeleted
+        ));
+        match roundtrip(&LibraryResponse::PlaylistDeleteConflict {
+            current: snapshot(),
+        }) {
+            LibraryResponse::PlaylistDeleteConflict { current } => {
+                assert_eq!(current, snapshot())
+            }
+            other => panic!("expected PlaylistDeleteConflict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn invalid_edit_error_roundtrips_and_names_the_op() {
+        let error = ProtocolError::InvalidEdit {
+            op: 2,
+            reason: "position 9 is out of range".to_string(),
+        };
+        let back: ProtocolError = roundtrip(&error);
+        assert_eq!(back.to_string(), error.to_string());
+        assert_eq!(
+            error.to_string(),
+            "invalid edit (op 2): position 9 is out of range"
+        );
     }
 
     #[test]
@@ -1737,6 +2268,16 @@ mod tests {
     }
 
     #[test]
+    fn attribute_list_keeps_the_canonical_spelling() {
+        let list = AttributeList::try_new(["title", "BPM", "bpm"]).unwrap();
+        assert_eq!(
+            serde_json::to_string(&list).unwrap(),
+            r#"["Title","BPM","BPM"]"#
+        );
+        assert!(list.contains(&MusicValue::Title(music_facts::Title::new("t"))));
+    }
+
+    #[test]
     fn service_status_without_unparseable_lines_decodes() {
         let status: ServiceStatus = serde_json::from_str(
             r#"{"version":"1","tracks_indexed":1,"facts_count":2,"inbox_queue_size":0,"uptime_seconds":3}"#,
@@ -2087,6 +2628,10 @@ mod tests {
             beat_grid: None,
             role: None,
             energy: None,
+            genre: None,
+            label: None,
+            styles: vec![],
+            marks: vec![Mark::Default, "banger".parse().unwrap()],
         };
 
         let json = serde_json::to_string(&track).unwrap();
@@ -2095,6 +2640,35 @@ mod tests {
         assert_eq!(parsed.content_hash.as_str(), track.content_hash.as_str());
         assert_eq!(parsed.memory_cues, track.memory_cues);
         assert_eq!(parsed.beat_grid, track.beat_grid);
+        assert_eq!(parsed.marks, track.marks);
+    }
+
+    /// A node that predates `marks` sends none: the track decodes as unmarked.
+    #[test]
+    fn track_info_marks_are_optional_on_the_wire() {
+        let old = r#"{"content_hash":"sha256:abc123","title":null,"artist":null,"album":null,
+            "duration":null,"bpm":null,"key":null,"blob_path":null,"cover_art_path":null,
+            "track_number":null,"disc_number":null,"added":null}"#;
+        let decoded: TrackInfo = serde_json::from_str(old).unwrap();
+        assert_eq!(decoded.marks, Vec::<Mark>::new());
+    }
+
+    /// A node that predates `genre` sends no such field: the track still decodes,
+    /// with no genre. And a node that sends it is read by a client that has it.
+    #[test]
+    fn track_info_genre_is_optional_on_the_wire() {
+        let old = r#"{"content_hash":"sha256:abc123","title":null,"artist":null,"album":null,
+            "duration":null,"bpm":null,"key":null,"blob_path":null,"cover_art_path":null,
+            "track_number":null,"disc_number":null,"added":null}"#;
+        let decoded: TrackInfo = serde_json::from_str(old).unwrap();
+        assert_eq!(decoded.genre, None);
+
+        let with_genre = r#"{"content_hash":"sha256:abc123","title":null,"artist":null,
+            "album":null,"duration":null,"bpm":null,"key":null,"blob_path":null,
+            "cover_art_path":null,"track_number":null,"disc_number":null,"added":null,
+            "genre":"Techno"}"#;
+        let decoded: TrackInfo = serde_json::from_str(with_genre).unwrap();
+        assert_eq!(decoded.genre.as_deref(), Some("Techno"));
     }
 
     #[test]
@@ -2135,6 +2709,10 @@ mod tests {
             }),
             role: None,
             energy: None,
+            genre: None,
+            label: None,
+            styles: vec![],
+            marks: vec![],
         };
 
         let json = serde_json::to_string(&track).unwrap();

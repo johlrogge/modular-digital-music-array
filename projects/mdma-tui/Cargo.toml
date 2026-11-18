@@ -11,7 +11,6 @@ name = "mdma-tui"
 path = "src/main.rs"
 
 [dependencies]
-client = { path = "../../bases/client" }
 ratatui = "0.29"
 crossterm = "0.28"
 tui-base = { path = "../../bases/tui" }
@@ -28,7 +27,13 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "1.0"
 corsett = { git = "https://github.com/johlrogge/corsett.git", rev = "bf16c1aa2e8d6ba1f833e33009f2deecadc3ee26" }
 track-formatter = { path = "../../components/track_formatter" }
+client-facts = { workspace = true }
+node-discovery = { workspace = true }
 
 [dev-dependencies]
 library-ipc-protocol = { path = "../../components/library_ipc_protocol" }
 music-primitives = { path = "../../components/music_primitives" }
+client-facts = { workspace = true, features = ["test-support"] }
+mdma-client = { path = "../../components/mdma_client", features = ["test-support"] }
+music-facts = { workspace = true }
+tempfile = { workspace = true }

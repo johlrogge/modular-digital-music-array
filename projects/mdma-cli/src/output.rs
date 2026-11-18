@@ -5,8 +5,8 @@ use color_eyre::eyre::eyre;
 use colored::Colorize;
 use gateway_client::AdminResponse;
 use library_ipc_client::{ClientError, LibraryResponse, ProtocolError, TrackInfo};
+pub use mdma_client::source_label;
 use mdma_client::{upgrade_node_text, Mark, MarkFilter, MarkWrite, Unmark};
-use nng_transport::ConnectionError;
 use source_protocol::{SourceError, SourceResponse};
 use track_formatter::{
     format_track_line as format_track_line_shared, render_for_user, ALL_COLUMNS,
@@ -79,28 +79,6 @@ pub fn print_tracks(tracks: &[TrackInfo], header: &str) {
             println!("{}", format_track_line(track));
         }
     }
-}
-
-/// Why connecting to `what` failed, as one layer: `Failed to connect to
-/// <what> at <address>: <OS error>` for a failed dial, else `Failed to connect
-/// to <what>: <error>`.
-pub fn connect_failure(what: &str, err: &ConnectionError) -> String {
-    match err {
-        ConnectionError::Dial { address, cause } => {
-            format!("Failed to connect to {what} at {address}: {cause}")
-        }
-        other => connect_failure_text(what, other),
-    }
-}
-
-/// `Failed to connect to <what>: <err>`, for a failure without a dialed address.
-pub fn connect_failure_text(what: &str, err: &dyn std::fmt::Display) -> String {
-    format!("Failed to connect to {what}: {err}")
-}
-
-/// How a source is named in messages: `source 'bandcamp'`.
-pub fn source_label(name: &str) -> String {
-    format!("source '{name}'")
 }
 
 /// The failure for a reply `what` sent that the command did not expect.
@@ -242,11 +220,29 @@ pub fn interpret_library<T>(
 pub enum TrackFailure {
     Client(ClientError),
     Said(String),
+    /// The facts cannot be read at all (no replica, an unreachable node): it ends the
+    /// run, and is reported once, as it is.
+    Fatal(client_facts::FactsError),
 }
 
 impl From<ClientError> for TrackFailure {
     fn from(e: ClientError) -> Self {
         Self::Client(e)
+    }
+}
+
+impl From<client_facts::FactsError> for TrackFailure {
+    /// A refusal of the library or of the facts (not found, ambiguous) is about this
+    /// track alone; a transport failure may be the node being too old; anything else
+    /// is about every track.
+    fn from(e: client_facts::FactsError) -> Self {
+        use client_facts::FactsError;
+        match e {
+            FactsError::Library(refusal) => Self::Said(refusal.to_string()),
+            FactsError::Refused(text) => Self::Said(text),
+            FactsError::Transport(e) => Self::Client(e),
+            other => Self::Fatal(other),
+        }
     }
 }
 
@@ -259,20 +255,19 @@ pub fn each_track<E: Into<TrackFailure>>(
     mut act: impl FnMut(&library_ipc_client::ContentHash) -> Result<(), E>,
 ) -> color_eyre::Result<hicli::Success> {
     let mut failed = false;
+    let mut report = |hash: &library_ipc_client::ContentHash, text: String| {
+        failed = true;
+        eprintln!("{}  {}", track_formatter::short_hash(hash), text);
+    };
     for hash in hashes {
         match act(&hash).map_err(Into::into) {
             Ok(()) => {}
             Err(TrackFailure::Client(e)) if e.is_unsupported_request() => {
                 return Err(library_error(e))
             }
-            Err(failure) => {
-                failed = true;
-                let text = match failure {
-                    TrackFailure::Client(e) => library_error(e).to_string(),
-                    TrackFailure::Said(text) => text,
-                };
-                eprintln!("{}  {}", track_formatter::short_hash(&hash), text);
-            }
+            Err(TrackFailure::Fatal(e)) => return Err(e.into()),
+            Err(TrackFailure::Client(e)) => report(&hash, library_error(e).to_string()),
+            Err(TrackFailure::Said(text)) => report(&hash, text),
         }
     }
     Ok(success_unless(failed))
@@ -548,24 +543,17 @@ mod tests {
     // ── error messages as values ────────────────────────────────────────────────
 
     use super::{
-        connect_failure, display_error, interpret_admin, interpret_library, interpret_source,
-        library_error, lost_contact, request_failed, source_label, unexpected_response,
+        display_error, interpret_admin, interpret_library, interpret_source, library_error,
+        lost_contact, request_failed, source_label, unexpected_response,
     };
     use gateway_client::AdminResponse;
     use library_ipc_client::{ClientError, LibraryResponse, ProtocolError};
     use mdma_client::{upgrade_node_text, PlaybackClientError};
-    use nng_transport::{ConnectionError, NngClientError};
+    use nng_transport::NngClientError;
     use source_protocol::{SourceError, SourceResponse};
 
     fn lib_text(err: ClientError) -> String {
         failure_text::<()>(Err(library_error(err)))
-    }
-
-    fn refused_at(address: &str) -> ConnectionError {
-        ConnectionError::Dial {
-            address: address.to_string(),
-            cause: nng::Error::ConnectionRefused,
-        }
     }
 
     #[test]
@@ -624,25 +612,6 @@ mod tests {
         assert_eq!(
             failure_text::<()>(Err(lost_contact("the job", &"timed out", "mdma status"))),
             "Lost contact with the job (timed out); check later with 'mdma status'"
-        );
-    }
-
-    #[test]
-    fn connect_failure_names_what_and_where_once() {
-        assert_eq!(
-            connect_failure("library", &refused_at("tcp://10.0.0.2:5555")),
-            "Failed to connect to library at tcp://10.0.0.2:5555: Connection refused"
-        );
-    }
-
-    #[test]
-    fn connect_failure_without_an_address_keeps_the_cause() {
-        assert_eq!(
-            connect_failure(
-                "library",
-                &ConnectionError::DnsResolution("no host".to_string())
-            ),
-            "Failed to connect to library: DNS resolution failed: no host"
         );
     }
 

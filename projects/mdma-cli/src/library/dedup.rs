@@ -185,7 +185,7 @@ pub(crate) fn scan(args: ScanArgs, ctx: &Ctx) -> Result<Success> {
     let ScanArgs {
         apply: Apply(apply),
     } = args;
-    let library = ctx.library()?;
+    let library = ctx.node().library()?;
     let report = library.dedup_scan(apply).map_err(display_error)?;
     let failed = report
         .applied
@@ -225,7 +225,7 @@ pub(crate) fn merge(args: MergeArgs, ctx: &Ctx) -> hicli::Outcome<Success> {
         losers,
     } = args;
     let losers: Vec<ContentHash> = losers.into_iter().map(|TrackArg(h)| h).collect();
-    let library = ctx.library()?;
+    let library = ctx.node().library()?;
     if !yes {
         if let Ok(report) = library.dedup_scan(false) {
             // Every prefix must name at most one group before anything is confirmed.

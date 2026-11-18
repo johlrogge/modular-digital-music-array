@@ -28,6 +28,11 @@ serde_json = "1.0"
 hound = "3.5"    # For WAV handling
 anyhow = "1.0"
 
+[features]
+# `PlaybackEngine::new_headless`: an engine without an audio output, for tests
+# on machines with no sound server.
+test-support = []
+
 [[bench]]
 name = "track_loading"
 harness = false

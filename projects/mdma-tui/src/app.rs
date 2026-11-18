@@ -1,16 +1,17 @@
 use crate::browser_pane::BrowserPane;
 use crate::commands::{matching, Command};
 use crate::events::AppEvent;
+use crate::link::Link;
 use crate::now_playing::NowPlaying;
-use crate::pane::{Pane, PaneKind};
+use crate::pane::{Pane, PaneAction, PaneKind};
 use crate::playlists_pane::PlaylistsPane;
 use crate::queue_pane::QueuePane;
 use crate::search_pane::SearchPane;
 use crate::theme::ColorMode;
 use event_protocol::PlaybackEvent;
-use mdma_client::{ContentHash, LibraryBackend, PlaybackBackend, PlaylistName};
-use std::rc::Rc;
-use std::sync::mpsc::Receiver;
+use mdma_client::{ContentHash, Deck, PlaylistName, TransportStatus};
+use std::process::Child;
+use std::sync::mpsc::{Receiver, TryRecvError};
 
 /// An entry in the command palette — either a built-in command or a playlist open/create action.
 #[derive(Clone)]
@@ -76,17 +77,21 @@ pub struct App {
     pub live_filter_active: bool,
     pub name_input: String,
     pub should_quit: bool,
-    /// Shared library backend, used for opening new panes (e.g. PlaylistPane).
-    pub library: Rc<LibraryBackend>,
-    /// Shared playback backend, used for command palette execution.
-    pub playback: Rc<PlaybackBackend>,
+    /// The node and the facts, shared with every pane; used for opening new panes
+    /// and for the transport.
+    pub link: Link,
     // --- Palette state ---
     pub palette_query: String,
     pub palette_matches: Vec<PaletteEntry>,
     pub palette_cursor: usize,
     /// Background event receiver (NNG playback events from the subscriber thread).
-    /// `None` when no event subscription was established (e.g. no --node flag).
+    /// `None` when there is no live subscription: the node is not resolved yet, it has
+    /// no event address (local services), or the subscription ended.
     pub event_rx: Option<Receiver<AppEvent>>,
+    /// Whether the subscription was tried: it is made once, when the node is resolved.
+    subscribed: bool,
+    /// Background syncs started and not yet reaped (see [`App::reap_syncs`]).
+    syncs: Vec<Child>,
     /// Cut/yank clipboard: hashes placed here by `d` (cut) in PlaylistPane.
     /// Paste (`p`) reads from here non-destructively, allowing multi-paste.
     pub clipboard: Vec<ContentHash>,
@@ -95,11 +100,22 @@ pub struct App {
 }
 
 impl App {
+    /// The app as it opens: the browser on the left and the queue on the right.
+    /// Nothing here needs the node to answer: a node that cannot be reached shows in
+    /// the queue pane and the status line, and the app starts all the same.
+    ///
+    /// There are no events yet: the first tick after the node is resolved subscribes
+    /// (see [`App::subscribe_to_events`]).
+    pub fn start(link: Link, color_mode: ColorMode) -> Self {
+        let left_pane: Box<dyn Pane> = Box::new(BrowserPane::new(link.clone()));
+        let right_pane: Box<dyn Pane> = Box::new(QueuePane::new(link.clone()));
+        Self::new(left_pane, right_pane, link, None, color_mode)
+    }
+
     pub fn new(
         left_pane: Box<dyn Pane>,
         right_pane: Box<dyn Pane>,
-        library: Rc<LibraryBackend>,
-        playback: Rc<PlaybackBackend>,
+        link: Link,
         event_rx: Option<Receiver<AppEvent>>,
         color_mode: ColorMode,
     ) -> Self {
@@ -126,12 +142,13 @@ impl App {
             live_filter_active: false,
             name_input: String::new(),
             should_quit: false,
-            library,
-            playback,
+            link,
             palette_query: String::new(),
             palette_matches: Vec::new(),
             palette_cursor: 0,
             event_rx,
+            subscribed: false,
+            syncs: Vec::new(),
             clipboard: Vec::new(),
             color_mode,
         }
@@ -280,12 +297,19 @@ impl App {
     /// Events are collected into a `Vec` first so the borrow on `self.event_rx` is
     /// released before we mutate other fields (panes, now_playing, status).
     pub fn drain_events(&mut self) {
-        let events: Vec<AppEvent> = match self.event_rx.as_ref() {
-            Some(rx) => std::iter::from_fn(|| rx.try_recv().ok()).collect(),
-            None => return,
+        let Some(rx) = self.event_rx.as_ref() else {
+            return;
+        };
+        let mut events = Vec::new();
+        // A closed channel is a subscriber thread that has ended.
+        let ended = loop {
+            match rx.try_recv() {
+                Ok(event) => events.push(event),
+                Err(TryRecvError::Empty) => break false,
+                Err(TryRecvError::Disconnected) => break true,
+            }
         };
 
-        let library = Rc::clone(&self.library);
         for ev in events {
             match ev {
                 AppEvent::Playback(pe) => {
@@ -304,7 +328,7 @@ impl App {
                     }
                     // Resolve track metadata when a new track starts.
                     if let PlaybackEvent::TrackStarted { hash } = &pe {
-                        let meta = library.get_track(hash);
+                        let meta = self.link.node_track(hash);
                         let (title, artist) = match meta {
                             Ok(t) => (t.title, t.artist),
                             Err(_) => (None, None),
@@ -312,12 +336,91 @@ impl App {
                         self.now_playing.set_track_metadata(title, artist);
                     }
                     self.now_playing.apply(&pe);
+                    // A preview starting or ending changes the audible track
+                    // without a TrackStarted: ask the node what is audible.
+                    if matches!(
+                        pe,
+                        PlaybackEvent::PreviewStarted { .. } | PlaybackEvent::PreviewEnded { .. }
+                    ) {
+                        self.reread_transport();
+                    }
                 }
+                // News for the status line; the subscription goes on.
+                AppEvent::Malformed(msg) => self.set_status(format!("Event error: {msg}")),
                 AppEvent::SubscriberError(msg) => {
                     self.set_status(format!("Event error: {msg}"));
                 }
             }
         }
+        // The thread has ended: there is no subscription any more, and no new one is
+        // made (a subscriber reconnects by itself; one that failed has failed).
+        if ended {
+            self.event_rx = None;
+        }
+    }
+
+    /// Show what the node says is audible (`GetTransport`) with its title and
+    /// artist. Keeps what is shown when the node cannot be asked.
+    fn reread_transport(&mut self) {
+        let Ok(playback) = self.link.playback() else {
+            return;
+        };
+        let Ok(status) = playback.get_transport(Deck::A) else {
+            return;
+        };
+        let (title, artist) = match &status {
+            TransportStatus::Loaded { now, .. } => match self.link.node_track(now) {
+                Ok(t) => (t.title, t.artist),
+                Err(_) => (None, None),
+            },
+            TransportStatus::Idle => (None, None),
+        };
+        self.now_playing.set_track_metadata(title, artist);
+        self.now_playing.apply_transport(&status);
+    }
+
+    /// Subscribe to the node's events, once, as soon as the node is resolved. Nothing
+    /// here waits for the node or asks whether it answers: the subscriber connects,
+    /// and reconnects, by itself. Cheap to call on every tick.
+    pub fn subscribe_to_events(&mut self) {
+        if self.subscribed {
+            return;
+        }
+        if let Some(address) = self.link.event_address() {
+            self.subscribed = true;
+            self.event_rx = crate::events::spawn_event_subscriber(&address).ok();
+        }
+    }
+
+    /// Ask for a background sync of the replica (see [`crate::background`]) and keep
+    /// the child to reap. Gives the text for the status line when `mdma` was needed
+    /// and not found.
+    pub fn request_sync(&mut self, urgency: client_facts::Urgency) -> Option<String> {
+        let (child, problem) = crate::background::request(&self.link, urgency);
+        self.syncs.extend(child);
+        problem
+    }
+
+    /// Reap the background syncs that have finished, so none stays a zombie for as
+    /// long as the TUI runs.
+    pub fn reap_syncs(&mut self) {
+        self.syncs
+            .retain_mut(|child| matches!(child.try_wait(), Ok(None)));
+    }
+
+    /// What the status line says besides the hints: where the facts come from, how
+    /// the node is, and that nothing updates live while the node is reached and
+    /// there is no live subscription.
+    pub fn source_text(&self) -> Option<String> {
+        let no_events = (self.link.node_reached() && self.event_rx.is_none())
+            .then(|| "no live updates".to_string());
+        let parts: Vec<String> = self
+            .link
+            .status_text()
+            .into_iter()
+            .chain(no_events)
+            .collect();
+        (!parts.is_empty()).then(|| parts.join("  ·  "))
     }
 
     // =========================================================================
@@ -362,7 +465,12 @@ impl App {
     pub fn palette_update_query(&mut self, query: String) {
         if let Some(arg) = query.strip_prefix("o ") {
             // Open/create mode: fetch playlists and filter by arg prefix
-            let playlists = self.library.playlist_list().unwrap_or_default();
+            let playlists = self
+                .link
+                .library()
+                .ok()
+                .and_then(|library| library.playlist_list().ok())
+                .unwrap_or_default();
             let lower = arg.to_lowercase();
             let mut entries: Vec<PaletteEntry> = playlists
                 .into_iter()
@@ -396,9 +504,28 @@ impl App {
     // Pane factories
     // =========================================================================
 
-    /// Construct a fresh SearchPane backed by this app's library.
+    /// Read the facts again and refresh every pane from them (the replica folds anew,
+    /// the panes ask again). A view that cannot be read again stays as it was, and
+    /// the panes are refreshed all the same: the node's panes do not depend on the
+    /// replica. Returns the first error.
+    pub fn refresh_all(&mut self) -> Result<(), String> {
+        let mut first_error = self.link.refold().err().map(|e| e.to_string());
+        let panes = self
+            .left_tabs
+            .iter_mut()
+            .chain(self.right_tabs.iter_mut())
+            .flatten();
+        for pane in panes {
+            if let PaneAction::Error(msg) = pane.refresh() {
+                first_error.get_or_insert(msg);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    /// Construct a fresh SearchPane backed by this app's facts.
     pub fn make_search_pane(&self) -> Box<dyn Pane> {
-        Box::new(SearchPane::new(Rc::clone(&self.library)))
+        Box::new(SearchPane::new(self.link.clone()))
     }
 
     /// Construct a SearchPane with a pre-filled query and immediately run the search.
@@ -409,28 +536,25 @@ impl App {
         &self,
         query: String,
     ) -> (Box<dyn Pane>, crate::pane::PaneAction) {
-        let (pane, action) = SearchPane::with_query(Rc::clone(&self.library), query);
+        let (pane, action) = SearchPane::with_query(self.link.clone(), query);
         (Box::new(pane), action)
     }
 
-    /// Construct a fresh BrowserPane backed by this app's library.
+    /// Construct a fresh BrowserPane backed by this app's facts.
     pub fn make_browser_pane(&self) -> Box<dyn Pane> {
-        Box::new(BrowserPane::new(Rc::clone(&self.library)))
+        Box::new(BrowserPane::new(self.link.clone()))
     }
 
-    /// Construct a fresh QueuePane backed by this app's playback and library backends.
+    /// Construct a fresh QueuePane backed by this app's node and facts.
     pub fn make_queue_pane(&self) -> Box<dyn Pane> {
-        Box::new(QueuePane::new(
-            Rc::clone(&self.playback),
-            Rc::clone(&self.library),
-        ))
+        Box::new(QueuePane::new(self.link.clone()))
     }
 
-    /// Construct a fresh PlaylistsPane backed by this app's library.
+    /// Construct a fresh PlaylistsPane backed by this app's node.
     ///
-    /// Returns `Err` if the library backend cannot be reached.
+    /// Returns `Err` if the node cannot be reached.
     pub fn make_playlists_pane(&self) -> color_eyre::Result<Box<dyn Pane>> {
-        let pane = PlaylistsPane::new(Rc::clone(&self.library))?;
+        let pane = PlaylistsPane::new(self.link.clone())?;
         Ok(Box::new(pane))
     }
 }
@@ -443,7 +567,9 @@ impl tui_base::TuiApp for App {
     }
 
     fn on_tick(&mut self) {
+        self.subscribe_to_events();
         self.drain_events();
+        self.reap_syncs();
     }
 
     fn render(&self, frame: &mut ratatui::Frame) {
@@ -464,6 +590,8 @@ mod tests {
     use super::*;
     use crate::pane::{AddPlayingTarget, PaneAction, PaneKind};
     use crate::selection::SelectionState;
+    use crate::test_support::{catalog, catalog_with_a_fourth, World};
+    use client_facts::FactsChoice;
     use crossterm::event::KeyEvent;
     use ratatui::layout::Rect;
     use ratatui::Frame;
@@ -555,6 +683,168 @@ mod tests {
     // tests deterministic and backend-free.
     //
     // The integration tests rely on clippy + manual verification for end-to-end.
+
+    fn render_text(app: &App) -> String {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut terminal = Terminal::new(TestBackend::new(240, 12)).unwrap();
+        terminal.draw(|f| crate::ui::render(f, app)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    /// A node that is not there does not stop the app from starting: the browser
+    /// still reads the replica, the queue says why it is empty, and the status line
+    /// says where the facts come from and that the node is unreachable.
+    #[test]
+    fn starting_with_a_dead_node_builds_the_app_and_does_not_exit() {
+        let world = World::new(Some(catalog()));
+
+        let mut app = App::start(world.link(), ColorMode::TrueColor);
+
+        assert!(!app.should_quit);
+        assert_eq!(app.left_tabs[0].as_ref().unwrap().title(), "Browser");
+        assert_eq!(app.right_tabs[0].as_ref().unwrap().item_count(), 0);
+        let shown = render_text(&app);
+        assert!(shown.contains("needs the node"), "{shown}");
+        assert!(shown.contains("replica of stage, synced "), "{shown}");
+        assert!(shown.ends_with("node unreachable"), "{shown}");
+        // The browser reads the replica all the same.
+        app.active_pane_mut().handle_key(KeyEvent::new(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert_eq!(app.active_pane().item_count(), 2, "two artists");
+    }
+
+    #[test]
+    fn starting_with_no_node_selected_says_how_to_select_one() {
+        let world = World::new(Some(catalog()));
+        let link = Link::new(world.cancelled_node(), FactsChoice::Replica);
+
+        let app = App::start(link, ColorMode::TrueColor);
+
+        let shown = render_text(&app);
+        assert!(
+            shown.contains("no node selected; run `mdma node select`"),
+            "{shown}"
+        );
+        assert!(shown.ends_with("no node selected"), "{shown}");
+    }
+
+    /// A refold that fails (no replica) does not leave the panes unrefreshed, and its
+    /// error is the one reported.
+    #[test]
+    fn a_failed_refold_still_refreshes_every_pane_and_its_error_wins() {
+        let world = World::new(None);
+        let mut app = App::start(world.link(), ColorMode::TrueColor);
+        app.active_pane_mut().handle_key(KeyEvent::new(
+            crossterm::event::KeyCode::Down,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert_eq!(
+            app.active_pane().selection_state().list_state.selected(),
+            Some(2)
+        );
+
+        let refreshed = app.refresh_all();
+
+        let error = refreshed.expect_err("there is no replica to fold");
+        assert!(error.contains("`mdma replica sync`"), "{error}");
+        assert_eq!(
+            app.active_pane().selection_state().list_state.selected(),
+            Some(1),
+            "the browser went back to the top all the same"
+        );
+    }
+
+    /// While the node is reached and nothing is subscribed, the status line says
+    /// that nothing updates live; with a subscription it does not.
+    #[test]
+    fn the_status_line_says_no_live_updates_while_reached_without_a_subscription() {
+        let world = World::new(Some(catalog()));
+        let pane = || -> Box<dyn Pane> { Box::new(StubPane::new("Pane", 0)) };
+
+        let without = App::new(pane(), pane(), world.link(), None, ColorMode::TrueColor);
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let with = App::new(pane(), pane(), world.link(), Some(rx), ColorMode::TrueColor);
+
+        assert!(without.source_text().unwrap().ends_with("no live updates"));
+        assert!(!with.source_text().unwrap().contains("no live updates"));
+    }
+
+    /// A message that cannot be read is news for the status line; it ends nothing.
+    #[test]
+    fn a_malformed_event_leaves_the_subscription_in_place() {
+        use crate::events::AppEvent;
+        let world = World::new(Some(catalog()));
+        let pane = || -> Box<dyn Pane> { Box::new(StubPane::new("Pane", 0)) };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut app = App::new(pane(), pane(), world.link(), Some(rx), ColorMode::TrueColor);
+
+        tx.send(AppEvent::Malformed("Parse error: x".to_string()))
+            .unwrap();
+        app.drain_events();
+
+        assert!(app.event_rx.is_some(), "the subscription goes on");
+        assert!(!app.source_text().unwrap().contains("no live updates"));
+        assert!(app
+            .status_message
+            .as_deref()
+            .unwrap()
+            .contains("Parse error"));
+    }
+
+    /// A thread that has ended closes its channel: that is the subscription's real
+    /// state, and no other subscription is made in its place.
+    #[test]
+    fn an_ended_subscription_is_dropped_and_not_made_again() {
+        use crate::events::AppEvent;
+        let world = World::new(Some(catalog()));
+        let pane = || -> Box<dyn Pane> { Box::new(StubPane::new("Pane", 0)) };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut app = App::new(pane(), pane(), world.link(), Some(rx), ColorMode::TrueColor);
+        app.subscribed = true;
+
+        tx.send(AppEvent::SubscriberError("gone".to_string()))
+            .unwrap();
+        drop(tx);
+        app.drain_events();
+        app.subscribe_to_events();
+
+        assert!(app.event_rx.is_none());
+        assert!(app.source_text().unwrap().ends_with("no live updates"));
+        assert!(app.status_message.unwrap().contains("gone"));
+    }
+
+    #[test]
+    fn refreshing_reads_the_replica_again() {
+        let world = World::new(Some(catalog()));
+        let mut app = App::start(world.link(), ColorMode::TrueColor);
+        let all = |app: &mut App| {
+            app.active_pane_mut().handle_key(KeyEvent::new(
+                crossterm::event::KeyCode::Up,
+                crossterm::event::KeyModifiers::NONE,
+            ));
+            app.active_pane_mut().handle_key(KeyEvent::new(
+                crossterm::event::KeyCode::Enter,
+                crossterm::event::KeyModifiers::NONE,
+            ));
+            app.active_pane().item_count()
+        };
+        assert_eq!(all(&mut app), 3, "Up from Artists is Tracks");
+
+        world.sync(catalog_with_a_fourth());
+        let refreshed = app.refresh_all();
+
+        assert!(refreshed.is_err(), "the dead node's queue cannot refresh");
+        assert_eq!(app.active_pane().title(), "Browser", "back at the top");
+        assert_eq!(all(&mut app), 4, "all four tracks");
+    }
 
     #[test]
     fn activate_tab_same_side_same_idx_is_noop() {

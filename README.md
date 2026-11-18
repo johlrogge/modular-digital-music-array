@@ -31,8 +31,13 @@ MDMA runs headlessly on a Pi 5 with an NVMe drive. You control it from your lapt
 mdma search --artist CBL --bpm "128+-4"
 
 # Filter by role, energy, and key — new in 0.25.0
-mdma search --role banger --bpm "128+-3" --key "8A~"
+mdma search --role banger --bpm "128+-3" --key "8A+-1"
 mdma search --energy "8..10" --genre Techno
+
+# Keys: 8A, 1m, Am, "A minor" (exact); 8A+-2, 8A+2, 8A-1 (steps round the Camelot
+# wheel in one letter, or the relative key: 6A 7A 8A 9A 10A 8B); add d for any path
+# (8A+-2d also takes 7B, 9B); ,+7 adds a power jump (8A+-1,+7 adds 3A);
+# 6A..10B (numbers clockwise, letters A or B)
 
 # Filter by when tracks were added (date expressions: ~ = today, ^week = start of week)
 mdma search --added "^week"
@@ -165,7 +170,7 @@ This is a [Polylith](https://polylith.gitbook.io/polylith/) workspace. Deployabl
 | `mdma-audio` | Audio playback source — wraps PlaybackEngine (Symphonia + rubato + PipeWire), speaks `stream_source_protocol` over NNG |
 | `mdma-tui` | Terminal UI — multi-pane tabs (nnn-style, `1`–`5`/`6`–`0`), field-aware search grammar (`:artist`, `:bpm`, `:added`, …), DJ shortcuts (`A`, `P`, `d`/`p`, `u`), modal keybindings, command palette, live queue sync, intelligent column compression, own theme colours on every terminal (`MDMA_TUI_COLORS=truecolor\|24bit\|256` overrides detection) |
 | `mdma-bandcamp` | Bandcamp source — collection sync into the library inbox, fan playlist listing/fetching, and background playlist import jobs for `mdma source bandcamp` |
-| `mdma-console` | Web management console — player controls, search, queue, upload, export |
+| `mdma-console` | Web management console — player controls, search with mix-well key filter, queue, playlist workbench with preview timeline and seek, marks/hearts, key notation setting, upload, export |
 | `mdma-cli` | CLI — search, queue, playlists, playback, export, subscribe, marks, Bandcamp playlist import, play history, local fact replica, offline shell completions |
 | `dj-workspace` | Bevy GUI app (laptop-only, not packaged for Pi) — playlist browser and BPM/Key/Role/Energy candidate finder with sortable results; connects via gateway (`dj-workspace --node <host>`) |
 
@@ -274,7 +279,7 @@ Quick install is at the [top](#install). Every `vX.Y.Z` release publishes `mdma-
 
 ```bash
 # Install a specific release
-curl -fsSL https://raw.githubusercontent.com/johlrogge/modular-digital-music-array/master/scripts/install-mdma.sh | bash -s v0.38.3
+curl -fsSL https://raw.githubusercontent.com/johlrogge/modular-digital-music-array/master/scripts/install-mdma.sh | bash -s v0.39.0
 
 # Install to a user-writable location (no sudo)
 curl -fsSL https://raw.githubusercontent.com/johlrogge/modular-digital-music-array/master/scripts/install-mdma.sh | MDMA_INSTALL_DIR=~/.local/bin bash
@@ -292,6 +297,21 @@ cp target/release/mdma /usr/local/bin/
 ---
 
 See [ROADMAP.md](ROADMAP.md) for detailed status and planned work.
+
+---
+
+## What's new in 0.39
+
+### Console playlist workbench, mix-well key filter, local reads
+
+- **The console gets a playlist workbench:** browse and narrow the library and add tracks to a playlist in one view. Click a row to preview it (click again to pause, Back resumes what was playing); the previewing row shows a timeline with cues, bars, beat-step skipping and keys, and a click seeks, snapped to the beat. Seek also works in the main player. Playlists are in the left rail, you can create one, and each shows a cover mosaic.
+- **"Replace queue"** replaces Up next and keeps the playing track.
+- **Marks and hearts with macro marks** in the console (macro buttons are configured on the node, defaults "banger" and "opener"), a **key notation setting** (Musical, Camelot or Open Key, stored per browser), and **row keyboard navigation** (↑/↓ or `j`/`k`).
+- **Mix-well key filter,** also in `mdma search --key`: `8A+-2` (Straight), a `d` suffix for any path, `,+7` for a power jump.
+- **Local reads from the client replica** (ADR-030), through the shared `library_projection::search`.
+- **The library repairs covers at startup:** it re-extracts art for cover facts whose file is missing or empty, and extracts art for tracks with no cover fact. The gateway no longer hangs on the NNG callback thread (#113).
+
+**Upgrade notes:** none. Upgrade the mdma-* packages together, by name. See CHANGELOG.md.
 
 ---
 
@@ -476,7 +496,7 @@ Nodes announce `_mdma._tcp` over mDNS and the gateway answers a new Identify req
 
 New commands: `mdma node list`, `select`, `forget` and `show`. The choice is cached at `~/.config/mdma/node.json` on Linux (under Application Support on macOS, where first use shows a Local Network permission prompt).
 
-Gateways at 0.29.0 or older answer Identify as "unsupported" and are not remembered through discovery; use `--node` until they are updated. The TUI and dj-workspace still use only `MDMA_NODE`.
+Gateways at 0.29.0 or older answer Identify as "unsupported" and are not remembered through discovery; use `--node` until they are updated. The TUI resolves its node the same way as the CLI (including the saved `mdma node select` choice and the interactive pick, shown before the TUI starts); dj-workspace still uses only `MDMA_NODE`.
 
 ### Packaging fix (#75)
 
@@ -629,7 +649,7 @@ Pause/resume is immediate and resumes at the exact sample. Volume is applied at 
 ### Role and energy are searchable and hand-taggable
 
 ```bash
-mdma search --role banger --bpm "128+-3" --key "8A~"
+mdma search --role banger --bpm "128+-3" --key "8A+-1"
 mdma fact set sha256:<hash> role banger
 mdma fact set sha256:<hash> energy 9
 ```

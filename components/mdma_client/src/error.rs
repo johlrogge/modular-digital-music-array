@@ -1,6 +1,7 @@
 //! Error mapping helpers between gateway and service-specific error types
 
 use library_ipc_client::{ClientError, ProtocolError};
+use nng_transport::ConnectionError;
 
 /// The text shown when a node rejects a request it does not understand; `client`
 /// names the program that sent it (e.g. "CLI").
@@ -9,6 +10,28 @@ pub fn upgrade_node_text(client: &str) -> String {
         "The node did not understand this request; it may be older than this {client} \
          — upgrade the node."
     )
+}
+
+/// Why connecting to `what` failed, as one layer: `Failed to connect to
+/// <what> at <address>: <OS error>` for a failed dial, else `Failed to connect
+/// to <what>: <error>`.
+pub fn connect_failure(what: &str, err: &ConnectionError) -> String {
+    match err {
+        ConnectionError::Dial { address, cause } => {
+            format!("Failed to connect to {what} at {address}: {cause}")
+        }
+        other => connect_failure_text(what, other),
+    }
+}
+
+/// `Failed to connect to <what>: <err>`, for a failure without a dialed address.
+pub fn connect_failure_text(what: &str, err: &dyn std::fmt::Display) -> String {
+    format!("Failed to connect to {what}: {err}")
+}
+
+/// How a source is named in messages: `source 'bandcamp'`.
+pub fn source_label(name: &str) -> String {
+    format!("source '{name}'")
 }
 
 /// Map gateway client errors to library client errors.
@@ -38,6 +61,32 @@ pub fn map_gw_to_lib_error(e: gateway_client::ClientError) -> ClientError {
 mod tests {
     use super::*;
     use nng_transport::NngClientError;
+
+    fn refused_at(address: &str) -> ConnectionError {
+        ConnectionError::Dial {
+            address: address.to_string(),
+            cause: nng::Error::ConnectionRefused,
+        }
+    }
+
+    #[test]
+    fn connect_failure_names_what_and_where_once() {
+        assert_eq!(
+            connect_failure("library", &refused_at("tcp://10.0.0.2:5555")),
+            "Failed to connect to library at tcp://10.0.0.2:5555: Connection refused"
+        );
+    }
+
+    #[test]
+    fn connect_failure_without_an_address_keeps_the_cause() {
+        assert_eq!(
+            connect_failure(
+                "library",
+                &ConnectionError::DnsResolution("no host".to_string())
+            ),
+            "Failed to connect to library: DNS resolution failed: no host"
+        );
+    }
 
     #[test]
     fn old_gateway_rejection_is_unsupported_request() {

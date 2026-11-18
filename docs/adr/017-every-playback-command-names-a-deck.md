@@ -42,7 +42,7 @@ Amended by ADR-021 (2026-11-14): §6.9 also writes a new log epoch.
 - The values carry no time, deck or id, so every play of a track is the same value.
 - The tags `Played` and `Skipped` are **taken**. `rewrite_legacy` maps them to `TrackStopped(OnCompletion)` and `TrackStopped(OnSkip)` (value.rs:381-396), and such lines exist in old logs (music_facts/tests/fixtures/legacy_facts.jsonl:4-7).
 - Playback 0.2.0 wrote the event time as the value (`{"t":"TrackStarted","v":"2026-02-23T11:34:39.496504277Z"}`; `Played`/`Skipped` have the same form). These and any other unknown string are *guessed* as `OnRequest` (value.rs:32-33, 66-67).
-- Older playback wrote short-hash entities (#86, 8 or 12 hex characters) and once the empty entity `""`. Readers resolve short hashes by unique prefix (service.rs:3205-3220).
+- Playback wrote short-hash entities (#86, 8 or 12 hex characters) and once the empty entity `""`. The short hashes are not only history: until ADR-026 the writer was live. The CLI sent whatever prefix the user typed, and playback queued it and wrote it verbatim into `TrackStarted`/`TrackStopped`. Readers resolve short hashes by unique prefix (`library_projection::resolve_prefix`).
 - The only play retracts come from retire batches (`retract_all_entity_facts_locked`, service.rs:2359-2395), which the hard retract in `merge_into` uses. They re-serialise the parsed value, so a 0.2.0 value is retracted as `"OnRequest"`.
 - Stage2 (2026-11-10): 1,466 play lines out of 22,959. 721 `TrackStarted` and 704 `TrackStopped` asserts (79 and 76 of them datetime-valued); 7 `Played` and 6 `Skipped`; 28 retracts, written by three dedup merges on 2026-11-04 (14 starts and 14 stops); 364 short-hash lines and 5 with `""`.
 - The logs show that starts and stops cannot be paired. There are stops with no start, starts with no stop, and bursts of stops for tracks that started days earlier.
@@ -168,7 +168,7 @@ Points marked **Decided** were decided by Joakim. Everything else is **Proposed*
    - there are no replicas yet (ADR-016 §2).
 
    Keeping positions keeps future replica cursors valid and makes the backup easy to diff.
-4. **Entities are kept exactly as written**, including #86 short hashes and the empty entity `""`. Readers keep resolving short hashes as today. The migration repairs nothing.
+4. **Entities are kept exactly as written**, including #86 short hashes and the empty entity `""`. Readers keep resolving short hashes as today. The migration repairs nothing. (The short hashes were still being written when this was decided; ADR-026 stops the writer, and the readers keep handling the lines already in the log.)
 5. **Asserts.** Each line is mapped on its own; there is no pairing (§3.3).
    - `TrackStarted(r)` becomes `PlayStarted { deck: A, via: r, at }`.
    - `TrackStopped(r)` becomes `PlayStopped { deck: A, reason: r, at }`.

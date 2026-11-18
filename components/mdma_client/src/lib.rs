@@ -2,25 +2,38 @@
 //!
 //! Provides gateway-or-direct transport for library, playback, and source services.
 
+mod client_config;
 mod error;
 pub mod library;
+pub mod node;
 pub mod playback;
+mod queue_resolve;
+pub mod seek;
 pub mod source;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 
-pub use error::upgrade_node_text;
+pub use client_config::ClientConfig;
+pub use error::{map_gw_to_lib_error, source_label, upgrade_node_text};
 pub use library::LibraryBackend;
+pub use node::{Answer, NeededBy, Node, NodeError, NodeOptions};
+pub use node_discovery::{NodeSpec, RemoteTarget, Source, Target};
 pub use playback::PlaybackBackend;
+pub use queue_resolve::resolve_in_queue;
+pub use seek::{seek_to, skip_beats, Placement, SeekError};
 pub use source::{list_available_sources, SourceClient};
 
 // Re-export key types so clients don't need to depend on individual protocol crates.
 pub use library_ipc_client::{
-    ClientError as LibraryClientError, ContentHash, InboxPath, IngestAllItem, IngestResult,
-    IngestSource, LibraryRequest, LibraryResponse, Mark, MarkFilter, MarkNameError, MarkWrite,
-    PlaylistName, ProtocolError, ServiceStatus, TrackInfo, Unmark,
+    entries_for_playback, entry_tracks, track_hashes, unresolved_entries, CanonicalHash,
+    ClientError as LibraryClientError, ContentHash, EntryError, EntryTrackError, InboxPath,
+    IngestAllItem, IngestResult, IngestSource, LibraryRequest, LibraryResponse, Mark, MarkFilter,
+    MarkNameError, MarkWrite, PlayableEntries, PlaylistEntry, PlaylistName, ProtocolError,
+    ResolveError, ServiceStatus, TrackInfo, Unmark, UnplayableEntry,
 };
 pub use library_search::TrackQuery;
 pub use media_client::{
-    AudioOutputConfig, AudioSinkInfo, ClientError as PlaybackClientError, Command, Deck, Response,
-    ResponseData, SourceName,
+    AudioOutputConfig, AudioSinkInfo, ClientError as PlaybackClientError, Command, Deck,
+    PositionMs, PreviewStatus, Response, ResponseData, SourceName, Transport, TransportStatus,
 };
 pub use source_protocol::{SourceRequest, SourceResponse};

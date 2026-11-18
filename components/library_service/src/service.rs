@@ -4,30 +4,30 @@
 
 use crate::identity::{identity_facts_for_blob, IdentityOpts};
 use crate::ipc::{
-    bookmark_scope_mark, parse_request, AttributeList, BeatGridInfo, Bpm, ContentHash, CueInfo,
-    DurationSeconds, FactType, InboxPath, IngestAllItem, IngestResult, IpcServer, Key,
-    LibraryRequest, LibraryResponse, Mark, MarkWrite, OrphanInfo, OrphanReason, ProtocolError,
-    ServiceStatus, TrackInfo, TrackQuery, Unmark,
+    bookmark_scope_mark, parse_request, AttributeList, ContentHash, FactType, InboxPath,
+    IngestAllItem, IngestResult, IpcServer, LibraryRequest, LibraryResponse, Mark, MarkWrite,
+    OrphanInfo, OrphanReason, PlaylistName, ProtocolError, ServiceStatus, TrackInfo, TrackQuery,
+    Unmark,
 };
 use crate::pipeline::InboxFile;
 use crate::sources::{self, LibrarySources, ReleaseVersion};
 use acid_client::AcidClient;
 use event_protocol::{acid_event_from_topic_message, AcidEvent, TOPIC_ACID};
 use library_projection::{
-    ambiguity_message, apply_fact, distinct_retractions, hash_key, is_play_event,
-    is_provenance_tracked, project, remove_cancelled, resolve_prefix, retain_live, retract_matches,
-    try_parse_fact_line, IndexedTrackInfo, MusicFact, PlayLog, Unresolved,
+    apply_fact, distinct_retractions, entity_facts, fact_values, hash_key, is_play_event,
+    is_provenance_tracked, project, remove_cancelled, resolve_prefix, resolve_visible, retain_live,
+    retract_matches, search, track_info, try_parse_fact_line, unresolved_error, visible,
+    AlbumCovers, IndexedTrackInfo, LineageLog, MusicFact, Unresolved,
 };
 #[cfg(test)]
 use library_projection::{apply_fact_to_track, blob_path_for, IndexedCue};
-use library_search::{matches_query, TrackFields};
 #[cfg(test)]
 use music_facts::MarkFilter;
 use music_facts::MusicValue;
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use thiserror::Error;
@@ -65,7 +65,8 @@ pub struct LibraryService {
     acid_client: AcidClient,
     /// Album name -> cover_art_path for tracks that have cover art.
     /// Used as a fallback when a track on the same album has no cover art of its own.
-    album_cover_cache: Mutex<HashMap<String, String>>,
+    /// Rebuilt from `tracks` every time the projection catches up (`drop_non_live`).
+    album_cover_cache: Mutex<AlbumCovers>,
     /// Generic fact value index: fact_type -> set of values
     /// Used for fast HasFact/HasFacts lookups (e.g., ItemId -> {"p123", "p456"})
     fact_index: Mutex<HashMap<FactType, HashSet<String>>>,
@@ -79,13 +80,21 @@ pub struct LibraryService {
     /// (the fact subscriber or a writer that just wrote to ACID).
     ///
     /// Lock order: `retire_gate` -> `cursor` -> `tracks` -> `fact_index` ->
-    /// `content_hashes`; `event_cursor` -> `tracks` -> `play_events`
-    /// (`refresh_event_timestamps`); `tracks` -> `album_cover_cache` (nothing taken while
-    /// holding it). `identity_backfill` is independent: take it alone and never
+    /// `content_hashes`; `event_cursor` -> `tracks` -> `lineage`
+    /// (`refresh_lineage`). The archiving of a retired file asks whether a cover is
+    /// still shown (`cover_art_in_use`) while it holds `retire_gate`, so
+    /// `retire_gate` -> `event_cursor` -> `tracks` -> `lineage` is an edge too: no
+    /// path takes `retire_gate` inside `event_cursor` or `tracks`.
+    ///
+    /// Covers: `tracks` -> `album_cover_cache` (nothing taken while holding it;
+    /// `drop_non_live` takes it inside `content_hashes`, `refresh_lineage` takes it
+    /// inside `tracks` after it has let go of `lineage`).
+    ///
+    /// `identity_backfill` is independent: take it alone and never
     /// together with another lock in this list.
     /// No projection lock may be held while calling `catch_up`.
     cursor: Mutex<Option<String>>,
-    /// Cursor for incremental reads in refresh_event_timestamps.
+    /// Cursor for incremental reads in refresh_lineage.
     ///
     /// Separate from `cursor` (used by spawn_fact_subscriber) so the two readers
     /// don't fight over the same position.  Starts at None (full scan on first
@@ -95,12 +104,19 @@ pub struct LibraryService {
     /// The assumption is that such retractions never occur in production.  If they
     /// become meaningful, a full scan from None would be required.
     event_cursor: Mutex<Option<String>>,
-    /// Latest start and stop recorded under every entity key (normalised hash) seen
-    /// by `refresh_event_timestamps`, retired entities included: a track's play
-    /// history is its own plus that of every hash it replaces (ADR-013).
+    /// The play events and the cover art events recorded under every entity key
+    /// (normalised hash) seen by `refresh_lineage`, retired entities included: a
+    /// track's play history is its own plus that of every hash it replaces, and a
+    /// track without a cover of its own inherits one along the same lineage (ADR-013).
     ///
     /// Lock order: taken after `tracks`, alone or inside it; nothing is taken while holding it.
-    play_events: Mutex<PlayLog>,
+    lineage: Mutex<LineageLog>,
+    /// Whether the last `refresh_lineage` read to the end of the stream. False until the
+    /// first one: the lineage is then not known to be current. It says nothing about
+    /// facts written since: a caller that needs the lineage to include a write
+    /// (`cover_art_in_use`) must have refreshed after it. Stored with `tracks` held and
+    /// loaded with `tracks` held, so it is read together with the tracks it describes.
+    lineage_current: AtomicBool,
     /// Address of the ACID request socket (used by background subscriber thread).
     acid_socket: String,
     /// Address of the ACID events pub/sub socket.
@@ -132,6 +148,23 @@ pub struct LibraryService {
     /// the gate, so the compiler proves their callers hold this mutex.
     /// Lock order: before `cursor`; see there.
     retire_gate: Mutex<gate::RetireToken>,
+    /// Serialises every playlist writer and every playlist read-modify-write
+    /// (ADR-027 §7): the IPC handlers (New, Append, Replace, Edit, Revert, Delete,
+    /// Remove, Rename), the on-read repair (read, repair and write are one critical
+    /// section, so Get, Entries and Snapshot read under it), and the dedup rewrite
+    /// (for its whole sweep). Without it a repair or dedup pass that read before an
+    /// edit would write the old content back over it. Playlists are small and rare
+    /// to change, so one lock for all of them is enough.
+    ///
+    /// The guard (`MutexGuard<PlaylistsToken>`) is passed to the functions that need
+    /// the lock, so the compiler proves their callers hold it. The mutex is not reentrant.
+    ///
+    /// Lock order: `playlists_lock` -> `tracks` (repair and Insert resolution take
+    /// `tracks` inside it) -> `album_cover_cache` (writing a new line). Outermost
+    /// among the playlist-related locks: never take `retire_gate`, `cursor` or
+    /// `identity_backfill` while holding it, and never take it while holding
+    /// `tracks` or any lock listed under `cursor`.
+    playlists_lock: Mutex<PlaylistsToken>,
     /// Test-only: called by the backfill worker after hashing a track and before
     /// the liveness check + write, to inject a concurrent change at that point.
     #[cfg(test)]
@@ -151,10 +184,57 @@ pub struct LibraryService {
     merge_pre_archive_hook: Mutex<Option<IdentityWriteHook>>,
 }
 
+fn playlist_not_found(name: &PlaylistName) -> ProtocolError {
+    ProtocolError::PlaylistNotFound {
+        name: name.to_string(),
+    }
+}
+
+/// Write a playlist file: all of `bytes` or nothing (ADR-027 §7). The one
+/// function every playlist write goes through. The caller holds `playlists_lock`.
+///
+/// The bytes go to a sibling temp file (its name ends in `.tmp`, so the `.plist`
+/// listing ignores it), which is fsynced and renamed over `path`. A missing
+/// playlists directory is created.
+fn write_playlist_atomic(path: &std::path::Path, bytes: &[u8]) -> Result<(), ProtocolError> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| ProtocolError::Internal {
+            message: format!("Failed to create playlist directory: {e}"),
+        })?;
+    }
+    private_file::write_file_atomic(path, bytes, 0o644).map_err(|e| ProtocolError::Internal {
+        message: format!("Failed to write playlist: {e}"),
+    })
+}
+
+/// Delete a playlist file and answer `done`. The caller holds `playlists_lock`.
+fn remove_playlist_file(path: &std::path::Path, done: LibraryResponse) -> LibraryResponse {
+    match std::fs::remove_file(path) {
+        Ok(()) => done,
+        Err(e) => LibraryResponse::Error(ProtocolError::Internal {
+            message: format!("Failed to remove playlist: {e}"),
+        }),
+    }
+}
+
+/// Store what `planned` says to write, and answer its outcome. The caller holds
+/// `playlists_lock`.
+fn commit_playlist(path: &std::path::Path, planned: playlist_edit::Planned) -> LibraryResponse {
+    let (write, outcome) = planned.into_parts();
+    if let Some(bytes) = write {
+        if let Err(e) = write_playlist_atomic(path, bytes.as_bytes()) {
+            return LibraryResponse::Error(e);
+        }
+    }
+    LibraryResponse::PlaylistEdited(outcome)
+}
+
 #[cfg(test)]
 type IdentityWriteHook = Box<dyn Fn(&LibraryService, &ContentHash) + Send + Sync>;
 
 mod backfill;
+#[cfg(test)]
+mod cover_tests;
 mod dedup;
 #[cfg(test)]
 mod dedup_tests;
@@ -169,11 +249,22 @@ mod gate {
     pub(super) fn new_gate() -> Mutex<RetireToken> {
         Mutex::new(RetireToken(()))
     }
+
+    /// The payload of `playlists_lock`; made only by `new_playlists_lock`, so a
+    /// `MutexGuard<PlaylistsToken>` is proof of holding the real lock.
+    pub(super) struct PlaylistsToken(());
+
+    pub(super) fn new_playlists_lock() -> Mutex<PlaylistsToken> {
+        Mutex::new(PlaylistsToken(()))
+    }
 }
-use gate::RetireToken;
+use gate::{PlaylistsToken, RetireToken};
 
 /// Proof that the caller holds `retire_gate`.
 type RetireGuard<'a> = std::sync::MutexGuard<'a, RetireToken>;
+
+/// Proof that the caller holds `playlists_lock`.
+type PlaylistsGuard<'a> = std::sync::MutexGuard<'a, PlaylistsToken>;
 
 /// The files a retired track owned, relative to `music_dir`. Captured before the
 /// retire removes the track's index entry.
@@ -232,6 +323,53 @@ impl Drop for ProjectOnDrop<'_> {
     }
 }
 
+/// Live tracks with a blob, sorted by the state of their cover.
+#[derive(Debug, Default)]
+struct CoverScan {
+    /// Cover fact and file both there
+    present: usize,
+    /// A cover fact whose file is gone or empty: (content hash, blob, cover file),
+    /// the paths relative to the music dir. Cover files inside `cover-art/` only.
+    dangling: Vec<(ContentHash, PathBuf, PathBuf)>,
+    /// Cover facts naming a path outside `cover-art/`: never written to
+    failed: usize,
+    /// No cover fact: (content hash, blob)
+    missing: Vec<(ContentHash, PathBuf)>,
+}
+
+/// What one cover heal did, per track.
+#[derive(Debug, Default, PartialEq, Eq, Clone, Copy)]
+struct CoverSummary {
+    present: usize,
+    /// Cover file re-extracted to the path its fact names (no fact written)
+    repaired: usize,
+    /// Art extracted and a `CoverArtPath` fact asserted
+    extracted: usize,
+    /// The blob has no usable picture; nothing changed
+    no_art: usize,
+    failed: usize,
+}
+
+impl CoverSummary {
+    fn log(&self) {
+        tracing::info!(
+            present = self.present,
+            repaired = self.repaired,
+            extracted = self.extracted,
+            no_art = self.no_art,
+            failed = self.failed,
+            "Cover heal complete"
+        );
+    }
+}
+
+/// The outcome of repairing one cover file.
+enum CoverRepair {
+    Repaired,
+    NoArt,
+    Failed,
+}
+
 /// Result of loading tracks from the fact stream
 struct LoadResult {
     tracks: Vec<IndexedTrackInfo>,
@@ -242,8 +380,6 @@ struct LoadResult {
     content_hashes: HashSet<String>,
     /// Content hashes of tracks that already have a Format fact
     has_format: HashSet<String>,
-    /// Content hashes of tracks that already have a CoverArtPath fact
-    has_cover_art: HashSet<String>,
 }
 
 /// One line of a fact stream, or `None` for a line that is not a fact. Never dropped
@@ -289,11 +425,6 @@ fn acid_error(e: acid_client::ClientError) -> ProtocolError {
     }
 }
 
-/// Format a MusicValue for display (returns type name and string value)
-fn format_fact_for_display(value: &MusicValue) -> (String, String) {
-    (value.display_name().to_string(), value.to_string())
-}
-
 impl LibraryService {
     /// Create a new library service. `version` is the release version of the binary
     /// hosting it (ADR-020).
@@ -331,7 +462,7 @@ impl LibraryService {
         let (loaded, final_cursor) = Self::load_from_acid_stream(&acid_client, None)?;
 
         let tracks_count = loaded.tracks.len();
-        let album_cover_cache = Self::build_album_cover_cache(&loaded.tracks);
+        let album_cover_cache = AlbumCovers::build(&loaded.tracks);
 
         // The fallible bootstrap above runs before `new_cyclic`, whose closure cannot fail.
         let service = Arc::new_cyclic(|self_ref| Self {
@@ -349,13 +480,15 @@ impl LibraryService {
             content_hashes: Mutex::new(loaded.content_hashes),
             cursor: Mutex::new(final_cursor),
             event_cursor: Mutex::new(None),
-            play_events: Mutex::new(PlayLog::default()),
+            lineage: Mutex::new(LineageLog::default()),
+            lineage_current: AtomicBool::new(false),
             acid_socket: acid_socket.to_string(),
             acid_events_socket: acid_events_socket.to_string(),
             self_ref: self_ref.clone(),
             identity_backfill: Mutex::new(crate::ipc::IdentityBackfillStatus::Idle),
             identity_cancel: std::sync::atomic::AtomicBool::new(false),
             retire_gate: gate::new_gate(),
+            playlists_lock: gate::new_playlists_lock(),
             #[cfg(test)]
             identity_write_hook: Mutex::new(None),
             #[cfg(test)]
@@ -369,8 +502,30 @@ impl LibraryService {
         // Backfill Format facts for tracks that don't have one yet
         service.backfill_format_facts(&loaded.has_format);
 
-        // Backfill cover art for tracks that don't have CoverArtPath yet
-        service.backfill_cover_art(&loaded.has_cover_art);
+        // Heal covers, in the two halves `heal_covers_with` runs in a row. Both start
+        // from one scan taken here (memory and file stats only, no ACID request).
+        // Extracting the art of tracks with no cover fact asserts facts, so it is done
+        // before serving, like the other startup backfills: a caller (and every test)
+        // may rely on those facts existing once the service is up. Repairing the files
+        // that went missing writes no fact and opens one blob per cover (some hundreds
+        // after a lost cover dir), so it runs on a thread and needs no ACID client.
+        let scan = service.scan_covers();
+        let mut summary = CoverSummary {
+            present: scan.present,
+            failed: scan.failed,
+            ..CoverSummary::default()
+        };
+        service.extract_missing_covers(&service.acid_client, &scan.missing, &mut summary);
+        let worker = Arc::clone(&service);
+        let spawned = std::thread::Builder::new()
+            .name("cover-repair".into())
+            .spawn(move || {
+                worker.repair_dangling_covers(&scan.dangling, &mut summary);
+                summary.log();
+            });
+        if let Err(e) = spawned {
+            tracing::warn!(error = %e, "Cover repair thread did not start");
+        }
 
         // Ensure playlists directory exists so writes never fail on a fresh install
         std::fs::create_dir_all(service.metadata_dir.join("playlists"))?;
@@ -382,7 +537,7 @@ impl LibraryService {
     ///
     /// Reads all paged fact lines from ACID, then uses `stainless_facts::aggregate_facts`
     /// to fold them into `IndexedTrackInfo` aggregators (one per entity), then
-    /// post-processes the result to build `fact_index`, `has_format`, `has_cover_art`.
+    /// post-processes the result to build `fact_index`, `has_format`.
     ///
     /// Returns `Ok((LoadResult, Option<cursor>))`:
     /// - ACID reachable with 0 facts → `Ok((empty, Some(cursor)))` — correct on fresh system
@@ -442,7 +597,6 @@ impl LibraryService {
             fact_index: projection.fact_index,
             content_hashes: projection.content_hashes,
             has_format: projection.has_format,
-            has_cover_art: projection.has_cover_art,
         };
         Ok((loaded, final_cursor))
     }
@@ -471,7 +625,6 @@ impl LibraryService {
                         fact_index: HashMap::new(),
                         content_hashes: HashSet::new(),
                         has_format: HashSet::new(),
-                        has_cover_art: HashSet::new(),
                     };
                 }
             };
@@ -479,7 +632,6 @@ impl LibraryService {
         let mut tracks_map: HashMap<String, IndexedTrackInfo> = HashMap::new();
         let mut fact_index: HashMap<FactType, HashSet<String>> = HashMap::new();
         let mut has_format: HashSet<String> = HashSet::new();
-        let mut has_cover_art: HashSet<String> = HashSet::new();
         let mut errors = 0;
         let mut total = 0;
 
@@ -552,9 +704,6 @@ impl LibraryService {
             {
                 has_format.insert(key.clone());
             }
-            if entry.cover_art_path.is_some() {
-                has_cover_art.insert(key.clone());
-            }
         }
 
         let content_hashes: HashSet<String> = tracks_map.keys().cloned().collect();
@@ -565,7 +714,6 @@ impl LibraryService {
             fact_index,
             content_hashes,
             has_format,
-            has_cover_art,
         }
     }
 
@@ -631,36 +779,87 @@ impl LibraryService {
         }
     }
 
+    /// The picture to show for an audio file: the front cover, else the first one.
+    /// `Ok(None)` when the file has no picture; `Err` when it cannot be read.
+    fn best_cover_picture(blob_path: &Path) -> Result<Option<audio_metadata::PictureData>, String> {
+        use audio_metadata::{extract_pictures, PictureType};
+
+        let mut pictures = extract_pictures(blob_path).map_err(|e| e.to_string())?;
+        let best = pictures
+            .iter()
+            .position(|p| p.picture_type == PictureType::CoverFront)
+            .unwrap_or(0);
+        Ok((best < pictures.len()).then(|| pictures.swap_remove(best)))
+    }
+
+    /// Store a cover image at `path` (directory created if need be). Atomic with a
+    /// unique temp file: a reader (the console's `/cover` route) never sees half an
+    /// image, and two writers of the same cover (startup heal and `ReindexCovers`) each
+    /// leave a complete one.
+    fn store_cover_file(path: &Path, data: &[u8]) -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        private_file::write_file_atomic(path, data, 0o644)
+    }
+
+    /// Re-extract the embedded art of `blob_abs` into `cover_abs`, the file a
+    /// `CoverArtPath` fact already names. Writes no fact. The image goes there even if
+    /// its type does not match the extension (the blob is what the original was
+    /// extracted from, so it does not in practice): a new path would need a new fact.
+    fn repair_cover_file(blob_abs: &Path, cover_abs: &Path) -> CoverRepair {
+        match Self::best_cover_picture(blob_abs) {
+            Ok(Some(picture)) => match Self::store_cover_file(cover_abs, &picture.data) {
+                Ok(()) => CoverRepair::Repaired,
+                Err(e) => {
+                    tracing::warn!(error = %e, path = %cover_abs.display(), "Failed to write repaired cover");
+                    CoverRepair::Failed
+                }
+            },
+            Ok(None) => {
+                tracing::info!(blob = %blob_abs.display(), cover = %cover_abs.display(), "Cover file is missing and the blob has no embedded picture; fact left alone");
+                CoverRepair::NoArt
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, blob = %blob_abs.display(), "Cannot read the blob to repair its cover");
+                CoverRepair::Failed
+            }
+        }
+    }
+
     /// Extract the best available picture from an audio file and write it to cover-art storage.
     ///
     /// Returns the relative path (e.g. `cover-art/<hash>.jpg`) on success, or `None` if no
     /// picture is present or writing fails.
     fn extract_and_store_cover_art(
         &self,
-        blob_path: &PathBuf,
+        blob_path: &Path,
         content_hash: &ContentHash,
     ) -> Option<PathBuf> {
-        use audio_metadata::{extract_pictures, PictureType};
+        self.try_extract_and_store_cover_art(blob_path, content_hash)
+            .ok()
+            .flatten()
+    }
 
-        let pictures = match extract_pictures(blob_path) {
-            Ok(p) => p,
+    /// [`extract_and_store_cover_art`](Self::extract_and_store_cover_art) telling "no
+    /// (usable) picture" (`Ok(None)`) from a failure (`Err`).
+    fn try_extract_and_store_cover_art(
+        &self,
+        blob_path: &Path,
+        content_hash: &ContentHash,
+    ) -> Result<Option<PathBuf>, ()> {
+        let picture = match Self::best_cover_picture(blob_path) {
+            Ok(Some(p)) => p,
+            Ok(None) => return Ok(None),
             Err(e) => {
                 tracing::debug!(error = %e, "Failed to extract pictures from blob");
-                return None;
+                return Err(());
             }
         };
 
-        if pictures.is_empty() {
-            return None;
-        }
-
-        // Prefer CoverFront; fall back to first available
-        let picture = pictures
-            .iter()
-            .find(|p| p.picture_type == PictureType::CoverFront)
-            .or_else(|| pictures.first())?;
-
-        let ext = Self::mime_to_ext(&picture.mime_type)?;
+        let Some(ext) = Self::mime_to_ext(&picture.mime_type) else {
+            return Ok(None);
+        };
 
         let hash_clean = content_hash
             .as_str()
@@ -670,86 +869,177 @@ impl LibraryService {
         let rel_path = PathBuf::from("cover-art").join(&filename);
         let abs_path = self.music_dir.join(&rel_path);
 
-        // Ensure cover-art directory exists
-        if let Some(parent) = abs_path.parent() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
-                tracing::warn!(error = %e, "Failed to create cover-art directory");
-                return None;
-            }
-        }
-
-        if let Err(e) = std::fs::write(&abs_path, &picture.data) {
+        if let Err(e) = Self::store_cover_file(&abs_path, &picture.data) {
             tracing::warn!(error = %e, path = %abs_path.display(), "Failed to write cover art");
-            return None;
+            return Err(());
         }
 
         tracing::debug!(path = %rel_path.display(), "Stored cover art");
-        Some(rel_path)
+        Ok(Some(rel_path))
     }
 
-    /// Backfill CoverArtPath facts for tracks that don't have cover art stored yet.
+    /// Sort the live tracks that have a blob by the state of their cover. A cover is
+    /// present when the track has a live `CoverArtPath` fact AND that file exists under
+    /// the music dir; this is the one check startup and `ReindexCovers` share. Only
+    /// stats files: cheap enough to run on every start. A zero-length file is not a
+    /// cover. A fact naming a path outside `cover-art/` is counted failed, never
+    /// repaired: a fact must not steer a write out of the store.
     ///
-    /// Returns the number of CoverArtPath facts written.
-    fn backfill_cover_art(&self, has_cover_art: &HashSet<String>) -> usize {
-        let tracks = self.tracks.lock().unwrap();
-
-        // Collect tracks that need backfill: have a blob_path but no CoverArtPath fact,
-        // and are not retired by a `Replaces`
-        let needs_backfill: Vec<_> = tracks
+    /// Limit: only a track's own fact is checked. An heir showing a cover inherited
+    /// from a retired loser (ADR-013) whose file is gone stays broken: the loser is
+    /// retired, so its blob is skipped here.
+    fn scan_covers(&self) -> CoverScan {
+        // Copy out under the lock; stat after releasing it.
+        let candidates: Vec<(ContentHash, PathBuf, Option<PathBuf>)> = self
+            .tracks
+            .lock()
+            .unwrap()
             .iter()
             .filter(|t| !t.is_retired())
-            .filter(|t| !has_cover_art.contains(t.content_hash.as_str()))
             .filter(|t| !t.blob_path.as_os_str().is_empty())
-            .map(|t| (t.content_hash.clone(), t.blob_path.clone()))
+            .map(|t| {
+                (
+                    t.content_hash.clone(),
+                    t.blob_path.clone(),
+                    t.cover_art_path.clone(),
+                )
+            })
             .collect();
 
-        drop(tracks);
-
-        if needs_backfill.is_empty() {
-            return 0;
-        }
-
-        tracing::info!(
-            count = needs_backfill.len(),
-            "Backfilling CoverArtPath facts for tracks"
-        );
-
-        let fact_source = self.sources.derived.clone();
-
-        // Written facts are projected through the single path when the batch ends.
-        let backfilled = self.write_batch_and_project_with(&self.acid_client, |w| {
-            let mut backfilled = 0;
-            for (hash, blob_rel_path) in &needs_backfill {
-                let blob_abs = self.music_dir.join(blob_rel_path);
-                if let Some(rel_path) = self.extract_and_store_cover_art(&blob_abs, hash) {
-                    let value = MusicValue::CoverArtPath(rel_path.to_string_lossy().to_string());
-                    if w.write_music_facts(hash, &[(value, fact_source.clone())])
-                        .is_ok()
-                    {
-                        backfilled += 1;
+        let mut scan = CoverScan::default();
+        for (hash, blob, cover) in candidates {
+            match cover {
+                Some(cover) => {
+                    let present = std::fs::metadata(self.music_dir.join(&cover))
+                        .map(|m| m.is_file() && m.len() > 0)
+                        .unwrap_or(false);
+                    if present {
+                        scan.present += 1;
+                    } else if dedup::is_store_path(&cover, "cover-art") {
+                        scan.dangling.push((hash, blob, cover));
+                    } else {
+                        tracing::warn!(
+                            hash = %hash.as_str(), cover = %cover.display(),
+                            "Cover fact names a path outside cover-art/; not repairing"
+                        );
+                        scan.failed += 1;
                     }
                 }
+                None => scan.missing.push((hash, blob)),
             }
-            backfilled
-        });
-
-        tracing::info!(backfilled, "CoverArtPath fact backfill complete");
-        backfilled
+        }
+        scan
     }
 
-    /// Re-extract and store cover art for all tracks missing a CoverArtPath fact.
-    /// Returns the number of tracks processed.
-    fn reindex_covers_internal(&self) -> usize {
-        let has_cover_art: HashSet<String> = {
-            let tracks = self.tracks.lock().unwrap();
-            tracks
-                .iter()
-                .filter(|t| t.cover_art_path.is_some())
-                .map(|t| t.content_hash.as_str().to_owned())
-                .collect()
-        };
+    /// Whether a live track `hash` still names `cover` as its cover. Call under
+    /// `retire_gate`: a retire that finishes after the check cannot have its cover file
+    /// written meanwhile.
+    fn names_cover(&self, _gate: &RetireGuard<'_>, hash: &ContentHash, cover: &Path) -> bool {
+        self.tracks.lock().unwrap().iter().any(|t| {
+            t.content_hash.as_str() == hash.as_str()
+                && !t.is_retired()
+                && t.cover_art_path.as_deref() == Some(cover)
+        })
+    }
 
-        self.backfill_cover_art(&has_cover_art)
+    /// Re-extract the file of every `dangling` cover fact. Writes files, never facts.
+    /// One outcome per cover path: tracks sharing a path are tried in order and the
+    /// first blob with art wins. Each write is made under `retire_gate` after checking
+    /// that a live track still names the path, so a track retired meanwhile gets no
+    /// orphan file.
+    fn repair_dangling_covers(
+        &self,
+        dangling: &[(ContentHash, PathBuf, PathBuf)],
+        summary: &mut CoverSummary,
+    ) {
+        let mut by_cover: Vec<(&PathBuf, Vec<(&ContentHash, &PathBuf)>)> = Vec::new();
+        for (hash, blob, cover) in dangling {
+            match by_cover.iter_mut().find(|(c, _)| *c == cover) {
+                Some((_, owners)) => owners.push((hash, blob)),
+                None => by_cover.push((cover, vec![(hash, blob)])),
+            }
+        }
+
+        for (cover, owners) in by_cover {
+            let mut outcome = None;
+            for (hash, blob) in owners {
+                let gate = self.retire_gate.lock().unwrap();
+                if !self.names_cover(&gate, hash, cover) {
+                    tracing::debug!(cover = %cover.display(), "Track retired or cover changed; not repairing");
+                    continue;
+                }
+                let result = Self::repair_cover_file(
+                    &self.music_dir.join(blob),
+                    &self.music_dir.join(cover),
+                );
+                drop(gate);
+                let done = matches!(result, CoverRepair::Repaired);
+                // A failure outranks "no art" when no later owner repairs it.
+                outcome = match (outcome, result) {
+                    (Some(CoverRepair::Failed), CoverRepair::NoArt) => Some(CoverRepair::Failed),
+                    (_, r) => Some(r),
+                };
+                if done {
+                    break;
+                }
+            }
+            match outcome {
+                Some(CoverRepair::Repaired) => summary.repaired += 1,
+                Some(CoverRepair::NoArt) => summary.no_art += 1,
+                Some(CoverRepair::Failed) => summary.failed += 1,
+                None => {}
+            }
+        }
+    }
+
+    /// Extract the art of every `missing` track (no cover fact) and assert its
+    /// `CoverArtPath`, through `client`.
+    fn extract_missing_covers(
+        &self,
+        client: &AcidClient,
+        missing: &[(ContentHash, PathBuf)],
+        summary: &mut CoverSummary,
+    ) {
+        if missing.is_empty() {
+            return;
+        }
+        let fact_source = self.sources.derived.clone();
+        // Written facts are projected through the single path when the batch ends.
+        self.write_batch_and_project_with(client, |w| {
+            for (hash, blob_rel) in missing {
+                let blob_abs = self.music_dir.join(blob_rel);
+                match self.try_extract_and_store_cover_art(&blob_abs, hash) {
+                    Ok(Some(rel_path)) => {
+                        let value =
+                            MusicValue::CoverArtPath(rel_path.to_string_lossy().to_string());
+                        match w.write_music_facts(hash, &[(value, fact_source.clone())]) {
+                            Ok(_) => summary.extracted += 1,
+                            Err(_) => summary.failed += 1,
+                        }
+                    }
+                    Ok(None) => summary.no_art += 1,
+                    Err(()) => summary.failed += 1,
+                }
+            }
+        });
+    }
+
+    /// Make every live track's cover present (see [`scan_covers`](Self::scan_covers)):
+    /// a fact whose file is gone gets its file re-extracted from the blob (no fact is
+    /// written), a track with no fact gets the art extracted and a `CoverArtPath` fact
+    /// asserted through `client`. Runs to the end on the calling thread. Logs and
+    /// returns the summary.
+    fn heal_covers_with(&self, client: &AcidClient) -> CoverSummary {
+        let scan = self.scan_covers();
+        let mut summary = CoverSummary {
+            present: scan.present,
+            failed: scan.failed,
+            ..CoverSummary::default()
+        };
+        self.repair_dangling_covers(&scan.dangling, &mut summary);
+        self.extract_missing_covers(client, &scan.missing, &mut summary);
+        summary.log();
+        summary
     }
 
     // =========================================================================
@@ -761,7 +1051,7 @@ impl LibraryService {
     ///
     /// Each line is a JSON-serialised `Fact<ContentHash, MusicValue, FactSource>`.
     /// Lines that do not parse are warned about and skipped.
-    pub fn apply_stream_lines(&self, lines: &[String]) {
+    fn apply_stream_lines(&self, lines: &[String]) {
         let (facts, unparseable) = parse_fact_lines(lines);
         self.unparseable_lines
             .fetch_add(unparseable, Ordering::Relaxed);
@@ -804,11 +1094,16 @@ impl LibraryService {
     ///
     /// Run once after *all* pages of a catch-up, never per line or per page, so an
     /// ingest batch split across a page boundary is not dropped half-way.
+    ///
+    /// The album covers are rebuilt from the swept index here, the one place the
+    /// projection catches up, so a cover asserted or retracted after start shows
+    /// (ADR-030 §1.3).
     fn drop_non_live(&self) {
         let mut tracks = self.tracks.lock().unwrap();
         let mut content_hashes = self.content_hashes.lock().unwrap();
         retain_live(&mut tracks, &mut content_hashes);
         self.tracks_indexed.store(tracks.len(), Ordering::Relaxed);
+        *self.album_cover_cache.lock().unwrap() = AlbumCovers::build(&tracks);
     }
 
     /// Project every ACID stream line this service has not yet seen, using the
@@ -973,7 +1268,9 @@ impl LibraryService {
             }
 
             LibraryRequest::ListMarked { filter } => {
-                LibraryResponse::Tracks(self.tracks_where(|t| t.has_mark(&filter), None))
+                LibraryResponse::Tracks(self.with_catalog(|tracks, covers| {
+                    library_projection::marked(tracks, covers, &filter)
+                }))
             }
 
             LibraryRequest::GetTrack { hash } => match self.get_track(&hash) {
@@ -995,14 +1292,7 @@ impl LibraryService {
             }
 
             LibraryRequest::GetFactValues { fact_type } => {
-                let mut values: Vec<String> = self
-                    .fact_index
-                    .lock()
-                    .unwrap()
-                    .get(&fact_type)
-                    .map(|s| s.iter().cloned().collect())
-                    .unwrap_or_default();
-                values.sort();
+                let values = fact_values(&self.fact_index.lock().unwrap(), &fact_type);
                 LibraryResponse::FactValues(values)
             }
 
@@ -1061,123 +1351,112 @@ impl LibraryService {
                 }
             }
 
-            LibraryRequest::PlaylistList => {
-                let dir = self.metadata_dir.join("playlists");
-                let mut names: Vec<library_ipc_protocol::PlaylistName> = std::fs::read_dir(&dir)
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|e| e.ok())
-                    .filter_map(|e| {
-                        let path = e.path();
-                        if path.extension().and_then(|x| x.to_str()) == Some("plist") {
-                            path.file_stem()
-                                .and_then(|s| s.to_str())
-                                .and_then(|s| library_ipc_protocol::PlaylistName::new(s).ok())
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-                names.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+            LibraryRequest::PlaylistList => LibraryResponse::PlaylistNames(self.playlist_names()),
+
+            LibraryRequest::PlaylistSearch { query } => {
+                let matcher = library_search::StringMatcher::new(&query);
+                let mut names = self.playlist_names();
+                names.retain(|n| matcher.matches(n.as_str()));
                 LibraryResponse::PlaylistNames(names)
             }
 
-            LibraryRequest::PlaylistGet { name } => {
-                let path = self.resolve_playlist_path(&name);
-                match std::fs::read_to_string(&path) {
-                    Ok(content) => {
-                        // Lazy repair: follow Replaces chain for any unresolvable hash lines.
-                        // If a repair is found the playlist file is amended in place (one-time heal).
-                        let repaired = self.repair_playlist_content(&content, &path);
-                        LibraryResponse::PlaylistContent(repaired)
+            LibraryRequest::PlaylistGet { name } => self.with_playlist(&name, |_, content| {
+                LibraryResponse::PlaylistContent(content.to_string())
+            }),
+
+            LibraryRequest::PlaylistEntries { name } => self.with_playlist(&name, |_, content| {
+                let tracks = self.tracks.lock().unwrap();
+                LibraryResponse::PlaylistEntries(playlist_edit::entries(content, &tracks))
+            }),
+
+            LibraryRequest::PlaylistSnapshot { name } => self.with_playlist(&name, |_, content| {
+                let tracks = self.tracks.lock().unwrap();
+                LibraryResponse::PlaylistSnapshot(playlist_edit::snapshot(content, &tracks))
+            }),
+
+            LibraryRequest::PlaylistEdit { name, version, ops } => {
+                // The outcome carries TrackInfo, so plays are refreshed like for
+                // every such read, before the playlists lock (ADR-030 §1.3).
+                self.refresh_lineage();
+                self.with_playlist(&name, |path, content| {
+                    let planned = {
+                        let tracks = self.tracks.lock().unwrap();
+                        playlist_edit::plan_edit(content, &version, &ops, &tracks, |t| {
+                            self.to_track_info(t)
+                        })
+                    };
+                    match planned {
+                        Ok(planned) => commit_playlist(path, planned),
+                        Err(e) => LibraryResponse::Error(e),
                     }
-                    Err(_) => LibraryResponse::Error(ProtocolError::PlaylistNotFound {
-                        name: name.to_string(),
-                    }),
-                }
+                })
+            }
+
+            LibraryRequest::PlaylistRevert {
+                name,
+                version,
+                content: to,
+            } => self.with_playlist(&name, |path, content| {
+                let planned = {
+                    let tracks = self.tracks.lock().unwrap();
+                    playlist_edit::plan_revert(content, &version, &to, &tracks)
+                };
+                commit_playlist(path, planned)
+            }),
+
+            LibraryRequest::PlaylistDelete { name, version } => {
+                self.with_playlist(&name, |path, content| {
+                    let verdict = {
+                        let tracks = self.tracks.lock().unwrap();
+                        playlist_edit::plan_delete(content, &version, &tracks)
+                    };
+                    match verdict {
+                        Ok(()) => remove_playlist_file(path, LibraryResponse::PlaylistDeleted),
+                        Err(current) => LibraryResponse::PlaylistDeleteConflict { current },
+                    }
+                })
             }
 
             LibraryRequest::PlaylistNew { name, content } => {
+                let _lock = self.playlists_lock.lock().unwrap();
                 let path = self.resolve_playlist_path(&name);
                 if path.exists() {
                     LibraryResponse::Error(ProtocolError::PlaylistAlreadyExists {
                         name: name.to_string(),
                     })
                 } else {
-                    if let Some(parent) = path.parent() {
-                        if let Err(e) = std::fs::create_dir_all(parent) {
-                            return LibraryResponse::Error(ProtocolError::Internal {
-                                message: format!("Failed to create playlist directory: {}", e),
-                            });
-                        }
-                    }
-                    match std::fs::write(&path, &content) {
+                    match write_playlist_atomic(&path, content.as_bytes()) {
                         Ok(()) => LibraryResponse::PlaylistContent(content),
-                        Err(e) => LibraryResponse::Error(ProtocolError::Internal {
-                            message: format!("Failed to write playlist: {}", e),
-                        }),
+                        Err(e) => LibraryResponse::Error(e),
                     }
                 }
             }
 
             LibraryRequest::PlaylistAppend { name, content } => {
-                let path = self.resolve_playlist_path(&name);
-                if !path.exists() {
-                    return LibraryResponse::Error(ProtocolError::PlaylistNotFound {
-                        name: name.to_string(),
-                    });
-                }
-                match std::fs::read_to_string(&path) {
-                    Ok(existing) => {
-                        let mut new_content = existing;
-                        if !new_content.is_empty() && !new_content.ends_with('\n') {
-                            new_content.push('\n');
-                        }
-                        new_content.push_str(&content);
-                        if let Some(parent) = path.parent() {
-                            if let Err(e) = std::fs::create_dir_all(parent) {
-                                return LibraryResponse::Error(ProtocolError::Internal {
-                                    message: format!("Failed to create playlist directory: {}", e),
-                                });
-                            }
-                        }
-                        match std::fs::write(&path, &new_content) {
-                            Ok(()) => LibraryResponse::PlaylistContent(new_content),
-                            Err(e) => LibraryResponse::Error(ProtocolError::Internal {
-                                message: format!("Failed to write playlist: {}", e),
-                            }),
-                        }
+                self.with_playlist(&name, |path, existing| {
+                    let new_content = playlist_edit::appended(existing, &content);
+                    match write_playlist_atomic(path, new_content.as_bytes()) {
+                        Ok(()) => LibraryResponse::PlaylistContent(new_content),
+                        Err(e) => LibraryResponse::Error(e),
                     }
-                    Err(e) => LibraryResponse::Error(ProtocolError::Internal {
-                        message: format!("Failed to read playlist: {}", e),
-                    }),
-                }
+                })
             }
 
             LibraryRequest::PlaylistReplace { name, content } => {
+                let _lock = self.playlists_lock.lock().unwrap();
                 let path = self.resolve_playlist_path(&name);
-                if let Some(parent) = path.parent() {
-                    if let Err(e) = std::fs::create_dir_all(parent) {
-                        return LibraryResponse::Error(ProtocolError::Internal {
-                            message: format!("Failed to create playlist directory: {}", e),
-                        });
-                    }
-                }
-                match std::fs::write(&path, &content) {
+                match write_playlist_atomic(&path, content.as_bytes()) {
                     Ok(()) => LibraryResponse::PlaylistContent(content),
-                    Err(e) => LibraryResponse::Error(ProtocolError::Internal {
-                        message: format!("Failed to write playlist: {}", e),
-                    }),
+                    Err(e) => LibraryResponse::Error(e),
                 }
             }
 
             LibraryRequest::PlaylistRename { from, to } => {
+                let _lock = self.playlists_lock.lock().unwrap();
                 let from_path = self.resolve_playlist_path(&from);
                 let to_path = self.resolve_playlist_path(&to);
                 if !from_path.exists() {
-                    return LibraryResponse::Error(ProtocolError::PlaylistNotFound {
-                        name: from.to_string(),
-                    });
+                    return LibraryResponse::Error(playlist_not_found(&from));
                 }
                 if to_path.exists() {
                     return LibraryResponse::Error(ProtocolError::PlaylistAlreadyExists {
@@ -1193,25 +1472,22 @@ impl LibraryService {
             }
 
             LibraryRequest::PlaylistRemove { name } => {
+                let _lock = self.playlists_lock.lock().unwrap();
                 let path = self.resolve_playlist_path(&name);
                 if !path.exists() {
-                    return LibraryResponse::Error(ProtocolError::PlaylistNotFound {
-                        name: name.to_string(),
-                    });
+                    return LibraryResponse::Error(playlist_not_found(&name));
                 }
-                match std::fs::remove_file(&path) {
-                    Ok(()) => LibraryResponse::Pong,
-                    Err(e) => LibraryResponse::Error(ProtocolError::Internal {
-                        message: format!("Failed to remove playlist: {}", e),
-                    }),
-                }
+                remove_playlist_file(&path, LibraryResponse::Pong)
             }
 
             LibraryRequest::ReindexCovers => {
-                let reindexed = self.reindex_covers_internal();
+                let s = self.heal_covers_with(&self.acid_client);
                 LibraryResponse::IngestResult(IngestResult::Success {
                     hash: None,
-                    message: format!("Cover art reindexed for {} tracks", reindexed),
+                    message: format!(
+                        "Cover art: {} present, {} repaired, {} extracted, {} without art, {} failed",
+                        s.present, s.repaired, s.extracted, s.no_art, s.failed
+                    ),
                 })
             }
 
@@ -1717,7 +1993,7 @@ impl LibraryService {
 
         // Neither of these takes the gate (it is not reentrant), and neither needs it.
         let playlists_rewritten = self.rewrite_playlists_replace_hash(loser, winner);
-        self.refresh_event_timestamps();
+        self.refresh_lineage();
 
         Ok(MergeOutcome {
             playlists_rewritten,
@@ -1844,7 +2120,8 @@ impl LibraryService {
         old_hash: &ContentHash,
         new_hash: &ContentHash,
     ) -> usize {
-        use std::io::Write;
+        // Held for the whole sweep: no edit lands between a read and its write.
+        let _lock = self.playlists_lock.lock().unwrap();
 
         let playlists_dir = self.metadata_dir.join("playlists");
         let old_clean = hash_key(old_hash.as_str());
@@ -1868,49 +2145,26 @@ impl LibraryService {
                 Err(_) => continue,
             };
 
-            let mut changed = false;
-            let new_content: String = content
-                .lines()
-                .map(|line| {
-                    // First whitespace-delimited field is the hash token
-                    let token = line.split_whitespace().next().unwrap_or("");
+            // Only the token of a matching line changes; the rest of the file,
+            // line endings included, stays as it was.
+            let Some(rewritten) = playlist_edit::replace_tokens(
+                &playlist_edit::PlaylistDoc::parse(&content),
+                |token| {
                     let token_clean = hash_key(token);
-
                     // A line matches if the stored token is a prefix of the old full hash,
                     // or the full hash starts with the stored token (short-hash support)
-                    if !token_clean.is_empty()
+                    (!token_clean.is_empty()
                         && (old_clean.starts_with(&token_clean)
-                            || token_clean.starts_with(&old_clean))
-                    {
-                        changed = true;
-                        // Replace only the hash token; preserve rest of line verbatim
-                        let rest = line[token.len()..].to_string();
-                        format!("{}{}", new_token, rest)
-                    } else {
-                        line.to_string()
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-
-            // Preserve trailing newline if original had one
-            let new_content = if content.ends_with('\n') {
-                format!("{}\n", new_content)
-            } else {
-                new_content
+                            || token_clean.starts_with(&old_clean)))
+                    .then(|| new_token.clone())
+                },
+            ) else {
+                continue;
             };
+            let new_content = rewritten.render();
 
-            if changed {
-                // Write atomically via temp file
-                let tmp_path = path.with_extension("plist.tmp");
-                if let Ok(mut f) = std::fs::File::create(&tmp_path) {
-                    if f.write_all(new_content.as_bytes()).is_ok() {
-                        let _ = std::fs::rename(&tmp_path, &path);
-                        total_rewritten += 1;
-                    } else {
-                        let _ = std::fs::remove_file(&tmp_path);
-                    }
-                }
+            if write_playlist_atomic(&path, new_content.as_bytes()).is_ok() {
+                total_rewritten += 1;
             }
         }
 
@@ -2002,6 +2256,28 @@ impl LibraryService {
         LibraryResponse::OrphansList(orphans)
     }
 
+    /// The names of all playlists on disk, sorted.
+    fn playlist_names(&self) -> Vec<library_ipc_protocol::PlaylistName> {
+        let dir = self.metadata_dir.join("playlists");
+        let mut names: Vec<library_ipc_protocol::PlaylistName> = std::fs::read_dir(&dir)
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e.ok())
+            .filter_map(|e| {
+                let path = e.path();
+                if path.extension().and_then(|x| x.to_str()) == Some("plist") {
+                    path.file_stem()
+                        .and_then(|s| s.to_str())
+                        .and_then(|s| library_ipc_protocol::PlaylistName::new(s).ok())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        names.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        names
+    }
+
     /// Resolve a PlaylistName to an absolute filesystem path
     fn resolve_playlist_path(&self, name: &library_ipc_protocol::PlaylistName) -> PathBuf {
         self.metadata_dir
@@ -2049,92 +2325,23 @@ impl LibraryService {
 
     /// Convert internal track to protocol TrackInfo
     fn to_track_info(&self, t: &IndexedTrackInfo) -> TrackInfo {
-        TrackInfo {
-            content_hash: t.content_hash.clone(),
-            title: t.title.clone(),
-            artist: t.artist.clone(),
-            album: t.album.clone(),
-            duration: t.duration_seconds.map(DurationSeconds::new),
-            bpm: t.bpm.and_then(|b| Bpm::from_f32(b).ok()),
-            key: t.key.as_ref().and_then(|k| Key::from_traditional(k).ok()),
-            blob_path: Some(t.blob_path.to_string_lossy().to_string()),
-            cover_art_path: t
-                .cover_art_path
-                .as_ref()
-                .map(|p| p.to_string_lossy().to_string())
-                .or_else(|| {
-                    t.album.as_ref().and_then(|album| {
-                        self.album_cover_cache.lock().unwrap().get(album).cloned()
-                    })
-                }),
-            track_number: t.track_number,
-            disc_number: t.disc_number,
-            added: t.added_at.map(|dt| dt.to_rfc3339()),
-            started: t.last_started.map(|dt| dt.to_rfc3339()),
-            stopped: t.last_stopped.map(|dt| dt.to_rfc3339()),
-            memory_cues: t
-                .memory_cues
-                .iter()
-                .map(|c| CueInfo {
-                    position_ms: c.position_ms,
-                    kind: c.kind.clone(),
-                    label: c.label.clone(),
-                    index: c.index,
-                })
-                .collect(),
-            beat_grid: t
-                .beat_grid
-                .and_then(|(first_beat_ms, bpm_f32, beats_per_bar)| {
-                    Bpm::from_f32(bpm_f32).ok().map(|bpm| BeatGridInfo {
-                        first_beat_ms,
-                        bpm,
-                        beats_per_bar,
-                    })
-                }),
-            role: t.role,
-            energy: t.energy,
-        }
+        track_info(t, &self.album_cover_cache.lock().unwrap())
     }
 
-    /// Build a mapping of album name -> cover_art_path from an indexed track list.
-    ///
-    /// Only tracks that have both an album and a cover_art_path contribute to the cache.
-    /// The first cover art path seen for each album wins.
-    fn build_album_cover_cache(tracks: &[IndexedTrackInfo]) -> HashMap<String, String> {
-        let mut cache = HashMap::new();
-        for track in tracks {
-            if let (Some(album), Some(cover)) = (&track.album, &track.cover_art_path) {
-                cache
-                    .entry(album.clone())
-                    .or_insert_with(|| cover.to_string_lossy().to_string());
-            }
-        }
-        cache
+    /// Run a read that returns `TrackInfo` over the track index and the album covers,
+    /// taking the locks in their documented order (`tracks` -> `album_cover_cache`).
+    /// Plays are refreshed first, for every such read (ADR-030 §1.3), so the answer
+    /// matches a local fold of the same log.
+    fn with_catalog<R>(&self, read: impl FnOnce(&[IndexedTrackInfo], &AlbumCovers) -> R) -> R {
+        self.refresh_lineage();
+        let tracks = self.tracks.lock().unwrap();
+        let covers = self.album_cover_cache.lock().unwrap();
+        read(&tracks, &covers)
     }
 
     /// List tracks from in-memory index (hidden tracks excluded)
     fn list_tracks(&self, limit: Option<usize>) -> Vec<TrackInfo> {
-        self.tracks_where(|_| true, limit)
-    }
-
-    /// Visible tracks from the in-memory index that match `filter` (hidden tracks
-    /// excluded), optionally limited.
-    fn tracks_where(
-        &self,
-        filter: impl Fn(&IndexedTrackInfo) -> bool,
-        limit: Option<usize>,
-    ) -> Vec<TrackInfo> {
-        let tracks = self.tracks.lock().unwrap();
-
-        let iter = tracks
-            .iter()
-            .filter(|t| !t.is_hidden() && filter(t))
-            .map(|t| self.to_track_info(t));
-
-        match limit {
-            Some(n) => iter.take(n).collect(),
-            None => iter.collect(),
-        }
+        self.with_catalog(|tracks, covers| visible(tracks, covers, limit))
     }
 
     /// Apply `mark` to a track unless the track already carries it live; then
@@ -2190,36 +2397,19 @@ impl LibraryService {
     /// Resolve a partial hash to a full hash (like git short refs)
     fn resolve_hash(&self, partial: &ContentHash) -> Result<ContentHash, ProtocolError> {
         let tracks = self.tracks.lock().unwrap();
-        match resolve_prefix(&tracks, partial.as_str()) {
-            Ok(track) => Ok(track.content_hash.clone()),
-            Err(Unresolved::NotFound) => Err(ProtocolError::TrackNotFound {
-                hash: partial.as_str().to_owned(),
-            }),
-            Err(Unresolved::Ambiguous(found)) => Err(ProtocolError::Internal {
-                message: ambiguity_message(partial.as_str(), &found),
-            }),
-        }
+        resolve_prefix(&tracks, partial.as_str())
+            .map(|track| track.content_hash.clone())
+            .map_err(|unresolved| unresolved_error(partial.as_str(), unresolved))
     }
 
     /// Get track by hash from in-memory index (supports partial hashes).
     /// Returns TrackNotFound for hidden (deleted/superseded) tracks.
     fn get_track(&self, hash: &ContentHash) -> Result<TrackInfo, ProtocolError> {
-        let full_hash = self.resolve_hash(hash)?;
-
-        let tracks = self.tracks.lock().unwrap();
-        let track = tracks
-            .iter()
-            .find(|t| t.content_hash.as_str() == full_hash.as_str());
-
-        match track {
-            Some(t) if t.is_hidden() => Err(ProtocolError::TrackNotFound {
-                hash: hash.as_str().to_owned(),
-            }),
-            Some(t) => Ok(self.to_track_info(t)),
-            None => Err(ProtocolError::TrackNotFound {
-                hash: hash.as_str().to_owned(),
-            }),
-        }
+        self.with_catalog(|tracks, covers| {
+            resolve_visible(tracks, hash.as_str())
+                .map(|track| track_info(track, covers))
+                .map_err(|unresolved| unresolved_error(hash.as_str(), unresolved))
+        })
     }
 
     /// Get all facts for a track by hash (supports partial hashes)
@@ -2227,8 +2417,6 @@ impl LibraryService {
         &self,
         hash: &ContentHash,
     ) -> Result<(ContentHash, Vec<(String, String)>), ProtocolError> {
-        use music_facts::FactSource;
-
         let full_hash = self.resolve_hash(hash)?;
 
         let lines = self
@@ -2238,16 +2426,7 @@ impl LibraryService {
                 message: format!("Failed to read entity from ACID: {}", e),
             })?;
 
-        let facts: Vec<_> = lines
-            .iter()
-            .filter_map(|line| {
-                serde_json::from_str::<stainless_facts::Fact<ContentHash, MusicValue, FactSource>>(
-                    line,
-                )
-                .ok()
-            })
-            .map(|f| format_fact_for_display(f.value()))
-            .collect();
+        let facts = entity_facts(lines.iter().map(String::as_str), &full_hash);
 
         if facts.is_empty() {
             Err(ProtocolError::TrackNotFound {
@@ -2258,8 +2437,10 @@ impl LibraryService {
         }
     }
 
-    /// Read new TrackStarted/TrackStopped facts from the ACID stream (since the last
-    /// call) and update `last_started` / `last_stopped` in the in-memory index.
+    /// Read the new plays and cover art facts and `Replaces` assertions from the ACID
+    /// stream (since the last call) into `lineage`, and apply the lineage to the
+    /// in-memory index: `last_started` / `last_stopped`, the cover a track inherits,
+    /// and the album covers.
     ///
     /// Uses `event_cursor` (a separate cursor from the subscriber's `cursor`) so that
     /// the background fact subscriber and this refresh path don't interfere with each
@@ -2277,10 +2458,17 @@ impl LibraryService {
     /// transitively replaces, with their original timestamps (ADR-013), so a merged
     /// or replaced track keeps its predecessors' history. Events keyed by the short
     /// hashes older playback wrote (#86) resolve to the full hash. Every event seen
-    /// is remembered in `play_events`, whether or not its entity is still live, and
+    /// is remembered in `lineage`, whether or not its entity is still live, and
     /// the lineage is re-applied on every refresh so a `Replaces` asserted after the
-    /// events were read takes effect too.
-    fn refresh_event_timestamps(&self) {
+    /// events were read takes effect too. The same goes for the cover a track
+    /// without one of its own inherits, and the album covers are rebuilt from it.
+    ///
+    /// When a page cannot be read, the pages read before it are still applied and the
+    /// cursor stays after the last of them, so the next refresh goes on from there.
+    /// `lineage_current` records whether the last refresh read to the end of the
+    /// stream, so that what must not act on a stale lineage (the archiving of a cover)
+    /// can tell; it must also have refreshed after the writes it depends on.
+    fn refresh_lineage(&self) {
         const PAGE_SIZE: usize = 10_000;
 
         // Held for the whole refresh, like `cursor` in `catch_up_with`: concurrent
@@ -2288,8 +2476,9 @@ impl LibraryService {
         let mut event_cursor = self.event_cursor.lock().unwrap();
         let mut current_cursor = event_cursor.clone();
 
-        // The play events since the last refresh, per normalised entity key.
-        let mut delta = PlayLog::default();
+        // The lineage events since the last refresh, per normalised entity key.
+        let mut delta = LineageLog::default();
+        let mut caught_up = true;
 
         loop {
             let chunk = match self
@@ -2300,9 +2489,10 @@ impl LibraryService {
                 Err(e) => {
                     tracing::warn!(
                         error = %e,
-                        "refresh_event_timestamps: ACID read failed, skipping refresh"
+                        "refresh_lineage: ACID read failed, applying the pages read so far"
                     );
-                    return;
+                    caught_up = false;
+                    break;
                 }
             };
 
@@ -2319,50 +2509,27 @@ impl LibraryService {
             }
         }
 
-        // Advance the stored cursor so the next call only reads new facts.
+        // Advance the stored cursor (to the last page read) so the next call only
+        // reads new facts.
         *event_cursor = current_cursor;
 
         let mut tracks = self.tracks.lock().unwrap();
-        let mut events = self.play_events.lock().unwrap();
-        events.merge(delta);
+        let mut lineage = self.lineage.lock().unwrap();
+        lineage.merge(delta);
 
-        // Apply each track's lineage (itself and what it replaces) to the index.
-        events.apply_to(&mut tracks);
+        // Apply each track's lineage (itself and what it replaces) to the index: plays
+        // and the cover a track without one inherits.
+        lineage.apply_to(&mut tracks);
+        drop(lineage);
+        // The album covers follow it, so they never name a cover another lineage
+        // reading would not. `lineage` is let go first: nothing is taken inside it.
+        *self.album_cover_cache.lock().unwrap() = AlbumCovers::build(&tracks);
+        self.lineage_current.store(caught_up, Ordering::Relaxed);
     }
 
     /// Search tracks by structured query (uses library-search for evaluation; hidden tracks excluded)
     fn search_tracks(&self, query: &TrackQuery) -> Vec<TrackInfo> {
-        if query.started.is_some() || query.stopped.is_some() {
-            self.refresh_event_timestamps();
-        }
-        let tracks = self.tracks.lock().unwrap();
-
-        tracks
-            .iter()
-            .filter(|t| !t.is_hidden())
-            .filter(|t| {
-                let fields = TrackFields {
-                    title: t.title.as_deref(),
-                    artist: t.artist.as_deref(),
-                    album: t.album.as_deref(),
-                    label: t.label.as_deref(),
-                    genre: t.genre.as_deref(),
-                    styles: &t.styles,
-                    bpm: t.bpm,
-                    key: t.key.as_deref(),
-                    duration: t.duration_seconds,
-                    year: t.year,
-                    source: t.source.as_deref(),
-                    last_started: t.last_started,
-                    last_stopped: t.last_stopped,
-                    added: t.added_at,
-                    role: t.role,
-                    energy: t.energy.map(u8::from),
-                };
-                matches_query(query, &fields)
-            })
-            .map(|t| self.to_track_info(t))
-            .collect()
+        self.with_catalog(|tracks, covers| search(tracks, covers, query))
     }
 
     /// Ingest a file from the inbox
@@ -2648,7 +2815,10 @@ impl LibraryService {
     ///
     /// "Live" means: the track is in the index AND is not hidden (deleted_at is None).
     /// This is stricter than resolve_hash (which accepts hidden tracks).
-    fn resolve_through_replaces(&self, hash: &ContentHash) -> Option<ContentHash> {
+    fn resolve_through_replaces(
+        tracks: &[IndexedTrackInfo],
+        hash: &ContentHash,
+    ) -> Option<ContentHash> {
         const MAX_CHAIN_DEPTH: usize = 64;
 
         let normalize = |h: &str| h.strip_prefix("sha256:").unwrap_or(h).to_lowercase();
@@ -2663,22 +2833,19 @@ impl LibraryService {
             let current_clean = normalize(current.as_str());
 
             // Scan all tracks' provenance for Replaces(current)
-            let successor = {
-                let tracks = self.tracks.lock().unwrap();
-                tracks
-                    .iter()
-                    .find(|t| {
-                        t.provenance.iter().any(|(v, _)| {
-                            if let MusicValue::Replaces(old) = v {
-                                let old_clean = normalize(old.as_str());
-                                old_clean == current_clean
-                            } else {
-                                false
-                            }
-                        })
+            let successor = tracks
+                .iter()
+                .find(|t| {
+                    t.provenance.iter().any(|(v, _)| {
+                        if let MusicValue::Replaces(old) = v {
+                            let old_clean = normalize(old.as_str());
+                            old_clean == current_clean
+                        } else {
+                            false
+                        }
                     })
-                    .map(|t| t.content_hash.clone())
-            };
+                })
+                .map(|t| t.content_hash.clone());
 
             match successor {
                 None => {
@@ -2700,13 +2867,9 @@ impl LibraryService {
                     visited.insert(next_clean.clone());
 
                     // Check if next_hash is live (in index and not hidden)
-                    let is_live = {
-                        let tracks = self.tracks.lock().unwrap();
-                        tracks.iter().any(|t| {
-                            let h = normalize(t.content_hash.as_str());
-                            h == next_clean && t.deleted_at.is_none()
-                        })
-                    };
+                    let is_live = tracks.iter().any(|t| {
+                        normalize(t.content_hash.as_str()) == next_clean && !t.is_hidden()
+                    });
 
                     if is_live {
                         return Some(next_hash);
@@ -2725,77 +2888,82 @@ impl LibraryService {
         None
     }
 
+    /// Read a playlist's content verbatim, after the lazy repair: follow the
+    /// Replaces chain for any unresolvable hash line; a repair amends the playlist
+    /// file in place (one-time heal).
+    ///
+    /// A missing file is `PlaylistNotFound`; any other read failure (including
+    /// content that is not UTF-8) is `Internal`.
+    fn read_playlist(
+        &self,
+        lock: &PlaylistsGuard<'_>,
+        name: &PlaylistName,
+        path: &std::path::Path,
+    ) -> Result<String, ProtocolError> {
+        let content = std::fs::read_to_string(path).map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => playlist_not_found(name),
+            _ => ProtocolError::Internal {
+                message: format!("Failed to read playlist {name}: {e}"),
+            },
+        })?;
+        Ok(self.repair_playlist_content(lock, &content, path))
+    }
+
+    /// Run `f` on the path and the repaired content of playlist `name`, holding
+    /// `playlists_lock` from the read to the end of `f`: whatever `f` writes
+    /// replaces exactly the bytes it was given. A missing playlist is
+    /// `PlaylistNotFound`.
+    fn with_playlist(
+        &self,
+        name: &PlaylistName,
+        f: impl FnOnce(&std::path::Path, &str) -> LibraryResponse,
+    ) -> LibraryResponse {
+        let lock = self.playlists_lock.lock().unwrap();
+        let path = self.resolve_playlist_path(name);
+        match self.read_playlist(&lock, name, &path) {
+            Ok(content) => f(&path, &content),
+            Err(e) => LibraryResponse::Error(e),
+        }
+    }
+
     /// Scan a playlist's content, follow the Replaces chain for any unresolvable
     /// hash, amend lines to the live successor, and persist the file if anything changed.
     ///
     /// Returns the (possibly amended) content string.
-    fn repair_playlist_content(&self, content: &str, plist_path: &std::path::Path) -> String {
-        use std::io::Write;
-
-        let normalize = |h: &str| h.strip_prefix("sha256:").unwrap_or(h).to_lowercase();
-
-        let mut changed = false;
-        let new_lines: Vec<String> = content
-            .lines()
-            .map(|line| {
-                let token = line.split_whitespace().next().unwrap_or("");
-                if token.is_empty() {
-                    return line.to_string();
-                }
-
-                let token_clean = normalize(token);
-                // Build a ContentHash from the token to try resolve_hash
-                let candidate = ContentHash::new(token);
-
-                // Is this hash already live?
-                let is_live = {
-                    let tracks = self.tracks.lock().unwrap();
-                    tracks.iter().any(|t| {
-                        let h = normalize(t.content_hash.as_str());
-                        (h.starts_with(&token_clean) || token_clean.starts_with(&h))
-                            && t.deleted_at.is_none()
-                    })
+    fn repair_playlist_content(
+        &self,
+        _lock: &PlaylistsGuard<'_>,
+        content: &str,
+        plist_path: &std::path::Path,
+    ) -> String {
+        // One view of the index for the whole repair. Only tokens change, so a
+        // file that needs no repair is returned as it was read, byte for byte.
+        let repaired = {
+            let tracks = self.tracks.lock().unwrap();
+            playlist_edit::replace_tokens(&playlist_edit::PlaylistDoc::parse(content), |token| {
+                // Live: the token resolves to a visible track. Ambiguous: leave it.
+                // Unknown or hidden: try the Replaces chain; a dead end leaves the line.
+                let leave_alone = match resolve_prefix(&tracks, token) {
+                    Ok(track) => !track.is_hidden(),
+                    Err(Unresolved::Ambiguous(_)) => true,
+                    Err(Unresolved::NotFound) => false,
                 };
-
-                if is_live {
-                    return line.to_string();
+                if leave_alone {
+                    return None;
                 }
-
-                // Not live — try repair via Replaces chain
-                match self.resolve_through_replaces(&candidate) {
-                    None => {
-                        // Dead end — leave line unchanged
-                        line.to_string()
-                    }
-                    Some(successor) => {
-                        changed = true;
-                        // Replace only the hash token; preserve rest of line verbatim
-                        let rest = line[token.len()..].to_string();
-                        format!("{}{}", successor.as_str(), rest)
-                    }
-                }
+                Self::resolve_through_replaces(&tracks, &ContentHash::new(token))
+                    .map(|successor| successor.as_str().to_string())
             })
-            .collect();
-
-        let new_content = new_lines.join("\n");
-        let new_content = if content.ends_with('\n') {
-            format!("{}\n", new_content)
-        } else {
-            new_content
+        };
+        let Some(repaired) = repaired else {
+            return content.to_string();
         };
 
-        if changed {
-            // Persist atomically via temp file (same approach as rewrite_playlists_replace_hash)
-            let tmp_path = plist_path.with_extension("plist.tmp");
-            if let Ok(mut f) = std::fs::File::create(&tmp_path) {
-                if f.write_all(new_content.as_bytes()).is_ok() {
-                    let _ = std::fs::rename(&tmp_path, plist_path);
-                } else {
-                    let _ = std::fs::remove_file(&tmp_path);
-                }
-            }
+        let new_content = repaired.render();
+        // A failed heal leaves the old file; the next read tries again.
+        if let Err(e) = write_playlist_atomic(plist_path, new_content.as_bytes()) {
+            tracing::warn!(path = %plist_path.display(), "Playlist repair not saved: {e}");
         }
-
         new_content
     }
 }
@@ -2941,6 +3109,7 @@ pub fn spawn_fact_subscriber(service: Arc<LibraryService>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use library_ipc_protocol::{Duplicates, EditOp, EditOutcome, PlaylistVersion};
 
     /// The release version the tests hand the service; deliberately not this
     /// component's own crate version.
@@ -3149,7 +3318,7 @@ mod tests {
         assert_eq!(before.len(), 1, "track should appear before play event");
 
         // Simulate playback service writing a TrackStarted fact via ACID after startup.
-        // refresh_event_timestamps() now reads from the ACID stream incrementally, so
+        // refresh_lineage() now reads from the ACID stream incrementally, so
         // this write will be picked up on the next search_tracks call.
         let source = music_facts::FactSource::new("test-playback", "1.0.0", "Unknown");
         let external_client = AcidClient::connect(&facts_addr).unwrap();
@@ -3367,6 +3536,31 @@ mod tests {
             }
             other => panic!("Expected PlaylistNames, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn playlist_search_uses_the_library_text_rules() {
+        use library_ipc_protocol::PlaylistName;
+        let (service, _dir, _acid) = make_service_with_playlists_dir();
+        for n in ["Carbon-Based-Lifeforms", "warmup"] {
+            service.handle_request(LibraryRequest::PlaylistNew {
+                name: PlaylistName::new(n).unwrap(),
+                content: String::new(),
+            });
+        }
+        let search = |text: &str| match service.handle_request(LibraryRequest::PlaylistSearch {
+            query: library_search::parse_string_query(text),
+        }) {
+            LibraryResponse::PlaylistNames(names) => names
+                .iter()
+                .map(|n| n.as_str().to_string())
+                .collect::<Vec<_>>(),
+            other => panic!("Expected PlaylistNames, got {:?}", other),
+        };
+        // Upper case is an initialism; lower case is a plain "contains".
+        assert_eq!(search("CBL"), ["Carbon-Based-Lifeforms"]);
+        assert!(search("cbl").is_empty());
+        assert_eq!(search("warm"), ["warmup"]);
     }
 
     #[test]
@@ -3661,12 +3855,20 @@ mod tests {
 
         // Use "sha256:abcdef00" as the partial prefix that matches both hashes.
         let partial = ContentHash::new("sha256:abcdef00");
-        let result = service.resolve_hash(&partial);
-        assert!(
-            result.is_err(),
-            "expected Ambiguous error for genuine prefix collision, got: {:?}",
-            result
-        );
+        for result in [
+            service.resolve_hash(&partial).map(|_| ()),
+            service.get_track(&partial).map(|_| ()),
+        ] {
+            match result {
+                Err(ProtocolError::AmbiguousHash { hash, candidates }) => {
+                    assert_eq!(hash, partial.as_str());
+                    assert_eq!(candidates.len(), 2);
+                    assert!(candidates.contains(&hash_a.as_str().to_owned()));
+                    assert!(candidates.contains(&hash_b.as_str().to_owned()));
+                }
+                other => panic!("expected AmbiguousHash, got: {other:?}"),
+            }
+        }
     }
 
     #[test]
@@ -3944,44 +4146,17 @@ mod tests {
     fn make_service_with_facts(
         facts_file: &std::path::Path,
     ) -> (Arc<LibraryService>, tempfile::TempDir) {
-        let music_dir = tempfile::tempdir().unwrap();
-        // Use a shared metadata dir for both ACID and the service so that
-        // acid_service::start() can replay the facts file from it.
-        let metadata_dir = tempfile::tempdir().unwrap();
-        let facts_dest = metadata_dir.path().join("facts.jsonl");
-        std::fs::copy(facts_file, &facts_dest).unwrap();
-
-        let (acid_handle, facts_addr, events_addr) = {
-            let id = ACID_SERVER_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let pid = std::process::id();
-            let fa = format!("ipc:///tmp/mdma-test-acid-facts-{}-{}.sock", pid, id);
-            let ea = format!("ipc:///tmp/mdma-test-acid-events-{}-{}.sock", pid, id);
-            let rep = nng::Socket::new(nng::Protocol::Rep0).expect("rep socket");
-            rep.listen(&fa).expect("rep listen");
-            let pub_sock = nng::Socket::new(nng::Protocol::Pub0).expect("pub socket");
-            pub_sock.listen(&ea).expect("pub listen");
-            let handle = acid_service::start(rep, pub_sock, metadata_dir.path())
-                .expect("failed to start acid server");
-            std::thread::sleep(std::time::Duration::from_millis(20));
-            (handle, fa, ea)
-        };
-
-        let service = LibraryService::new_with_events(
-            music_dir.path().to_path_buf(),
-            metadata_dir.path().to_path_buf(),
-            &facts_addr,
-            &events_addr,
-            test_version(),
-        )
-        .unwrap();
-        // Leak the ACID ServerHandle so the background thread outlives this test.
-        // In a test process this is benign — the process exits when tests finish.
-        Box::leak(Box::new(acid_handle));
+        let (service, metadata_dir, _facts_addr) = make_service_with_facts_and_addr(facts_file);
         (service, metadata_dir)
     }
 
     /// Like `make_service_with_facts` but also returns the ACID request socket address
     /// so the caller can connect an external AcidClient and write additional facts.
+    ///
+    /// The metadata dir is shared by ACID and the service so that
+    /// `acid_service::start()` can replay the facts file from it. The ACID server
+    /// handle is leaked so its background thread outlives the test; in a test process
+    /// that is benign, the process exits when tests finish.
     fn make_service_with_facts_and_addr(
         facts_file: &std::path::Path,
     ) -> (Arc<LibraryService>, tempfile::TempDir, String) {
@@ -4014,7 +4189,7 @@ mod tests {
         (service, metadata_dir, facts_addr)
     }
 
-    /// Verify that refresh_event_timestamps advances the event_cursor so that a
+    /// Verify that refresh_lineage advances the event_cursor so that a
     /// second call does not double-process already-seen facts.
     ///
     /// Step 1: Write TrackStarted for hash_a, call search (triggers refresh).
@@ -4023,7 +4198,7 @@ mod tests {
     ///         hash_b should now appear with last_started set.
     ///         hash_a's last_started must remain unchanged (cursor didn't go back).
     #[test]
-    fn refresh_event_timestamps_incremental_cursor() {
+    fn refresh_lineage_incremental_cursor() {
         use library_search::{query::DateQuery, TrackQuery};
 
         let hash_a = ContentHash::new("sha256:cursor_test_a");
@@ -4107,6 +4282,484 @@ mod tests {
         assert_eq!(
             a_after.last_started, a_started,
             "hash_a last_started must be identical after second refresh (cursor advanced)"
+        );
+    }
+
+    // =========================================================================
+    // ADR-030 §7: the service and a local fold of the same log give the same reads
+    // =========================================================================
+
+    /// One log with a replaced track, a deleted one, plays (one on the replaced
+    /// track), two discs, a mark, a cover shared by an album and an untagged track.
+    fn equivalence_fixture() -> NamedTempFile {
+        use music_facts::{
+            Album, Artist, Bpm as BpmValue, CueKind, DiscNumber, DurationSeconds, EnergyLevel,
+            Mark, TrackNumber, TrackRole,
+        };
+        let at = |day| Utc.with_ymd_and_hms(2026, 1, day, 10, 0, 0).unwrap();
+        let mut facts = Vec::new();
+        let mut put = |hash: &str, value: MusicValue, day: u32| {
+            facts.push((ContentHash::new(hash), value, at(day), Operation::Assert));
+        };
+        let on_album = |put: &mut dyn FnMut(&str, MusicValue, u32),
+                        hash: &str,
+                        title: &str,
+                        artist: &str,
+                        album: &str| {
+            put(hash, MusicValue::Title(Title::new(title)), 1);
+            put(hash, MusicValue::Artist(Artist::new(artist)), 1);
+            put(hash, MusicValue::Album(Album::new(album)), 1);
+        };
+        on_album(&mut put, "sha256:eq_a1", "One", "Zed", "Alpha");
+        put(
+            "sha256:eq_a1",
+            MusicValue::DiscNumber(DiscNumber::new(1)),
+            1,
+        );
+        put(
+            "sha256:eq_a1",
+            MusicValue::TrackNumber(TrackNumber::new(2)),
+            1,
+        );
+        put(
+            "sha256:eq_a1",
+            MusicValue::CoverArtPath("cover-art/alpha.jpg".to_string()),
+            1,
+        );
+        put(
+            "sha256:eq_a1",
+            MusicValue::Bpm(BpmValue::from_f32(128.0).unwrap()),
+            1,
+        );
+        put("sha256:eq_a1", Mark::Default.fact_value(at(5)), 5);
+        put(
+            "sha256:eq_a1",
+            "banger".parse::<Mark>().unwrap().fact_value(at(6)),
+            6,
+        );
+        // A blob path, so the startup backfills have something to write facts for.
+        put(
+            "sha256:eq_a1",
+            MusicValue::FilePath("blobs/aa/eq_a1.flac".into()),
+            1,
+        );
+        put(
+            "sha256:eq_a1",
+            MusicValue::Key("A Minor".parse().expect("valid key")),
+            1,
+        );
+        put("sha256:eq_a1", MusicValue::AddedAt(at(1)), 1);
+        put(
+            "sha256:eq_a1",
+            MusicValue::DurationSeconds(DurationSeconds::new(240)),
+            1,
+        );
+        put("sha256:eq_a1", MusicValue::Role(TrackRole::Peak), 1);
+        put(
+            "sha256:eq_a1",
+            MusicValue::Energy(EnergyLevel::new(8).unwrap()),
+            1,
+        );
+        put(
+            "sha256:eq_a1",
+            MusicValue::MainGenre("Techno".to_string()),
+            1,
+        );
+        put("sha256:eq_a1", MusicValue::Label("Drumcode".to_string()), 1);
+        put(
+            "sha256:eq_a1",
+            MusicValue::StyleDescriptor("Deep".to_string()),
+            1,
+        );
+        put(
+            "sha256:eq_a1",
+            MusicValue::StyleDescriptor("Dub".to_string()),
+            1,
+        );
+        put(
+            "sha256:eq_a1",
+            MusicValue::MemoryCue {
+                position_ms: 32_000,
+                kind: CueKind::Hot,
+                label: Some("Drop".to_string()),
+                index: Some(0),
+            },
+            1,
+        );
+        put(
+            "sha256:eq_a1",
+            MusicValue::BeatGrid {
+                first_beat_ms: 500,
+                bpm: BpmValue::from_f32(128.0).unwrap(),
+                beats_per_bar: 4,
+            },
+            1,
+        );
+        on_album(&mut put, "sha256:eq_a2", "Two", "Zed", "Alpha");
+        put(
+            "sha256:eq_a2",
+            MusicValue::DiscNumber(DiscNumber::new(2)),
+            1,
+        );
+        put(
+            "sha256:eq_a2",
+            MusicValue::TrackNumber(TrackNumber::new(1)),
+            1,
+        );
+        on_album(&mut put, "sha256:eq_a3", "Three", "zed", "Alpha");
+        put(
+            "sha256:eq_a3",
+            MusicValue::DiscNumber(DiscNumber::new(1)),
+            1,
+        );
+        put(
+            "sha256:eq_a3",
+            MusicValue::TrackNumber(TrackNumber::new(1)),
+            1,
+        );
+        on_album(&mut put, "sha256:eq_old", "Older", "Abe", "Beta");
+        on_album(&mut put, "sha256:eq_new", "Newer", "Abe", "Beta");
+        put(
+            "sha256:eq_new",
+            MusicValue::Replaces(ContentHash::new("sha256:eq_old")),
+            2,
+        );
+        on_album(&mut put, "sha256:eq_gone", "Gone", "Abe", "Beta");
+        put(
+            "sha256:eq_gone",
+            MusicValue::Deleted { timestamp: at(3) },
+            3,
+        );
+        put("sha256:eq_bare", MusicValue::ItemId("p9".to_string()), 1);
+        put(
+            "sha256:eq_a1",
+            MusicValue::TrackStarted(StartReason::OnRequest),
+            10,
+        );
+        put(
+            "sha256:eq_a1",
+            MusicValue::TrackStopped(StopReason::OnSkip),
+            11,
+        );
+        put(
+            "sha256:eq_old",
+            MusicValue::TrackStarted(StartReason::OnRequest),
+            12,
+        );
+
+        // Covers along `Replaces` (ADR-013, amendment 2026-11-17): two finished merges,
+        // in stream order. `eq_lost` had a cover, so `eq_heir` shows it though the merge
+        // retracted it; `eq_user_lost`'s cover was retracted before the merge, so
+        // `eq_user_heir` shows none.
+        let in_album = |hash: &str, title: &str, album: &str, day| {
+            [
+                (MusicValue::Title(Title::new(title)), day),
+                (MusicValue::Album(Album::new(album)), day),
+            ]
+            .map(|(value, day)| (ContentHash::new(hash), value, at(day), Operation::Assert))
+        };
+        let cover = |hash: &str, path: &str, day, op| {
+            (
+                ContentHash::new(hash),
+                MusicValue::CoverArtPath(path.to_string()),
+                at(day),
+                op,
+            )
+        };
+        let replaces = |winner: &str, loser: &str, day| {
+            (
+                ContentHash::new(winner),
+                MusicValue::Replaces(ContentHash::new(loser)),
+                at(day),
+                Operation::Assert,
+            )
+        };
+        let retract_title = |hash: &str, title: &str, album: &str, day| {
+            [
+                MusicValue::Title(Title::new(title)),
+                MusicValue::Album(Album::new(album)),
+            ]
+            .map(|value| (ContentHash::new(hash), value, at(day), Operation::Retract))
+        };
+        facts.extend(in_album("sha256:eq_lost", "Lost", "Gamma", 13));
+        facts.push(cover(
+            "sha256:eq_lost",
+            "cover-art/lost.jpg",
+            13,
+            Operation::Assert,
+        ));
+        facts.extend(in_album("sha256:eq_heir", "Heir", "Gamma", 14));
+        facts.push(replaces("sha256:eq_heir", "sha256:eq_lost", 14));
+        facts.extend(retract_title("sha256:eq_lost", "Lost", "Gamma", 15));
+        facts.push(cover(
+            "sha256:eq_lost",
+            "cover-art/lost.jpg",
+            15,
+            Operation::Retract,
+        ));
+        facts.extend(in_album("sha256:eq_user_lost", "User lost", "Delta", 16));
+        facts.push(cover(
+            "sha256:eq_user_lost",
+            "cover-art/user.jpg",
+            16,
+            Operation::Assert,
+        ));
+        facts.push(cover(
+            "sha256:eq_user_lost",
+            "cover-art/user.jpg",
+            17,
+            Operation::Retract,
+        ));
+        facts.extend(in_album("sha256:eq_user_heir", "User heir", "Delta", 18));
+        facts.push(replaces("sha256:eq_user_heir", "sha256:eq_user_lost", 19));
+        facts.extend(retract_title(
+            "sha256:eq_user_lost",
+            "User lost",
+            "Delta",
+            20,
+        ));
+        write_facts_file_with_operations(&facts)
+    }
+
+    /// The log as ACID holds it now (the backfills wrote their facts at startup),
+    /// folded the way a client replica folds it: `project_lines`, then the plays.
+    struct LocalView {
+        lines: usize,
+        projection: library_projection::Projection,
+        covers: AlbumCovers,
+    }
+
+    fn local_view(facts_addr: &str) -> LocalView {
+        const PAGE: usize = 1_000;
+        let client = AcidClient::connect(facts_addr).unwrap();
+        let mut lines = Vec::new();
+        let mut cursor = None;
+        loop {
+            let chunk = client.read_stream(cursor, PAGE).unwrap();
+            let last_page = chunk.lines.len() < PAGE;
+            lines.extend(chunk.lines);
+            cursor = Some(chunk.cursor);
+            if last_page {
+                break;
+            }
+        }
+        let mut projection = library_projection::project_lines(lines.iter().map(String::as_str));
+        projection.lineage.apply_to(&mut projection.tracks);
+        let covers = AlbumCovers::build(&projection.tracks);
+        LocalView {
+            lines: lines.len(),
+            projection,
+            covers,
+        }
+    }
+
+    fn json<T: serde::Serialize>(value: &T) -> serde_json::Value {
+        serde_json::to_value(value).unwrap()
+    }
+
+    fn tracks_of(response: LibraryResponse) -> Vec<TrackInfo> {
+        match response {
+            LibraryResponse::Tracks(tracks) | LibraryResponse::SearchResults(tracks) => tracks,
+            LibraryResponse::Track(track) => vec![*track],
+            other => panic!("expected tracks, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_service_and_a_local_fold_of_its_log_give_the_same_reads() {
+        use library_search::query::DateQuery;
+
+        let fixture = equivalence_fixture();
+        let written = std::fs::read_to_string(fixture.path())
+            .unwrap()
+            .lines()
+            .count();
+        let (service, _metadata_dir, facts_addr) = make_service_with_facts_and_addr(fixture.path());
+        let local = local_view(&facts_addr);
+        // The startup backfills wrote facts of their own: the log is longer than the
+        // fixture, and the comparison below covers them.
+        assert!(
+            local.lines > written,
+            "{} lines, fixture {written}",
+            local.lines
+        );
+        assert_eq!(
+            *service.fact_index.lock().unwrap(),
+            local.projection.fact_index,
+            "fact index"
+        );
+        let (tracks, covers) = (&local.projection.tracks, &local.covers);
+        let ask = |request| tracks_of(service.handle_request(request));
+
+        let everything = TrackQuery::default();
+        let never_played = TrackQuery {
+            started: Some(DateQuery::NA),
+            ..Default::default()
+        };
+        let banger = TrackQuery {
+            mark: Some("banger".parse().unwrap()),
+            ..Default::default()
+        };
+        for query in [everything, never_played, banger.clone()] {
+            assert_eq!(
+                json(&ask(LibraryRequest::Search {
+                    query: query.clone()
+                })),
+                json(&library_projection::search(tracks, covers, &query)),
+                "search {query:?}"
+            );
+        }
+        for limit in [None, Some(2)] {
+            assert_eq!(
+                json(&ask(LibraryRequest::ListTracks { limit })),
+                json(&library_projection::visible(tracks, covers, limit)),
+                "list {limit:?}"
+            );
+        }
+        let filter = MarkFilter::Any;
+        assert_eq!(
+            json(&ask(LibraryRequest::ListMarked {
+                filter: filter.clone()
+            })),
+            json(&library_projection::marked(tracks, covers, &filter)),
+            "marked"
+        );
+        let visible = library_projection::visible(tracks, covers, None);
+        for expected in &visible {
+            assert_eq!(
+                json(&ask(LibraryRequest::GetTrack {
+                    hash: expected.content_hash.clone()
+                })),
+                json(&vec![expected.clone()]),
+                "get {}",
+                expected.content_hash.as_str()
+            );
+        }
+        for fact_type in local.projection.fact_index.keys() {
+            let response = service.handle_request(LibraryRequest::GetFactValues {
+                fact_type: fact_type.clone(),
+            });
+            let LibraryResponse::FactValues(values) = response else {
+                panic!("expected fact values, got {response:?}");
+            };
+            assert_eq!(
+                values,
+                library_projection::fact_values(&local.projection.fact_index, fact_type),
+                "values of {fact_type:?}"
+            );
+        }
+
+        // The fixture must exercise what it is for, or the comparison proves nothing.
+        let by_hash = |hash: &str| {
+            visible
+                .iter()
+                .find(|t| t.content_hash.as_str() == hash)
+                .unwrap_or_else(|| panic!("{hash} is visible"))
+        };
+        assert_eq!(visible.len(), 8, "the deleted track is hidden");
+        assert_eq!(
+            by_hash("sha256:eq_heir").cover_art_path.as_deref(),
+            Some("cover-art/lost.jpg"),
+            "the heir shows the cover of the track it replaced, though the merge retracted it"
+        );
+        assert_eq!(
+            by_hash("sha256:eq_user_heir").cover_art_path,
+            None,
+            "a cover retracted before the merge is not inherited"
+        );
+        assert!(by_hash("sha256:eq_a1").started.is_some(), "a play");
+        assert!(
+            by_hash("sha256:eq_old").started.is_some(),
+            "a play on a replaced track"
+        );
+        assert!(
+            by_hash("sha256:eq_new").started.is_some(),
+            "the Replaces lineage credits the replaced track's plays"
+        );
+        let formats = service.handle_request(LibraryRequest::GetFactValues {
+            fact_type: FactType::new("Format"),
+        });
+        assert!(
+            matches!(&formats, LibraryResponse::FactValues(v) if !v.is_empty()),
+            "a backfilled Format fact: {formats:?}"
+        );
+        assert_eq!(
+            by_hash("sha256:eq_a2").cover_art_path.as_deref(),
+            Some("cover-art/alpha.jpg"),
+            "the album's cover"
+        );
+        assert!(by_hash("sha256:eq_bare").title.is_none(), "untagged");
+        let tagged = by_hash("sha256:eq_a1");
+        assert_eq!(tagged.genre.as_deref(), Some("Techno"), "genre on the wire");
+        assert_eq!(
+            tagged.label.as_deref(),
+            Some("Drumcode"),
+            "label on the wire"
+        );
+        let mut styles = tagged.styles.clone();
+        styles.sort();
+        assert_eq!(styles, ["Deep", "Dub"], "styles on the wire");
+        assert_eq!(
+            tagged.marks,
+            [Mark::Default, "banger".parse().unwrap()],
+            "marks on the wire"
+        );
+        let banger_hits = ask(LibraryRequest::Search { query: banger });
+        assert_eq!(banger_hits.len(), 1, "only the marked track matches");
+    }
+
+    #[test]
+    fn a_play_recorded_after_start_shows_in_a_search_that_is_not_a_date_query() {
+        let temp = write_facts_file(&[(
+            ContentHash::new("sha256:play_later"),
+            MusicValue::Title(Title::new("Later")),
+        )]);
+        let (service, _metadata_dir, facts_addr) = make_service_with_facts_and_addr(temp.path());
+        AcidClient::connect(&facts_addr)
+            .unwrap()
+            .write_music_facts(
+                &ContentHash::new("sha256:play_later"),
+                &[(
+                    MusicValue::TrackStarted(StartReason::OnRequest),
+                    FactSource::new("test-playback", "1.0.0", "Unknown"),
+                )],
+            )
+            .unwrap();
+
+        let found = service.search_tracks(&TrackQuery::default());
+
+        assert_eq!(found.len(), 1);
+        assert!(found[0].started.is_some(), "{:?}", found[0]);
+    }
+
+    #[test]
+    fn a_cover_asserted_after_start_shows_on_the_other_tracks_of_the_album() {
+        let album = || MusicValue::Album(music_facts::Album::new("Gamma"));
+        let temp = write_facts_file(&[
+            (ContentHash::new("sha256:cover_g1"), album()),
+            (ContentHash::new("sha256:cover_g2"), album()),
+        ]);
+        let (service, _metadata_dir, facts_addr) = make_service_with_facts_and_addr(temp.path());
+        AcidClient::connect(&facts_addr)
+            .unwrap()
+            .write_music_facts(
+                &ContentHash::new("sha256:cover_g1"),
+                &[(
+                    MusicValue::CoverArtPath("cover-art/gamma.jpg".to_string()),
+                    FactSource::new("test", "1.0.0", "Unknown"),
+                )],
+            )
+            .unwrap();
+        service.catch_up().unwrap();
+
+        let found = service.search_tracks(&TrackQuery::default());
+
+        assert_eq!(found.len(), 2);
+        assert!(
+            found
+                .iter()
+                .all(|t| t.cover_art_path.as_deref() == Some("cover-art/gamma.jpg")),
+            "{found:?}"
         );
     }
 
@@ -6414,6 +7067,44 @@ mod tests {
         );
     }
 
+    /// A key fact loaded through the projection is found by a Camelot key query
+    /// (the projection holds a typed `Key`, not its display string).
+    #[test]
+    fn search_by_key_finds_projected_track() {
+        use library_search::TrackQuery;
+        let a_minor = ContentHash::new("sha256:keysearch01");
+        let c_major = ContentHash::new("sha256:keysearch02");
+        let temp = write_facts_file(&[
+            (
+                a_minor.clone(),
+                MusicValue::Key("A Minor".parse().expect("valid key")),
+            ),
+            (
+                c_major.clone(),
+                MusicValue::Key("C Major".parse().expect("valid key")),
+            ),
+        ]);
+        let (service, _metadata_dir) = make_service_with_facts(temp.path());
+        let search = |key: &str| -> Vec<String> {
+            let query = TrackQuery {
+                key: Some(key.parse().expect("valid key query")),
+                ..Default::default()
+            };
+            let mut hashes: Vec<String> = service
+                .search_tracks(&query)
+                .iter()
+                .map(|t| t.content_hash.as_str().to_owned())
+                .collect();
+            hashes.sort();
+            hashes
+        };
+        assert_eq!(search("8A"), vec![a_minor.as_str().to_owned()]);
+        assert_eq!(search("Am"), vec![a_minor.as_str().to_owned()]);
+        assert_eq!(search("8B"), vec![c_major.as_str().to_owned()]);
+        assert_eq!(search("8A-1").len(), 2);
+        assert!(search("1A").is_empty());
+    }
+
     /// get_track returns TrackNotFound for hidden tracks.
     #[test]
     fn get_track_rejects_hidden_tracks() {
@@ -6537,6 +7228,29 @@ mod tests {
             !content.contains(old_hash.as_str()),
             "old hash should not appear in rewritten playlist"
         );
+    }
+
+    /// The dedup rewrite changes the token only: CRLF, comments and trailing text stay.
+    #[test]
+    fn rewrite_playlists_keeps_crlf_and_leaves_other_playlists_alone() {
+        let old_hash = ContentHash::new("sha256:oldaabbccdd001122334455667788990000");
+        let new_hash = ContentHash::new("sha256:neweeff1100aabbccdd220044006688aa");
+        let (service, metadata_dir, _acid) = make_service_with_playlists_dir();
+        let playlists_dir = metadata_dir.path().join("playlists");
+        let hit = playlists_dir.join("hit.plist");
+        let miss = playlists_dir.join("miss.plist");
+        let other = "# nothing here\r\nffffffff  x\r\n";
+        std::fs::write(&hit, format!("# c\r\n{old_hash}  Artist - T\r\nlast")).unwrap();
+        std::fs::write(&miss, other).unwrap();
+
+        let count = service.rewrite_playlists_replace_hash(&old_hash, &new_hash);
+
+        assert_eq!(count, 1);
+        assert_eq!(
+            std::fs::read_to_string(&hit).unwrap(),
+            format!("# c\r\n{new_hash}  Artist - T\r\nlast")
+        );
+        assert_eq!(std::fs::read_to_string(&miss).unwrap(), other);
     }
 
     // =========================================================================
@@ -7669,7 +8383,7 @@ mod tests {
     //
     // The FactAggregator::assert path uses Utc::now() as a placeholder
     // timestamp. After the fix, it must NOT populate last_started/last_stopped
-    // during bulk load — those are None until refresh_event_timestamps runs.
+    // during bulk load — those are None until refresh_lineage runs.
     // =========================================================================
 
     // =========================================================================
@@ -8082,6 +8796,442 @@ mod tests {
         }
 
         (service, metadata_dir, acid_handle)
+    }
+
+    // ---- PlaylistEntries -----------------------------------------------------
+
+    fn full_hash(prefix: &str, fill: char) -> String {
+        format!(
+            "sha256:{prefix}{}",
+            fill.to_string().repeat(64 - prefix.len())
+        )
+    }
+
+    fn track_entry(hash: &str) -> library_ipc_protocol::PlaylistEntry {
+        library_ipc_protocol::PlaylistEntry::Track {
+            hash: library_ipc_protocol::CanonicalHash::try_from(ContentHash::new(hash)).unwrap(),
+        }
+    }
+
+    fn unresolved_entry(
+        error: library_ipc_protocol::EntryError,
+    ) -> library_ipc_protocol::PlaylistEntry {
+        library_ipc_protocol::PlaylistEntry::Unresolved { error }
+    }
+
+    /// A service holding tracks `aaaa..` and two sharing the prefix `ab`, with
+    /// the playlist `set` holding `content`; also the playlist's path.
+    fn service_with_playlist(
+        content: &str,
+    ) -> (
+        Arc<LibraryService>,
+        std::path::PathBuf,
+        tempfile::TempDir,
+        AcidGuard,
+    ) {
+        let tracks = [
+            (ContentHash::new(full_hash("aaaa", 'a')), "A"),
+            (ContentHash::new(full_hash("ab", '1')), "B1"),
+            (ContentHash::new(full_hash("ab", '2')), "B2"),
+        ];
+        let (service, metadata_dir, acid) = make_service_with_replaces(&tracks, &[]);
+        let path = metadata_dir.path().join("playlists").join("set.plist");
+        std::fs::write(&path, content).unwrap();
+        (service, path, metadata_dir, acid)
+    }
+
+    fn playlist_entries(
+        service: &LibraryService,
+        name: &str,
+    ) -> Vec<library_ipc_protocol::PlaylistEntry> {
+        let name = PlaylistName::new(name).unwrap();
+        match service.handle_request(LibraryRequest::PlaylistEntries { name }) {
+            LibraryResponse::PlaylistEntries(entries) => entries,
+            other => panic!("expected PlaylistEntries, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn playlist_entries_keep_order_and_duplicates_of_mixed_short_and_full_lines() {
+        let a = full_hash("aaaa", 'a');
+        let b1 = full_hash("ab", '1');
+        let content =
+            format!("# a set\naaaaaaaa  Artist - Title  [3:00]\n\n{b1}\nsha256:aaaa\n{a}\n");
+        let (service, _path, _dir, _acid) = service_with_playlist(&content);
+        assert_eq!(
+            playlist_entries(&service, "set"),
+            vec![
+                track_entry(&a),
+                track_entry(&b1),
+                track_entry(&a),
+                track_entry(&a),
+            ]
+        );
+    }
+
+    #[test]
+    fn playlist_entries_report_unresolved_entries_in_place() {
+        use library_ipc_protocol::EntryError;
+        let a = full_hash("aaaa", 'a');
+        let content = "ffffffff\naaaaaaaa\nab\n";
+        let (service, _path, _dir, _acid) = service_with_playlist(content);
+        assert_eq!(
+            playlist_entries(&service, "set"),
+            vec![
+                unresolved_entry(EntryError::Unknown {
+                    hash: ContentHash::new("ffffffff")
+                }),
+                track_entry(&a),
+                unresolved_entry(EntryError::Ambiguous {
+                    hash: ContentHash::new("ab"),
+                    candidates: vec![
+                        ContentHash::new(full_hash("ab", '1')),
+                        ContentHash::new(full_hash("ab", '2')),
+                    ],
+                }),
+            ]
+        );
+    }
+
+    #[test]
+    fn playlist_entries_leave_the_file_byte_identical() {
+        let content =
+            "# a set\r\naaaaaaaa  Artist - Title\n\nffffffff\n  ab\t x\nno newline at end";
+        let (service, path, _dir, _acid) = service_with_playlist(content);
+        let _ = playlist_entries(&service, "set");
+        assert_eq!(std::fs::read(&path).unwrap(), content.as_bytes());
+    }
+
+    #[test]
+    fn playlist_entries_of_missing_playlist_is_playlist_not_found() {
+        let (service, _path, _dir, _acid) = service_with_playlist("");
+        let name = PlaylistName::new("nope").unwrap();
+        let resp = service.handle_request(LibraryRequest::PlaylistEntries { name });
+        assert!(
+            matches!(
+                resp,
+                LibraryResponse::Error(ProtocolError::PlaylistNotFound { .. })
+            ),
+            "{resp:?}"
+        );
+    }
+
+    // The ADR-027 contract, stated once in `playlist_edit::contract`.
+
+    fn contract_setup(content: &str) -> playlist_edit::contract::Handler {
+        let (service, _path, dir, acid) = service_with_playlist(content);
+        Box::new(move |request| {
+            let _keep_alive = (&dir, &acid);
+            service.handle_request(request)
+        })
+    }
+
+    playlist_edit::playlist_contract_tests!(contract_setup);
+
+    #[test]
+    fn a_repair_keeps_crlf_line_ends_and_trailing_text() {
+        let old = ContentHash::new(full_hash("aaaa", 'a'));
+        let new = ContentHash::new(full_hash("bbbb", 'b'));
+        let (service, metadata_dir, _acid) =
+            make_service_with_replaces(&[(new.clone(), "New")], &[(new.clone(), old.clone())]);
+        let path = metadata_dir.path().join("playlists").join("set.plist");
+        std::fs::write(
+            &path,
+            format!("# c\r\n{old}  Artist - Title  [3:00]\r\nlast"),
+        )
+        .unwrap();
+        let expected = format!("# c\r\n{new}  Artist - Title  [3:00]\r\nlast");
+
+        let got = service.handle_request(LibraryRequest::PlaylistGet {
+            name: PlaylistName::new("set").unwrap(),
+        });
+        assert!(
+            matches!(&got, LibraryResponse::PlaylistContent(c) if *c == expected),
+            "{got:?}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+    }
+
+    #[test]
+    fn reading_a_playlist_that_is_not_utf8_is_internal_not_not_found() {
+        let (service, path, _dir, _acid) = service_with_playlist("");
+        std::fs::write(&path, [0xff, 0xfe, b'\n']).unwrap();
+        let resp = service.handle_request(LibraryRequest::PlaylistGet {
+            name: PlaylistName::new("set").unwrap(),
+        });
+        assert!(
+            matches!(resp, LibraryResponse::Error(ProtocolError::Internal { .. })),
+            "{resp:?}"
+        );
+    }
+
+    // ---- ADR-027: files, atomic writes and the lock -------------------------
+
+    fn playlist_files(dir: &std::path::Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir.join("playlists"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn edit_request(version: &PlaylistVersion, ops: Vec<EditOp>) -> LibraryRequest {
+        LibraryRequest::PlaylistEdit {
+            name: PlaylistName::new("set").unwrap(),
+            version: version.clone(),
+            ops,
+        }
+    }
+
+    fn insert_op(at: usize, hash: &str) -> EditOp {
+        EditOp::Insert {
+            at,
+            hashes: vec![ContentHash::new(hash)],
+            duplicates: Duplicates::Keep,
+        }
+    }
+
+    #[test]
+    fn playlist_list_ignores_temp_files() {
+        let (service, path, dir, _acid) = service_with_playlist("aaaaaaaa\n");
+        let playlists = path.parent().unwrap();
+        std::fs::write(playlists.join(".set.plist.Xy12.tmp"), "half").unwrap();
+        std::fs::write(playlists.join("other.plist.tmp"), "half").unwrap();
+        let _ = &dir;
+        match service.handle_request(LibraryRequest::PlaylistList) {
+            LibraryResponse::PlaylistNames(names) => {
+                let names: Vec<&str> = names.iter().map(|n| n.as_str()).collect();
+                assert_eq!(names, vec!["set"]);
+            }
+            other => panic!("expected PlaylistNames, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn every_playlist_write_leaves_no_temp_file_and_is_world_readable() {
+        use std::os::unix::fs::PermissionsExt;
+        let (service, path, dir, _acid) = service_with_playlist("aaaaaaaa\n");
+        let name = PlaylistName::new("set").unwrap();
+        let a = full_hash("aaaa", 'a');
+        service.handle_request(LibraryRequest::PlaylistReplace {
+            name: name.clone(),
+            content: format!("{a}\n"),
+        });
+        service.handle_request(LibraryRequest::PlaylistAppend {
+            name: name.clone(),
+            content: format!("{a}\n"),
+        });
+        service.handle_request(LibraryRequest::PlaylistNew {
+            name: PlaylistName::new("fresh").unwrap(),
+            content: String::new(),
+        });
+        let version = PlaylistVersion::of(std::fs::read(&path).unwrap().as_slice());
+        service.handle_request(edit_request(&version, vec![insert_op(0, &a)]));
+        assert_eq!(
+            playlist_files(dir.path()),
+            vec!["fresh.plist".to_string(), "set.plist".to_string()]
+        );
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o644);
+    }
+
+    #[test]
+    fn an_edit_that_changes_nothing_does_not_touch_the_file() {
+        let content = "aaaaaaaa\n";
+        let (service, path, _dir, _acid) = service_with_playlist(content);
+        let version = PlaylistVersion::of(content.as_bytes());
+        let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let skip_all = EditOp::Insert {
+            at: 0,
+            hashes: vec![ContentHash::new(full_hash("aaaa", 'a'))],
+            duplicates: Duplicates::Skip,
+        };
+        service.handle_request(edit_request(&version, vec![skip_all]));
+        service.handle_request(edit_request(&version, vec![]));
+        let after = std::fs::metadata(&path).unwrap().modified().unwrap();
+        assert_eq!(after, before);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), content);
+    }
+
+    #[test]
+    fn concurrent_edits_at_one_version_apply_exactly_once() {
+        const EDITORS: usize = 8;
+        let content = "aaaaaaaa\n";
+        let (service, path, _dir, _acid) = service_with_playlist(content);
+        let version = PlaylistVersion::of(content.as_bytes());
+        let a = full_hash("aaaa", 'a');
+        let barrier = std::sync::Barrier::new(EDITORS);
+
+        let responses: Vec<LibraryResponse> = std::thread::scope(|scope| {
+            let editors: Vec<_> = (0..EDITORS)
+                .map(|_| {
+                    scope.spawn(|| {
+                        barrier.wait();
+                        service.handle_request(edit_request(&version, vec![insert_op(0, &a)]))
+                    })
+                })
+                .collect();
+            editors.into_iter().map(|e| e.join().unwrap()).collect()
+        });
+
+        let outcomes: Vec<&EditOutcome> = responses
+            .iter()
+            .map(|r| match r {
+                LibraryResponse::PlaylistEdited(outcome) => outcome,
+                other => panic!("expected PlaylistEdited, got {other:?}"),
+            })
+            .collect();
+        let applied = outcomes
+            .iter()
+            .filter(|o| matches!(o, EditOutcome::Applied { .. }))
+            .count();
+        let conflicts = outcomes
+            .iter()
+            .filter(|o| matches!(o, EditOutcome::Conflict { .. }))
+            .count();
+        assert_eq!((applied, conflicts), (1, EDITORS - 1), "{responses:?}");
+        assert_eq!(playlist_entries(&service, "set").len(), 2);
+        assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 2);
+    }
+
+    #[test]
+    fn a_repair_racing_an_edit_does_not_lose_the_edit() {
+        const READERS: usize = 4;
+        let old = ContentHash::new(full_hash("aaaa", 'a'));
+        let new = ContentHash::new(full_hash("bbbb", 'b'));
+        let other = ContentHash::new(full_hash("cccc", 'c'));
+        let (service, metadata_dir, _acid) = make_service_with_replaces(
+            &[(new.clone(), "New"), (other.clone(), "Other")],
+            &[(new.clone(), old.clone())],
+        );
+        let path = metadata_dir.path().join("playlists").join("set.plist");
+        // On disk the line still names the replaced track; its repaired form is what
+        // every version is taken from.
+        std::fs::write(&path, format!("{old}\n")).unwrap();
+        let repaired = format!("{new}\n");
+        let version = PlaylistVersion::of(repaired.as_bytes());
+        let barrier = std::sync::Barrier::new(READERS + 1);
+
+        let response = std::thread::scope(|scope| {
+            for _ in 0..READERS {
+                scope.spawn(|| {
+                    barrier.wait();
+                    playlist_entries(&service, "set");
+                });
+            }
+            scope
+                .spawn(|| {
+                    barrier.wait();
+                    let ops = vec![insert_op(1, other.as_str())];
+                    service.handle_request(edit_request(&version, ops))
+                })
+                .join()
+                .unwrap()
+        });
+
+        assert!(
+            matches!(
+                response,
+                LibraryResponse::PlaylistEdited(EditOutcome::Applied { .. })
+            ),
+            "{response:?}"
+        );
+        assert_eq!(
+            playlist_entries(&service, "set"),
+            vec![track_entry(new.as_str()), track_entry(other.as_str())]
+        );
+    }
+
+    #[test]
+    fn playlist_entries_of_a_replaced_track_name_its_successor() {
+        let old = ContentHash::new(full_hash("aaaa", 'a'));
+        let new = ContentHash::new(full_hash("bbbb", 'b'));
+        let (service, metadata_dir, _acid) =
+            make_service_with_replaces(&[(new.clone(), "New")], &[(new.clone(), old.clone())]);
+        let path = metadata_dir.path().join("playlists").join("set.plist");
+        std::fs::write(&path, format!("{}\n", old.as_str())).unwrap();
+        assert_eq!(
+            playlist_entries(&service, "set"),
+            vec![track_entry(new.as_str())]
+        );
+    }
+
+    /// Repair of one playlist (name `set`) holding `token`, in a service whose index holds
+    /// `live` and `hidden` hashes, and a live `successor` as (new, old) hash: `new`
+    /// asserts `Replaces(old)`.
+    fn repaired_line(
+        token: &str,
+        live: &[&str],
+        hidden: &[&str],
+        successor: Option<(&ContentHash, &ContentHash)>,
+    ) -> String {
+        let live_tracks: Vec<(ContentHash, &str)> = live
+            .iter()
+            .map(|h| (ContentHash::new(*h), "Live"))
+            .chain(successor.map(|(new, _)| (new.clone(), "New")))
+            .collect();
+        let replaces: Vec<(ContentHash, ContentHash)> = successor
+            .map(|(new, old)| (new.clone(), old.clone()))
+            .into_iter()
+            .collect();
+        let (service, metadata_dir, _acid) = make_service_with_replaces(&live_tracks, &replaces);
+        {
+            let mut tracks = service.tracks.lock().unwrap();
+            for hash in hidden {
+                let mut entry = IndexedTrackInfo::new_empty((*hash).to_owned());
+                entry.deleted_at = Some(chrono::Utc::now());
+                tracks.push(entry);
+            }
+        }
+        let path = metadata_dir.path().join("playlists").join("set.plist");
+        std::fs::write(&path, format!("{token}\n")).unwrap();
+        let name = PlaylistName::new("set").unwrap();
+        match service.handle_request(LibraryRequest::PlaylistGet { name }) {
+            LibraryResponse::PlaylistContent(content) => content,
+            other => panic!("expected PlaylistContent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lazy_repair_full_token_with_only_a_legacy_short_entry_follows_replaces() {
+        let token = full_hash("aaaaaaaa", 'a');
+        let legacy = "aaaaaaaa";
+        let new = ContentHash::new(full_hash("bbbb", 'b'));
+        let old = ContentHash::new(token.clone());
+        let healed = repaired_line(&token, &[legacy], &[], Some((&new, &old)));
+        assert_eq!(healed, format!("{}\n", new.as_str()));
+        // With no chain the line stays as it was.
+        let unchanged = repaired_line(&token, &[legacy], &[], None);
+        assert_eq!(unchanged, format!("{token}\n"));
+    }
+
+    #[test]
+    fn lazy_repair_ambiguous_token_of_only_hidden_tracks_is_left_unchanged() {
+        let (a, b) = (full_hash("ab", '1'), full_hash("ab", '2'));
+        let new = ContentHash::new(full_hash("bbbb", 'b'));
+        let old = ContentHash::new("ab");
+        let line = repaired_line("ab", &[], &[&a, &b], Some((&new, &old)));
+        assert_eq!(line, "ab\n");
+    }
+
+    #[test]
+    fn lazy_repair_leaves_a_commented_hash_alone() {
+        let hash_a = ContentHash::new("sha256:lazy_repair_a_0009");
+        let hash_b = ContentHash::new("sha256:lazy_repair_b_0009");
+        let (service, metadata_dir, _acid) = make_service_with_replaces(
+            &[(hash_b.clone(), "Track B")],
+            &[(hash_b.clone(), hash_a.clone())],
+        );
+        let plist_path = metadata_dir.path().join("playlists").join("set.plist");
+        let content = format!("# {}\n", hash_a.as_str());
+        std::fs::write(&plist_path, &content).unwrap();
+
+        let name = PlaylistName::new("set").unwrap();
+        let resp = service.handle_request(LibraryRequest::PlaylistGet { name });
+        assert!(matches!(resp, LibraryResponse::PlaylistContent(c) if c == content));
+        assert_eq!(std::fs::read_to_string(&plist_path).unwrap(), content);
     }
 
     /// 1-hop repair: A (retracted/not-in-index) → B (live).
@@ -8602,7 +9752,7 @@ mod tests {
 
     /// After a bulk bootstrap containing TrackStarted/TrackStopped facts,
     /// last_started and last_stopped must be None (not a bootstrap wall-clock
-    /// value). refresh_event_timestamps is the sole source of truth.
+    /// value). refresh_lineage is the sole source of truth.
     #[test]
     fn bulk_bootstrap_does_not_set_timestamps_from_placeholder() {
         let hash = ContentHash::new("sha256:bulk_ts_placeholder");
@@ -8652,7 +9802,7 @@ mod tests {
             .expect("track must be indexed after bulk bootstrap");
 
         // The bulk path must NOT populate last_started/last_stopped with Utc::now().
-        // refresh_event_timestamps (triggered by a date-filtered search) is the sole
+        // refresh_lineage (triggered by a date-filtered search) is the sole
         // source of truth for these fields after bootstrap.
         assert_eq!(
             track.last_started, None,

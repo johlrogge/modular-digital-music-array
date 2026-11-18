@@ -200,6 +200,36 @@ Points marked **decided** were decided by Joakim. Everything else is **proposed*
 
 Macro buttons can ship any time after phase 1 for online use. They work offline after phase 3.
 
+## Amendment 2026-11-17
+
+Clients (the console first) need each track's marks without a lookup per track, and need to narrow a search by mark.
+
+- **`TrackInfo.marks: Vec<Mark>`** (`#[serde(default)]`). `library_projection::read::track_info` fills it from the track's live marks (`IndexedTrackInfo::marks`), so the service and a client replica give the same answer (ADR-030).
+  - The order is deterministic: the default mark first, then named marks sorted by name. Each mark appears once.
+  - Legacy free-text scopes are not marks and are left out. `ListMarked` with `MarkFilter::Any` still lists those tracks.
+- **`TrackQuery.mark: Option<Mark>`** (`#[serde(default)]`). A query with a mark matches the tracks that hold that mark live. It combines with the other filters by AND, and `not` inverts the whole query. `mdma search --mark NAME` sets it; `liked` is the default mark.
+- **Old nodes.** An old library sends no `marks`, which reads as unmarked, and an old library ignores the unknown `mark` field and answers unfiltered. The real exposure is small:
+  - Replica reads evaluate `mark` locally, so they are right whatever the node runs. Only `--facts=node` reaches the node.
+  - The console ships together with the library (ADR-004).
+  - It is the same accepted property as `role` and `energy` when they were added.
+  - `TrackQuery` now has `deny_unknown_fields`, so a filter added later fails loudly on a node that predates it instead of being ignored. That closes the class for later filters; `mark` itself predates the guard.
+
+### Console surfaces and macro configuration
+
+The web console (`projects/mdma-console`) is the first client to put marks on screen. Answers to Open question 3 for the console: a mark always goes to the track the console **showed**, never to "whatever is playing now", so a track change between the click and the request cannot redirect it.
+
+- **Routes** (all in `api/marks.rs`, one gateway connection each):
+  - `POST /api/marks {action: "mark"|"unmark", hashes, mark?}`: a set operation, not a toggle, so it is idempotent and safe to retry. `mark` omitted, blank or `"liked"` is the default mark. Hashes are resolved against the library first (named twice, they are written once), then written one by one with `WriteMark` / `UnmarkTrack`.
+    - 200 `{changed: [hash], tracks: [ApiTrack]}`. `changed` holds the canonical hashes whose marks this request changed (`MarkWrite::Written`, `Unmark::Retracted`); a track that already had the mark is not in it. The catalogue's hashes are canonical too, so the browser compares them as they are. `tracks` are the named tracks as `GET /api/tracks` serves them, and replace the browser's entries.
+    - 207 `{changed, tracks, error}` when it stopped partway.
+    - 400 for an empty `hashes`; 422 for a bad mark name or an unknown hash (nothing written); 502/503 per the library failure policy.
+  - `GET /api/marks/config` returns `{macros: ["banger", "opener"]}`.
+  - `GET /api/tracks` carries `marks` on every track, and the narrowing routes take `mark=` (`SearchParams.mark` becomes `TrackQuery.mark`; a bad name is 400).
+- **Macro marks are node-side configuration, owned by the console.** The defaults are a Rust constant (`DEFAULT_MACROS = ["banger", "opener"]`, each valid as a `MarkName`), served read-only. A browser-side setting would differ between the laptop and the phone, and it is not a fact about music, so it is not stored as facts. Editing the list (a state file, `PUT /api/marks/config`, a settings page) is later work.
+- **Marks stay separate from `TrackRole`.** `TrackRole::Banger` and `Opener` remain curation facts for import; the macro marks are quick personal labels that happen to share two names.
+- **Surfaces:** a heart on every catalogue track row (library, album, artist, playlist, workbench, Marked; not Up next), in the now-playing bar and in the full player; named marks as small chips on a row's meta line; "Like/Unlike" and "Mark as <macro>" in the row menu; macro chips in the full player. Keys: `M` likes and `Shift+1..9` sets macro n, on the focused row, or on the bar's track when no row has focus. Mark or unmark is chosen from the marks the user saw painted, not from the store at click time. A mark answers with a toast with Undo (shown only when `changed` holds the track) and never asks to confirm. Undoing an unmark marks again with a new time; the original time is lost.
+- **Marked view** at `#/marked/:mark?`: chips All, Liked and one per macro, linked from the Library. It is built from the catalogue's `marks`, so "All" means any live mark and a track marked only with a legacy free-text scope is not listed (`mdma marked` is the place to see those). `ApiTrack.marks` is the one source; there is no separate list route.
+
 ## Related
 
 - ADR-001, ADR-004, ADR-009, ADR-011, ADR-013, ADR-014, ADR-015

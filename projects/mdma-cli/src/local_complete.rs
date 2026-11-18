@@ -12,12 +12,13 @@
 
 use std::path::Path;
 
-use fact_replica::{NodeId, Replica, UnixSecs};
+use client_facts::{
+    replica_from_environment, request_sync, CompletionSnapshot, NodeId, Probed, Replica, UnixSecs,
+    Urgency,
+};
 use hicli::Candidate;
 
-use crate::background::{request_sync, spawn_background_sync, Urgency};
-use crate::replica::{replica_from_environment, replicas_dir, Probed};
-use crate::snapshot::CompletionSnapshot;
+use crate::background::{replicas_dir, spawn_background_sync};
 
 /// A list of names in the snapshot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -181,8 +182,8 @@ pub(crate) fn complete_query(typed: &str) -> Vec<Candidate> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::replica::{Probe, Probed};
     use crate::test_support::{env_lock, EnvVars};
+    use client_facts::Probe;
     use fact_replica::test_support::FakeNode;
     use fact_replica::{Host, LineCount};
     use pretty_assertions::assert_eq;
@@ -348,6 +349,14 @@ mod tests {
         replica
     }
 
+    /// Held by a test that takes a replica's sync lock (an `flock`). A process started
+    /// meanwhile by another test (the editor tests start one, under this same lock)
+    /// would inherit the lock until its `exec`, and a released lock would read as busy:
+    /// the throttle would answer "a sync is running" for one that is due (#107).
+    fn no_process_starts() -> std::sync::MutexGuard<'static, ()> {
+        env_lock()
+    }
+
     fn ask(
         dir: &Path,
         replica: Option<&NodeId>,
@@ -359,6 +368,7 @@ mod tests {
 
     #[test]
     fn with_no_replica_a_completion_offers_nothing_and_starts_a_sync() {
+        let _quiet = no_process_starts();
         let dir = tempfile::tempdir().unwrap();
         let mut spawns = 0;
 
@@ -375,6 +385,7 @@ mod tests {
 
     #[test]
     fn a_completion_spawns_a_refresh_at_most_once_per_interval() {
+        let _quiet = no_process_starts();
         let dir = tempfile::tempdir().unwrap();
         replica_with_snapshot(dir.path(), "n", &snapshot());
         let mut spawns = 0;
@@ -396,6 +407,7 @@ mod tests {
 
     #[test]
     fn the_snapshot_is_served_without_the_expired_probe() {
+        let _quiet = no_process_starts();
         let dir = tempfile::tempdir().unwrap();
         replica_with_snapshot(dir.path(), "n", &snapshot());
         let mut spawns = 0;

@@ -1,4 +1,4 @@
-use playback_primitives::{ContentHash, SessionId};
+use playback_primitives::{ContentHash, OutputHealth, SessionId};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use thiserror::Error;
 
@@ -41,6 +41,15 @@ pub const TOPIC_SESSION_STARTED: &str = "playback/session_started";
 /// Topic for session ended events.
 pub const TOPIC_SESSION_ENDED: &str = "playback/session_ended";
 
+/// Topic for audio output health changes (see ADR-028).
+pub const TOPIC_OUTPUT: &str = "playback/output";
+
+/// Topic for preview started events (ADR-031).
+pub const TOPIC_PREVIEW_STARTED: &str = "playback/preview_started";
+
+/// Topic for preview ended events (ADR-031).
+pub const TOPIC_PREVIEW_ENDED: &str = "playback/preview_ended";
+
 /// Events emitted by the playback service.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type")]
@@ -74,6 +83,23 @@ pub enum PlaybackEvent {
     SessionEnded {
         id: SessionId,
     },
+    /// The audio output's health changed (deckless: see ADR-028).
+    OutputChanged {
+        health: OutputHealth,
+    },
+    /// `hash` is now previewed, over `back_to` (the track held to return to,
+    /// `None` when nothing was playing). A preview is not a play: no
+    /// `TrackStarted` follows, and `PositionUpdate` names `hash` while it plays.
+    PreviewStarted {
+        hash: ContentHash,
+        back_to: Option<ContentHash>,
+    },
+    /// The preview of `hash` is over, by itself or on request. `resumed` is the
+    /// track that is audible again (`None`: nothing, playback is idle).
+    PreviewEnded {
+        hash: ContentHash,
+        resumed: Option<ContentHash>,
+    },
 }
 
 impl PlaybackEvent {
@@ -89,6 +115,9 @@ impl PlaybackEvent {
             PlaybackEvent::PositionUpdate { .. } => TOPIC_POSITION_UPDATE,
             PlaybackEvent::SessionStarted { .. } => TOPIC_SESSION_STARTED,
             PlaybackEvent::SessionEnded { .. } => TOPIC_SESSION_ENDED,
+            PlaybackEvent::OutputChanged { .. } => TOPIC_OUTPUT,
+            PlaybackEvent::PreviewStarted { .. } => TOPIC_PREVIEW_STARTED,
+            PlaybackEvent::PreviewEnded { .. } => TOPIC_PREVIEW_ENDED,
         }
     }
 }
@@ -288,6 +317,26 @@ mod tests {
     #[case(
         PlaybackEvent::SessionEnded { id: SessionId::new("2026-02-24T12:00:00+00:00") },
         TOPIC_SESSION_ENDED
+    )]
+    #[case(
+        PlaybackEvent::OutputChanged { health: OutputHealth::Stalled },
+        TOPIC_OUTPUT
+    )]
+    #[case(
+        PlaybackEvent::PreviewStarted { hash: ContentHash::new("sha256:abc123"), back_to: Some(ContentHash::new("sha256:def456")) },
+        TOPIC_PREVIEW_STARTED
+    )]
+    #[case(
+        PlaybackEvent::PreviewStarted { hash: ContentHash::new("sha256:abc123"), back_to: None },
+        TOPIC_PREVIEW_STARTED
+    )]
+    #[case(
+        PlaybackEvent::PreviewEnded { hash: ContentHash::new("sha256:abc123"), resumed: Some(ContentHash::new("sha256:def456")) },
+        TOPIC_PREVIEW_ENDED
+    )]
+    #[case(
+        PlaybackEvent::PreviewEnded { hash: ContentHash::new("sha256:abc123"), resumed: None },
+        TOPIC_PREVIEW_ENDED
     )]
     fn roundtrip(#[case] event: PlaybackEvent, #[case] expected_topic: &str) {
         let bytes = to_topic_message(&event);

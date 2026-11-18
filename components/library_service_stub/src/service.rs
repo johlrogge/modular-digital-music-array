@@ -5,13 +5,18 @@
 //! ACID, ingestion, or file-system side effects.
 
 use crate::ipc::{
-    bookmark_scope_mark, parse_request, BeatGridInfo, Bpm, ContentHash, CueInfo, DurationSeconds,
-    FactType, IpcServer, LibraryRequest, LibraryResponse, Mark, MarkFilter, MarkWrite, OrphanInfo,
-    OrphanReason, PlaylistName, ProtocolError, ServiceStatus, TrackInfo, TrackQuery, Unmark,
+    bookmark_scope_mark, parse_request, ContentHash, FactType, IpcServer, LibraryRequest,
+    LibraryResponse, Mark, MarkWrite, OrphanInfo, OrphanReason, PlaylistName, ProtocolError,
+    ServiceStatus, TrackInfo, TrackQuery, Unmark,
 };
-use library_search::{matches_query, TrackFields};
+use library_projection::{
+    apply_fact, distinct_retractions, fact_values, marked, project, resolve_prefix,
+    resolve_visible, retain_live, search, track_info, unresolved_error, visible, AlbumCovers,
+    IndexedTrackInfo, LineageLog,
+};
 use music_facts::{FactSource, MusicValue};
-use music_primitives::{EnergyLevel, TrackRole};
+use stainless_facts::{Fact, Operation};
+use std::collections::hash_map::{Entry, OccupiedEntry};
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
@@ -51,110 +56,23 @@ impl ReleaseVersion {
     }
 }
 
-/// Compact track record stored in-memory.
-#[derive(Clone, Default)]
-struct IndexedTrack {
-    content_hash: String,
-    title: Option<String>,
-    artist: Option<String>,
-    album: Option<String>,
-    label: Option<String>,
-    genre: Option<String>,
-    styles: Vec<String>,
-    duration_seconds: Option<u32>,
-    bpm: Option<f32>,
-    key: Option<String>,
-    year: Option<u32>,
-    source: Option<String>,
-    track_number: Option<u32>,
-    disc_number: Option<u32>,
-    deleted_at: Option<chrono::DateTime<chrono::Utc>>,
-    /// Projected cue points (assert-only; retract not handled in stub).
-    memory_cues: Vec<CueInfo>,
-    /// Projected beat-grid anchor (last asserted wins).
-    beat_grid: Option<BeatGridInfo>,
-    /// DJ curation role.
-    role: Option<TrackRole>,
-    /// Energy level 1–10.
-    energy: Option<EnergyLevel>,
-    /// Live `Bookmarked` values, from loaded facts and `WriteMark`/`WriteBookmark`. A loaded
-    /// retract or `UnmarkTrack` removes the matching value, as the real service's
-    /// provenance does. Retracts of every other fact are skipped, not applied.
-    bookmarks: Vec<MusicValue>,
-}
-
-impl IndexedTrack {
-    fn is_hidden(&self) -> bool {
-        self.deleted_at.is_some()
-    }
-
-    fn has_mark(&self, filter: &MarkFilter) -> bool {
-        self.bookmarks
-            .iter()
-            .filter_map(MusicValue::stored_mark)
-            .any(|m| filter.admits(&m))
-    }
-}
-
-impl IndexedTrack {
-    fn new(entity: &str) -> Self {
-        Self {
-            content_hash: entity.to_owned(),
-            ..Default::default()
-        }
-    }
-
-    fn to_track_info(&self) -> TrackInfo {
-        TrackInfo {
-            content_hash: ContentHash::new(self.content_hash.clone()),
-            title: self.title.clone(),
-            artist: self.artist.clone(),
-            album: self.album.clone(),
-            duration: self.duration_seconds.map(DurationSeconds::new),
-            bpm: self.bpm.and_then(|b| Bpm::from_f32(b).ok()),
-            key: None,
-            blob_path: None,
-            cover_art_path: None,
-            track_number: self.track_number,
-            disc_number: self.disc_number,
-            added: None,
-            started: None,
-            stopped: None,
-            memory_cues: self.memory_cues.clone(),
-            beat_grid: self.beat_grid.clone(),
-            role: self.role,
-            energy: self.energy,
-        }
-    }
-
-    fn as_fields(&self) -> TrackFields<'_> {
-        TrackFields {
-            title: self.title.as_deref(),
-            artist: self.artist.as_deref(),
-            album: self.album.as_deref(),
-            label: self.label.as_deref(),
-            genre: self.genre.as_deref(),
-            styles: &self.styles,
-            bpm: self.bpm,
-            key: self.key.as_deref(),
-            duration: self.duration_seconds,
-            year: self.year,
-            source: self.source.as_deref(),
-            last_started: None,
-            last_stopped: None,
-            added: None,
-            role: self.role,
-            energy: self.energy.map(u8::from),
-        }
-    }
-}
-
 /// In-memory library service (stub for BDD tests).
+///
+/// It holds the projection's own track index and answers through the projection's
+/// read side, so it cannot disagree with the real service about what a fact means
+/// or how a list is ordered (ADR-030 §1).
 pub struct LibraryService {
-    tracks: Mutex<Vec<IndexedTrack>>,
+    tracks: Mutex<Vec<IndexedTrackInfo>>,
+    /// The plays and covers of the lineage, recorded as every fact is projected and
+    /// applied to the tracks before every catalog read, as the real service does.
+    ///
+    /// Lock order: `tracks` -> `lineage`.
+    lineage: Mutex<LineageLog>,
     fact_index: Mutex<HashMap<FactType, HashSet<String>>>,
-    /// Playlist name -> content (list/get/new/replace; append, remove and
-    /// rename are not supported).
+    /// Playlist name -> content (everything but append). This mutex is the
+    /// stub's `playlists_lock`: held by every playlist reader and writer.
+    ///
+    /// Lock order: `playlists` -> `tracks`, as in the real service.
     playlists: Mutex<HashMap<String, String>>,
     /// Every `WriteFact` received, with the source it stated, in order.
     written: Mutex<Vec<(ContentHash, MusicValue, Option<FactSource>)>>,
@@ -166,6 +84,19 @@ pub struct LibraryService {
 }
 
 impl LibraryService {
+    /// The names of all playlists, sorted (as the real service lists them).
+    fn playlist_names(&self) -> Vec<PlaylistName> {
+        let mut names: Vec<PlaylistName> = self
+            .playlists
+            .lock()
+            .unwrap()
+            .keys()
+            .filter_map(|n| PlaylistName::new(n).ok())
+            .collect();
+        names.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        names
+    }
+
     /// The source the last `WriteFact` of `fact` for `hash` stated: `None` when no
     /// such write was received, `Some(None)` when it stated no source.
     pub fn written_source(
@@ -242,72 +173,39 @@ impl LibraryService {
 
         let facts_path = metadata_dir.join("facts.jsonl");
 
-        let mut tracks_map: HashMap<String, IndexedTrack> = HashMap::new();
-        let mut fact_index: HashMap<FactType, HashSet<String>> = HashMap::new();
+        let mut facts = Vec::new();
         let mut facts_count = 0usize;
 
         if facts_path.exists() {
-            let reader: FactStreamReader<ContentHash, MusicValue, FactSource> =
-                match FactStreamReader::open(&facts_path) {
-                    Ok(r) => r,
+            // An unreadable file gives an empty service rather than an error.
+            let reader: Vec<_> =
+                match FactStreamReader::<ContentHash, MusicValue, FactSource>::open(&facts_path) {
+                    Ok(reader) => reader.collect(),
                     Err(e) => {
                         tracing::warn!("Stub: failed to open facts file: {:?}", e);
-                        // Return empty service rather than error
-                        return Ok(Self {
-                            tracks: Mutex::new(vec![]),
-                            fact_index: Mutex::new(HashMap::new()),
-                            playlists: Mutex::new(HashMap::new()),
-                            written: Mutex::new(Vec::new()),
-                            tracks_count: 0,
-                            facts_count: 0,
-                            version,
-                            start_time: Instant::now(),
-                        });
+                        Vec::new()
                     }
                 };
-
             for fact_result in reader {
                 facts_count += 1;
-                let fact = match fact_result {
-                    Ok(f) => f,
-                    Err(e) => {
-                        tracing::warn!("Stub: failed to parse fact: {:?}", e);
-                        continue;
-                    }
-                };
-
-                let entity = fact.entity().as_str().to_owned();
-                let entry = tracks_map
-                    .entry(entity.clone())
-                    .or_insert_with(|| IndexedTrack::new(&entity));
-
-                // Update fact index
-                let variant_name = fact.value().display_name();
-                let value_str = fact.value().to_string();
-                fact_index
-                    .entry(FactType::new(variant_name))
-                    .or_default()
-                    .insert(value_str);
-
-                // Apply fact to the indexed track
-                match fact.operation() {
-                    stainless_facts::Operation::Assert => apply_fact(entry, fact.value()),
-                    stainless_facts::Operation::Retract => {
-                        retract_fact(entry, fact.value());
-                    }
+                match fact_result {
+                    Ok(fact) => facts.push(fact),
+                    Err(e) => tracing::warn!("Stub: failed to parse fact: {:?}", e),
                 }
             }
         }
 
-        let tracks_count = tracks_map.len();
-        let tracks: Vec<IndexedTrack> = tracks_map.into_values().collect();
+        // The real service's startup fold, then its plays.
+        let mut projection = project(facts);
+        projection.lineage.apply_to(&mut projection.tracks);
 
         Ok(Self {
-            tracks: Mutex::new(tracks),
-            fact_index: Mutex::new(fact_index),
+            tracks_count: projection.tracks.len(),
+            tracks: Mutex::new(projection.tracks),
+            lineage: Mutex::new(projection.lineage),
+            fact_index: Mutex::new(projection.fact_index),
             playlists: Mutex::new(HashMap::new()),
             written: Mutex::new(Vec::new()),
-            tracks_count,
             facts_count,
             version,
             start_time: Instant::now(),
@@ -331,13 +229,13 @@ impl LibraryService {
                 LibraryResponse::Status(status)
             }
 
-            LibraryRequest::ListTracks { limit } => {
-                LibraryResponse::Tracks(self.tracks_where(|_| true, limit))
-            }
+            LibraryRequest::ListTracks { limit } => LibraryResponse::Tracks(
+                self.with_catalog(|tracks, covers| visible(tracks, covers, limit)),
+            ),
 
-            LibraryRequest::ListMarked { filter } => {
-                LibraryResponse::Tracks(self.tracks_where(|t| t.has_mark(&filter), None))
-            }
+            LibraryRequest::ListMarked { filter } => LibraryResponse::Tracks(
+                self.with_catalog(|tracks, covers| marked(tracks, covers, &filter)),
+            ),
 
             LibraryRequest::GetTrack { hash } => match self.get_track(&hash) {
                 Ok(track) => LibraryResponse::Track(Box::new(track)),
@@ -358,14 +256,7 @@ impl LibraryService {
             }
 
             LibraryRequest::GetFactValues { fact_type } => {
-                let mut values: Vec<String> = self
-                    .fact_index
-                    .lock()
-                    .unwrap()
-                    .get(&fact_type)
-                    .map(|s| s.iter().cloned().collect())
-                    .unwrap_or_default();
-                values.sort();
+                let values = fact_values(&self.fact_index.lock().unwrap(), &fact_type);
                 LibraryResponse::FactValues(values)
             }
 
@@ -395,25 +286,91 @@ impl LibraryService {
 
             // Playlists are kept in memory. List, get, new and replace mirror the
             // real service (list is sorted; replace creates a missing playlist).
-            LibraryRequest::PlaylistList => {
-                let mut names: Vec<PlaylistName> = self
-                    .playlists
-                    .lock()
-                    .unwrap()
-                    .keys()
-                    .filter_map(|n| PlaylistName::new(n).ok())
-                    .collect();
-                names.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+            LibraryRequest::PlaylistList => LibraryResponse::PlaylistNames(self.playlist_names()),
+
+            LibraryRequest::PlaylistSearch { query } => {
+                let matcher = library_search::StringMatcher::new(&query);
+                let mut names = self.playlist_names();
+                names.retain(|n| matcher.matches(n.as_str()));
                 LibraryResponse::PlaylistNames(names)
             }
 
-            LibraryRequest::PlaylistGet { name } => {
-                match self.playlists.lock().unwrap().get(name.as_str()) {
-                    Some(content) => LibraryResponse::PlaylistContent(content.clone()),
-                    None => LibraryResponse::Error(ProtocolError::PlaylistNotFound {
-                        name: name.to_string(),
-                    }),
+            LibraryRequest::PlaylistGet { name } => self.with_playlist(&name, |entry, _| {
+                LibraryResponse::PlaylistContent(entry.get().clone())
+            }),
+
+            LibraryRequest::PlaylistEntries { name } => {
+                self.with_playlist(&name, |entry, tracks| {
+                    LibraryResponse::PlaylistEntries(playlist_edit::entries(entry.get(), tracks))
+                })
+            }
+
+            LibraryRequest::PlaylistSnapshot { name } => {
+                self.with_playlist(&name, |entry, tracks| {
+                    LibraryResponse::PlaylistSnapshot(playlist_edit::snapshot(entry.get(), tracks))
+                })
+            }
+
+            LibraryRequest::PlaylistEdit { name, version, ops } => {
+                self.with_playlist(&name, |entry, tracks| {
+                    let covers = AlbumCovers::build(tracks);
+                    match playlist_edit::plan_edit(entry.get(), &version, &ops, tracks, |t| {
+                        track_info(t, &covers)
+                    }) {
+                        Ok(planned) => commit(entry, planned),
+                        Err(e) => LibraryResponse::Error(e),
+                    }
+                })
+            }
+
+            LibraryRequest::PlaylistRevert {
+                name,
+                version,
+                content: to,
+            } => self.with_playlist(&name, |entry, tracks| {
+                let planned = playlist_edit::plan_revert(entry.get(), &version, &to, tracks);
+                commit(entry, planned)
+            }),
+
+            LibraryRequest::PlaylistDelete { name, version } => {
+                self.with_playlist(&name, |entry, tracks| {
+                    match playlist_edit::plan_delete(entry.get(), &version, tracks) {
+                        Ok(()) => {
+                            entry.remove();
+                            LibraryResponse::PlaylistDeleted
+                        }
+                        Err(current) => LibraryResponse::PlaylistDeleteConflict { current },
+                    }
+                })
+            }
+
+            LibraryRequest::PlaylistRemove { name } => self.with_playlist(&name, |entry, _| {
+                entry.remove();
+                LibraryResponse::Pong
+            }),
+
+            LibraryRequest::PlaylistAppend { name, content } => {
+                self.with_playlist(&name, |mut entry, _| {
+                    let new_content = playlist_edit::appended(entry.get(), &content);
+                    *entry.get_mut() = new_content.clone();
+                    LibraryResponse::PlaylistContent(new_content)
+                })
+            }
+
+            LibraryRequest::PlaylistRename { from, to } => {
+                let mut playlists = self.playlists.lock().unwrap();
+                if !playlists.contains_key(from.as_str()) {
+                    return not_found(&from);
                 }
+                if playlists.contains_key(to.as_str()) {
+                    return LibraryResponse::Error(ProtocolError::PlaylistAlreadyExists {
+                        name: to.to_string(),
+                    });
+                }
+                if let Some(content) = playlists.remove(from.as_str()) {
+                    playlists.insert(to.as_str().to_string(), content);
+                }
+                LibraryResponse::Pong
             }
 
             LibraryRequest::PlaylistNew { name, content } => {
@@ -434,14 +391,6 @@ impl LibraryService {
                     .unwrap()
                     .insert(name.as_str().to_string(), content.clone());
                 LibraryResponse::PlaylistContent(content)
-            }
-
-            LibraryRequest::PlaylistAppend { .. }
-            | LibraryRequest::PlaylistRemove { .. }
-            | LibraryRequest::PlaylistRename { .. } => {
-                LibraryResponse::Error(ProtocolError::Internal {
-                    message: "playlist operations not supported in stub".to_string(),
-                })
             }
 
             // Stub no-ops for inbox/ingestion operations
@@ -484,32 +433,38 @@ impl LibraryService {
             },
 
             LibraryRequest::WriteFact { hash, fact, source } => {
+                // Like the real service, a write names a track that exists.
+                let entity = match self.resolve_hash(&hash) {
+                    Ok(h) => h,
+                    Err(e) => return LibraryResponse::Error(e),
+                };
                 self.written
                     .lock()
                     .unwrap()
-                    .push((hash.clone(), fact.clone(), source));
-                // Store the fact in the fact_index so has_facts probes work in tests.
-                let variant_name = fact.display_name();
-                let value_str = fact.to_string();
-                self.fact_index
-                    .lock()
-                    .unwrap()
-                    .entry(FactType::new(variant_name))
-                    .or_default()
-                    .insert(value_str);
-                if matches!(fact, MusicValue::Bookmarked { .. }) {
-                    self.with_track(&hash, |t| apply_fact(t, &fact));
-                }
-                tracing::debug!(hash = %hash.as_str(), "Stub: WriteFact stored");
+                    .push((hash, fact.clone(), source.clone()));
+                let source = source.unwrap_or_else(|| self.user_source());
+                self.project(&entity, fact, source, Operation::Assert);
+                tracing::debug!(hash = %entity.as_str(), "Stub: WriteFact stored");
                 LibraryResponse::FactWritten
             }
 
-            LibraryRequest::RetractFact { hash, fact, .. } => {
-                match self.try_with_track(&hash, |t| retract_fact(t, &fact)) {
-                    Ok(true) => LibraryResponse::FactRetracted,
-                    Ok(false) => LibraryResponse::NothingToRetract,
-                    Err(e) => LibraryResponse::Error(e),
+            LibraryRequest::RetractFact { hash, fact, source } => {
+                let full_hash = match self.resolve_hash(&hash) {
+                    Ok(h) => h,
+                    Err(e) => return LibraryResponse::Error(e),
+                };
+                let source = source.unwrap_or_else(|| self.user_source());
+                let live = self
+                    .tracks
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|t| t.content_hash == full_hash && t.is_live_from(&fact, &source));
+                if !live {
+                    return LibraryResponse::NothingToRetract;
                 }
+                self.project(&full_hash, fact, source, Operation::Retract);
+                LibraryResponse::FactRetracted
             }
 
             LibraryRequest::RetractSourceFacts { .. } => LibraryResponse::SourceFactsRetracted,
@@ -524,30 +479,38 @@ impl LibraryService {
             }
 
             // Track lifecycle — stub implementations
-            LibraryRequest::TrackDelete { hash } => {
-                let mut tracks = self.tracks.lock().unwrap();
-                match tracks.iter_mut().find(|t| t.content_hash == hash.as_str()) {
-                    Some(t) => {
-                        t.deleted_at = Some(chrono::Utc::now());
-                        LibraryResponse::TrackDeleted
-                    }
-                    None => LibraryResponse::Error(ProtocolError::TrackNotFound {
-                        hash: hash.as_str().to_owned(),
-                    }),
+            // Like the real service: assert `Deleted`, and retract the current one.
+            LibraryRequest::TrackDelete { hash } => match self.resolve_hash(&hash) {
+                Ok(full_hash) => {
+                    let fact = MusicValue::Deleted {
+                        timestamp: chrono::Utc::now(),
+                    };
+                    self.project(&full_hash, fact, self.user_source(), Operation::Assert);
+                    LibraryResponse::TrackDeleted
                 }
-            }
+                Err(e) => LibraryResponse::Error(e),
+            },
 
             LibraryRequest::TrackRestore { hash } => {
-                let mut tracks = self.tracks.lock().unwrap();
-                match tracks.iter_mut().find(|t| t.content_hash == hash.as_str()) {
-                    Some(t) => {
-                        t.deleted_at = None;
-                        LibraryResponse::TrackRestored
-                    }
-                    None => LibraryResponse::Error(ProtocolError::TrackNotFound {
-                        hash: hash.as_str().to_owned(),
-                    }),
-                }
+                let full_hash = match self.resolve_hash(&hash) {
+                    Ok(h) => h,
+                    Err(e) => return LibraryResponse::Error(e),
+                };
+                let deleted_at = self
+                    .tracks
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .find(|t| t.content_hash == full_hash)
+                    .and_then(|t| t.deleted_at);
+                let Some(timestamp) = deleted_at else {
+                    return LibraryResponse::Error(ProtocolError::Internal {
+                        message: "Track is not deleted".to_string(),
+                    });
+                };
+                let fact = MusicValue::Deleted { timestamp };
+                self.project(&full_hash, fact, self.user_source(), Operation::Retract);
+                LibraryResponse::TrackRestored
             }
 
             LibraryRequest::TrackReplace { .. } => {
@@ -595,7 +558,7 @@ impl LibraryService {
                             }
                         };
                         OrphanInfo {
-                            content_hash: ContentHash::new(t.content_hash.clone()),
+                            content_hash: t.content_hash.clone(),
                             artist: t.artist.clone(),
                             title: t.title.clone(),
                             reason,
@@ -607,229 +570,118 @@ impl LibraryService {
         }
     }
 
-    /// Visible tracks that match `filter` (hidden tracks excluded), optionally limited.
-    fn tracks_where(
-        &self,
-        filter: impl Fn(&IndexedTrack) -> bool,
-        limit: Option<usize>,
-    ) -> Vec<TrackInfo> {
-        let tracks = self.tracks.lock().unwrap();
-        let iter = tracks
-            .iter()
-            .filter(|t| !t.is_hidden() && filter(t))
-            .map(|t| t.to_track_info());
-        match limit {
-            Some(n) => iter.take(n).collect(),
-            None => iter.collect(),
-        }
+    /// What the stub's own writes state as their source when they state none: the
+    /// user, like the real service's `user_default`.
+    fn user_source(&self) -> FactSource {
+        FactSource::new("mdma", self.version.as_str(), "User")
     }
 
-    /// Run `f` on the track `hash` resolves to; an unknown or ambiguous hash is
-    /// skipped.
-    fn with_track(&self, hash: &ContentHash, f: impl FnOnce(&mut IndexedTrack)) {
-        let _ = self.try_with_track(hash, f);
-    }
-
-    /// Run `f` on the track `hash` resolves to; an unknown or ambiguous hash is
-    /// an error.
-    fn try_with_track<T>(
-        &self,
-        hash: &ContentHash,
-        f: impl FnOnce(&mut IndexedTrack) -> T,
-    ) -> Result<T, ProtocolError> {
-        let full_hash = self.resolve_hash(hash)?;
+    /// Run a read over the track index and its album covers, which the projection's
+    /// read side needs (rebuilt per read: the stub is small). The lineage is applied
+    /// first, as the node does before every such read (ADR-030 §1.3), so a `Replaces`
+    /// or a cover written after startup takes effect.
+    fn with_catalog<R>(&self, read: impl FnOnce(&[IndexedTrackInfo], &AlbumCovers) -> R) -> R {
         let mut tracks = self.tracks.lock().unwrap();
-        tracks
-            .iter_mut()
-            .find(|t| t.content_hash == full_hash.as_str())
-            .map(f)
-            .ok_or_else(|| ProtocolError::TrackNotFound {
-                hash: hash.as_str().to_owned(),
-            })
+        self.lineage.lock().unwrap().apply_to(&mut tracks);
+        read(&tracks, &AlbumCovers::build(&tracks))
+    }
+
+    /// Project a write: build the fact and apply it with the projection's own
+    /// `apply_fact`, as the real service projects what it wrote.
+    fn project(
+        &self,
+        entity: &ContentHash,
+        value: MusicValue,
+        source: FactSource,
+        operation: Operation,
+    ) {
+        let fact = Fact::new(entity.clone(), value, chrono::Utc::now(), source, operation);
+        let mut tracks = self.tracks.lock().unwrap();
+        self.lineage.lock().unwrap().record(&fact);
+        let mut positions: HashMap<String, usize> = tracks
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (t.content_hash.as_str().to_owned(), i))
+            .collect();
+        apply_fact(
+            &mut tracks,
+            &mut positions,
+            &mut HashSet::new(),
+            &mut self.fact_index.lock().unwrap(),
+            &fact,
+        );
+        // The real service's sweep after a catch-up: what no assertion holds is gone.
+        retain_live(&mut tracks, &mut HashSet::new());
     }
 
     /// Apply `mark` to a track unless the track already carries it live; then
-    /// nothing is stored and the original time is kept.
+    /// nothing is written and the original time is kept.
     fn write_mark(&self, hash: &ContentHash, mark: &Mark) -> Result<MarkWrite, ProtocolError> {
-        self.try_with_track(hash, |track| {
-            if track.bookmarks.iter().any(|v| mark.matches(v)) {
-                return MarkWrite::AlreadyLive;
-            }
-            track.bookmarks.push(mark.fact_value(chrono::Utc::now()));
-            MarkWrite::Written
-        })
-    }
-
-    /// Remove every live assertion of `mark` from a track. `count` is the number of
-    /// distinct values removed, like the real service's one retract per value (the
-    /// stub keeps no sources).
-    fn unmark(&self, hash: &ContentHash, mark: &Mark) -> Result<Unmark, ProtocolError> {
-        self.try_with_track(hash, |track| {
-            let mut removed: Vec<MusicValue> = Vec::new();
-            track.bookmarks.retain(|v| {
-                if !mark.matches(v) {
-                    return true;
-                }
-                if !removed.contains(v) {
-                    removed.push(v.clone());
-                }
-                false
-            });
-            NonZeroUsize::new(removed.len())
-                .map_or(Unmark::NotLive, |count| Unmark::Retracted { count })
-        })
-    }
-
-    /// Resolve a partial hash to a full hash (same algorithm as real service).
-    fn resolve_hash(&self, partial: &ContentHash) -> Result<ContentHash, ProtocolError> {
-        let normalize = |h: &str| h.strip_prefix("sha256:").unwrap_or(h).to_lowercase();
-        let partial_clean = normalize(partial.as_str());
-
-        let tracks = self.tracks.lock().unwrap();
-        let matches: Vec<_> = tracks
+        let full_hash = self.resolve_hash(hash)?;
+        let already_live = self
+            .tracks
+            .lock()
+            .unwrap()
             .iter()
-            .filter(|t| {
-                let hash = t
-                    .content_hash
-                    .as_str()
-                    .strip_prefix("sha256:")
-                    .unwrap_or(t.content_hash.as_str());
-                hash.to_lowercase().starts_with(&partial_clean)
-            })
-            .collect();
-
-        match matches.len() {
-            0 => Err(ProtocolError::TrackNotFound {
-                hash: partial.as_str().to_owned(),
-            }),
-            1 => Ok(ContentHash::new(matches[0].content_hash.clone())),
-            _ => {
-                // Check if all matches are the same content (prefix/full hash pair)
-                let normalized: Vec<String> = matches
-                    .iter()
-                    .map(|t| normalize(t.content_hash.as_str()))
-                    .collect();
-                let all_same = normalized.iter().all(|a| {
-                    normalized
-                        .iter()
-                        .all(|b| a.starts_with(b.as_str()) || b.starts_with(a.as_str()))
-                });
-                if all_same {
-                    let best = matches.iter().max_by_key(|t| t.content_hash.len()).unwrap();
-                    return Ok(ContentHash::new(best.content_hash.clone()));
-                }
-
-                // Genuinely ambiguous
-                let n = matches.len();
-                let examples: Vec<_> = matches
-                    .iter()
-                    .take(3)
-                    .map(|t| {
-                        let hash_str = t.content_hash.as_str();
-                        let short = hash_str.get(7..15).unwrap_or(hash_str);
-                        let name = t.title.as_deref().unwrap_or("Unknown");
-                        format!("  {} ({})", short, name)
-                    })
-                    .collect();
-                Err(ProtocolError::Internal {
-                    message: format!(
-                        "Ambiguous hash '{}' matches {} tracks:\n{}",
-                        partial.as_str(),
-                        n,
-                        examples.join("\n")
-                    ),
-                })
-            }
+            .find(|t| t.content_hash == full_hash)
+            .is_some_and(|t| t.live_marks(mark).next().is_some());
+        if already_live {
+            return Ok(MarkWrite::AlreadyLive);
         }
+        self.project(
+            &full_hash,
+            mark.fact_value(chrono::Utc::now()),
+            self.user_source(),
+            Operation::Assert,
+        );
+        Ok(MarkWrite::Written)
+    }
+
+    /// Retract every live assertion of `mark` on a track: one retract per (value,
+    /// source identity), like the real service. `count` is the number of retracts.
+    fn unmark(&self, hash: &ContentHash, mark: &Mark) -> Result<Unmark, ProtocolError> {
+        let full_hash = self.resolve_hash(hash)?;
+        let live = {
+            let tracks = self.tracks.lock().unwrap();
+            let track = tracks
+                .iter()
+                .find(|t| t.content_hash == full_hash)
+                .ok_or_else(|| ProtocolError::TrackNotFound {
+                    hash: hash.as_str().to_owned(),
+                })?;
+            distinct_retractions(track.live_marks(mark).cloned())
+        };
+        let Some(count) = NonZeroUsize::new(live.len()) else {
+            return Ok(Unmark::NotLive);
+        };
+        for (value, source) in live {
+            self.project(&full_hash, value, source, Operation::Retract);
+        }
+        Ok(Unmark::Retracted { count })
+    }
+
+    /// Resolve a partial hash to a full hash (the real service's `resolve_prefix`).
+    fn resolve_hash(&self, partial: &ContentHash) -> Result<ContentHash, ProtocolError> {
+        let tracks = self.tracks.lock().unwrap();
+        resolve_prefix(&tracks, partial.as_str())
+            .map(|track| track.content_hash.clone())
+            .map_err(|unresolved| unresolved_error(partial.as_str(), unresolved))
     }
 
     /// Look up a track by content hash (supports partial hashes).
     /// Returns TrackNotFound for hidden (deleted/superseded) tracks.
     fn get_track(&self, hash: &ContentHash) -> Result<TrackInfo, ProtocolError> {
-        let full_hash = self.resolve_hash(hash)?;
-
-        let tracks = self.tracks.lock().unwrap();
-        let track = tracks.iter().find(|t| t.content_hash == full_hash.as_str());
-
-        match track {
-            Some(t) if t.is_hidden() => Err(ProtocolError::TrackNotFound {
-                hash: hash.as_str().to_owned(),
-            }),
-            Some(t) => Ok(t.to_track_info()),
-            None => Err(ProtocolError::TrackNotFound {
-                hash: hash.as_str().to_owned(),
-            }),
-        }
+        self.with_catalog(|tracks, covers| {
+            resolve_visible(tracks, hash.as_str())
+                .map(|track| track_info(track, covers))
+                .map_err(|unresolved| unresolved_error(hash.as_str(), unresolved))
+        })
     }
 
     /// Search tracks against a `TrackQuery` (hidden tracks excluded).
     fn search_tracks(&self, query: &TrackQuery) -> Vec<TrackInfo> {
-        self.tracks_where(|t| matches_query(query, &t.as_fields()), None)
+        self.with_catalog(|tracks, covers| search(tracks, covers, query))
     }
-}
-
-/// Apply a single `MusicValue` to an `IndexedTrack`.
-fn apply_fact(entry: &mut IndexedTrack, value: &MusicValue) {
-    match value {
-        MusicValue::Title(v) => entry.title = Some(v.as_str().to_string()),
-        MusicValue::Artist(v) => entry.artist = Some(v.as_str().to_string()),
-        MusicValue::Album(v) => entry.album = Some(v.as_str().to_string()),
-        MusicValue::Label(v) => entry.label = Some(v.clone()),
-        MusicValue::MainGenre(v) => entry.genre = Some(v.clone()),
-        MusicValue::StyleDescriptor(v) => entry.styles.push(v.clone()),
-        MusicValue::DurationSeconds(v) => entry.duration_seconds = Some(v.value()),
-        MusicValue::Bpm(v) => entry.bpm = Some(v.as_f32()),
-        MusicValue::Year(v) => entry.year = Some(v.value()),
-        MusicValue::TrackNumber(v) => entry.track_number = Some(v.value()),
-        MusicValue::DiscNumber(v) => entry.disc_number = Some(v.value()),
-        MusicValue::Source(v) => entry.source = Some(v.clone()),
-        MusicValue::Replaces(_) => {
-            // Replaces is asserted on the new track; no scalar field needed in stub.
-        }
-        MusicValue::Deleted { timestamp } => {
-            entry.deleted_at = Some(*timestamp);
-        }
-        MusicValue::MemoryCue {
-            position_ms,
-            kind,
-            label,
-            index,
-        } => {
-            entry.memory_cues.push(CueInfo {
-                position_ms: *position_ms,
-                kind: kind.clone(),
-                label: label.clone(),
-                index: *index,
-            });
-        }
-        MusicValue::BeatGrid {
-            first_beat_ms,
-            bpm,
-            beats_per_bar,
-        } => {
-            entry.beat_grid = Bpm::from_f32(bpm.as_f32()).ok().map(|b| BeatGridInfo {
-                first_beat_ms: *first_beat_ms,
-                bpm: b,
-                beats_per_bar: *beats_per_bar,
-            });
-        }
-        MusicValue::Role(v) => entry.role = Some(*v),
-        MusicValue::Energy(v) => entry.energy = Some(*v),
-        MusicValue::Bookmarked { .. } => entry.bookmarks.push(value.clone()),
-        _ => {} // ignore all other facts (key, format, cover art, timestamps, etc.)
-    }
-}
-
-/// Apply a loaded retraction. Only bookmarks honour it: every equal value is removed. The real service also requires the same
-/// source (ADR-018); the stub keeps no sources, so it matches by value alone. Every
-/// other retraction is skipped.
-/// Whether anything was removed.
-fn retract_fact(entry: &mut IndexedTrack, value: &MusicValue) -> bool {
-    let before = entry.bookmarks.len();
-    if let MusicValue::Bookmarked { .. } = value {
-        entry.bookmarks.retain(|b| b != value);
-    }
-    entry.bookmarks.len() != before
 }
 
 /// Run the IPC server loop, handling requests until the socket closes.
@@ -867,9 +719,46 @@ pub fn run_ipc_server(svc: Arc<LibraryService>, address: &str) -> Result<(), Ser
 /// `library_service::service::spawn_fact_subscriber` compile unchanged.
 pub fn spawn_fact_subscriber(_service: Arc<LibraryService>) {}
 
+fn not_found(name: &PlaylistName) -> LibraryResponse {
+    LibraryResponse::Error(ProtocolError::PlaylistNotFound {
+        name: name.to_string(),
+    })
+}
+
+/// Store what `planned` says to write, and answer its outcome.
+fn commit(
+    entry: OccupiedEntry<'_, String, String>,
+    planned: playlist_edit::Planned,
+) -> LibraryResponse {
+    let (write, outcome) = planned.into_parts();
+    if let Some(bytes) = write {
+        *entry.into_mut() = bytes;
+    }
+    LibraryResponse::PlaylistEdited(outcome)
+}
+
+impl LibraryService {
+    /// Run `f` on the entry of playlist `name` (read, change or remove it) and on
+    /// the tracks, under the playlists lock and then the tracks lock (the lock
+    /// order). A missing playlist is `PlaylistNotFound`.
+    fn with_playlist(
+        &self,
+        name: &PlaylistName,
+        f: impl FnOnce(OccupiedEntry<'_, String, String>, &[IndexedTrackInfo]) -> LibraryResponse,
+    ) -> LibraryResponse {
+        let mut playlists = self.playlists.lock().unwrap();
+        let Entry::Occupied(entry) = playlists.entry(name.as_str().to_string()) else {
+            return not_found(name);
+        };
+        let tracks = self.tracks.lock().unwrap();
+        f(entry, &tracks)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ipc::{CanonicalHash, EntryError, MarkFilter, PlaylistEntry};
 
     fn empty_service() -> Arc<LibraryService> {
         LibraryService::from_metadata_dir(PathBuf::from("/nonexistent"))
@@ -940,12 +829,38 @@ mod tests {
         }
     }
 
+    fn search_playlists(svc: &LibraryService, text: &str) -> Vec<String> {
+        let query = library_search::parse_string_query(text);
+        match svc.handle_request(LibraryRequest::PlaylistSearch { query }) {
+            LibraryResponse::PlaylistNames(names) => {
+                names.iter().map(|n| n.as_str().to_string()).collect()
+            }
+            other => panic!("expected PlaylistNames, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn playlist_search_uses_the_library_text_rules() {
+        let svc = empty_service();
+        for n in ["Carbon-Based-Lifeforms", "warmup"] {
+            svc.handle_request(LibraryRequest::PlaylistNew {
+                name: name(n),
+                content: String::new(),
+            });
+        }
+        // Upper case is an initialism; lower case is a plain "contains".
+        assert_eq!(search_playlists(&svc, "CBL"), ["Carbon-Based-Lifeforms"]);
+        assert!(search_playlists(&svc, "cbl").is_empty());
+        assert_eq!(search_playlists(&svc, "warm"), ["warmup"]);
+    }
+
     fn service_with_tracks(hashes: &[&str]) -> Arc<LibraryService> {
         let svc = empty_service();
-        svc.tracks
-            .lock()
-            .unwrap()
-            .extend(hashes.iter().map(|h| IndexedTrack::new(h)));
+        svc.tracks.lock().unwrap().extend(
+            hashes
+                .iter()
+                .map(|h| IndexedTrackInfo::new_empty((*h).to_owned())),
+        );
         svc
     }
 
@@ -966,6 +881,158 @@ mod tests {
 
     fn marked_any(svc: &LibraryService) -> Vec<String> {
         marked(svc, MarkFilter::Any)
+    }
+
+    #[test]
+    fn a_prefix_of_two_tracks_is_an_ambiguous_hash_not_an_internal_error() {
+        let a = format!("sha256:ab{}", "0".repeat(62));
+        let b = format!("sha256:ab{}", "1".repeat(62));
+        let svc = service_with_tracks(&[a.as_str(), b.as_str()]);
+        let partial = ContentHash::new("sha256:ab");
+        for result in [
+            svc.resolve_hash(&partial).map(|_| ()),
+            svc.get_track(&partial).map(|_| ()),
+        ] {
+            match result {
+                Err(ProtocolError::AmbiguousHash { hash, candidates }) => {
+                    assert_eq!(hash, "sha256:ab");
+                    assert_eq!(candidates.len(), 2);
+                    assert!(candidates.contains(&a) && candidates.contains(&b));
+                }
+                other => panic!("expected AmbiguousHash, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn search_by_key_finds_projected_track() {
+        let svc = service_with_tracks(&["sha256:aaaa", "sha256:bbbb", "sha256:cccc"]);
+        for (i, key) in ["A Minor", "C Major", "E Minor"].iter().enumerate() {
+            let mut tracks = svc.tracks.lock().unwrap();
+            library_projection::apply_fact_to_track(
+                &mut tracks[i],
+                &MusicValue::Key(key.parse().expect("valid key")),
+                chrono::Utc::now(),
+                Operation::Assert,
+                &FactSource::new("test", "1.0.0", "Unknown"),
+            );
+        }
+        let search = |key: &str| {
+            let query = TrackQuery {
+                key: Some(key.parse().expect("valid key query")),
+                ..Default::default()
+            };
+            match svc.handle_request(LibraryRequest::Search { query }) {
+                LibraryResponse::SearchResults(tracks) => {
+                    let mut hashes: Vec<String> = tracks
+                        .iter()
+                        .map(|t| t.content_hash.as_str().to_owned())
+                        .collect();
+                    hashes.sort();
+                    hashes
+                }
+                other => panic!("expected SearchResults, got {other:?}"),
+            }
+        };
+        assert_eq!(search("8A"), vec!["sha256:aaaa"]);
+        // 8B is a mode switch away (one step); 9A is one step clockwise.
+        assert_eq!(search("8A-1"), vec!["sha256:aaaa", "sha256:bbbb"]);
+        assert_eq!(
+            search("8A+-1"),
+            vec!["sha256:aaaa", "sha256:bbbb", "sha256:cccc"]
+        );
+        assert!(search("1A").is_empty());
+    }
+
+    #[test]
+    fn every_track_list_is_in_catalog_order() {
+        use stainless_facts::Operation::Assert;
+        let artist = |a: &str| MusicValue::Artist(music_facts::Artist::new(a));
+        let svc = service_from_facts(
+            "catalog-order",
+            &[
+                ("sha256:c", artist("B"), Assert),
+                ("sha256:b", artist("a"), Assert),
+                ("sha256:a", artist("a"), Assert),
+                (
+                    "sha256:d",
+                    MusicValue::ItemId("untagged".to_owned()),
+                    Assert,
+                ),
+            ],
+        );
+        let in_order = |resp: LibraryResponse| match resp {
+            LibraryResponse::Tracks(tracks) | LibraryResponse::SearchResults(tracks) => tracks
+                .iter()
+                .map(|t| t.content_hash.as_str().to_owned())
+                .collect::<Vec<_>>(),
+            other => panic!("expected tracks, got {other:?}"),
+        };
+        let expected = strs(&["sha256:a", "sha256:b", "sha256:c", "sha256:d"]);
+        assert_eq!(
+            in_order(svc.handle_request(LibraryRequest::ListTracks { limit: None })),
+            expected,
+            "artist ignoring case, then hash; a missing artist last"
+        );
+        assert_eq!(
+            in_order(svc.handle_request(LibraryRequest::Search {
+                query: TrackQuery::default()
+            })),
+            expected
+        );
+    }
+
+    fn listed(svc: &LibraryService) -> Vec<String> {
+        sorted_hashes(svc.handle_request(LibraryRequest::ListTracks { limit: None }))
+    }
+
+    #[test]
+    fn write_fact_to_an_unknown_hash_is_track_not_found_and_makes_no_entity() {
+        let svc = service_with_mark_track(&[]);
+        let resp = svc.handle_request(LibraryRequest::WriteFact {
+            hash: ContentHash::new("sha256:nobody"),
+            fact: MusicValue::ItemId("p1".to_string()),
+            source: None,
+        });
+        assert_track_not_found(resp);
+        assert_eq!(listed(&svc), strs(&[MARK_TRACK]));
+        assert!(svc
+            .written_source(
+                &ContentHash::new("sha256:nobody"),
+                &MusicValue::ItemId("p1".to_string())
+            )
+            .is_none());
+    }
+
+    #[test]
+    fn a_retract_that_empties_an_entity_drops_it_from_the_list() {
+        let svc = service_with_mark_track(&[]);
+        let resp = svc.handle_request(LibraryRequest::RetractFact {
+            hash: ContentHash::new(MARK_TRACK),
+            fact: MusicValue::Title(music_facts::Title::new("T")),
+            source: Some(FactSource::new("test", "1.0.0", "Unknown")),
+        });
+        assert!(matches!(resp, LibraryResponse::FactRetracted), "{resp:?}");
+        assert!(listed(&svc).is_empty());
+    }
+
+    #[test]
+    fn delete_hides_a_track_and_restore_brings_it_back() {
+        let svc = service_with_mark_track(&[]);
+        let hash = ContentHash::new(MARK_TRACK);
+        let resp = svc.handle_request(LibraryRequest::TrackDelete { hash: hash.clone() });
+        assert!(matches!(resp, LibraryResponse::TrackDeleted), "{resp:?}");
+        assert!(listed(&svc).is_empty());
+
+        let resp = svc.handle_request(LibraryRequest::TrackRestore { hash: hash.clone() });
+        assert!(matches!(resp, LibraryResponse::TrackRestored), "{resp:?}");
+        assert_eq!(listed(&svc), strs(&[MARK_TRACK]));
+
+        let resp = svc.handle_request(LibraryRequest::TrackRestore { hash });
+        assert!(
+            matches!(resp, LibraryResponse::Error(ProtocolError::Internal { .. })),
+            "{resp:?}"
+        );
     }
 
     #[test]
@@ -1136,10 +1203,13 @@ mod tests {
         let tracks = svc.tracks.lock().unwrap();
         tracks
             .iter()
-            .find(|t| t.content_hash == MARK_TRACK)
+            .find(|t| t.content_hash.as_str() == MARK_TRACK)
             .expect("the mark track")
-            .bookmarks
-            .clone()
+            .provenance
+            .iter()
+            .filter(|(v, _)| matches!(v, MusicValue::Bookmarked { .. }))
+            .map(|(v, _)| v.clone())
+            .collect()
     }
 
     #[test]
@@ -1313,7 +1383,7 @@ mod tests {
 
     #[test]
     fn unmark_removes_every_live_entry_of_the_mark() {
-        // The stub has no sources; two loaded assertions stand in for a merge carry.
+        // Two loaded assertions stand in for a merge carry: one retract per value.
         let svc = service_with_mark_track(&[
             stored_bookmark("banger", 1_767_225_600),
             stored_bookmark("banger", 1_767_312_000),
@@ -1526,6 +1596,125 @@ mod tests {
         }
         assert_eq!(list(&svc), vec!["alpha".to_string(), "zeta".to_string()]);
     }
+
+    // The PlaylistEntries contract, as the real service's tests state it.
+
+    fn full_hash(prefix: &str, fill: char) -> String {
+        format!(
+            "sha256:{prefix}{}",
+            fill.to_string().repeat(64 - prefix.len())
+        )
+    }
+
+    fn track_entry(hash: &str) -> PlaylistEntry {
+        PlaylistEntry::Track {
+            hash: CanonicalHash::try_from(ContentHash::new(hash)).unwrap(),
+        }
+    }
+
+    /// A stub holding tracks `aaaa..` and two sharing the prefix `ab`, with the
+    /// playlist `set` holding `content`.
+    fn service_with_playlist(content: &str) -> Arc<LibraryService> {
+        let svc = service_with_tracks(&[
+            &full_hash("aaaa", 'a'),
+            &full_hash("ab", '1'),
+            &full_hash("ab", '2'),
+        ]);
+        svc.handle_request(LibraryRequest::PlaylistNew {
+            name: name("set"),
+            content: content.to_string(),
+        });
+        svc
+    }
+
+    fn playlist_entries(svc: &LibraryService, playlist: &str) -> LibraryResponse {
+        svc.handle_request(LibraryRequest::PlaylistEntries {
+            name: name(playlist),
+        })
+    }
+
+    fn entries_of(resp: LibraryResponse) -> Vec<PlaylistEntry> {
+        match resp {
+            LibraryResponse::PlaylistEntries(entries) => entries,
+            other => panic!("expected PlaylistEntries, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn playlist_entries_keep_order_and_duplicates_of_mixed_short_and_full_lines() {
+        let a = full_hash("aaaa", 'a');
+        let b1 = full_hash("ab", '1');
+        let content =
+            format!("# a set\naaaaaaaa  Artist - Title  [3:00]\n\n{b1}\nsha256:aaaa\n{a}\n");
+        let svc = service_with_playlist(&content);
+        assert_eq!(
+            entries_of(playlist_entries(&svc, "set")),
+            vec![
+                track_entry(&a),
+                track_entry(&b1),
+                track_entry(&a),
+                track_entry(&a),
+            ]
+        );
+    }
+
+    #[test]
+    fn playlist_entries_report_unresolved_entries_in_place() {
+        let a = full_hash("aaaa", 'a');
+        let svc = service_with_playlist("ffffffff\naaaaaaaa\nab\n");
+        assert_eq!(
+            entries_of(playlist_entries(&svc, "set")),
+            vec![
+                PlaylistEntry::Unresolved {
+                    error: EntryError::Unknown {
+                        hash: ContentHash::new("ffffffff")
+                    }
+                },
+                track_entry(&a),
+                PlaylistEntry::Unresolved {
+                    error: EntryError::Ambiguous {
+                        hash: ContentHash::new("ab"),
+                        candidates: vec![
+                            ContentHash::new(full_hash("ab", '1')),
+                            ContentHash::new(full_hash("ab", '2')),
+                        ],
+                    }
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn playlist_entries_leave_the_file_byte_identical() {
+        let content =
+            "# a set\r\naaaaaaaa  Artist - Title\n\nffffffff\n  ab\t x\nno newline at end";
+        let svc = service_with_playlist(content);
+        let _ = playlist_entries(&svc, "set");
+        let resp = svc.handle_request(LibraryRequest::PlaylistGet { name: name("set") });
+        assert!(matches!(resp, LibraryResponse::PlaylistContent(c) if c == content));
+    }
+
+    #[test]
+    fn playlist_entries_of_missing_playlist_is_playlist_not_found() {
+        let svc = service_with_playlist("");
+        let resp = playlist_entries(&svc, "nope");
+        assert!(
+            matches!(
+                resp,
+                LibraryResponse::Error(ProtocolError::PlaylistNotFound { .. })
+            ),
+            "{resp:?}"
+        );
+    }
+
+    // The ADR-027 contract, stated once in `playlist_edit::contract`.
+
+    fn contract_setup(content: &str) -> playlist_edit::contract::Handler {
+        let svc = service_with_playlist(content);
+        Box::new(move |request| svc.handle_request(request))
+    }
+
+    playlist_edit::playlist_contract_tests!(contract_setup);
 
     #[test]
     fn playlist_replace_creates_a_missing_playlist_like_the_real_service() {

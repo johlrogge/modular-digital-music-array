@@ -2,11 +2,91 @@ use crate::args::{HashInput, StdinDash};
 use crate::ctx::Ctx;
 use crate::output::{display_error, format_track_line, render_track_table};
 use crate::stdin::{hashes_in, hashes_of_input, require_stdin_hashes};
+use color_eyre::eyre::eyre;
 use color_eyre::Result;
 use colored::Colorize;
-use library_ipc_client::{ContentHash, TrackInfo};
-use mdma_client::SourceName;
-use track_formatter::short_hash;
+use library_ipc_client::{CanonicalHash, ContentHash, TrackInfo};
+use mdma_client::{resolve_in_queue, LibraryBackend, PlaybackBackend, SourceName};
+use track_formatter::{short_hash, unavailable_line};
+
+/// The canonical hash of each of `hashes`, resolved by the library: for adding
+/// to the queue. Removing and replacing resolve against the queue as well
+/// ([`queue_remove_resolved`], [`queue_replace_resolved`]).
+///
+/// Playback holds only full hashes (ADR-026), so every hash bound for it goes
+/// through a resolver first, full ones too. All are resolved before the caller
+/// sends anything: the first that is unknown or ambiguous fails the batch,
+/// naming it.
+pub(crate) fn resolve_for_playback(
+    library: &LibraryBackend,
+    hashes: &[ContentHash],
+) -> Result<Vec<CanonicalHash>> {
+    library.resolve_for_playback(hashes).map_err(display_error)
+}
+
+/// Queue `hashes` to play next, keeping their order. Returns how many.
+fn queue_next_resolved(
+    library: &LibraryBackend,
+    playback: &PlaybackBackend,
+    hashes: &[ContentHash],
+) -> Result<usize> {
+    let resolved = resolve_for_playback(library, hashes)?;
+    // Prepend in reverse so the first hash ends up at the front of the queue.
+    for content_hash in resolved.iter().rev() {
+        playback
+            .queue_next(content_hash.into(), SourceName::audio())
+            .map_err(display_error)?;
+    }
+    Ok(resolved.len())
+}
+
+/// Queue `hashes` at the end. Returns how many.
+fn queue_append_resolved(
+    library: &LibraryBackend,
+    playback: &PlaybackBackend,
+    hashes: &[ContentHash],
+) -> Result<usize> {
+    let resolved = resolve_for_playback(library, hashes)?;
+    for content_hash in &resolved {
+        playback
+            .queue_append(content_hash.into(), SourceName::audio())
+            .map_err(display_error)?;
+    }
+    Ok(resolved.len())
+}
+
+/// Remove `hashes` from the queue, however they are spelled. Returns how many went.
+///
+/// They are resolved against the entries the queue holds, not the library, so an
+/// entry whose track has left the library can still be removed.
+fn queue_remove_resolved(playback: &PlaybackBackend, hashes: &[ContentHash]) -> Result<usize> {
+    let queue = playback.queue_list().map_err(display_error)?;
+    let resolved = resolve_in_queue(&queue, hashes).map_err(display_error)?;
+    playback
+        .queue_remove(resolved.into_iter().map(ContentHash::from).collect())
+        .map_err(display_error)
+}
+
+/// Make `hashes` the whole queue. Returns how many.
+///
+/// An entry of `queue` (the queue as it is now) stays even when its track has
+/// left the library; a new one must exist in the library.
+fn queue_replace_resolved(
+    library: &LibraryBackend,
+    playback: &PlaybackBackend,
+    queue: &[ContentHash],
+    hashes: &[ContentHash],
+) -> Result<usize> {
+    let entries: Vec<(ContentHash, SourceName)> = library
+        .resolve_for_queue_replace(queue, hashes)
+        .map_err(display_error)?
+        .into_iter()
+        .map(|hash| (hash.into(), SourceName::audio()))
+        .collect();
+    let count = entries.len();
+    playback.queue_replace(entries).map_err(display_error)?;
+    Ok(count)
+}
 
 /// Prepend a track to the front of the queue (plays next)
 ///
@@ -20,15 +100,10 @@ use track_formatter::short_hash;
 /// ```
 #[hicli::command]
 pub(crate) fn next(hash: HashInput, ctx: &Ctx) -> Result<()> {
-    let playback = ctx.playback()?;
+    let library = ctx.node().library()?;
+    let playback = ctx.node().playback()?;
     let hashes = hashes_of_input(hash)?;
-    let count = hashes.len();
-    // Prepend in reverse so the first hash ends up at the front of the queue.
-    for content_hash in hashes.into_iter().rev() {
-        playback
-            .queue_next(content_hash, SourceName::audio())
-            .map_err(display_error)?;
-    }
+    let count = queue_next_resolved(&library, &playback, &hashes)?;
     println!("Queued {} track(s) next", count);
     Ok(())
 }
@@ -45,14 +120,10 @@ pub(crate) fn next(hash: HashInput, ctx: &Ctx) -> Result<()> {
 /// ```
 #[hicli::command]
 pub(crate) fn append(hash: HashInput, ctx: &Ctx) -> Result<()> {
-    let playback = ctx.playback()?;
+    let library = ctx.node().library()?;
+    let playback = ctx.node().playback()?;
     let hashes = hashes_of_input(hash)?;
-    let count = hashes.len();
-    for content_hash in hashes {
-        playback
-            .queue_append(content_hash, SourceName::audio())
-            .map_err(display_error)?;
-    }
+    let count = queue_append_resolved(&library, &playback, &hashes)?;
     println!("Appended {} track(s) to queue", count);
     Ok(())
 }
@@ -60,8 +131,8 @@ pub(crate) fn append(hash: HashInput, ctx: &Ctx) -> Result<()> {
 /// Show the current queue
 #[hicli::command]
 pub(crate) fn list(ctx: &Ctx) -> Result<()> {
-    let library = ctx.library()?;
-    let playback = ctx.playback()?;
+    let library = ctx.node().library()?;
+    let playback = ctx.node().playback()?;
     let hashes = playback.queue_list().map_err(display_error)?;
 
     if hashes.is_empty() {
@@ -132,7 +203,7 @@ pub(crate) fn list(ctx: &Ctx) -> Result<()> {
 /// Clear the queue
 #[hicli::command]
 pub(crate) fn clear(ctx: &Ctx) -> Result<()> {
-    let playback = ctx.playback()?;
+    let playback = ctx.node().playback()?;
     playback.queue_clear().map_err(display_error)?;
     println!("Queue cleared");
     Ok(())
@@ -150,12 +221,10 @@ pub(crate) fn clear(ctx: &Ctx) -> Result<()> {
 /// ```
 #[hicli::command]
 pub(crate) fn remove(hash: HashInput, ctx: &Ctx) -> Result<()> {
-    let playback = ctx.playback()?;
+    let playback = ctx.node().playback()?;
     let content_hashes = hashes_of_input(hash)?;
 
-    let removed = playback
-        .queue_remove(content_hashes)
-        .map_err(display_error)?;
+    let removed = queue_remove_resolved(&playback, &content_hashes)?;
     if removed > 0 {
         println!("Removed {} track(s) from queue", removed);
     }
@@ -175,14 +244,11 @@ pub(crate) fn remove(hash: HashInput, ctx: &Ctx) -> Result<()> {
 /// ```
 #[hicli::command]
 pub(crate) fn replace(_stdin: StdinDash, ctx: &Ctx) -> Result<()> {
-    let playback = ctx.playback()?;
+    let library = ctx.node().library()?;
+    let playback = ctx.node().playback()?;
     let hashes = require_stdin_hashes()?;
-    let entries: Vec<(ContentHash, SourceName)> = hashes
-        .into_iter()
-        .map(|hash| (hash, SourceName::audio()))
-        .collect();
-    let count = entries.len();
-    playback.queue_replace(entries).map_err(display_error)?;
+    let queue = playback.queue_list().map_err(display_error)?;
+    let count = queue_replace_resolved(&library, &playback, &queue, &hashes)?;
     println!("Queue replaced: {} tracks", count);
     Ok(())
 }
@@ -192,13 +258,28 @@ pub(crate) fn replace(_stdin: StdinDash, ctx: &Ctx) -> Result<()> {
 /// Opens the current queue as a playlist file; save to apply changes.
 #[hicli::command]
 pub(crate) fn edit(ctx: &Ctx) -> Result<()> {
-    let library = ctx.library()?;
-    let playback = ctx.playback()?;
+    let library = ctx.node().library()?;
+    let playback = ctx.node().playback()?;
+    let count = edit_queue(&library, &playback, |content| {
+        crate::editor::edit_text("mdma-queue-", content)
+    })?;
+    println!("Queue updated: {} tracks", count);
+    Ok(())
+}
+
+/// Show the queue as playlist text to `edit`, and make what comes back the queue.
+/// Returns how many tracks the queue holds. When the new queue is rejected the
+/// edited text is kept in a file whose path is in the error.
+fn edit_queue(
+    library: &LibraryBackend,
+    playback: &PlaybackBackend,
+    edit: impl FnOnce(&str) -> Result<String>,
+) -> Result<usize> {
     // 1. Get current queue hashes.
     let hashes = playback.queue_list().map_err(display_error)?;
 
-    // 2. Look up each track for display info. Unresolvable entries are written as
-    //    plain-hash comment lines so they survive the edit round-trip unchanged.
+    // 2. Look up each track for display info. Unavailable entries are written
+    //    with their full hash and a comment, so they survive the round-trip.
     // 3. Write to temp file in playlist format.
     let mut content = String::from(
         "# MDMA queue — reorder, delete, or add lines. Save to apply.\n\
@@ -211,34 +292,253 @@ pub(crate) fn edit(ctx: &Ctx) -> Result<()> {
                 content.push_str(&format_track_line(&track));
             }
             Err(e) => {
-                // Write the raw hash with an inline comment so the user can keep or remove it.
-                // parse_hash_from_line reads only the first whitespace token, so the comment is ignored
-                // when the file is parsed back — the hash will survive the round-trip.
-                content.push_str(&format!("{}  # [unavailable: {}]", short_hash(hash), e));
+                // The full hash with an inline comment, so the user can keep or remove it.
+                // The first whitespace token is the hash and the comment is ignored when
+                // the text is parsed back, so the entry survives the round-trip. The full
+                // hash is used rather than the short form so it still resolves by prefix
+                // against the queue after the track has left the library.
+                content.push_str(&unavailable_line(hash, e));
             }
         }
         content.push('\n');
     }
-    // 4. Launch $EDITOR (fallback to vi) and read back what was saved.
-    let edited = crate::editor::edit_text("mdma-queue-", &content)?;
+    // 4. Let the user edit it (the real one launches $EDITOR, falling back to vi).
+    let edited = edit(&content)?;
 
     // 5. Parse hashes using the standard filter.
     let edited_hashes = hashes_in(&edited);
 
-    // 6. Replace queue with reordered hashes.
-    let entries: Vec<(ContentHash, SourceName)> = edited_hashes
-        .into_iter()
-        .map(|hash| (hash, SourceName::audio()))
-        .collect();
-    let count = entries.len();
-    playback.queue_replace(entries).map_err(display_error)?;
-    println!("Queue updated: {} tracks", count);
-    Ok(())
+    // 6. Replace queue with reordered hashes (the lines carry short hashes).
+    queue_replace_resolved(library, playback, &hashes, &edited_hashes).map_err(|e| {
+        match crate::editor::keep_text("mdma-queue-", &edited) {
+            Some(path) => eyre!("{e}; your edits are kept in {}", path.display()),
+            None => e,
+        }
+    })
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::test_support::{parse, usage_error};
+    use super::*;
+    use crate::test_support::{parse, recorded, usage_error, FakeServices};
+    use mdma_client::Command;
+    use pretty_assertions::assert_eq;
+
+    const A: &str = "sha256:9fb4105e0a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5";
+    const B: &str = "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+    const C: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    fn services() -> FakeServices {
+        FakeServices::new(&[A, B, C])
+    }
+
+    fn hashes(spelled: &[&str]) -> Vec<ContentHash> {
+        spelled.iter().map(|h| ContentHash::new(*h)).collect()
+    }
+
+    fn append(hash: &str) -> serde_json::Value {
+        recorded(&Command::QueueAppend {
+            hash: ContentHash::new(hash),
+            source: SourceName::audio(),
+        })
+    }
+
+    #[test]
+    fn append_sends_the_full_hash_for_a_short_one() {
+        let fake = services();
+        let count =
+            queue_append_resolved(&fake.library, &fake.playback, &hashes(&["9fb4105e"])).unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(fake.sent(), vec![append(A)]);
+    }
+
+    #[test]
+    fn next_sends_full_hashes_so_the_first_ends_up_in_front() {
+        let fake = services();
+        queue_next_resolved(
+            &fake.library,
+            &fake.playback,
+            &hashes(&["9fb4105e0a1b", "12345678"]),
+        )
+        .unwrap();
+        let next = |hash: &str| {
+            recorded(&Command::QueueNext {
+                hash: ContentHash::new(hash),
+                source: SourceName::audio(),
+            })
+        };
+        assert_eq!(fake.sent(), vec![next(B), next(A)]);
+    }
+
+    #[test]
+    fn an_unresolvable_hash_in_a_batch_sends_no_playback_command() {
+        let fake = services();
+        let err = queue_append_resolved(
+            &fake.library,
+            &fake.playback,
+            &hashes(&["9fb4105e", "deadbeef", "12345678"]),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("deadbeef"), "{err}");
+        assert_eq!(fake.sent(), Vec::<serde_json::Value>::new());
+    }
+
+    #[test]
+    fn an_ambiguous_hash_sends_nothing_and_is_named() {
+        let fake = FakeServices::new(&[
+            A,
+            "sha256:9fb4105effffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        ]);
+        let err =
+            queue_replace_resolved(&fake.library, &fake.playback, &[], &hashes(&["9fb4105e"]))
+                .unwrap_err();
+        assert!(err.to_string().contains("9fb4105e"), "{err}");
+        assert_eq!(fake.sent(), Vec::<serde_json::Value>::new());
+    }
+
+    #[test]
+    fn append_refuses_an_unknown_full_hash() {
+        let fake = services();
+        let err =
+            queue_append_resolved(&fake.library, &fake.playback, &hashes(&[GONE])).unwrap_err();
+        assert!(err.to_string().contains(GONE), "{err}");
+        assert_eq!(fake.sent(), Vec::<serde_json::Value>::new());
+    }
+
+    #[test]
+    fn append_looks_up_a_known_full_hash() {
+        let fake = services();
+        queue_append_resolved(&fake.library, &fake.playback, &hashes(&[A])).unwrap();
+        assert_eq!(fake.sent(), vec![append(A)]);
+    }
+
+    fn queue_list() -> serde_json::Value {
+        recorded(&Command::QueueList)
+    }
+
+    #[test]
+    fn remove_sends_the_full_hash_for_a_short_one() {
+        let fake = FakeServices::with_queue(&[A, B, C], &[A, B]);
+        let removed = queue_remove_resolved(&fake.playback, &hashes(&["9fb4105e"])).unwrap();
+        assert_eq!(removed, 1);
+        assert_eq!(
+            fake.sent(),
+            vec![
+                queue_list(),
+                recorded(&Command::QueueRemove {
+                    hashes: vec![ContentHash::new(A)]
+                })
+            ]
+        );
+    }
+
+    #[test]
+    fn remove_resolves_a_stale_queue_entry_by_prefix() {
+        // GONE is queued but the library no longer has it.
+        let fake = FakeServices::with_queue(&[A], &[A, GONE]);
+        queue_remove_resolved(&fake.playback, &hashes(&["dddddddd", GONE])).unwrap();
+        assert_eq!(
+            fake.sent(),
+            vec![
+                queue_list(),
+                recorded(&Command::QueueRemove {
+                    hashes: vec![ContentHash::new(GONE), ContentHash::new(GONE)]
+                })
+            ]
+        );
+    }
+
+    #[test]
+    fn remove_refuses_a_hash_that_is_not_in_the_queue() {
+        // B is in the library but not queued: removing it is refused, whatever its length.
+        let fake = FakeServices::with_queue(&[A, B], &[A]);
+        for spelled in [B, "12345678"] {
+            let err = queue_remove_resolved(&fake.playback, &hashes(&[spelled])).unwrap_err();
+            assert!(err.to_string().contains(spelled), "{err}");
+        }
+        assert_eq!(fake.sent(), vec![queue_list(), queue_list()]);
+    }
+
+    #[test]
+    fn replace_and_edit_lines_of_twelve_chars_send_full_hashes() {
+        let fake = services();
+        // What `replace -` and `edit` hand over: the first token of each line.
+        let lines = format!(
+            "9fb4105e0a1b  Artist - Title  [3:45]\n{}\n",
+            unavailable_line("1234567890ab", "x")
+        );
+        let count = queue_replace_resolved(
+            &fake.library,
+            &fake.playback,
+            &[],
+            &crate::stdin::hashes_in(&lines),
+        )
+        .unwrap();
+        assert_eq!(count, 2);
+        let entry = |hash: &str| (ContentHash::new(hash), SourceName::audio());
+        assert_eq!(
+            fake.sent(),
+            vec![recorded(&Command::QueueReplace {
+                entries: vec![entry(A), entry(B)]
+            })]
+        );
+    }
+
+    const GONE: &str = "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+
+    #[test]
+    fn edit_round_trip_keeps_an_unavailable_entry_by_its_full_hash() {
+        let fake = FakeServices::with_queue(&[A, B], &[A, GONE, B]);
+        let mut shown = String::new();
+        let count = edit_queue(&fake.library, &fake.playback, |text| {
+            shown = text.to_string();
+            Ok(text.to_string())
+        })
+        .unwrap();
+        assert_eq!(count, 3);
+        let reason = fake.library.get_track(&ContentHash::new(GONE)).unwrap_err();
+        let line = unavailable_line(GONE, reason);
+        assert!(shown.lines().any(|l| l == line), "{line} not in {shown}");
+        let entry = |hash: &str| (ContentHash::new(hash), SourceName::audio());
+        assert_eq!(
+            fake.sent(),
+            vec![
+                recorded(&Command::QueueList),
+                recorded(&Command::QueueReplace {
+                    entries: vec![entry(A), entry(GONE), entry(B)]
+                })
+            ]
+        );
+    }
+
+    #[test]
+    fn edit_refuses_a_new_unknown_full_hash() {
+        // GONE is not queued and not in the library: a new entry must exist.
+        let fake = FakeServices::with_queue(&[A], &[A]);
+        let err = edit_queue(&fake.library, &fake.playback, |text| {
+            Ok(format!("{text}{GONE}\n"))
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains(GONE), "{err}");
+        assert_eq!(fake.sent(), vec![queue_list()], "nothing replaced");
+    }
+
+    #[test]
+    fn a_rejected_edit_names_the_file_that_keeps_it() {
+        let fake = FakeServices::with_queue(&[A], &[A]);
+        let err = edit_queue(&fake.library, &fake.playback, |_| {
+            Ok("deadbeef  my careful work\n".to_string())
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("deadbeef"), "{err}");
+        let (_, path) = err.split_once("your edits are kept in ").expect(&err);
+        assert_eq!(
+            std::fs::read_to_string(path).unwrap(),
+            "deadbeef  my careful work\n"
+        );
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn queue_hash_arguments_are_validated_at_parse_time() {
@@ -252,7 +552,8 @@ mod tests {
             assert!(parse(&["queue", sub, "-"]).is_ok(), "{sub} -");
             // Omitted: nothing to act on (stdin is not read unasked).
             let err = usage_error(&["queue", sub]);
-            assert!(err.contains("<HASH|->"), "{sub}: {err}");
+            let hint = "`-` reads hashes from stdin";
+            assert!(err.contains(hint), "{sub}: {err}");
             // A hash and `-` do not mix.
             usage_error(&["queue", sub, "-", "abcd1234"]);
             usage_error(&["queue", sub, "abcd1234", "-"]);

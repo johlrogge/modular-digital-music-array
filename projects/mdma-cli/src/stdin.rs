@@ -161,7 +161,9 @@ pub(crate) fn hashes_from_dash_or_playing(
     ctx: &Ctx,
     dash: Option<StdinDash>,
 ) -> Result<Vec<ContentHash>> {
-    hashes_or_playing(hashes_if_dash(dash), || playing_track(&ctx.playback()?))
+    hashes_or_playing(hashes_if_dash(dash), || {
+        playing_track(&ctx.node().playback()?)
+    })
 }
 
 /// `piped` when stdin was asked for (`Some`; it must hold a hash), else the hash
@@ -195,6 +197,26 @@ pub(crate) fn resolve_tracks_skip_errors(
             }
         })
         .collect()
+}
+
+/// Resolve a list of hashes to `TrackInfo` through `facts`, skipping any that the
+/// facts do not have (a warning is printed for each). Facts that cannot be read at
+/// all (no replica, an unreachable node) are the error, once.
+pub(crate) fn resolve_facts_skip_errors(
+    facts: &client_facts::Facts<&mdma_client::Node>,
+    hashes: Vec<ContentHash>,
+) -> Result<Vec<TrackInfo>> {
+    let mut tracks = Vec::with_capacity(hashes.len());
+    for hash in hashes {
+        match facts.track(&hash) {
+            Ok(track) => tracks.push(track),
+            Err(client_facts::FactsError::Library(refusal)) => {
+                eprintln!("Warning: skipping track {}: {}", hash, refusal);
+            }
+            Err(unreadable) => return Err(unreadable.into()),
+        }
+    }
+    Ok(tracks)
 }
 
 /// Like [`resolve_tracks_skip_errors`], but an error when none could be resolved.

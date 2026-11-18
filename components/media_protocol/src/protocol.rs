@@ -1,5 +1,6 @@
 use playback_primitives::{
-    AudioOutputConfig, AudioSinkInfo, ContentHash, Deck, SourceName, Volume,
+    AudioOutputConfig, AudioSinkInfo, CanonicalHash, ContentHash, Deck, OutputHealth, PositionMs,
+    SourceName, Volume,
 };
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -16,6 +17,7 @@ pub enum Command {
         path: PathBuf,
         deck: Deck,
     },
+    /// Resume a paused track or preview; a no-op otherwise.
     Play {
         deck: Deck,
     },
@@ -37,9 +39,31 @@ pub enum Command {
     Unload {
         deck: Deck,
     },
+    /// Move the audible track to `position_ms` (kept within the track).
+    /// Playing stays playing and paused stays paused; Idle is refused. The
+    /// audio source drops its preload, which playback re-sends. Answers
+    /// `ResponseData::Transport` with where the track actually is.
     Seek {
         deck: Deck,
-        position: usize,
+        position_ms: PositionMs,
+    },
+    /// Where the deck is: transport state, audible track, position, duration.
+    GetTransport {
+        deck: Deck,
+    },
+    /// Play `hash` at once without losing what is audible (ADR-031): playback
+    /// holds that track, its position and its transport, and goes back to it
+    /// when the preview ends by itself or on `EndPreview`. Previewing again
+    /// replaces the preview and keeps the hold. A preview is not a play.
+    Preview {
+        deck: Deck,
+        hash: ContentHash,
+    },
+    /// End the preview and restore what was held. A no-op when nothing is
+    /// previewing. Answers `ResponseData::NowPlaying` with the track that is
+    /// audible afterwards (`None`: nothing).
+    EndPreview {
+        deck: Deck,
     },
     GetLength {
         deck: Deck,
@@ -64,7 +88,9 @@ pub enum Command {
     QueueReplace {
         entries: Vec<(ContentHash, SourceName)>,
     },
-    /// Pop from queue head, load on deck A, and start playing.
+    /// Pop from queue head, load on deck A, and start playing. Resumes a
+    /// paused track instead; refused while previewing, whatever the queue
+    /// holds ("Previewing: go back first").
     PlayQueue,
     /// Return the hash of the track currently loaded on deck A (None if nothing playing).
     NowPlaying,
@@ -80,6 +106,9 @@ pub enum Command {
     },
     /// Get the currently selected audio output.
     GetAudioOutput,
+    /// Ask whether the audio output is pulling samples. Deckless: output
+    /// commands are exempt from naming a deck (ADR-017 section 2.5).
+    GetOutputStatus,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -87,6 +116,36 @@ pub enum Command {
 pub enum Response {
     Ok { data: Option<ResponseData> },
     Err { message: String },
+}
+
+impl Command {
+    /// The content hashes this command carries, for the queue commands and
+    /// `Preview`.
+    pub fn hashes_held(&self) -> Vec<&ContentHash> {
+        match self {
+            Command::Preview { hash, .. } => vec![hash],
+            Command::QueueAppend { hash, .. } | Command::QueueNext { hash, .. } => vec![hash],
+            Command::QueueRemove { hashes } => hashes.iter().collect(),
+            Command::QueueReplace { entries } => entries.iter().map(|(h, _)| h).collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Refuse the whole command if any hash it carries is not a full one.
+    pub fn check_canonical(&self) -> Result<(), Response> {
+        self.hashes_held()
+            .into_iter()
+            .try_for_each(|hash| require_canonical(hash.clone()).map(drop))
+    }
+}
+
+/// The one place a hash received from a client becomes a [`CanonicalHash`]
+/// (playback holds only full hashes, ADR-026). A prefix is refused with the
+/// error response to send back, which tells the client what to do.
+pub fn require_canonical(hash: ContentHash) -> Result<CanonicalHash, Response> {
+    CanonicalHash::try_from(hash).map_err(|e| Response::Err {
+        message: format!("{e}; resolve it through the library"),
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -100,6 +159,62 @@ pub enum ResponseData {
     Session(Option<String>),
     AudioOutputs(Vec<AudioSinkInfo>),
     AudioOutput(AudioOutputConfig),
+    /// `None` until the source has reported its output health (see ADR-028).
+    OutputStatus(Option<OutputHealth>),
+    Transport(TransportStatus),
+}
+
+/// Whether a loaded track is playing or paused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Transport {
+    Playing,
+    Paused,
+}
+
+/// The track a preview goes back to: which, where in it, and whether it played.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Held {
+    pub hash: ContentHash,
+    pub at: PositionMs,
+    pub transport: Transport,
+}
+
+/// What a running preview goes back to (ADR-031). `back_to` is `None` when the
+/// preview started over nothing: going back stops.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreviewStatus {
+    pub back_to: Option<Held>,
+}
+
+/// The answer to `GetTransport`, and to a successful `Seek`. An idle deck has
+/// no track, so it has no position either: the track and its transport exist
+/// together or not at all.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum TransportStatus {
+    Idle,
+    Loaded {
+        transport: Transport,
+        /// The audible track.
+        now: ContentHash,
+        /// `None` when the source cannot say (an old source, or a failed poll).
+        position_ms: Option<PositionMs>,
+        duration_ms: Option<PositionMs>,
+        /// `Some` while the audible track (`now`) is a preview.
+        #[serde(default)]
+        preview: Option<PreviewStatus>,
+    },
+}
+
+impl TransportStatus {
+    /// The audible position, when a track is loaded and the source said where.
+    pub fn position(&self) -> Option<PositionMs> {
+        match self {
+            TransportStatus::Loaded { position_ms, .. } => *position_ms,
+            TransportStatus::Idle => None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -107,6 +222,185 @@ mod tests {
     use super::*;
     use playback_primitives::SourceName;
     use pretty_assertions::assert_eq;
+
+    #[test]
+    fn require_canonical_refusal_names_the_hash_and_the_remedy() {
+        let Err(Response::Err { message }) = require_canonical(ContentHash::new("9fb4105e")) else {
+            panic!("expected a refusal");
+        };
+        assert_eq!(
+            message,
+            "not a full content hash: 9fb4105e; resolve it through the library"
+        );
+    }
+
+    #[test]
+    fn hashes_held_lists_every_hash_of_queue_commands() {
+        let a = ContentHash::new("a");
+        let b = ContentHash::new("b");
+        let replace = Command::QueueReplace {
+            entries: vec![
+                (a.clone(), SourceName::audio()),
+                (b.clone(), SourceName::audio()),
+            ],
+        };
+        assert_eq!(replace.hashes_held(), vec![&a, &b]);
+        let remove = Command::QueueRemove {
+            hashes: vec![a.clone()],
+        };
+        assert_eq!(remove.hashes_held(), vec![&a]);
+        assert!(Command::QueueList.hashes_held().is_empty());
+        assert!(Command::QueueClear.check_canonical().is_ok());
+        assert!(remove.check_canonical().is_err());
+        assert!(Command::GetOutputStatus.hashes_held().is_empty());
+    }
+
+    #[test]
+    fn get_output_status_roundtrips_without_a_deck() {
+        let json = serde_json::to_string(&Command::GetOutputStatus).unwrap();
+        assert_eq!(json, r#""get_output_status""#);
+        let decoded: Command = serde_json::from_str(&json).unwrap();
+        assert!(matches!(decoded, Command::GetOutputStatus));
+    }
+
+    #[test]
+    fn seek_carries_a_deck_and_milliseconds() {
+        let cmd = Command::Seek {
+            deck: Deck::A,
+            position_ms: PositionMs::new(90_000),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert_eq!(json, r#"{"seek":{"deck":"A","position_ms":90000}}"#);
+        let decoded: Command = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            decoded,
+            Command::Seek {
+                deck: Deck::A,
+                position_ms
+            } if position_ms == PositionMs::new(90_000)
+        ));
+    }
+
+    #[test]
+    fn the_old_seek_form_no_longer_parses() {
+        let old = r#"{"seek":{"deck":"A","position":441000}}"#;
+        assert!(serde_json::from_str::<Command>(old).is_err());
+    }
+
+    #[test]
+    fn get_transport_requires_a_deck() {
+        let json = serde_json::to_string(&Command::GetTransport { deck: Deck::B }).unwrap();
+        assert_eq!(json, r#"{"get_transport":{"deck":"B"}}"#);
+        assert!(serde_json::from_str::<Command>(r#""get_transport""#).is_err());
+        assert!(Command::GetTransport { deck: Deck::A }
+            .hashes_held()
+            .is_empty());
+    }
+
+    #[test]
+    fn preview_carries_a_deck_and_a_hash_that_check_canonical_covers() {
+        let hash = ContentHash::new("9fb4105e");
+        let preview = Command::Preview {
+            deck: Deck::A,
+            hash: hash.clone(),
+        };
+        let json = serde_json::to_string(&preview).unwrap();
+        assert_eq!(json, r#"{"preview":{"deck":"A","hash":"9fb4105e"}}"#);
+        assert!(matches!(
+            serde_json::from_str::<Command>(&json).unwrap(),
+            Command::Preview { deck: Deck::A, hash: h } if h == hash
+        ));
+        assert_eq!(preview.hashes_held(), vec![&hash]);
+        assert!(preview.check_canonical().is_err(), "a prefix is refused");
+        assert!(serde_json::from_str::<Command>(r#"{"preview":{"hash":"abc"}}"#).is_err());
+    }
+
+    #[test]
+    fn end_preview_requires_a_deck_and_holds_no_hash() {
+        let json = serde_json::to_string(&Command::EndPreview { deck: Deck::B }).unwrap();
+        assert_eq!(json, r#"{"end_preview":{"deck":"B"}}"#);
+        assert!(serde_json::from_str::<Command>(r#""end_preview""#).is_err());
+        assert!(Command::EndPreview { deck: Deck::A }
+            .hashes_held()
+            .is_empty());
+    }
+
+    #[test]
+    fn a_previewing_transport_names_what_it_goes_back_to() {
+        let status = TransportStatus::Loaded {
+            transport: Transport::Playing,
+            now: ContentHash::new("preview"),
+            position_ms: Some(PositionMs::new(1_000)),
+            duration_ms: None,
+            preview: Some(PreviewStatus {
+                back_to: Some(Held {
+                    hash: ContentHash::new("held"),
+                    at: PositionMs::new(90_000),
+                    transport: Transport::Paused,
+                }),
+            }),
+        };
+        let json = serde_json::to_string(&status).unwrap();
+        assert!(
+            json.contains(
+                r#""preview":{"back_to":{"hash":"held","at":90000,"transport":"paused"}}"#
+            ),
+            "{json}"
+        );
+        assert_eq!(
+            serde_json::from_str::<TransportStatus>(&json).unwrap(),
+            status
+        );
+    }
+
+    #[test]
+    fn transport_response_roundtrips_and_tolerates_a_missing_preview() {
+        let status = TransportStatus::Loaded {
+            transport: Transport::Paused,
+            now: ContentHash::new("abc"),
+            position_ms: Some(PositionMs::new(1_500)),
+            duration_ms: Some(PositionMs::new(240_000)),
+            preview: None,
+        };
+        let json = serde_json::to_string(&ResponseData::Transport(status.clone())).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"transport","value":{"state":"loaded","transport":"paused","now":"abc","position_ms":1500,"duration_ms":240000,"preview":null}}"#
+        );
+        let ResponseData::Transport(back) = serde_json::from_str(&json).unwrap() else {
+            panic!("expected Transport");
+        };
+        assert_eq!(back, status);
+
+        let no_preview = r#"{"type":"transport","value":{"state":"loaded","transport":"playing","now":"abc","position_ms":null,"duration_ms":null}}"#;
+        let ResponseData::Transport(loaded) = serde_json::from_str(no_preview).unwrap() else {
+            panic!("expected Transport");
+        };
+        assert!(matches!(
+            loaded,
+            TransportStatus::Loaded {
+                transport: Transport::Playing,
+                preview: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn an_idle_transport_has_no_track_to_put_a_position_on() {
+        let json = serde_json::to_string(&TransportStatus::Idle).unwrap();
+        assert_eq!(json, r#"{"state":"idle"}"#);
+        assert_eq!(TransportStatus::Idle.position(), None);
+    }
+
+    #[test]
+    fn output_status_response_roundtrips() {
+        for health in [None, Some(OutputHealth::Stalled)] {
+            let json = serde_json::to_string(&ResponseData::OutputStatus(health)).unwrap();
+            let decoded: ResponseData = serde_json::from_str(&json).unwrap();
+            assert!(matches!(decoded, ResponseData::OutputStatus(h) if h == health));
+        }
+    }
 
     #[test]
     fn queue_append_without_source_defaults_to_audio() {

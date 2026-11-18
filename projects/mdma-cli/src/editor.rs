@@ -40,6 +40,13 @@ pub(crate) fn edit_text(prefix: &str, initial: &str) -> Result<String> {
     std::fs::read_to_string(path).map_err(|e| eyre!("Failed to read temp file: {e}"))
 }
 
+/// Keep `text` in a file that is not removed, so work the user did in the
+/// editor survives a rejected save. Returns its path (`None` if it cannot be written).
+pub(crate) fn keep_text(prefix: &str, text: &str) -> Option<std::path::PathBuf> {
+    let file = create_temp(prefix, text).ok()?;
+    file.keep().ok().map(|(_, path)| path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

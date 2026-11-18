@@ -1,12 +1,12 @@
 //! The completion snapshot: `completion.json` in the replica directory (ADR-021 §4).
 //!
 //! Completion must answer in a few milliseconds and never touch the network, so it
-//! does not fold the replica's raw lines. After each sync the CLI folds them once
+//! does not fold the replica's raw lines. After each sync the client folds them once
 //! with `library_projection` and writes the distinct names completion offers: mark
 //! names, artists, titles, albums, labels, genres, styles and origins, plus the
 //! playlist and source names probed at the same sync.
 //!
-//! Lives here, not in `fact_replica`: the snapshot needs the CLI's [`Probe`] and the
+//! Lives here, not in `fact_replica`: the snapshot needs the [`Probe`] and the
 //! fold, and `fact_replica` stays a plain store without a dependency on
 //! `library_projection`.
 //!
@@ -21,7 +21,7 @@ use color_eyre::eyre::eyre;
 use color_eyre::Result;
 use fact_replica::{LineCount, Replica, SyncReport, UnixSecs};
 use library_projection::{project_lines, IndexedTrackInfo, Projection};
-use music_facts::{Mark, StoredMark};
+use music_facts::Mark;
 use serde::{Deserialize, Serialize};
 
 use crate::replica::{Probe, Probed, PROBE_TTL_SECS};
@@ -34,7 +34,7 @@ const SNAPSHOT_FILE: &str = "completion.json";
 /// does not parse at all counts as missing and is rebuilt by the next sync.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
-pub(crate) struct CompletionSnapshot {
+pub struct CompletionSnapshot {
     /// Lines of the replica this was built from; a different count means it is behind.
     pub lines: LineCount,
     /// Mark names; `liked`, the default mark, is always among them.
@@ -86,21 +86,23 @@ fn field(tracks: &[IndexedTrackInfo], get: fn(&IndexedTrackInfo) -> Option<&str>
 
 impl CompletionSnapshot {
     /// Fold of `projection` and the probed names, built from `lines` replica lines.
-    pub(crate) fn build(projection: &Projection, probe: &Probe, lines: LineCount) -> Self {
+    pub fn build(projection: &Projection, probe: &Probe, lines: LineCount) -> Self {
         let tracks = &projection.tracks;
         let styles = tracks.iter().flat_map(|t| &t.styles).map(String::as_str);
-        let mut marks: BTreeSet<String> = BTreeSet::from([Mark::Default.to_string()]);
-        let mut origins: BTreeSet<&str> = BTreeSet::new();
-        for (value, source) in tracks.iter().flat_map(|t| &t.provenance) {
-            // A legacy free-text scope is not a mark name `mark` would accept.
-            if let Some(StoredMark::Mark(mark)) = value.stored_mark() {
-                marks.insert(mark.to_string());
-            }
-            origins.insert(source.origin.kind.as_str());
-        }
+        // Legacy free-text scopes are not marks, and `marks()` leaves them out.
+        let marks: BTreeSet<Mark> = tracks
+            .iter()
+            .flat_map(IndexedTrackInfo::marks)
+            .chain([Mark::Default])
+            .collect();
+        let origins: BTreeSet<&str> = tracks
+            .iter()
+            .flat_map(|t| &t.provenance)
+            .map(|(_, source)| source.origin.kind.as_str())
+            .collect();
         Self {
             lines,
-            marks: marks.into_iter().collect(),
+            marks: marks.iter().map(Mark::to_string).collect(),
             artists: field(tracks, |t| t.artist.as_deref()),
             titles: field(tracks, |t| t.title.as_deref()),
             albums: field(tracks, |t| t.album.as_deref()),
@@ -118,13 +120,13 @@ impl CompletionSnapshot {
     }
 
     /// The stored snapshot as written. `None` when there is none or it is unreadable.
-    pub(crate) fn load(replica: &Replica) -> Option<Self> {
+    pub fn load(replica: &Replica) -> Option<Self> {
         let bytes = std::fs::read(Self::path(replica)).ok()?;
         serde_json::from_slice(&bytes).ok()
     }
 
     /// Only the probed names still within their TTL.
-    pub(crate) fn live(self, now: UnixSecs) -> Self {
+    pub fn live(self, now: UnixSecs) -> Self {
         Self {
             probe: self.probe.live(now),
             ..self
@@ -158,7 +160,7 @@ impl CompletionSnapshot {
     /// does not touch the replica: the names come from the lines that parse, and the
     /// count of the others is kept in the snapshot for `replica status` to report.
     /// Discarding the replica instead would refetch the whole log at every sync.
-    pub(crate) fn refresh(replica: &Replica, report: &SyncReport, probe: &Probe) -> Result<bool> {
+    pub fn refresh(replica: &Replica, report: &SyncReport, probe: &Probe) -> Result<bool> {
         if Self::load(replica).is_some_and(|existing| existing.is_current(report, probe)) {
             return Ok(false);
         }
@@ -298,7 +300,7 @@ mod tests {
         let snapshot = CompletionSnapshot::build(&projection, &probed, LineCount::new(13));
 
         assert_eq!(snapshot.lines, LineCount::new(13));
-        assert_eq!(snapshot.marks, strings(&["banger", "liked"]));
+        assert_eq!(snapshot.marks, strings(&["liked", "banger"]));
         assert_eq!(snapshot.artists, strings(&["New Order", "deadmau5"]));
         assert_eq!(snapshot.titles, strings(&["Blue Monday", "Strobe"]));
         assert_eq!(snapshot.albums, strings(&["Power"]), "distinct");
@@ -564,8 +566,8 @@ mod tests {
 
         // The plays of every track, and the latest of them, as `mdma plays` reads them.
         let started = std::time::Instant::now();
-        let histories = projection.plays.histories(&projection.tracks);
-        let recent = projection.plays.recent(&projection.tracks, 20);
+        let histories = projection.lineage.histories(&projection.tracks);
+        let recent = projection.lineage.recent(&projection.tracks, 20);
         let plays = started.elapsed();
         assert_eq!(histories.iter().filter(|h| h.count() == 1).count(), 4_000);
         assert_eq!(recent.len(), 20);

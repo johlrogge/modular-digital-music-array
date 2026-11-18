@@ -64,7 +64,7 @@ pub fn build_track_query(state: &FilterState) -> Result<TrackQuery, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use library_search::{KeyQuery, NumericQuery};
+    use library_search::{KeyQuery, NumericQuery, Reach};
 
     fn state_with(bpm: &str, key: &str, role: Option<TrackRole>, energy: &str) -> FilterState {
         FilterState {
@@ -121,38 +121,33 @@ mod tests {
     // --- Key parsing ---
 
     #[test]
-    fn key_8a_tilde_parses_without_error() {
-        // "8A~" is a valid key query (exact 8A, ~ hint is accepted by parser).
-        let s = state_with("", "8A~", None, "");
+    fn key_8a_parses_as_exact_steps() {
+        let s = state_with("", "8A", None, "");
         let q = build_track_query(&s).unwrap();
-        // The parser returns Exact for a bare key with ~ (no tolerance digits).
+        assert_eq!(q.key, Some("8A".parse::<KeyQuery>().unwrap()));
+    }
+
+    #[test]
+    fn key_8a_pm1_produces_steps_both_ways() {
+        let s = state_with("", "8A+-1", None, "");
+        let q = build_track_query(&s).unwrap();
         match q.key {
-            Some(KeyQuery::Exact { number, .. }) => {
-                assert_eq!(number, 8);
+            Some(KeyQuery::Steps { centre, reach, .. }) => {
+                assert_eq!(centre.to_camelot(), "8A");
+                assert_eq!(reach, Reach::Both(1));
             }
-            other => panic!("Expected Exact key, got {:?}", other),
+            other => panic!("Expected Steps key, got {:?}", other),
         }
     }
 
     #[test]
-    fn key_8a_pm1_tilde_produces_tolerance_with_include_relative() {
+    fn key_tilde_is_an_error_naming_the_key_field() {
         let s = state_with("", "8A+-1~", None, "");
-        let q = build_track_query(&s).unwrap();
-        match q.key {
-            Some(KeyQuery::Tolerance {
-                number,
-                include_relative,
-                tolerance_up,
-                tolerance_down,
-                ..
-            }) => {
-                assert_eq!(number, 8);
-                assert!(include_relative);
-                assert_eq!(tolerance_up, 1);
-                assert_eq!(tolerance_down, 1);
-            }
-            other => panic!("Expected Tolerance key, got {:?}", other),
-        }
+        let err = build_track_query(&s).unwrap_err();
+        assert!(
+            err.starts_with("Key:") && err.contains("`~` suffix is gone"),
+            "{err}"
+        );
     }
 
     // --- Energy parsing ---

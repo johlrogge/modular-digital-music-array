@@ -1,5 +1,6 @@
 use crate::args::{parse_count, value_and_dash, HashInput, StdinDash};
 use crate::ctx::Ctx;
+use crate::fact_filter::{facts_block, FactsArgs, KindFilter};
 use crate::local_complete::complete_marks;
 use crate::output::{
     each_track, for_each_track, format_track_line, library_error, mark_outcome, marked_header,
@@ -7,7 +8,7 @@ use crate::output::{
 };
 use crate::stdin::{
     hashes_from_dash_or_playing, hashes_of_input, read_hashes, require_stdin_hashes,
-    resolve_tracks_skip_errors,
+    resolve_facts_skip_errors,
 };
 use bpaf::{construct, long, short, Parser};
 use color_eyre::Result;
@@ -169,7 +170,7 @@ impl SortDirection {
 /// Check if the service is running
 #[hicli::command]
 pub(crate) fn ping(ctx: &Ctx) -> Result<()> {
-    let library = ctx.library()?;
+    let library = ctx.node().library()?;
     library.ping().map_err(library_error)?;
     println!("pong - service is alive");
     Ok(())
@@ -178,7 +179,7 @@ pub(crate) fn ping(ctx: &Ctx) -> Result<()> {
 /// Get service status
 #[hicli::command]
 pub(crate) fn status(ctx: &Ctx) -> Result<()> {
-    let library = ctx.library()?;
+    let library = ctx.node().library()?;
     let status = library.status().map_err(library_error)?;
     print!("{}", format_status(&status));
     Ok(())
@@ -212,26 +213,25 @@ fn format_status(status: &library_ipc_client::ServiceStatus) -> String {
 /// List tracks in library
 #[hicli::command]
 pub(crate) fn list(limit: Option<LimitArg>, ctx: &Ctx) -> Result<()> {
-    let library = ctx.library()?;
-    let tracks = library
-        .list_tracks(limit.map(|LimitArg(n)| n.get()))
-        .map_err(library_error)?;
-    if tracks.is_empty() {
-        println!("No tracks in library");
-        return Ok(());
-    }
+    ctx.read(|facts| {
+        let tracks = facts.tracks(limit.map(|LimitArg(n)| n.get()))?;
+        if tracks.is_empty() {
+            println!("No tracks in library");
+            return Ok(());
+        }
 
-    println!("Tracks in library ({}):", tracks.len());
-    println!("{}", "=".repeat(65));
+        println!("Tracks in library ({}):", tracks.len());
+        println!("{}", "=".repeat(65));
 
-    for track in tracks {
-        println!(
-            "{} | {}",
-            short_hash(&track.content_hash),
-            format_track_line(&track)
-        );
-    }
-    Ok(())
+        for track in tracks {
+            println!(
+                "{} | {}",
+                short_hash(&track.content_hash),
+                format_track_line(&track)
+            );
+        }
+        Ok(())
+    })
 }
 
 /// Get a specific track by hash (supports partial hashes like git)
@@ -247,11 +247,12 @@ pub(crate) fn list(limit: Option<LimitArg>, ctx: &Ctx) -> Result<()> {
 /// ```
 #[hicli::command]
 pub(crate) fn get(hash: HashInput, ctx: &Ctx) -> Result<hicli::Success> {
-    let library = ctx.library()?;
-    let hashes = hashes_of_input(hash)?;
-    // A track that can't be found is reported and the rest are still shown.
-    each_track(hashes, |content_hash| {
-        library.get_track(content_hash).map(print_track_details)
+    ctx.read(|facts| {
+        let hashes = hashes_of_input(hash)?;
+        // A track that can't be found is reported and the rest are still shown.
+        each_track(hashes, |content_hash| {
+            facts.track(content_hash).map(print_track_details)
+        })
     })
 }
 
@@ -294,23 +295,32 @@ fn print_track_details(track: TrackInfo) {
 /// that can't be found is reported on stderr, the rest are still shown, and the exit
 /// code is 1.
 ///
+/// With --include, only facts of those kinds are shown; with --exclude, facts of those
+/// kinds are left out (and win over --include). Both repeat, and ignore case.
+///
 /// # Examples
 ///
 /// ```sh
 /// mdma facts abcd1234
-/// mdma search --artist CBL | mdma facts -
+/// mdma facts --include=BPM --include=Key abcd1234
+/// mdma search --artist CBL | mdma facts --exclude=TrackStarted -
 /// ```
 #[hicli::command]
-pub(crate) fn facts(hash: HashInput, ctx: &Ctx) -> Result<hicli::Success> {
-    let library = ctx.library()?;
-    let hashes = hashes_of_input(hash)?;
-    each_track(hashes, |content_hash| {
-        library.get_facts(content_hash).map(|(full_hash, facts)| {
-            println!("Facts for: {}", full_hash.as_str());
-            println!("{}", "=".repeat(65));
-            for (fact_type, fact_value) in facts {
-                println!("{:20} | {}", fact_type, fact_value);
+pub(crate) fn facts(args: FactsArgs, ctx: &Ctx) -> Result<hicli::Success> {
+    ctx.read(|source| {
+        let hashes = hashes_of_input(args.hash)?;
+        let filter = KindFilter::new(args.include, args.exclude);
+        each_track(hashes, |content_hash| {
+            let facts = source.facts_of(content_hash)?;
+            // `facts_of` does not say which track a prefix named: ask for it. A track
+            // the visible tracks lack (a deleted one) is shown under the hash as given.
+            let full_hash = source
+                .track(content_hash)
+                .map_or_else(|_| content_hash.clone(), |track| track.content_hash);
+            for line in facts_block(full_hash.as_str(), &facts, &filter) {
+                println!("{line}");
             }
+            Ok::<(), client_facts::FactsError>(())
         })
     })
 }
@@ -363,11 +373,17 @@ pub(crate) fn sort(
     _stdin: StdinDash,
     ctx: &Ctx,
 ) -> Result<()> {
-    let library = ctx.library()?;
+    ctx.read(|facts| {
+        let hashes = require_stdin_hashes()?;
+        let mut tracks = resolve_facts_skip_errors(facts, hashes)?;
+        sort_tracks(&mut tracks, field, direction);
+        print_tracks(&tracks, &format!("Sorted ({} tracks)", tracks.len()));
+        Ok(())
+    })
+}
 
-    let hashes = require_stdin_hashes()?;
-    let mut tracks = resolve_tracks_skip_errors(&library, hashes);
-
+/// Sort `tracks` by `field`; stable, so chained sorts give a multi-key order.
+fn sort_tracks(tracks: &mut [TrackInfo], field: SortField, direction: SortDirection) {
     tracks.sort_by(|a, b| match field {
         SortField::Bpm => compare_optional(a.bpm, b.bpm, direction),
         SortField::Title => compare_optional(
@@ -408,9 +424,6 @@ pub(crate) fn sort(
             direction,
         ),
     });
-
-    print_tracks(&tracks, &format!("Sorted ({} tracks)", tracks.len()));
-    Ok(())
 }
 
 /// Mark tracks (liked unless NAME is given)
@@ -431,7 +444,7 @@ pub(crate) fn sort(
 #[hicli::command(alias = "bookmark")]
 pub(crate) fn mark(input: MarkInput, ctx: &Ctx) -> Result<hicli::Success> {
     let mark = mark_or_default(input.name);
-    let library = ctx.library()?;
+    let library = ctx.node().library()?;
     let playing = input.stdin.is_none();
     let hashes = hashes_from_dash_or_playing(ctx, input.stdin)?;
     for_each_track(hashes, |hash| {
@@ -457,7 +470,7 @@ pub(crate) fn mark(input: MarkInput, ctx: &Ctx) -> Result<hicli::Success> {
 #[hicli::command]
 pub(crate) fn unmark(input: MarkInput, ctx: &Ctx) -> Result<hicli::Success> {
     let mark = mark_or_default(input.name);
-    let library = ctx.library()?;
+    let library = ctx.node().library()?;
     let playing = input.stdin.is_none();
     let hashes = hashes_from_dash_or_playing(ctx, input.stdin)?;
     for_each_track(hashes, |hash| {
@@ -497,19 +510,20 @@ fn note_if_playing(
 #[hicli::command(alias = "bookmarks")]
 pub(crate) fn marked(name: Option<MarkArg>, ctx: &Ctx) -> Result<()> {
     let filter = mark_filter(name);
-    let library = ctx.library()?;
-    let tracks = library.list_marked(&filter).map_err(library_error)?;
+    ctx.read(|facts| {
+        let tracks = facts.marked(&filter)?;
 
-    if tracks.is_empty() {
-        use std::io::IsTerminal;
-        if std::io::stdout().is_terminal() {
-            println!("{}", no_marked_tracks(&filter));
+        if tracks.is_empty() {
+            use std::io::IsTerminal;
+            if std::io::stdout().is_terminal() {
+                println!("{}", no_marked_tracks(&filter));
+            }
+            return Ok(());
         }
-        return Ok(());
-    }
 
-    print_tracks(&tracks, &marked_header(&filter, tracks.len()));
-    Ok(())
+        print_tracks(&tracks, &marked_header(&filter, tracks.len()));
+        Ok(())
+    })
 }
 
 /// Display selected fields for tracks read from stdin
@@ -531,50 +545,52 @@ pub(crate) fn view(columns: ViewColumns, _stdin: StdinDash, ctx: &Ctx) -> Result
     use std::io::IsTerminal;
 
     let ViewColumns(columns) = columns;
-    let library = ctx.library()?;
+    ctx.read(|facts| {
+        // Read hashes from stdin (same format as `mdma playlist append` / `mdma search` output).
+        let hashes = read_hashes();
 
-    // Read hashes from stdin (same format as `mdma playlist append` / `mdma search` output).
-    let hashes = read_hashes();
-
-    if hashes.is_empty() {
-        if std::io::stdout().is_terminal() {
-            eprintln!("No hashes on stdin. Pipe `mdma search` output or a playlist.");
+        if hashes.is_empty() {
+            if std::io::stdout().is_terminal() {
+                eprintln!("No hashes on stdin. Pipe `mdma search` output or a playlist.");
+            }
+            return Ok(());
         }
-        return Ok(());
-    }
 
-    // Look up TrackInfo for each hash, preserving order.
-    let mut tracks: Vec<TrackInfo> = Vec::with_capacity(hashes.len());
-    for hash in hashes {
-        match library.get_track(&hash) {
-            Ok(track) => tracks.push(track),
-            Err(e) => {
-                eprintln!("Warning: could not resolve {}: {}", hash, e);
+        // Look up TrackInfo for each hash, preserving order.
+        let mut tracks: Vec<TrackInfo> = Vec::with_capacity(hashes.len());
+        for hash in hashes {
+            match facts.track(&hash) {
+                Ok(track) => tracks.push(track),
+                // A refusal is about this hash alone; the rest are still shown.
+                Err(client_facts::FactsError::Library(refusal)) => {
+                    eprintln!("Warning: could not resolve {}: {}", hash, refusal);
+                }
+                Err(unreadable) => return Err(unreadable.into()),
             }
         }
-    }
 
-    if tracks.is_empty() {
-        if std::io::stdout().is_terminal() {
-            println!("No tracks found");
+        if tracks.is_empty() {
+            if std::io::stdout().is_terminal() {
+                println!("No tracks found");
+            }
+            return Ok(());
         }
-        return Ok(());
-    }
 
-    // Always use the parameterized corsett renderer.
-    // TTY → real terminal width (corsett truncates as needed via RightEllipsis).
-    // Pipe/file → virtual fixed-large width so the 8-char hash stays intact and
-    //             content is not truncated (Joakim's uniqueness hypothesis).
-    let term_width = if std::io::stdout().is_terminal() {
-        terminal_width()
-    } else {
-        PIPE_TERM_WIDTH
-    };
-    for line in render_for_user(&tracks, &columns, term_width, 0) {
-        println!("{}", line);
-    }
+        // Always use the parameterized corsett renderer.
+        // TTY → real terminal width (corsett truncates as needed via RightEllipsis).
+        // Pipe/file → virtual fixed-large width so the 8-char hash stays intact and
+        //             content is not truncated (Joakim's uniqueness hypothesis).
+        let term_width = if std::io::stdout().is_terminal() {
+            terminal_width()
+        } else {
+            PIPE_TERM_WIDTH
+        };
+        for line in render_for_user(&tracks, &columns, term_width, 0) {
+            println!("{}", line);
+        }
 
-    Ok(())
+        Ok(())
+    })
 }
 
 #[cfg(test)]
@@ -689,6 +705,11 @@ mod tests {
 
     #[test]
     fn mark_commands_without_a_connection_fail_cleanly() {
+        // `marked` reads facts from the node, and a failure to reach it looks for a
+        // replica to name as the alternative: not the one of whoever runs the tests.
+        let _lock = crate::test_support::env_lock();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let _env = client_facts::test_support::offline_env(dir.path());
         let ctx = crate::test_support::local_ctx();
         for result in [
             marked(None, &ctx),
@@ -707,7 +728,10 @@ mod tests {
             crate::test_support::failure_text(mark(nothing(), &ctx)),
             crate::test_support::failure_text(unmark(nothing(), &ctx)),
         ] {
-            assert!(text.starts_with("Failed to connect to library"), "{text}");
+            assert!(
+                text.starts_with("mdma needs the node: Failed to connect to library"),
+                "{text}"
+            );
         }
     }
 

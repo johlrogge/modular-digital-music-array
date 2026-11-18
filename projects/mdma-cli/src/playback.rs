@@ -1,5 +1,7 @@
 use crate::ctx::Ctx;
 use crate::output::{display_error, library_error};
+use crate::preview::PreviewTarget;
+use crate::seek::SeekArg;
 use color_eyre::eyre::eyre;
 use color_eyre::Result;
 use hicli::Arg;
@@ -10,7 +12,7 @@ use track_formatter::short_hash;
 /// Start playback from the queue (use `mdma queue append <hash>` to enqueue tracks)
 #[hicli::command]
 pub(crate) fn start(ctx: &Ctx) -> Result<()> {
-    let playback = ctx.playback()?;
+    let playback = ctx.node().playback()?;
     playback.play_queue().map_err(display_error)?;
     println!("Playing from queue");
     Ok(())
@@ -19,7 +21,7 @@ pub(crate) fn start(ctx: &Ctx) -> Result<()> {
 /// Stop playback on deck A
 #[hicli::command]
 pub(crate) fn stop(ctx: &Ctx) -> Result<()> {
-    let playback = ctx.playback()?;
+    let playback = ctx.node().playback()?;
     playback.stop(Deck::A).map_err(display_error)?;
 
     println!("Stopped");
@@ -29,7 +31,7 @@ pub(crate) fn stop(ctx: &Ctx) -> Result<()> {
 /// Pause playback on deck A (keeps the current track loaded; resume to continue)
 #[hicli::command]
 pub(crate) fn pause(ctx: &Ctx) -> Result<()> {
-    let playback = ctx.playback()?;
+    let playback = ctx.node().playback()?;
     playback.pause(Deck::A).map_err(display_error)?;
 
     println!("Paused");
@@ -39,17 +41,67 @@ pub(crate) fn pause(ctx: &Ctx) -> Result<()> {
 /// Resume playback on deck A after a pause
 #[hicli::command]
 pub(crate) fn resume(ctx: &Ctx) -> Result<()> {
-    let playback = ctx.playback()?;
+    let playback = ctx.node().playback()?;
     playback.resume(Deck::A).map_err(display_error)?;
 
     println!("Resumed");
     Ok(())
 }
 
+/// Seek the track that is playing on deck A
+///
+/// TIME is seconds, or M:SS or H:MM:SS, and goes exactly there. +Nb and -Nb
+/// move N beats from the nearest beat and need the track to have a beat grid.
+/// A time past the end goes to the end. Playing stays playing and paused stays
+/// paused. A value that starts with - needs `--` before it.
+///
+/// # Examples
+///
+/// ```sh
+/// mdma playback seek 1:30
+/// mdma playback seek +8b
+/// mdma playback seek -- -8b
+/// ```
+#[hicli::command]
+pub(crate) fn seek(target: SeekArg, ctx: &Ctx) -> Result<()> {
+    let playback = ctx.node().playback()?;
+    let SeekArg(target) = target;
+    println!(
+        "{}",
+        crate::seek::run(&playback, || ctx.node().library(), target)?
+    );
+    Ok(())
+}
+
+/// Preview a track over what is playing on deck A, or go back
+///
+/// Give a HASH to hear that track at once. What was playing is held (which
+/// track, where in it, and whether it played), and playback goes back to it by
+/// itself when the preview ends. Previewing again replaces the preview and
+/// keeps what is held. `--back` goes back now. While previewing, pause, resume
+/// and seek act on the preview, skip and starting the queue are refused, and
+/// stop ends everything. A preview is not a play.
+///
+/// # Examples
+///
+/// ```sh
+/// mdma playback preview abcd1234
+/// mdma playback preview --back
+/// ```
+#[hicli::command]
+pub(crate) fn preview(target: PreviewTarget, ctx: &Ctx) -> Result<()> {
+    let playback = ctx.node().playback()?;
+    println!(
+        "{}",
+        crate::preview::run(&playback, || ctx.node().library(), target)?
+    );
+    Ok(())
+}
+
 /// Skip to the next track in the queue
 #[hicli::command]
 pub(crate) fn skip(ctx: &Ctx) -> Result<()> {
-    let playback = ctx.playback()?;
+    let playback = ctx.node().playback()?;
     playback.skip().map_err(display_error)?;
 
     println!("Skipped");
@@ -68,11 +120,11 @@ pub(crate) fn playing_track(playback: &PlaybackBackend) -> Result<ContentHash> {
 #[hicli::command]
 pub(crate) fn now(ctx: &Ctx) -> Result<()> {
     use std::io::IsTerminal;
-    let playback = ctx.playback()?;
+    let playback = ctx.node().playback()?;
     // The library is only consulted on a terminal, where the track is shown in full.
     let library = std::io::stdout()
         .is_terminal()
-        .then(|| ctx.library())
+        .then(|| ctx.node().library())
         .transpose()?;
     let h = playing_track(&playback)?;
     match library {
@@ -94,7 +146,7 @@ pub(crate) fn now(ctx: &Ctx) -> Result<()> {
 /// Show the current session ID (a session spans from first play to queue empty)
 #[hicli::command]
 pub(crate) fn session(ctx: &Ctx) -> Result<()> {
-    let playback = ctx.playback()?;
+    let playback = ctx.node().playback()?;
     match playback.session().map_err(display_error)? {
         Some(id) => println!("{}", id),
         None => println!("No active session"),
@@ -105,7 +157,7 @@ pub(crate) fn session(ctx: &Ctx) -> Result<()> {
 /// List available audio output devices
 #[hicli::command]
 pub(crate) fn outputs(ctx: &Ctx) -> Result<()> {
-    let playback = ctx.playback()?;
+    let playback = ctx.node().playback()?;
     let sinks = playback.list_audio_outputs().map_err(display_error)?;
     println!("{:<40} {:<40} MAX RATE", "NAME", "DESCRIPTION");
     println!("{}", "-".repeat(90));
@@ -132,7 +184,7 @@ pub(crate) struct OutputNameArg(pub String);
 #[hicli::command]
 pub(crate) fn set_output(name: OutputNameArg, ctx: &Ctx) -> Result<()> {
     let OutputNameArg(name) = name;
-    let playback = ctx.playback()?;
+    let playback = ctx.node().playback()?;
     let cfg = playback.set_audio_output(name).map_err(display_error)?;
     let device = cfg.device_name.as_deref().unwrap_or("auto");
     let rate = cfg
@@ -146,7 +198,7 @@ pub(crate) fn set_output(name: OutputNameArg, ctx: &Ctx) -> Result<()> {
 /// Show the currently selected audio output
 #[hicli::command]
 pub(crate) fn get_output(ctx: &Ctx) -> Result<()> {
-    let playback = ctx.playback()?;
+    let playback = ctx.node().playback()?;
     let cfg = playback.get_audio_output().map_err(display_error)?;
     let device = cfg.device_name.as_deref().unwrap_or("auto");
     let rate = cfg

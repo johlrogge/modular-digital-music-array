@@ -4,12 +4,30 @@
 //! Used by mdma-cli.
 
 pub use media_protocol::{
-    AudioOutputConfig, AudioSinkInfo, Command, ContentHash, Deck, Response, ResponseData,
-    SourceName,
+    AudioOutputConfig, AudioSinkInfo, Command, ContentHash, Deck, Held, PreviewStatus, Response,
+    ResponseData, SourceName, Transport, TransportStatus,
 };
-pub use playback_primitives::Volume;
+pub use playback_primitives::{PositionMs, Volume};
 
 use std::path::PathBuf;
+
+/// The transport in a response's data, for the commands that answer one
+/// (`GetTransport` and `Seek`).
+pub fn into_transport(data: ResponseData) -> Option<TransportStatus> {
+    match data {
+        ResponseData::Transport(status) => Some(status),
+        _ => None,
+    }
+}
+
+/// The audible track in a response's data, for the commands that answer one
+/// (`NowPlaying` and `EndPreview`).
+pub fn into_now_playing(data: ResponseData) -> Option<Option<ContentHash>> {
+    match data {
+        ResponseData::NowPlaying(hash) => Some(hash),
+        _ => None,
+    }
+}
 
 /// Errors that can occur when communicating with the playback service.
 ///
@@ -17,8 +35,10 @@ use std::path::PathBuf;
 /// carries command-level error messages.
 pub type ClientError = nng_transport::NngClientError;
 
+/// A clone shares the socket.
+#[derive(Clone)]
 pub struct MediaClient {
-    socket: nng::Socket,
+    socket: nng_transport::SharedSocket,
 }
 
 impl MediaClient {
@@ -37,8 +57,19 @@ impl MediaClient {
     /// # Ok::<(), media_client::ClientError>(())
     /// ```
     pub fn connect(url: &str) -> Result<Self, ClientError> {
-        let socket = nng_transport::connect(url)?;
+        let socket = nng_transport::SharedSocket::connect(url)?;
         Ok(Self { socket })
+    }
+
+    /// Whether `other` is a clone of this client, on the same connection.
+    pub fn is_same_connection(&self, other: &Self) -> bool {
+        self.socket.is_same_socket(&other.socket)
+    }
+
+    /// Why a request found the node unreachable since this was last asked, if one
+    /// did; see [`nng_transport::SharedSocket::take_unreachable`].
+    pub fn take_unreachable(&self) -> Option<String> {
+        self.socket.take_unreachable()
     }
 
     pub fn load_track(&self, path: PathBuf, deck: Deck) -> Result<(), ClientError> {
@@ -79,9 +110,34 @@ impl MediaClient {
         result
     }
 
-    pub fn seek(&self, deck: Deck, position: usize) -> Result<(), ClientError> {
-        let cmd = Command::Seek { deck, position };
-        self.send_command(cmd)
+    /// Move the audible track to `position` (kept within the track); playing
+    /// stays playing, paused stays paused. Answers where the track is now.
+    pub fn seek(&self, deck: Deck, position: PositionMs) -> Result<TransportStatus, ClientError> {
+        self.send_command_with_response(
+            Command::Seek {
+                deck,
+                position_ms: position,
+            },
+            into_transport,
+        )
+    }
+
+    /// Play `hash` (a full one) at once, holding what is audible to go back to
+    /// (ADR-031). Previewing again replaces the preview.
+    pub fn preview(&self, deck: Deck, hash: ContentHash) -> Result<(), ClientError> {
+        self.send_command(Command::Preview { deck, hash })
+    }
+
+    /// End the preview and go back to what it held; nothing happens when no
+    /// preview runs. Answers the track that is audible afterwards (`None`:
+    /// nothing was held, so playback is idle).
+    pub fn end_preview(&self, deck: Deck) -> Result<Option<ContentHash>, ClientError> {
+        self.send_command_with_response(Command::EndPreview { deck }, into_now_playing)
+    }
+
+    /// Transport state, audible track, position and duration of `deck`.
+    pub fn get_transport(&self, deck: Deck) -> Result<TransportStatus, ClientError> {
+        self.send_command_with_response(Command::GetTransport { deck }, into_transport)
     }
 
     pub fn get_length(&self, deck: Deck) -> Result<usize, ClientError> {
@@ -135,13 +191,7 @@ impl MediaClient {
     }
 
     pub fn now_playing(&self) -> Result<Option<ContentHash>, ClientError> {
-        self.send_command_with_response(Command::NowPlaying, |data| {
-            if let ResponseData::NowPlaying(hash) = data {
-                Some(hash)
-            } else {
-                None
-            }
-        })
+        self.send_command_with_response(Command::NowPlaying, into_now_playing)
     }
 
     pub fn play_queue(&self) -> Result<(), ClientError> {
@@ -195,12 +245,12 @@ impl MediaClient {
     fn send_command(&self, cmd: Command) -> Result<(), ClientError> {
         tracing::debug!("Serializing command: {:?}", cmd);
         tracing::debug!("Sending command to server");
-        let response: Response = nng_transport::request_response(&self.socket, &cmd)?;
+        let response: Response = self.socket.request_response(&cmd)?;
         tracing::debug!("Received response");
 
         match response {
             Response::Ok { .. } => Ok(()),
-            Response::Err { message } => Err(ClientError::Service(message)),
+            Response::Err { message } => Err(ClientError::Refused(message)),
         }
     }
 
@@ -209,10 +259,10 @@ impl MediaClient {
         cmd: Command,
         extract: fn(ResponseData) -> Option<T>,
     ) -> Result<T, ClientError> {
-        let response: Response = nng_transport::request_response(&self.socket, &cmd)?;
+        let response: Response = self.socket.request_response(&cmd)?;
 
         match response {
-            Response::Err { message } => Err(ClientError::Service(message)),
+            Response::Err { message } => Err(ClientError::Refused(message)),
             Response::Ok { data: Some(data) } => extract(data)
                 .ok_or_else(|| ClientError::Service("Unexpected response data type".to_string())),
             Response::Ok { data: None } => {

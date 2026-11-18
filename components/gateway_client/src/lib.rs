@@ -41,9 +41,10 @@ fn identity_from_response(response: GatewayResponse) -> Result<NodeIdentity, Ide
     }
 }
 
-/// Client for connecting to the API gateway.
+/// Client for connecting to the API gateway. A clone shares the socket.
+#[derive(Clone)]
 pub struct GatewayClient {
-    socket: nng::Socket,
+    socket: nng_transport::SharedSocket,
 }
 
 impl GatewayClient {
@@ -51,8 +52,19 @@ impl GatewayClient {
     ///
     /// Supports both IPC and TCP addresses.
     pub fn connect(address: &str) -> Result<Self, ClientError> {
-        let socket = nng_transport::connect(address)?;
+        let socket = nng_transport::SharedSocket::connect(address)?;
         Ok(Self { socket })
+    }
+
+    /// Whether `other` is a clone of this client, on the same connection.
+    pub fn is_same_connection(&self, other: &Self) -> bool {
+        self.socket.is_same_socket(&other.socket)
+    }
+
+    /// Why a request found the node unreachable since this was last asked, if one
+    /// did; see [`nng_transport::SharedSocket::take_unreachable`].
+    pub fn take_unreachable(&self) -> Option<String> {
+        self.socket.take_unreachable()
     }
 
     /// Connect without waiting, with every request bounded by `timeout`.
@@ -63,13 +75,13 @@ impl GatewayClient {
         address: &str,
         timeout: std::time::Duration,
     ) -> Result<Self, ClientError> {
-        let socket = nng_transport::connect_with_timeout(address, timeout)?;
+        let socket = nng_transport::SharedSocket::connect_with_timeout(address, timeout)?;
         Ok(Self { socket })
     }
 
     /// Send a raw gateway request and receive a response.
     fn request(&self, request: &GatewayRequest) -> Result<GatewayResponse, ClientError> {
-        nng_transport::request_response(&self.socket, request)
+        self.socket.request_response(request)
     }
 
     // =========================================================================

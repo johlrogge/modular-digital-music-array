@@ -44,8 +44,8 @@ fn complete_topics(typed: &str) -> Vec<hicli::Candidate> {
 pub(crate) fn subscribe(topic: TopicArg, ctx: &Ctx) -> Result<()> {
     let TopicArg(topic) = topic;
     // Event gateway of the resolved node (tcp://<ip>:5556)
-    let addr = ctx.event_gateway()?.ok_or_else(needs_remote_node)?;
-    let library = ctx.library()?;
+    let addr = ctx.node().event_gateway()?.ok_or_else(needs_remote_node)?;
+    let library = ctx.node().library()?;
     listen(&addr, topic.as_deref(), Some(&library))
 }
 
@@ -191,6 +191,33 @@ fn print_event_human(event: &PlaybackEvent, library: Option<&LibraryBackend>) {
                 "{} {}",
                 "◎ session ended".cyan().bold(),
                 id.to_string().bright_black()
+            );
+        }
+        PlaybackEvent::OutputChanged { health } => {
+            println!("{} {}", "◈ output".cyan().bold(), health);
+        }
+        PlaybackEvent::PreviewStarted { hash, back_to } => {
+            println!(
+                "{} {} {}",
+                "◐ preview".magenta().bold(),
+                hash.as_str().bright_black(),
+                match back_to {
+                    Some(held) => format!("(back to {})", held.as_str()),
+                    None => "(back stops)".to_string(),
+                }
+                .bright_black()
+            );
+        }
+        PlaybackEvent::PreviewEnded { hash, resumed } => {
+            println!(
+                "{} {} {}",
+                "◑ preview ended".magenta().bold(),
+                hash.as_str().bright_black(),
+                match resumed {
+                    Some(held) => format!("(back to {})", held.as_str()),
+                    None => "(stopped)".to_string(),
+                }
+                .bright_black()
             );
         }
     }

@@ -1,6 +1,6 @@
 //! Test helpers shared by several modules' tests.
 
-use crate::ctx::{Ctx, Globals, LibrarySocket, NodeFlag, PlaybackSocket, SourcesDir};
+use crate::ctx::{Ctx, FactsFlag, Globals, LibrarySocket, NodeFlag, PlaybackSocket, SourcesDir};
 use bpaf::{ParseFailure, Parser as _};
 use library_ipc_client::{ContentHash, TrackInfo};
 
@@ -53,52 +53,21 @@ pub(crate) fn run_arg<T: hicli::Arg>(args: &[&str]) -> Result<T, String> {
         .map_err(|failure| flat(&failure.unwrap_stderr()))
 }
 
-/// Held by every test that sets an environment variable (`MDMA_NODE`, `EDITOR`,
-/// `COLUMNS`): the environment is process-wide and tests run in parallel.
-pub(crate) fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-/// Environment variables set for the length of a test and put back when it ends,
-/// even if it panics. Hold [`env_lock`] first (declare it first, so it drops last).
-#[derive(Default)]
-pub(crate) struct EnvVars(Vec<(&'static str, Option<std::ffi::OsString>)>);
-
-impl EnvVars {
-    pub(crate) fn set(&mut self, name: &'static str, value: impl AsRef<std::ffi::OsStr>) {
-        self.0.push((name, std::env::var_os(name)));
-        std::env::set_var(name, value);
-    }
-}
-
-impl Drop for EnvVars {
-    fn drop(&mut self) {
-        for (name, original) in self.0.drain(..).rev() {
-            match original {
-                Some(value) => std::env::set_var(name, value),
-                None => std::env::remove_var(name),
-            }
-        }
-    }
-}
-
-/// Global options as given by none of the flags or variables.
-pub(crate) fn globals() -> Globals {
-    Globals {
-        node: NodeFlag(None),
-        socket: LibrarySocket(None),
-        playback_socket: PlaybackSocket(None),
-        sources_dir: SourcesDir(None),
-    }
-}
+// The environment is process-wide, so one lock serves every test that sets a variable
+// (`MDMA_NODE`, `EDITOR`, `COLUMNS`): the one `client-facts` takes, whose tests set
+// `XDG_CACHE_HOME`. Any new test that starts a process, or takes a sync flock, must
+// hold `env_lock` (#107: a forked child inherits the flock until its exec).
+pub(crate) use client_facts::test_support::{env_lock, EnvVars};
 
 /// A context for the local services (IPC), with no node to resolve. Its sockets
 /// and sources directory do not exist, so no test can reach a real local service.
+/// It reads facts from the node (which is not there), never from the replica of
+/// whoever runs the tests.
 pub(crate) fn local_ctx() -> Ctx {
     let nowhere = "/nonexistent/mdma-test";
     Ctx::with_target(
         Globals {
+            facts: FactsFlag::given(Some(client_facts::FactsChoice::Node)),
             node: NodeFlag(None),
             socket: LibrarySocket(Some(format!("ipc://{nowhere}/library.sock"))),
             playback_socket: PlaybackSocket(Some(format!("ipc://{nowhere}/playback.sock"))),
@@ -108,44 +77,7 @@ pub(crate) fn local_ctx() -> Ctx {
     )
 }
 
-/// Keeps a dead node's port reserved: bound but never listening, so dials are
-/// always refused and no other test can be handed the same port.
-pub(crate) struct PortGuard(#[allow(dead_code)] std::os::fd::OwnedFd);
-
-/// A node on this machine that refuses connections. The target, its port, and
-/// the guard that must be held for as long as the node should stay dead.
-pub(crate) fn dead_node() -> (node_discovery::Target, u16, PortGuard) {
-    use std::os::fd::FromRawFd;
-    // std has no bound-but-not-listening TCP socket, so go through libc.
-    // SAFETY: plain socket/bind/getsockname calls on a descriptor we own and
-    // immediately wrap in an OwnedFd; `addr` outlives every call using it.
-    let (fd, port) = unsafe {
-        let raw = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
-        assert!(raw >= 0, "create a socket");
-        let fd = std::os::fd::OwnedFd::from_raw_fd(raw);
-        let mut addr: libc::sockaddr_in = std::mem::zeroed();
-        addr.sin_family = libc::AF_INET as libc::sa_family_t;
-        addr.sin_addr.s_addr = u32::from(std::net::Ipv4Addr::LOCALHOST).to_be();
-        let len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
-        let addr_ptr = std::ptr::addr_of_mut!(addr).cast::<libc::sockaddr>();
-        let raw = std::os::fd::AsRawFd::as_raw_fd(&fd);
-        assert_eq!(libc::bind(raw, addr_ptr, len), 0, "bind a free port");
-        let mut out_len = len;
-        assert_eq!(
-            libc::getsockname(raw, addr_ptr, &mut out_len),
-            0,
-            "read the bound port"
-        );
-        (fd, u16::from_be(addr.sin_port))
-    };
-    let target = node_discovery::Target::Remote(node_discovery::RemoteTarget {
-        host: "localhost".to_string(),
-        ip: Some(std::net::Ipv4Addr::LOCALHOST),
-        port,
-        source: node_discovery::Source::Cache,
-    });
-    (target, port, PortGuard(fd))
-}
+pub(crate) use mdma_client::test_support::dead_node;
 
 /// The text hicli would print (after its `Error: ` prefix) for a failed command result.
 pub(crate) fn failure_text<T>(r: color_eyre::Result<T>) -> String {
@@ -181,11 +113,182 @@ pub(crate) fn strip_ansi(s: &str) -> String {
     out
 }
 
-/// One line of a fact log, as a replica stores it: an assertion of the JSON `value`
-/// (`{"t": .., "v": ..}`) about `entity` at `time` (RFC 3339).
-pub(crate) fn asserted(entity: &str, value: &str, time: &str) -> String {
-    let source = r#"{"tool":"t","version":"1","origin":{"type":"User"}}"#;
-    format!(r#"["{entity}",{value},"{time}",{source},"Assert"]"#)
+/// Fake library and playback services over IPC, for commands that talk to both.
+///
+/// The library knows the tracks given and resolves a hash the way the real one
+/// does: a unique prefix (with or without `sha256:`) is its track, anything else
+/// is an error. (This prefix matching is a simplification of
+/// `library_projection::resolve_prefix`, which the real library uses.) Playback
+/// answers a queue listing with the queue given and every other command with
+/// success (a removal counts every hash it was given), and keeps what it was
+/// sent, as JSON. A request either fake does not understand gets an error
+/// response, so a failure shows as itself rather than as a timeout.
+pub(crate) struct FakeServices {
+    _dir: tempfile::TempDir,
+    pub(crate) library: mdma_client::LibraryBackend,
+    pub(crate) playback: mdma_client::PlaybackBackend,
+    sent: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+}
+
+/// What the fake services know, beyond the tracks of the library.
+#[derive(Default)]
+pub(crate) struct Setup<'a> {
+    /// The full hashes the fake library holds.
+    pub(crate) tracks: &'a [&'a str],
+    /// What the fake playback lists as its queue.
+    pub(crate) queue: &'a [&'a str],
+    /// What the fake playback answers `GetTransport` with (nothing, if `None`).
+    pub(crate) transport: Option<mdma_client::TransportStatus>,
+    /// What it answers `Seek` with: where the track is afterwards.
+    pub(crate) seeked: Option<mdma_client::TransportStatus>,
+    /// The track it answers `EndPreview` with as audible afterwards.
+    pub(crate) resumed: Option<mdma_client::ContentHash>,
+    /// The beat grid every track of the fake library has.
+    pub(crate) grid: Option<library_ipc_client::BeatGridInfo>,
+}
+
+impl FakeServices {
+    /// `tracks`: the full hashes the fake library holds.
+    pub(crate) fn new(tracks: &[&str]) -> Self {
+        Self::with_queue(tracks, &[])
+    }
+
+    /// `tracks`: the full hashes the fake library holds; `queue`: what the
+    /// fake playback lists as its queue.
+    pub(crate) fn with_queue(tracks: &[&str], queue: &[&str]) -> Self {
+        Self::start(Setup {
+            tracks,
+            queue,
+            ..Setup::default()
+        })
+    }
+
+    pub(crate) fn start(setup: Setup) -> Self {
+        let Setup {
+            tracks,
+            queue,
+            transport,
+            seeked,
+            resumed,
+            grid,
+        } = setup;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let library_addr = format!("ipc://{}/library.sock", dir.path().display());
+        let playback_addr = format!("ipc://{}/playback.sock", dir.path().display());
+        let tracks: Vec<String> = tracks.iter().map(|t| t.to_string()).collect();
+        let queue: Vec<ContentHash> = queue.iter().map(|h| ContentHash::new(*h)).collect();
+        serve(&library_addr, move |request| {
+            let error = |message: String| {
+                serde_json::to_vec(&library_ipc_client::LibraryResponse::Error(
+                    library_ipc_client::ProtocolError::Internal { message },
+                ))
+                .expect("a response")
+            };
+            let request: library_ipc_client::LibraryRequest = match serde_json::from_slice(request)
+            {
+                Ok(request) => request,
+                Err(e) => return error(format!("the fake library cannot read the request: {e}")),
+            };
+            let hash = match request {
+                library_ipc_client::LibraryRequest::GetTrack { hash } => hash,
+                other => {
+                    return error(format!(
+                        "the fake library only answers GetTrack, got {other:?}"
+                    ))
+                }
+            };
+            let wanted = hash.as_str().trim_start_matches("sha256:");
+            let found: Vec<&String> = tracks
+                .iter()
+                .filter(|t| t.trim_start_matches("sha256:").starts_with(wanted))
+                .collect();
+            let response = match found.as_slice() {
+                [one] => library_ipc_client::LibraryResponse::Track(Box::new(TrackInfo {
+                    beat_grid: grid.clone(),
+                    ..track(one)
+                })),
+                [] => library_ipc_client::LibraryResponse::Error(
+                    library_ipc_client::ProtocolError::TrackNotFound {
+                        hash: hash.to_string(),
+                    },
+                ),
+                _ => library_ipc_client::LibraryResponse::Error(
+                    library_ipc_client::ProtocolError::Internal {
+                        message: format!("ambiguous hash prefix: {hash}"),
+                    },
+                ),
+            };
+            serde_json::to_vec(&response).expect("a response")
+        });
+        let sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = sent.clone();
+        serve(&playback_addr, move |request| {
+            let command = serde_json::from_slice::<serde_json::Value>(request).and_then(|value| {
+                serde_json::from_value::<mdma_client::Command>(value.clone())
+                    .map(|command| (value, command))
+            });
+            let response = match command {
+                Ok((value, command)) => {
+                    log.lock().unwrap().push(value);
+                    let data = match command {
+                        mdma_client::Command::QueueRemove { hashes } => {
+                            Some(mdma_client::ResponseData::Count(hashes.len()))
+                        }
+                        mdma_client::Command::QueueList => {
+                            Some(mdma_client::ResponseData::Queue(queue.clone()))
+                        }
+                        mdma_client::Command::GetTransport { .. } => {
+                            transport.clone().map(mdma_client::ResponseData::Transport)
+                        }
+                        mdma_client::Command::Seek { .. } => {
+                            seeked.clone().map(mdma_client::ResponseData::Transport)
+                        }
+                        mdma_client::Command::EndPreview { .. } => {
+                            Some(mdma_client::ResponseData::NowPlaying(resumed.clone()))
+                        }
+                        _ => None,
+                    };
+                    mdma_client::Response::Ok { data }
+                }
+                Err(e) => mdma_client::Response::Err {
+                    message: format!("the fake playback cannot read the command: {e}"),
+                },
+            };
+            serde_json::to_vec(&response).expect("a response")
+        });
+        Self {
+            library: mdma_client::LibraryBackend::connect_direct(&library_addr)
+                .expect("connect to the fake library"),
+            playback: mdma_client::PlaybackBackend::connect_direct(&playback_addr)
+                .expect("connect to the fake playback"),
+            _dir: dir,
+            sent,
+        }
+    }
+
+    /// The playback commands received so far, as JSON, in order.
+    pub(crate) fn sent(&self) -> Vec<serde_json::Value> {
+        self.sent.lock().unwrap().clone()
+    }
+}
+
+/// Answer each request on `address` with `handler`'s reply, on a thread of its own.
+fn serve(address: &str, handler: impl Fn(&[u8]) -> Vec<u8> + Send + 'static) {
+    let socket = nng::Socket::new(nng::Protocol::Rep0).expect("a socket");
+    socket.listen(address).expect("listen");
+    std::thread::spawn(move || {
+        while let Ok(request) = socket.recv() {
+            let reply = handler(&request);
+            if socket.send(nng::Message::from(&reply[..])).is_err() {
+                break;
+            }
+        }
+    });
+}
+
+/// A command as the fake playback records it.
+pub(crate) fn recorded(command: &mdma_client::Command) -> serde_json::Value {
+    serde_json::to_value(command).expect("a command as JSON")
 }
 
 /// A track with only its content hash set: everything optional is `None`,
@@ -196,6 +299,10 @@ pub(crate) fn track(hash: &str) -> TrackInfo {
         title: None,
         artist: None,
         album: None,
+        genre: None,
+        label: None,
+        styles: vec![],
+        marks: vec![],
         duration: None,
         bpm: None,
         key: None,

@@ -8,7 +8,6 @@ use mdma_client::{
     upgrade_node_text, ContentHash, Deck, LibraryClientError, Mark, MarkWrite, PlaybackBackend,
     PlaylistName, SourceName,
 };
-use std::rc::Rc;
 
 /// Status line text for the outcome of marking the playing track with `mark`.
 fn mark_status(mark: &Mark, result: Result<MarkWrite, LibraryClientError>) -> String {
@@ -17,6 +16,58 @@ fn mark_status(mark: &Mark, result: Result<MarkWrite, LibraryClientError>) -> St
         Ok(MarkWrite::AlreadyLive) => format!("Already marked {mark}"),
         Err(e) if e.is_unsupported_request() => upgrade_node_text("TUI"),
         Err(e) => format!("Mark failed: {e}"),
+    }
+}
+
+/// Where resolved tracks go in the playback queue.
+#[derive(Clone, Copy)]
+enum QueuePosition {
+    /// At the end of the queue, in selection order.
+    Append,
+    /// Right after the playing track, keeping the selection order.
+    Next,
+}
+
+/// Resolve `hashes` for playback and queue them at `position`.
+/// Returns how many tracks were queued; nothing is queued when resolving fails.
+fn queue_resolved(
+    app: &App,
+    hashes: &[ContentHash],
+    position: QueuePosition,
+) -> Result<usize, String> {
+    let library = app.link.library().map_err(|e| e.to_string())?;
+    let playback = app.link.playback().map_err(|e| e.to_string())?;
+    let resolved: Vec<ContentHash> = library
+        .resolve_for_playback(hashes)
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .map(Into::into)
+        .collect();
+    let count = resolved.len();
+    match position {
+        QueuePosition::Append => resolved.into_iter().try_for_each(|hash| {
+            playback
+                .queue_append(hash, SourceName::audio())
+                .map_err(|e| e.to_string())
+        }),
+        QueuePosition::Next => queue_next_order(resolved).into_iter().try_for_each(|hash| {
+            playback
+                .queue_next(hash, SourceName::audio())
+                .map_err(|e| e.to_string())
+        }),
+    }?;
+    Ok(count)
+}
+
+/// Send a transport command to playback, then say `done`. A node that cannot be
+/// reached is the status instead, so nothing claims to have happened that did not.
+fn transport<R>(app: &mut App, done: &str, send: impl FnOnce(&PlaybackBackend) -> R) {
+    match app.link.playback() {
+        Ok(playback) => {
+            send(&playback);
+            app.set_status(done);
+        }
+        Err(e) => app.set_status(format!("Playback: {e}")),
     }
 }
 
@@ -113,11 +164,10 @@ fn handle_normal(app: &mut App, key: KeyEvent) {
             if hashes.is_empty() {
                 app.set_status("No tracks selected");
             } else {
-                let count = hashes.len();
-                for hash in &hashes {
-                    let _ = app.playback.queue_append(hash.clone(), SourceName::audio());
+                match queue_resolved(app, &hashes, QueuePosition::Append) {
+                    Ok(count) => app.set_status(format!("Queued {} track(s)", count)),
+                    Err(e) => app.set_status(format!("Queue failed: {e}")),
                 }
-                app.set_status(format!("Queued {} track(s)", count));
             }
         }
         KeyCode::Char('Q') => {
@@ -125,11 +175,10 @@ fn handle_normal(app: &mut App, key: KeyEvent) {
             if hashes.is_empty() {
                 app.set_status("No tracks selected");
             } else {
-                let count = hashes.len();
-                for hash in hashes.iter().rev() {
-                    let _ = app.playback.queue_next(hash.clone(), SourceName::audio());
+                match queue_resolved(app, &hashes, QueuePosition::Next) {
+                    Ok(count) => app.set_status(format!("Queued next {} track(s)", count)),
+                    Err(e) => app.set_status(format!("Queue failed: {e}")),
                 }
-                app.set_status(format!("Queued next {} track(s)", count));
             }
         }
         KeyCode::Char('A') => {
@@ -146,7 +195,7 @@ fn handle_normal(app: &mut App, key: KeyEvent) {
                     let target = app.active_pane().add_playing_target();
                     match target {
                         AddPlayingTarget::Queue => {
-                            match app.playback.queue_append(h, SourceName::audio()) {
+                            match queue_resolved(app, &[h], QueuePosition::Append) {
                                 Ok(_) => {
                                     app.active_pane_mut().refresh();
                                     app.set_status("Added playing track to queue");
@@ -155,12 +204,19 @@ fn handle_normal(app: &mut App, key: KeyEvent) {
                             }
                         }
                         AddPlayingTarget::Playlist(name) => {
-                            use crate::playlist_pane::playlist_content_for_write;
-                            match app.library.get_track(&h) {
+                            use crate::rows::{rows_content_for_write, ListRow};
+                            match app.link.node_track(&h) {
                                 Ok(track) => {
-                                    let content =
-                                        playlist_content_for_write(std::slice::from_ref(&track));
-                                    match app.library.playlist_append(&name, content) {
+                                    let content = rows_content_for_write(&[ListRow::Track(track)]);
+                                    let appended =
+                                        app.link.library().map_err(|e| e.to_string()).and_then(
+                                            |library| {
+                                                library
+                                                    .playlist_append(&name, content)
+                                                    .map_err(|e| e.to_string())
+                                            },
+                                        );
+                                    match appended {
                                         Ok(()) => {
                                             app.active_pane_mut().refresh();
                                             app.set_status(format!(
@@ -191,13 +247,26 @@ fn handle_normal(app: &mut App, key: KeyEvent) {
                 app.set_status("No track selected");
             } else {
                 let count = hashes.len();
-                let result = (|| -> Result<(), mdma_client::PlaybackClientError> {
-                    for hash in queue_next_order(hashes) {
-                        app.playback.queue_next(hash, SourceName::audio())?;
-                    }
-                    app.playback.skip()?;
-                    Ok(())
-                })();
+                let result = app
+                    .link
+                    .library()
+                    .map_err(|e| e.to_string())
+                    .and_then(|library| {
+                        let playback = app.link.playback().map_err(|e| e.to_string())?;
+                        let resolved = library
+                            .resolve_for_playback(&hashes)
+                            .map_err(|e| e.to_string())?;
+                        let ordered =
+                            queue_next_order(resolved.into_iter().map(Into::into).collect());
+                        (|| -> Result<(), mdma_client::PlaybackClientError> {
+                            for hash in ordered {
+                                playback.queue_next(hash, SourceName::audio())?;
+                            }
+                            playback.skip()?;
+                            Ok(())
+                        })()
+                        .map_err(|e| e.to_string())
+                    });
                 match result {
                     Ok(()) => app.set_status(format!("Playing {} track(s)", count)),
                     Err(e) => app.set_status(format!("Play failed: {e}")),
@@ -254,12 +323,10 @@ fn handle_palette(app: &mut App, key: KeyEvent) {
             if let Some(entry) = app.palette_matches.get(cursor).cloned() {
                 match entry {
                     PaletteEntry::Command(cmd) => {
-                        let playback = Rc::clone(&app.playback);
-                        execute_command(cmd, &playback, app);
+                        execute_command(cmd, app);
                     }
                     PaletteEntry::OpenPlaylist(name) => {
-                        let library = Rc::clone(&app.library);
-                        match PlaylistPane::open(name.clone(), library) {
+                        match PlaylistPane::open(name.clone(), app.link.clone()) {
                             Ok(pane) => {
                                 app.switch_active_pane(Box::new(pane));
                                 app.set_status(format!("Opened: {}", name));
@@ -268,19 +335,14 @@ fn handle_palette(app: &mut App, key: KeyEvent) {
                         }
                     }
                     PaletteEntry::CreatePlaylist(name_str) => match PlaylistName::new(&name_str) {
-                        Ok(name) => match app.library.playlist_new(&name, String::new()) {
-                            Ok(()) => {
-                                let library = Rc::clone(&app.library);
-                                match PlaylistPane::open(name.clone(), library) {
-                                    Ok(pane) => {
-                                        app.switch_active_pane(Box::new(pane));
-                                        app.set_status(format!("Created: {}", name_str));
-                                    }
-                                    Err(e) => {
-                                        app.set_status(format!("Created but open failed: {e}"))
-                                    }
+                        Ok(name) => match new_playlist(app, &name) {
+                            Ok(()) => match PlaylistPane::open(name.clone(), app.link.clone()) {
+                                Ok(pane) => {
+                                    app.switch_active_pane(Box::new(pane));
+                                    app.set_status(format!("Created: {}", name_str));
                                 }
-                            }
+                                Err(e) => app.set_status(format!("Created but open failed: {e}")),
+                            },
                             Err(e) => app.set_status(format!("Create failed: {e}")),
                         },
                         Err(e) => app.set_status(format!("Invalid name: {e}")),
@@ -333,30 +395,15 @@ fn handle_playback(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Char('p') | KeyCode::Char(' ') => {
             // Toggle: if playing → pause, otherwise → play
-            let action = match &app.now_playing.status {
-                PlaybackStatus::Playing { .. } => {
-                    let _ = app.playback.pause(Deck::A);
-                    "Paused"
-                }
-                _ => {
-                    let _ = app.playback.play_queue();
-                    "Playing"
-                }
-            };
-            app.set_status(action);
+            if matches!(app.now_playing.status, PlaybackStatus::Playing { .. }) {
+                transport(app, "Paused", |playback| playback.pause(Deck::A));
+            } else {
+                transport(app, "Playing", PlaybackBackend::play_queue);
+            }
         }
-        KeyCode::Char('s') => {
-            let _ = app.playback.stop(Deck::A);
-            app.set_status("Stopped");
-        }
-        KeyCode::Char('n') => {
-            let _ = app.playback.skip();
-            app.set_status("Skipped");
-        }
-        KeyCode::Char('c') => {
-            let _ = app.playback.queue_clear();
-            app.set_status("Queue cleared");
-        }
+        KeyCode::Char('s') => transport(app, "Stopped", |playback| playback.stop(Deck::A)),
+        KeyCode::Char('n') => transport(app, "Skipped", PlaybackBackend::skip),
+        KeyCode::Char('c') => transport(app, "Queue cleared", PlaybackBackend::queue_clear),
         KeyCode::Char('b') => {
             let hash: Option<ContentHash> = match &app.now_playing.status {
                 PlaybackStatus::Playing { track, .. } | PlaybackStatus::Paused { track, .. } => {
@@ -368,7 +415,10 @@ fn handle_playback(app: &mut App, key: KeyEvent) {
                 None => app.set_status("Nothing playing"),
                 Some(h) => {
                     let mark = Mark::Default;
-                    let status = mark_status(&mark, app.library.write_mark(&h, &mark));
+                    let status = match app.link.library() {
+                        Ok(library) => mark_status(&mark, library.write_mark(&h, &mark)),
+                        Err(e) => format!("Mark failed: {e}"),
+                    };
                     app.set_status(status);
                 }
             }
@@ -403,7 +453,7 @@ fn handle_name_input(app: &mut App, key: KeyEvent) {
                     return;
                 }
             };
-            match app.library.playlist_new(&name, String::new()) {
+            match new_playlist(app, &name) {
                 Ok(()) => {
                     app.active_pane_mut().refresh();
                     app.set_status(format!("Created playlist \"{}\"", name_str));
@@ -418,28 +468,35 @@ fn handle_name_input(app: &mut App, key: KeyEvent) {
     }
 }
 
+/// Create an empty playlist `name` on the node. The error is the text to show.
+fn new_playlist(app: &App, name: &PlaylistName) -> Result<(), String> {
+    app.link
+        .library()
+        .map_err(|e| e.to_string())?
+        .playlist_new(name, String::new())
+        .map_err(|e| e.to_string())
+}
+
 /// Execute a palette command against the playback backend, updating app status.
-fn execute_command(cmd: &Command, playback: &PlaybackBackend, app: &mut App) {
+fn execute_command(cmd: &Command, app: &mut App) {
     match cmd.name {
-        "play" => {
-            let _ = playback.play_queue();
-            app.set_status("Playing");
-        }
-        "pause" => {
-            let _ = playback.pause(Deck::A);
-            app.set_status("Paused");
-        }
-        "stop" => {
-            let _ = playback.stop(Deck::A);
-            app.set_status("Stopped");
-        }
-        "next" => {
-            let _ = playback.skip();
-            app.set_status("Skipped");
-        }
-        "clear" => {
-            let _ = playback.queue_clear();
-            app.set_status("Queue cleared");
+        "play" => transport(app, "Playing", PlaybackBackend::play_queue),
+        "pause" => transport(app, "Paused", |playback| playback.pause(Deck::A)),
+        "stop" => transport(app, "Stopped", |playback| playback.stop(Deck::A)),
+        "next" => transport(app, "Skipped", PlaybackBackend::skip),
+        "clear" => transport(app, "Queue cleared", PlaybackBackend::queue_clear),
+        "refresh" => {
+            // Ask for a sync of the replica first: it runs in the background, and what
+            // is read now is what the replica holds now.
+            let sync = app.request_sync(client_facts::Urgency::Now);
+            let refreshed = match app.refresh_all() {
+                Ok(()) => "Facts read again".to_string(),
+                Err(e) => format!("Refresh: {e}"),
+            };
+            match sync {
+                Some(problem) => app.set_status(format!("{refreshed}; {problem}")),
+                None => app.set_status(refreshed),
+            }
         }
         "shuffle" => {
             app.set_status("shuffle not yet implemented");
@@ -581,8 +638,7 @@ fn dispatch_pane_action(app: &mut App, action: PaneAction) {
         }
         PaneAction::OpenPlaylist(name) => {
             // Open the requested playlist in the ACTIVE pane (replaces it).
-            let library = Rc::clone(&app.library);
-            match PlaylistPane::open(name.clone(), library) {
+            match PlaylistPane::open(name.clone(), app.link.clone()) {
                 Ok(playlist_pane) => {
                     app.switch_active_pane(Box::new(playlist_pane));
                     app.set_status(format!("Opened playlist: {}", name));

@@ -11,11 +11,11 @@ mod args;
 mod background;
 mod completions;
 mod ctx;
-mod detach;
 mod editor;
 /// Add or retract metadata facts on a track
 #[hicli::group]
 mod fact;
+mod fact_filter;
 /// Inbox management commands
 #[hicli::group]
 mod inbox;
@@ -35,6 +35,7 @@ mod playback;
 #[hicli::group]
 mod playlist;
 mod plays;
+mod preview;
 /// Queue management (feeds deck A)
 #[hicli::group]
 mod queue;
@@ -72,7 +73,7 @@ mod replica;
 /// ```
 #[hicli::group]
 mod search;
-mod snapshot;
+mod seek;
 /// Music source management
 ///
 /// Per-source commands: mdma source <SOURCE-NAME> <COMMAND>
@@ -117,23 +118,19 @@ fn app() -> hicli::App<ctx::Globals, ctx::Ctx> {
 }
 
 fn main() -> std::process::ExitCode {
-    // Rust ignores SIGPIPE, so printing to a closed pipe (`mdma ... | head`)
-    // would panic. Restore the default so the process ends quietly instead.
-    #[cfg(unix)]
-    // SAFETY: SIG_DFL installs no handler, and no other thread exists yet to race the change.
-    unsafe {
-        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
-    }
-
-    color_eyre::install().expect("installed once");
+    cli_base::init();
 
     // What `App::run` does with the process arguments, spelled out so the command
     // that ran is known afterwards.
     let args: Vec<String> = std::env::args().skip(1).collect();
     let command = background::parse_command(&args);
+    // What a failure to reach the node says needed it: the command path as typed.
+    let needed_by = ctx::needed_by(command.as_ref().map(|ran| ran.path.as_slice()));
     // The node is resolved once, on first use, so only commands that talk to
     // one resolve it.
-    let code = app().run_with_args(args, |globals| Ok(Ctx::new(globals)));
+    let code = app().run_with_args(args, |globals| {
+        Ok(Ctx::needed_by(needed_by.clone(), globals))
+    });
     // Once, here, for every command that ran (any exit code but 2, a usage error):
     // start a detached sync if the replica is stale or the command wrote. It never
     // waits, and never runs inside a command.
@@ -175,9 +172,11 @@ mod tests {
     /// Every command that takes track hashes accepts `-` for hashes on stdin.
     #[test]
     fn hash_commands_accept_a_dash_for_stdin() {
-        let cases: [&[&str]; 8] = [
+        let cases: [&[&str]; 10] = [
             &["get", "-"],
             &["facts", "-"],
+            &["facts", "--include=BPM", "-"],
+            &["facts", "-", "--exclude=TrackStarted"],
             &["library", "track", "delete", "-"],
             &["library", "track", "restore", "-"],
             &["fact", "add", "--field", "title", "--value", "x", "-"],
@@ -190,14 +189,35 @@ mod tests {
         }
         // Still a hash, still validated.
         usage_error(&["get", "xyz"]);
-        // Nothing at all is a usage error that names both spellings.
-        let err = usage_error(&["get"]);
-        assert!(err.contains("<HASH|->"), "{err}");
+        // Nothing at all is a usage error that names both spellings and says how to
+        // read stdin, for every command that takes a hash.
+        for argv in [
+            &["get"][..],
+            &["facts"],
+            &["fact", "add", "--field", "title", "--value", "x"],
+        ] {
+            let err = usage_error(argv);
+            let hint = "`-` reads hashes from stdin";
+            assert!(err.contains(hint), "{argv:?}: {err}");
+        }
+        // The hint is shared, so it names no one command.
+        let err = usage_error(&["queue", "next"]);
+        assert!(!err.contains("mdma facts"), "{err}");
+    }
+
+    /// The hash is required, so the usage line must not show it as optional.
+    #[test]
+    fn facts_help_shows_the_hash_as_required() {
+        let text = crate::test_support::help(&["facts", "--help"]);
+        assert!(text.contains("<HASH|->"), "{text}");
+        assert!(!text.contains("[<HASH|->]"), "{text}");
     }
 
     fn given(args: &[&str]) -> bool {
         let (globals, _) = parse_cli(args).expect("valid args");
-        Ctx::with_target(globals, node_discovery::Target::LocalIpc).sockets_given()
+        Ctx::with_target(globals, node_discovery::Target::LocalIpc)
+            .node()
+            .sockets_given()
     }
 
     #[test]
@@ -289,6 +309,8 @@ mod tests {
             (vec!["status"], vec!["status"]),
             (vec!["list"], vec!["list"]),
             (vec!["list", "--limit", "3"], vec!["list"]),
+            (vec!["--facts=node", "list"], vec!["list"]),
+            (vec!["search", "--facts", "replica", "jazz"], vec!["search"]),
             (vec!["get", "abcd1234"], vec!["get"]),
             (vec!["facts", "abcd1234"], vec!["facts"]),
             (vec!["search"], vec!["search"]),

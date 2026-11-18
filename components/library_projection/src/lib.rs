@@ -23,18 +23,31 @@
 //!
 //! ## Plays
 //! Play events (start/stop) are history with identity, not tracked provenance. The
-//! bulk fold leaves `last_started`/`last_stopped` unset; [`PlayLog`] folds them
+//! bulk fold leaves `last_started`/`last_stopped` unset; [`LineageLog`] folds them
 //! separately, keeps every event seen (retired entities included) and credits a track
 //! with the plays of every hash it transitively replaces (ADR-013, ADR-017). It is the
-//! one fold of plays: the last times ([`PlayLog::apply_to`]) and the whole history
+//! one fold of plays: the last times ([`LineageLog::apply_to`]) and the whole history
 //! ([`PlayHistory`]) read the same resolved events. [`resolve_prefix`] is the one
 //! resolution of a partial hash.
+//!
+//! ## Covers
+//! A cover follows the same lineage (ADR-013, amendment 2026-11-17): a track without
+//! a cover of its own shows the one the lineage member replaced last had live when it
+//! was replaced ([`IndexedTrackInfo::effective_cover_art_path`]). The [`LineageLog`]
+//! keeps what that needs, and [`LineageLog::apply_to`] sets it with the play times.
 
-use library_ipc_protocol::FactType;
-use music_facts::{ContentHash, Mark, MarkFilter, MusicValue, StartReason, StopReason};
+mod read;
+
+pub use read::{
+    entity_facts, fact_values, format_fact_for_display, marked, search, search_fields,
+    sort_catalog, track_info, visible, AlbumCovers,
+};
+
+use library_ipc_protocol::{CanonicalHash, EntryError, FactType, PlaylistEntry, ProtocolError};
+use music_facts::{ContentHash, Mark, MarkFilter, MusicValue, StartReason, StopReason, StoredMark};
 use stainless_facts::{aggregate_facts, Fact, Operation};
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// A fact of the music domain, as stored in the fact log.
 pub type MusicFact = Fact<ContentHash, MusicValue, music_facts::FactSource>;
@@ -63,7 +76,7 @@ pub struct IndexedTrackInfo {
     pub styles: Vec<String>,
     pub duration_seconds: Option<u32>,
     pub bpm: Option<f32>,
-    pub key: Option<String>,
+    pub key: Option<music_facts::Key>,
     pub year: Option<u32>,
     pub source: Option<String>,
     pub blob_path: PathBuf,
@@ -105,9 +118,26 @@ pub struct IndexedTrackInfo {
     /// liveness reset, so a re-ingested track starts clean) or when that `Replaces` is
     /// retracted (module docs, "Retirement").
     pub retired_by: Option<String>,
+    /// The cover of the lineage member this track replaced last, as it was when it was
+    /// replaced ([`IndexedTrackInfo::effective_cover_art_path`] falls back to it).
+    /// Always computed, whether or not the track has a cover of its own, so it is
+    /// there when that one is retracted. Derived, never a fact and never
+    /// part of the fold of one entity: [`LineageLog::apply_to`] sets it from the cover
+    /// assertions the log remembers along the `Replaces` lineage (ADR-013, amendment
+    /// 2026-11-17). `cover_art_path` stays the file's own fact.
+    pub inherited_cover_art_path: Option<PathBuf>,
 }
 
 impl IndexedTrackInfo {
+    /// The cover this track shows by itself: its own, else the nearest one up its
+    /// `Replaces` lineage. The one rule that the read side, the album covers and the
+    /// archiving of cover files all use.
+    pub fn effective_cover_art_path(&self) -> Option<&Path> {
+        self.cover_art_path
+            .as_deref()
+            .or(self.inherited_cover_art_path.as_deref())
+    }
+
     /// Whether a `Replaces` fact has retired this track while it was live (see
     /// [`IndexedTrackInfo::retired_by`]). The one predicate library writers ask before
     /// adding a fact to a track.
@@ -160,6 +190,7 @@ impl IndexedTrackInfo {
             provenance: Vec::new(),
             raw_file_path: None,
             retired_by: None,
+            inherited_cover_art_path: None,
         }
     }
 }
@@ -235,6 +266,22 @@ impl IndexedTrackInfo {
         mark: &'a Mark,
     ) -> impl Iterator<Item = &'a (MusicValue, music_facts::FactSource)> {
         self.provenance.iter().filter(move |(v, _)| mark.matches(v))
+    }
+
+    /// The marks this track holds live, each once: the default mark first, then the
+    /// named ones by name. Legacy free-text scopes are not marks and are left out.
+    pub fn marks(&self) -> Vec<Mark> {
+        let mut marks: Vec<Mark> = self
+            .provenance
+            .iter()
+            .filter_map(|(v, _)| match v.stored_mark()? {
+                StoredMark::Mark(mark) => Some(mark),
+                StoredMark::Legacy(_) => None,
+            })
+            .collect();
+        marks.sort_unstable();
+        marks.dedup();
+        marks
     }
 
     /// The keys ([`hash_key`]) of the tracks a live `Replaces` fact of this track
@@ -415,7 +462,7 @@ fn apply_assert_scalar(
         MusicValue::StyleDescriptor(v) => push_unique(&mut entry.styles, v.clone()),
         MusicValue::DurationSeconds(v) => entry.duration_seconds = Some(v.value()),
         MusicValue::Bpm(v) => entry.bpm = Some(v.as_f32()),
-        MusicValue::Key(v) => entry.key = Some(v.to_string()),
+        MusicValue::Key(v) => entry.key = Some(*v),
         MusicValue::Year(v) => entry.year = Some(v.value()),
         MusicValue::TrackNumber(v) => entry.track_number = Some(v.value()),
         MusicValue::DiscNumber(v) => entry.disc_number = Some(v.value()),
@@ -609,7 +656,7 @@ fn apply_retract_scalar(entry: &mut IndexedTrackInfo, retracted: &MusicValue) {
             entry.key = last_surviving(&entry.provenance, &|v| matches!(v, MusicValue::Key(_)))
                 .and_then(|v| {
                     if let MusicValue::Key(k) = v {
-                        Some(k.to_string())
+                        Some(k)
                     } else {
                         None
                     }
@@ -780,7 +827,7 @@ impl stainless_facts::FactAggregator<ContentHash, MusicValue, music_facts::FactS
         // but the FactAggregator trait only receives the value and source — the
         // timestamp is not available here. We must not populate last_started /
         // last_stopped with a bootstrap wall-clock placeholder, because
-        // `PlayLog` is the sole authoritative path for those fields in
+        // `LineageLog` is the sole authoritative path for those fields in
         // the bulk fold. Skip them here entirely.
         if is_play_event(value) {
             return;
@@ -796,7 +843,7 @@ impl stainless_facts::FactAggregator<ContentHash, MusicValue, music_facts::FactS
 
     fn retract(&mut self, value: &MusicValue, source: &music_facts::FactSource) {
         // TrackStarted/TrackStopped retractions are not emitted in production;
-        // and `PlayLog` handles these fields authoritatively.
+        // and `LineageLog` handles these fields authoritatively.
         // Skip to keep parity with assert.
         if is_play_event(value) {
             return;
@@ -842,13 +889,12 @@ pub struct Projection {
     pub content_hashes: HashSet<String>,
     /// Content hashes of tracks that already have a Format fact
     pub has_format: HashSet<String>,
-    /// Content hashes of tracks that already have a CoverArtPath fact
-    pub has_cover_art: HashSet<String>,
     /// Lines that were not facts and were skipped ([`project_lines`]); 0 for [`project`].
     pub unparseable_lines: usize,
-    /// Every play event of the log. Tracks carry no play times (the bulk fold leaves
-    /// `last_started`/`last_stopped` unset); read them from here.
-    pub plays: PlayLog,
+    /// Every play event of the log, and the covers of the lineage. Tracks carry no play
+    /// times and no inherited cover (the bulk fold leaves them unset); read them from
+    /// here.
+    pub lineage: LineageLog,
 }
 
 /// Bulk-fold facts into a [`Projection`].
@@ -859,9 +905,9 @@ pub struct Projection {
 /// blob path derived and the side-effect indexes built.
 ///
 /// `last_started` / `last_stopped` are left unset; the play events are in
-/// [`Projection::plays`], and [`PlayLog::apply_to`] fills those in.
+/// [`Projection::lineage`], and [`LineageLog::apply_to`] fills those in.
 pub fn project(facts: Vec<MusicFact>) -> Projection {
-    let plays = PlayLog::from_facts(&facts);
+    let lineage = LineageLog::from_facts(&facts);
     let marks = retirement_marks(&facts);
     let mut aggregated: HashMap<ContentHash, IndexedTrackInfo> = aggregate_facts(facts);
 
@@ -874,7 +920,6 @@ pub fn project(facts: Vec<MusicFact>) -> Projection {
 
     let mut fact_index: HashMap<FactType, HashSet<String>> = HashMap::new();
     let mut has_format: HashSet<String> = HashSet::new();
-    let mut has_cover_art: HashSet<String> = HashSet::new();
 
     for (entity, entry) in &mut aggregated {
         entry.content_hash = entity.clone();
@@ -898,9 +943,6 @@ pub fn project(facts: Vec<MusicFact>) -> Projection {
         {
             has_format.insert(entity.as_str().to_owned());
         }
-        if entry.cover_art_path.is_some() {
-            has_cover_art.insert(entity.as_str().to_owned());
-        }
     }
 
     let content_hashes: HashSet<String> =
@@ -910,9 +952,8 @@ pub fn project(facts: Vec<MusicFact>) -> Projection {
         fact_index,
         content_hashes,
         has_format,
-        has_cover_art,
         unparseable_lines: 0,
-        plays,
+        lineage,
     }
 }
 
@@ -1063,7 +1104,7 @@ fn note_retirement(
 /// that a `Replaces` retired while live and that has not emptied or been released
 /// since, read in stream order. `aggregate_facts` folds each entity alone, so the
 /// cross-entity question "was the loser live when the `Replaces` came?" needs this
-/// sequential pass (like [`PlayLog`]). It shadows the tracked provenance of the
+/// sequential pass (like [`LineageLog`]). It shadows the tracked provenance of the
 /// entities a `Replaces` names or comes from, and nothing else. Everything is keyed by
 /// [`hash_key`], like the incremental half.
 fn retirement_marks(facts: &[MusicFact]) -> HashMap<String, String> {
@@ -1293,40 +1334,141 @@ impl PlayHistory {
 /// not its entity is still live, so a merge or replace keeps its predecessors' history
 /// (ADR-013, ADR-017): a track is credited with the plays of every hash it
 /// transitively replaces, with their original timestamps. Events keyed by the short
-/// hashes older playback wrote (#86) resolve to the full hash. The lineage is
+/// hashes playback wrote (#86) resolve to the full hash. Playback wrote them until
+/// ADR-026 (the CLI sent prefixes and playback recorded them verbatim), so the log
+/// holds them from before that change, not only from some older playback. The lineage is
 /// re-resolved on every read, so a `Replaces` asserted after the events were recorded
 /// takes effect too.
 ///
 /// This is the one fold of plays: [`apply_to`](Self::apply_to) (last started/stopped)
 /// and [`history`](Self::history) (every play) read the same resolved events.
+///
+/// The log also remembers the cover art of each key, in stream order, because a cover
+/// follows the lineage like the plays do (ADR-013, amendment 2026-11-17): the merge
+/// retracts the loser's `CoverArtPath`, so the folded track no longer holds it. What
+/// the log keeps is the cover each hash had live when it was replaced
+/// ([`CoverEvent`]); a replacing track without a cover of its own inherits the one of
+/// the lineage member retired last ([`apply_to`](Self::apply_to)). Order matters for
+/// covers, so a log is appended to in stream order and [`merge`](Self::merge) appends
+/// what was recorded later.
 #[derive(Clone, Debug, Default)]
-pub struct PlayLog {
-    events: HashMap<String, Vec<PlayEvent>>,
+pub struct LineageLog {
+    plays: HashMap<String, Vec<PlayEvent>>,
+    covers: HashMap<String, Vec<CoverEvent>>,
 }
 
-impl PlayLog {
-    /// Record `fact` if it is a play assertion. Only play events create an entry for
-    /// their entity key; other facts are ignored.
-    pub fn record(&mut self, fact: &MusicFact) {
-        if fact.operation() != Operation::Assert {
-            return;
+/// What the lineage fold needs of a key's cover art, in stream order. `Retired` is
+/// recorded under the replaced hash when a `Replaces` of it is asserted: both merge
+/// paths write that before they retract the loser's facts, so a cover retracted
+/// before it was the user's intent and the merge's own retracts come after it. The
+/// values are `MusicValue::CoverArtPath`s, so the ADR-018 retract rule applies to them
+/// as it does to a track's provenance.
+#[derive(Clone, Debug)]
+enum CoverEvent {
+    Asserted {
+        value: MusicValue,
+        source: music_facts::FactSource,
+    },
+    Retracted {
+        value: MusicValue,
+        source: music_facts::FactSource,
+    },
+    Retired {
+        at: chrono::DateTime<chrono::Utc>,
+    },
+}
+
+impl CoverEvent {
+    /// When the key was last replaced and the cover it had live then, or `None` if it
+    /// was never replaced or had no cover.
+    ///
+    /// The key is *open* until a `Retired` closes it, and the cover live at that moment
+    /// is the snapshot (the last surviving assertion, which is the cover the entity fold
+    /// shows too). While it is closed the merge's own retracts and the `Replaces`
+    /// forward-inherited by later winners change nothing. An assertion after it reopens
+    /// the key, as a re-ingested track starts clean: what was live is dropped, the
+    /// retracts count again, and the next `Retired` takes a fresh snapshot.
+    fn cover_when_retired(
+        events: &[CoverEvent],
+    ) -> Option<(chrono::DateTime<chrono::Utc>, &MusicValue)> {
+        let mut live: Vec<(&MusicValue, &music_facts::FactSource)> = Vec::new();
+        let mut snapshot = None;
+        let mut open = true;
+        for event in events {
+            match event {
+                CoverEvent::Asserted { value, source } => {
+                    if !open {
+                        open = true;
+                        live.clear();
+                    }
+                    live.push((value, source));
+                }
+                CoverEvent::Retracted { value, source } if open => {
+                    live.retain(|(v, s)| !retract_matches(v, s, value, source));
+                }
+                CoverEvent::Retracted { .. } => {}
+                CoverEvent::Retired { at } if open => {
+                    snapshot = live.last().map(|(v, _)| (*at, *v));
+                    open = false;
+                }
+                CoverEvent::Retired { .. } => {}
+            }
         }
+        snapshot
+    }
+
+    /// Whether the key was ever replaced, so that it is worth folding.
+    fn is_retired(events: &[CoverEvent]) -> bool {
+        events
+            .iter()
+            .any(|e| matches!(e, CoverEvent::Retired { .. }))
+    }
+}
+
+impl LineageLog {
+    /// Record `fact` if it is a play, a cover art assertion or retract, or a
+    /// `Replaces` assertion. Only those create an entry for their key; other facts are
+    /// ignored.
+    pub fn record(&mut self, fact: &MusicFact) {
         let at = *fact.timestamp();
-        let event = match fact.value() {
-            MusicValue::TrackStarted(reason) => PlayEvent::Started {
-                at,
-                reason: *reason,
-            },
-            MusicValue::TrackStopped(reason) => PlayEvent::Stopped {
-                at,
-                reason: *reason,
-            },
-            _ => return,
-        };
-        self.events
-            .entry(hash_key(fact.entity().as_str()))
-            .or_default()
-            .push(event);
+        let key = hash_key(fact.entity().as_str());
+        let source = fact.source().clone();
+        match (fact.operation(), fact.value()) {
+            (Operation::Assert, MusicValue::TrackStarted(reason)) => {
+                self.plays.entry(key).or_default().push(PlayEvent::Started {
+                    at,
+                    reason: *reason,
+                })
+            }
+            (Operation::Assert, MusicValue::TrackStopped(reason)) => {
+                self.plays.entry(key).or_default().push(PlayEvent::Stopped {
+                    at,
+                    reason: *reason,
+                })
+            }
+            (Operation::Assert, value @ MusicValue::CoverArtPath(_)) => self
+                .covers
+                .entry(key)
+                .or_default()
+                .push(CoverEvent::Asserted {
+                    value: value.clone(),
+                    source,
+                }),
+            (Operation::Retract, value @ MusicValue::CoverArtPath(_)) => self
+                .covers
+                .entry(key)
+                .or_default()
+                .push(CoverEvent::Retracted {
+                    value: value.clone(),
+                    source,
+                }),
+            (Operation::Assert, MusicValue::Replaces(replaced)) => self
+                .covers
+                .entry(hash_key(replaced.as_str()))
+                .or_default()
+                .push(CoverEvent::Retired { at }),
+            _ => {}
+        }
     }
 
     /// The events of `facts`.
@@ -1339,18 +1481,24 @@ impl PlayLog {
     }
 
     /// Append the events of `later`, which were recorded after this log's.
-    pub fn merge(&mut self, later: PlayLog) {
-        for (key, mut events) in later.events {
-            self.events.entry(key).or_default().append(&mut events);
+    pub fn merge(&mut self, later: LineageLog) {
+        for (key, mut events) in later.plays {
+            self.plays.entry(key).or_default().append(&mut events);
+        }
+        for (key, mut events) in later.covers {
+            self.covers.entry(key).or_default().append(&mut events);
         }
     }
 
     /// Set every track's `last_started` / `last_stopped` to the latest over its
     /// lineage: itself and every hash it transitively replaces. A time already set
-    /// stays unless a later one is found.
+    /// stays unless a later one is found. Also sets every track's
+    /// `inherited_cover_art_path` ([`ResolvedLineage::inherited_cover`]), always, so
+    /// that it is there for a track whose own cover is retracted later.
     pub fn apply_to(&self, tracks: &mut [IndexedTrackInfo]) {
         let resolved = self.resolved(tracks);
         for track in tracks.iter_mut() {
+            track.inherited_cover_art_path = resolved.inherited_cover(track);
             for event in resolved.events_of(track) {
                 match event {
                     PlayEvent::Started { at, .. } => {
@@ -1387,8 +1535,8 @@ impl PlayLog {
 
     /// The lineage and short-key resolution for `tracks`, the one place either is
     /// decided. It costs a pass over `tracks`, so resolve once and ask it for each
-    /// track ([`ResolvedPlays::history`]) rather than once per track.
-    pub fn resolved(&self, tracks: &[IndexedTrackInfo]) -> ResolvedPlays<'_> {
+    /// track ([`ResolvedLineage::history`]) rather than once per track.
+    pub fn resolved(&self, tracks: &[IndexedTrackInfo]) -> ResolvedLineage<'_> {
         let replaces: HashMap<String, Vec<String>> = tracks
             .iter()
             .map(|t| {
@@ -1402,48 +1550,100 @@ impl PlayLog {
             replaces
                 .keys()
                 .chain(replaces.values().flatten())
-                .chain(self.events.keys())
+                .chain(self.plays.keys())
                 .map(String::as_str)
                 .collect::<HashSet<_>>()
                 .into_iter(),
         );
-        ResolvedPlays {
+        // For each key that was replaced while it had a cover: when, and which cover.
+        // Keys never replaced are not folded.
+        let covers_when_retired = self
+            .covers
+            .iter()
+            .filter(|(_, events)| CoverEvent::is_retired(events))
+            .filter_map(
+                |(key, events)| match CoverEvent::cover_when_retired(events)? {
+                    (at, MusicValue::CoverArtPath(path)) => {
+                        Some((key.as_str(), (at, path.as_str())))
+                    }
+                    _ => None,
+                },
+            )
+            .collect();
+        ResolvedLineage {
             log: self,
             replaces,
             prefix_counts,
+            covers_when_retired,
         }
     }
 }
 
-/// A [`PlayLog`] with the lineage and the short keys of a set of tracks resolved
-/// ([`PlayLog::resolved`]).
-pub struct ResolvedPlays<'a> {
-    log: &'a PlayLog,
+/// A [`LineageLog`] with the lineage and the short keys of a set of tracks resolved
+/// ([`LineageLog::resolved`]). It owns the one walk of `Replaces`
+/// ([`lineage`](Self::lineage)) that plays and covers both follow.
+pub struct ResolvedLineage<'a> {
+    log: &'a LineageLog,
     /// A live track's key -> the keys it replaces.
     replaces: HashMap<String, Vec<String>>,
     /// For every 8- and 12-character prefix, how many full keys start with it.
     prefix_counts: HashMap<String, usize>,
+    /// A key -> when it was last replaced and the cover it had live then.
+    covers_when_retired: HashMap<&'a str, (chrono::DateTime<chrono::Utc>, &'a str)>,
 }
 
-impl ResolvedPlays<'_> {
+impl ResolvedLineage<'_> {
     /// The plays of `track`, over its lineage. `track` should be one of the tracks
     /// this was resolved for.
     pub fn history(&self, track: &IndexedTrackInfo) -> PlayHistory {
         PlayHistory::from_events(self.events_of(track))
     }
 
+    /// `track`'s key followed by every hash it transitively replaces; a cycle ends
+    /// the walk. The one walk of `Replaces`, for plays and covers.
+    fn lineage(&self, track: &IndexedTrackInfo) -> Vec<String> {
+        let key = hash_key(track.content_hash.as_str());
+        let mut seen = vec![key.clone()];
+        let mut queue = vec![key];
+        while let Some(k) = queue.pop() {
+            for replaced in self.replaces.get(&k).into_iter().flatten() {
+                if !seen.contains(replaced) {
+                    seen.push(replaced.clone());
+                    queue.push(replaced.clone());
+                }
+            }
+        }
+        seen
+    }
+
+    /// The cover `track` inherits: the one the lineage member that was replaced last
+    /// had live when it was replaced (never `track`'s own, which is its
+    /// `cover_art_path`). Each member's cover is read before the merge's own retracts,
+    /// so one retracted before it stays gone; a member that came back after its merge
+    /// and was replaced again is read afresh ([`CoverEvent::cover_when_retired`]). The merges write `Replaces` in the
+    /// order the files were replaced, so the member retired last is the nearest
+    /// ancestor, whatever the quality order that picked the winners.
+    fn inherited_cover(&self, track: &IndexedTrackInfo) -> Option<PathBuf> {
+        self.lineage(track)
+            .iter()
+            .skip(1)
+            .filter_map(|k| self.covers_when_retired.get(k.as_str()))
+            .max()
+            .map(|(_, path)| PathBuf::from(path))
+    }
+
     /// The events that belong to `track`, in [`PlayEvent::order`]: those recorded
     /// under every key of its lineage. Each event key is read once, however many
     /// lineage members reach it.
     fn events_of(&self, track: &IndexedTrackInfo) -> Vec<PlayEvent> {
-        let lineage = replaces_lineage(&hash_key(track.content_hash.as_str()), &self.replaces);
+        let lineage = self.lineage(track);
         let keys: BTreeSet<&str> = lineage
             .iter()
             .flat_map(|key| self.event_keys(key))
             .collect();
         let mut events: Vec<PlayEvent> = keys
             .into_iter()
-            .filter_map(|key| self.log.events.get(key))
+            .filter_map(|key| self.log.plays.get(key))
             .flatten()
             .copied()
             .collect();
@@ -1452,7 +1652,8 @@ impl ResolvedPlays<'_> {
     }
 
     /// The keys events for `key` are recorded under: the full hash, and the 12- and
-    /// 8-character short forms older playback wrote (#86). A short form counts only
+    /// 8-character short forms playback wrote until ADR-026 (#86; the lines stay in the
+    /// log, so this reader workaround stays too). A short form counts only
     /// when `key` is the single full key it is a prefix of, the same rule
     /// [`resolve_prefix`] applies: an ambiguous short key belongs to nobody.
     fn event_keys<'k>(&self, key: &'k str) -> Vec<&'k str> {
@@ -1472,22 +1673,6 @@ impl ResolvedPlays<'_> {
     }
 }
 
-/// `key` followed by every hash it transitively replaces. `replaces` maps a live
-/// track's key to the keys it replaces; a cycle ends the walk.
-fn replaces_lineage(key: &str, replaces: &HashMap<String, Vec<String>>) -> Vec<String> {
-    let mut seen = vec![key.to_owned()];
-    let mut queue = vec![key.to_owned()];
-    while let Some(k) = queue.pop() {
-        for replaced in replaces.get(&k).into_iter().flatten() {
-            if !seen.contains(replaced) {
-                seen.push(replaced.clone());
-                queue.push(replaced.clone());
-            }
-        }
-    }
-    seen
-}
-
 /// The shortest key length that is a full hash, not one of the short forms.
 const SHORT_KEY_MAX: usize = 12;
 
@@ -1502,26 +1687,66 @@ fn short_prefix_counts<'a>(full_keys: impl Iterator<Item = &'a str>) -> HashMap<
     counts
 }
 
+/// A track record a partial hash can be resolved against. Implemented by the
+/// library's [`IndexedTrackInfo`] and the BDD stub's own record, so both resolve
+/// with the same [`resolve_prefix`].
+pub trait HashedTrack {
+    fn content_hash(&self) -> &str;
+    fn title(&self) -> Option<&str>;
+    fn is_hidden(&self) -> bool;
+}
+
+impl HashedTrack for IndexedTrackInfo {
+    fn content_hash(&self) -> &str {
+        self.content_hash.as_str()
+    }
+
+    fn title(&self) -> Option<&str> {
+        self.title.as_deref()
+    }
+
+    fn is_hidden(&self) -> bool {
+        IndexedTrackInfo::is_hidden(self)
+    }
+}
+
 /// Why a partial hash does not name one track ([`resolve_prefix`]).
-pub enum Unresolved<'a> {
+pub enum Unresolved<'a, T> {
     /// No track's hash starts with it.
     NotFound,
     /// Different hashes start with it: every track that does.
-    Ambiguous(Vec<&'a IndexedTrackInfo>),
+    Ambiguous(Vec<&'a T>),
+}
+
+/// The refusal the library answers with when `partial` names no single track: the one
+/// mapping from [`Unresolved`] to the protocol's error, for the service and for
+/// anything reading a replica.
+pub fn unresolved_error<T: HashedTrack>(
+    partial: &str,
+    unresolved: Unresolved<'_, T>,
+) -> ProtocolError {
+    match unresolved {
+        Unresolved::NotFound => ProtocolError::TrackNotFound {
+            hash: partial.to_owned(),
+        },
+        Unresolved::Ambiguous(found) => {
+            ProtocolError::ambiguous_hash(partial, found.iter().map(|t| t.content_hash()))
+        }
+    }
 }
 
 /// What to tell the user when `partial` matches several `tracks`: how many, and the
 /// first three.
-pub fn ambiguity_message(partial: &str, tracks: &[&IndexedTrackInfo]) -> String {
+pub fn ambiguity_message<T: HashedTrack>(partial: &str, tracks: &[&T]) -> String {
     let examples: Vec<_> = tracks
         .iter()
         .take(3)
         .map(|t| {
-            let hash_str = t.content_hash.as_str();
+            let hash_str = t.content_hash();
             // Show 8 chars after "sha256:" prefix; fall back to full string for
             // legacy short hashes that lack the prefix.
             let short = hash_str.get(7..15).unwrap_or(hash_str);
-            let name = t.title.as_deref().unwrap_or("Unknown");
+            let name = t.title().unwrap_or("Unknown");
             format!("  {} ({})", short, name)
         })
         .collect();
@@ -1536,23 +1761,16 @@ pub fn ambiguity_message(partial: &str, tracks: &[&IndexedTrackInfo]) -> String 
 /// Resolve a partial hash to the track it names (like git short refs). Hidden tracks
 /// resolve too; the one lookup behind the library service and anything reading a
 /// replica.
-pub fn resolve_prefix<'a>(
-    tracks: &'a [IndexedTrackInfo],
+pub fn resolve_prefix<'a, T: HashedTrack>(
+    tracks: &'a [T],
     partial: &str,
-) -> Result<&'a IndexedTrackInfo, Unresolved<'a>> {
+) -> Result<&'a T, Unresolved<'a, T>> {
     let normalize = |h: &str| h.strip_prefix("sha256:").unwrap_or(h).to_lowercase();
     let partial_clean = normalize(partial);
 
     let matches: Vec<_> = tracks
         .iter()
-        .filter(|t| {
-            let hash = t
-                .content_hash
-                .as_str()
-                .strip_prefix("sha256:")
-                .unwrap_or(t.content_hash.as_str());
-            hash.to_lowercase().starts_with(&partial_clean)
-        })
+        .filter(|t| normalize(t.content_hash()).starts_with(&partial_clean))
         .collect();
 
     match matches.len() {
@@ -1569,7 +1787,7 @@ pub fn resolve_prefix<'a>(
             // both normalize to the same prefix, so one starts_with the other.
             let normalized: Vec<String> = matches
                 .iter()
-                .map(|t| normalize(t.content_hash.as_str()))
+                .map(|t| normalize(t.content_hash()))
                 .collect();
             // All entries represent the same content if every pair of
             // normalized hashes has one that is a prefix of the other
@@ -1580,11 +1798,12 @@ pub fn resolve_prefix<'a>(
                     .all(|b| a.starts_with(b.as_str()) || b.starts_with(a.as_str()))
             });
             if all_same {
-                // Prefer the entry with the longest (most complete) hash,
-                // so a full "sha256:..." hash wins over a legacy 8-char hash.
+                // Prefer a visible entry over a hidden one, then the longest
+                // (most complete) hash, so a full "sha256:..." hash wins over a
+                // legacy 8-char hash.
                 let best = matches
                     .iter()
-                    .max_by_key(|t| t.content_hash.as_str().len())
+                    .max_by_key(|t| (!t.is_hidden(), t.content_hash().len()))
                     .unwrap();
                 return Ok(*best);
             }
@@ -1592,6 +1811,63 @@ pub fn resolve_prefix<'a>(
             // Genuinely different hashes share a prefix: real ambiguity.
             Err(Unresolved::Ambiguous(matches))
         }
+    }
+}
+
+/// Like [`resolve_prefix`], but a hidden (deleted/superseded) track is as absent as
+/// an unknown one: the one rule behind `get_track` and playlist entry resolution.
+/// When the index holds a hidden and a visible entry of one hash, the visible wins.
+pub fn resolve_visible<'a, T: HashedTrack>(
+    tracks: &'a [T],
+    partial: &str,
+) -> Result<&'a T, Unresolved<'a, T>> {
+    match resolve_prefix(tracks, partial) {
+        Ok(track) if track.is_hidden() => Err(Unresolved::NotFound),
+        other => other,
+    }
+}
+
+/// Resolve one playlist line's token to the entry it stands for.
+///
+/// Every token, short or full, resolves the same way, as `get_track` does
+/// ([`resolve_visible`]): `Track` means the track exists and is visible; a full
+/// hash that is absent or hidden is as unknown as a prefix.
+pub fn resolve_entry<T: HashedTrack>(tracks: &[T], token: &str) -> PlaylistEntry {
+    match resolve_entry_track(tracks, token) {
+        Ok((hash, _)) => PlaylistEntry::Track { hash },
+        Err(error) => PlaylistEntry::Unresolved { error },
+    }
+}
+
+/// [`resolve_entry`] with the track it found: the token's full hash and the
+/// track, or why the token names no single track with a full hash.
+pub fn resolve_entry_track<'a, T: HashedTrack>(
+    tracks: &'a [T],
+    token: &str,
+) -> Result<(CanonicalHash, &'a T), EntryError> {
+    match resolve_visible(tracks, token) {
+        Err(Unresolved::NotFound) => Err(EntryError::Unknown {
+            hash: ContentHash::new(token),
+        }),
+        Err(Unresolved::Ambiguous(found)) => {
+            let mut candidates: Vec<ContentHash> = Vec::new();
+            for track in found {
+                let hash = ContentHash::new(track.content_hash());
+                if !candidates.contains(&hash) {
+                    candidates.push(hash);
+                }
+            }
+            Err(EntryError::Ambiguous {
+                hash: ContentHash::new(token),
+                candidates,
+            })
+        }
+        Ok(track) => CanonicalHash::try_from(ContentHash::new(track.content_hash()))
+            .map(|hash| (hash, track))
+            .map_err(|not_canonical| EntryError::NotCanonical {
+                hash: ContentHash::new(token),
+                found: not_canonical.0,
+            }),
     }
 }
 
@@ -1833,7 +2109,7 @@ mod tests {
         ];
         let mut projection = project(facts.clone());
         assert_eq!(projection.tracks.len(), 1);
-        PlayLog::from_facts(&facts).apply_to(&mut projection.tracks);
+        LineageLog::from_facts(&facts).apply_to(&mut projection.tracks);
         let winner = &projection.tracks[0];
         assert_eq!(winner.content_hash.as_str(), "sha256:winner00000000");
         assert_eq!(winner.last_started, Some(ts(3)));
@@ -1850,7 +2126,7 @@ mod tests {
             retract_fact("sha256:a1", started, 3, &s),
         ];
         let mut tracks = project(facts.clone()).tracks;
-        PlayLog::from_facts(&facts).apply_to(&mut tracks);
+        LineageLog::from_facts(&facts).apply_to(&mut tracks);
         assert_eq!(tracks[0].last_started, Some(ts(2)));
     }
 
@@ -1860,11 +2136,286 @@ mod tests {
         let started = MusicValue::TrackStarted(StartReason::OnRequest);
         let late_play = assert_fact("sha256:a1", started.clone(), 5, &s);
         let early_play = assert_fact("sha256:a1", started, 2, &s);
-        let mut early = PlayLog::from_facts(&[late_play]);
-        early.merge(PlayLog::from_facts(&[early_play]));
+        let mut early = LineageLog::from_facts(&[late_play]);
+        early.merge(LineageLog::from_facts(&[early_play]));
         let mut tracks = vec![IndexedTrackInfo::new_empty("sha256:a1".to_owned())];
         early.apply_to(&mut tracks);
         assert_eq!(tracks[0].last_started, Some(ts(5)));
+    }
+
+    // ---- covers along the lineage (ADR-013 amendment 2026-11-17) -----------------
+
+    fn cover(path: &str) -> MusicValue {
+        MusicValue::CoverArtPath(path.to_owned())
+    }
+
+    /// The effective cover of `entity` after the whole `facts` log is folded.
+    fn effective_cover(facts: &[MusicFact], entity: &str) -> Option<PathBuf> {
+        let mut projection = project(facts.to_vec());
+        LineageLog::from_facts(facts).apply_to(&mut projection.tracks);
+        projection
+            .tracks
+            .iter()
+            .find(|t| t.content_hash.as_str() == entity)
+            .and_then(|t| t.effective_cover_art_path().map(Path::to_path_buf))
+    }
+
+    /// A finished merge: `winner` replaces `loser`, whose facts are retracted.
+    fn merged(winner: &str, loser: &str, loser_cover: Option<&str>) -> Vec<MusicFact> {
+        let s = ingest();
+        let mut facts = vec![assert_fact(loser, title("L"), 1, &s)];
+        facts.extend(loser_cover.map(|c| assert_fact(loser, cover(c), 1, &s)));
+        facts.extend([
+            assert_fact(winner, title("W"), 2, &s),
+            assert_fact(winner, MusicValue::Replaces(ContentHash::new(loser)), 3, &s),
+            retract_fact(loser, title("L"), 4, &s),
+        ]);
+        facts.extend(loser_cover.map(|c| retract_fact(loser, cover(c), 4, &s)));
+        facts
+    }
+
+    #[test]
+    fn a_replacing_track_without_a_cover_shows_the_cover_of_the_one_it_replaced() {
+        let facts = merged("sha256:new1", "sha256:old1", Some("cover-art/old.jpg"));
+        assert_eq!(
+            effective_cover(&facts, "sha256:new1"),
+            Some(PathBuf::from("cover-art/old.jpg"))
+        );
+        // The file's own fact stays the file's own.
+        let tracks = project(facts).tracks;
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0].cover_art_path, None);
+    }
+
+    #[test]
+    fn a_chain_of_three_follows_the_replaces_up_to_the_oldest_cover() {
+        let s = ingest();
+        let mut facts = merged("sha256:b1", "sha256:a1", Some("cover-art/a.jpg"));
+        // C replaces B, and carries the forward-inherited `Replaces(A)` (ADR-004).
+        facts.extend([
+            assert_fact("sha256:c1", title("C"), 5, &s),
+            assert_fact(
+                "sha256:c1",
+                MusicValue::Replaces(ContentHash::new("sha256:b1")),
+                6,
+                &s,
+            ),
+            assert_fact(
+                "sha256:c1",
+                MusicValue::Replaces(ContentHash::new("sha256:a1")),
+                6,
+                &s,
+            ),
+            retract_fact("sha256:b1", title("W"), 7, &s),
+            retract_fact(
+                "sha256:b1",
+                MusicValue::Replaces(ContentHash::new("sha256:a1")),
+                7,
+                &s,
+            ),
+        ]);
+        assert_eq!(
+            effective_cover(&facts, "sha256:c1"),
+            Some(PathBuf::from("cover-art/a.jpg"))
+        );
+    }
+
+    #[test]
+    fn the_nearest_ancestor_with_a_cover_wins_in_a_chain_still_live() {
+        let s = ingest();
+        // A (cover a) <- B (cover b) <- C, all live, as an unfinished merge leaves them.
+        let facts = vec![
+            assert_fact("sha256:a1", title("A"), 1, &s),
+            assert_fact("sha256:a1", cover("cover-art/a.jpg"), 1, &s),
+            assert_fact("sha256:b1", title("B"), 2, &s),
+            assert_fact("sha256:b1", cover("cover-art/b.jpg"), 2, &s),
+            assert_fact(
+                "sha256:b1",
+                MusicValue::Replaces(ContentHash::new("sha256:a1")),
+                3,
+                &s,
+            ),
+            assert_fact("sha256:c1", title("C"), 4, &s),
+            assert_fact(
+                "sha256:c1",
+                MusicValue::Replaces(ContentHash::new("sha256:b1")),
+                5,
+                &s,
+            ),
+            assert_fact(
+                "sha256:c1",
+                MusicValue::Replaces(ContentHash::new("sha256:a1")),
+                5,
+                &s,
+            ),
+        ];
+        assert_eq!(
+            effective_cover(&facts, "sha256:c1"),
+            Some(PathBuf::from("cover-art/b.jpg"))
+        );
+    }
+
+    #[test]
+    fn the_replacing_tracks_own_cover_wins_over_the_ancestors() {
+        let s = ingest();
+        let mut facts = merged("sha256:new1", "sha256:old1", Some("cover-art/old.jpg"));
+        facts.push(assert_fact(
+            "sha256:new1",
+            cover("cover-art/new.jpg"),
+            5,
+            &s,
+        ));
+        assert_eq!(
+            effective_cover(&facts, "sha256:new1"),
+            Some(PathBuf::from("cover-art/new.jpg"))
+        );
+    }
+
+    #[test]
+    fn the_effective_cover_does_not_depend_on_where_the_log_is_cut() {
+        let facts = merged("sha256:new1", "sha256:old1", Some("cover-art/old.jpg"));
+        // The order of the stream matters (a cover retracted before the `Replaces` is
+        // gone, the merge's own retracts come after it), but a log recorded in pieces
+        // and appended in order reads like the whole.
+        for cut in 0..=facts.len() {
+            let (early, late) = facts.split_at(cut);
+            let mut log = LineageLog::from_facts(early);
+            log.merge(LineageLog::from_facts(late));
+            let mut tracks = project(facts.clone()).tracks;
+            log.apply_to(&mut tracks);
+            assert_eq!(
+                tracks[0].effective_cover_art_path(),
+                Some(Path::new("cover-art/old.jpg")),
+                "cut at {cut}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_replaced_track_without_a_cover_gives_none() {
+        let facts = merged("sha256:new1", "sha256:old1", None);
+        assert_eq!(effective_cover(&facts, "sha256:new1"), None);
+    }
+
+    /// FLAC A (cover a) wins over MP3 B (cover b); b stays as A's fallback until the
+    /// orphan cleanup sweeps it. Then C, with no cover, replaces A and the
+    /// forward-inherited B. A was replaced last, so C shows a's file, and not b's, which
+    /// is the one asserted later and is nobody's fallback now.
+    fn quality_ordered_chain() -> Vec<MusicFact> {
+        let s = ingest();
+        vec![
+            assert_fact("sha256:a1", title("A"), 1, &s),
+            assert_fact("sha256:a1", cover("cover-art/a.jpg"), 1, &s),
+            assert_fact("sha256:b1", title("B"), 2, &s),
+            assert_fact("sha256:b1", cover("cover-art/b.jpg"), 2, &s),
+            replaces("sha256:a1", "sha256:b1", 3),
+            retract_fact("sha256:b1", title("B"), 4, &s),
+            retract_fact("sha256:b1", cover("cover-art/b.jpg"), 4, &s),
+            assert_fact("sha256:c1", title("C"), 5, &s),
+            replaces("sha256:c1", "sha256:a1", 6),
+            replaces("sha256:c1", "sha256:b1", 6),
+            retract_fact("sha256:a1", title("A"), 7, &s),
+            retract_fact("sha256:a1", cover("cover-art/a.jpg"), 7, &s),
+            retract_fact(
+                "sha256:a1",
+                MusicValue::Replaces(ContentHash::new("sha256:b1")),
+                7,
+                &s,
+            ),
+        ]
+    }
+
+    #[test]
+    fn the_nearest_ancestor_is_the_one_replaced_last_not_the_one_asserted_last() {
+        assert_eq!(
+            effective_cover(&quality_ordered_chain(), "sha256:c1"),
+            Some(PathBuf::from("cover-art/a.jpg"))
+        );
+    }
+
+    #[test]
+    fn a_cover_retracted_before_the_merge_is_not_inherited() {
+        let s = ingest();
+        let mut facts = vec![
+            assert_fact("sha256:old1", title("L"), 1, &s),
+            assert_fact("sha256:old1", cover("cover-art/old.jpg"), 1, &s),
+            // The user took the cover away before the merge.
+            retract_fact("sha256:old1", cover("cover-art/old.jpg"), 2, &s),
+        ];
+        facts.extend([
+            assert_fact("sha256:new1", title("W"), 3, &s),
+            assert_fact(
+                "sha256:new1",
+                MusicValue::Replaces(ContentHash::new("sha256:old1")),
+                4,
+                &s,
+            ),
+            retract_fact("sha256:old1", title("L"), 5, &s),
+        ]);
+        assert_eq!(effective_cover(&facts, "sha256:new1"), None);
+    }
+
+    /// `old1` was merged into `new1`, then ingested again (with `again` as its cover) and
+    /// is merged into `other1`.
+    fn merged_again(again: Option<&str>) -> Vec<MusicFact> {
+        let s = ingest();
+        let mut facts = merged("sha256:new1", "sha256:old1", Some("cover-art/old.jpg"));
+        facts.push(assert_fact("sha256:old1", title("L again"), 5, &s));
+        facts.extend(again.map(|c| assert_fact("sha256:old1", cover(c), 5, &s)));
+        facts.extend([
+            assert_fact("sha256:other1", title("O"), 6, &s),
+            replaces("sha256:other1", "sha256:old1", 7),
+            retract_fact("sha256:old1", title("L again"), 8, &s),
+        ]);
+        facts.extend(again.map(|c| retract_fact("sha256:old1", cover(c), 8, &s)));
+        facts
+    }
+
+    #[test]
+    fn a_track_ingested_again_and_merged_again_gives_its_new_cover() {
+        let facts = merged_again(Some("cover-art/again.jpg"));
+        assert_eq!(
+            effective_cover(&facts, "sha256:other1"),
+            Some(PathBuf::from("cover-art/again.jpg"))
+        );
+    }
+
+    #[test]
+    fn a_cover_retracted_after_the_re_ingest_is_not_inherited_by_the_second_merge() {
+        let s = ingest();
+        let mut facts = merged("sha256:new1", "sha256:old1", Some("cover-art/old.jpg"));
+        facts.extend([
+            assert_fact("sha256:old1", title("L again"), 5, &s),
+            assert_fact("sha256:old1", cover("cover-art/again.jpg"), 5, &s),
+            retract_fact("sha256:old1", cover("cover-art/again.jpg"), 6, &s),
+            assert_fact("sha256:other1", title("O"), 7, &s),
+            replaces("sha256:other1", "sha256:old1", 8),
+            retract_fact("sha256:old1", title("L again"), 9, &s),
+        ]);
+        assert_eq!(effective_cover(&facts, "sha256:other1"), None);
+    }
+
+    #[test]
+    fn a_track_ingested_again_without_a_cover_keeps_the_snapshot_of_its_first_merge() {
+        // Only a cover asserted after the merge reopens the key.
+        assert_eq!(
+            effective_cover(&merged_again(None), "sha256:other1"),
+            Some(PathBuf::from("cover-art/old.jpg"))
+        );
+    }
+
+    #[test]
+    fn a_replaces_that_is_retracted_again_clears_the_inheritance() {
+        let s = ingest();
+        let mut facts = merged("sha256:new1", "sha256:old1", Some("cover-art/old.jpg"));
+        // An unmerge: the winner lets go of the loser.
+        facts.push(retract_fact(
+            "sha256:new1",
+            MusicValue::Replaces(ContentHash::new("sha256:old1")),
+            5,
+            &s,
+        ));
+        assert_eq!(effective_cover(&facts, "sha256:new1"), None);
     }
 
     // ---- play histories --------------------------------------------------------
@@ -1901,7 +2452,7 @@ mod tests {
             .iter()
             .find(|t| t.content_hash.as_str() == hash)
             .expect("the track is live");
-        p.plays.resolved(&p.tracks).history(track)
+        p.lineage.resolved(&p.tracks).history(track)
     }
 
     /// Each play as `start-stop` by day of the month; either side empty when missing.
@@ -1936,12 +2487,12 @@ mod tests {
 
         let p = project(facts.clone());
         assert_eq!(p.tracks.len(), 1, "the loser is gone");
-        let history = p.plays.resolved(&p.tracks).history(&p.tracks[0]);
+        let history = p.lineage.resolved(&p.tracks).history(&p.tracks[0]);
         assert_eq!(history.count(), 4);
         assert_eq!(shape(&history), ["2-3", "4-5", "6-7", "8-9"]);
 
         let mut tracks = p.tracks;
-        PlayLog::from_facts(&facts).apply_to(&mut tracks);
+        LineageLog::from_facts(&facts).apply_to(&mut tracks);
         assert_eq!(tracks[0].last_started, Some(ts(8)));
         assert_eq!(tracks[0].last_stopped, Some(ts(9)));
         assert_eq!(tracks[0].last_started, history.last_started());
@@ -2111,7 +2662,7 @@ mod tests {
         ];
         let p = project(facts);
         let recent = |n| {
-            p.plays
+            p.lineage
                 .recent(&p.tracks, n)
                 .into_iter()
                 .map(|(i, play)| {
@@ -2141,8 +2692,8 @@ mod tests {
             .map(|f| serde_json::to_string(f).unwrap())
             .collect();
         let p = project_lines(lines.iter().map(String::as_str));
-        let expected = PlayLog::from_facts(&facts).histories(&p.tracks);
-        assert_eq!(p.plays.histories(&p.tracks), expected);
+        let expected = LineageLog::from_facts(&facts).histories(&p.tracks);
+        assert_eq!(p.lineage.histories(&p.tracks), expected);
         assert_eq!(expected[0].count(), 2, "the fixture has plays");
     }
 
@@ -2163,11 +2714,11 @@ mod tests {
             stopped(l, 6),
         ];
         let p = project(facts);
-        let resolved = p.plays.resolved(&p.tracks);
+        let resolved = p.lineage.resolved(&p.tracks);
 
         let one_by_one: Vec<PlayHistory> = p.tracks.iter().map(|t| resolved.history(t)).collect();
 
-        assert_eq!(one_by_one, p.plays.histories(&p.tracks));
+        assert_eq!(one_by_one, p.lineage.histories(&p.tracks));
         let counts: Vec<usize> = one_by_one.iter().map(PlayHistory::count).collect();
         assert_eq!(counts.iter().sum::<usize>(), 3, "a has two plays, b one");
     }
@@ -2231,6 +2782,168 @@ mod tests {
         );
     }
 
+    // ---- resolving a playlist entry ----------------------------------------------
+
+    fn full_hash(tag: char) -> String {
+        format!("sha256:{}", tag.to_string().repeat(64))
+    }
+
+    fn hash_entry(hash: &str) -> PlaylistEntry {
+        PlaylistEntry::Track {
+            hash: CanonicalHash::try_from(ContentHash::new(hash)).unwrap(),
+        }
+    }
+
+    fn unresolved(error: EntryError) -> PlaylistEntry {
+        PlaylistEntry::Unresolved { error }
+    }
+
+    #[test]
+    fn resolve_entry_prefix_of_one_visible_track_is_its_full_hash() {
+        let a = full_hash('a');
+        let tracks = [entry(&a, "A"), entry(&full_hash('b'), "B")];
+        assert_eq!(resolve_entry(&tracks, "aaaaaaaa"), hash_entry(&a));
+        assert_eq!(resolve_entry(&tracks, "sha256:aaaa"), hash_entry(&a));
+    }
+
+    #[test]
+    fn resolve_entry_full_hash_absent_from_index_is_unknown() {
+        let tracks = [entry(&full_hash('b'), "B")];
+        let absent = full_hash('a');
+        assert_eq!(
+            resolve_entry(&tracks, &absent),
+            unresolved(EntryError::Unknown {
+                hash: ContentHash::new(&absent)
+            })
+        );
+    }
+
+    #[test]
+    fn resolve_entry_full_hash_of_hidden_track_is_unknown() {
+        let hash = full_hash('a');
+        let mut hidden = entry(&hash, "A");
+        hidden.deleted_at = Some(chrono::Utc::now());
+        assert_eq!(
+            resolve_entry(&[hidden], &hash),
+            unresolved(EntryError::Unknown {
+                hash: ContentHash::new(&hash)
+            })
+        );
+    }
+
+    #[test]
+    fn resolve_entry_treats_full_and_prefix_of_same_track_alike() {
+        let a = full_hash('a');
+        let visible = [entry(&a, "A")];
+        assert_eq!(resolve_entry(&visible, &a), hash_entry(&a));
+        assert_eq!(resolve_entry(&visible, "aaaa"), hash_entry(&a));
+        let mut hidden = entry(&a, "A");
+        hidden.deleted_at = Some(chrono::Utc::now());
+        let hidden = [hidden];
+        let full = resolve_entry(&hidden, &a);
+        let prefix = resolve_entry(&hidden, "aaaa");
+        assert!(matches!(full, PlaylistEntry::Unresolved { .. }));
+        assert!(matches!(prefix, PlaylistEntry::Unresolved { .. }));
+    }
+
+    #[test]
+    fn resolve_entry_unknown_prefix_is_unknown_naming_it() {
+        let tracks = [entry(&full_hash('b'), "B")];
+        assert_eq!(
+            resolve_entry(&tracks, "ffff"),
+            unresolved(EntryError::Unknown {
+                hash: ContentHash::new("ffff")
+            })
+        );
+    }
+
+    #[test]
+    fn resolve_entry_prefix_of_hidden_track_is_unknown() {
+        let mut hidden = entry(&full_hash('a'), "A");
+        hidden.deleted_at = Some(chrono::Utc::now());
+        assert_eq!(
+            resolve_entry(&[hidden], "aaaa"),
+            unresolved(EntryError::Unknown {
+                hash: ContentHash::new("aaaa")
+            })
+        );
+    }
+
+    #[test]
+    fn resolve_entry_prefix_of_two_tracks_is_ambiguous_listing_both() {
+        let (a, b) = (
+            format!("sha256:ab{}", "1".repeat(62)),
+            format!("sha256:ab{}", "2".repeat(62)),
+        );
+        let tracks = [entry(&a, "A"), entry(&b, "B")];
+        assert_eq!(
+            resolve_entry(&tracks, "ab"),
+            unresolved(EntryError::Ambiguous {
+                hash: ContentHash::new("ab"),
+                candidates: vec![ContentHash::new(&a), ContentHash::new(&b)],
+            })
+        );
+    }
+
+    #[test]
+    fn resolve_entry_ambiguous_candidates_are_distinct_in_index_order() {
+        let (x, y) = (
+            format!("sha256:ab{}", "1".repeat(62)),
+            format!("sha256:ab{}", "2".repeat(62)),
+        );
+        let tracks = [entry(&x, "X"), entry(&x, "X again"), entry(&y, "Y")];
+        assert_eq!(
+            resolve_entry(&tracks, "ab"),
+            unresolved(EntryError::Ambiguous {
+                hash: ContentHash::new("ab"),
+                candidates: vec![ContentHash::new(&x), ContentHash::new(&y)],
+            })
+        );
+    }
+
+    #[test]
+    fn resolve_visible_prefers_the_visible_entry_of_an_identical_hash() {
+        let hash = full_hash('a');
+        let mut hidden = entry(&hash, "hidden");
+        hidden.deleted_at = Some(chrono::Utc::now());
+        let visible = entry(&hash, "visible");
+        for tracks in [[hidden.clone(), visible.clone()], [visible, hidden]] {
+            let Ok(track) = resolve_visible(&tracks, "aaaa") else {
+                panic!("the visible entry must resolve");
+            };
+            assert_eq!(track.title.as_deref(), Some("visible"));
+        }
+    }
+
+    #[test]
+    fn resolve_visible_treats_a_hidden_track_as_not_found() {
+        let mut hidden = entry(&full_hash('a'), "hidden");
+        hidden.deleted_at = Some(chrono::Utc::now());
+        assert!(matches!(
+            resolve_visible(&[hidden], "aaaa"),
+            Err(Unresolved::NotFound)
+        ));
+    }
+
+    #[test]
+    fn resolve_entry_prefix_of_legacy_short_and_full_of_one_track_is_the_full() {
+        let full = format!("sha256:9fb4105e{}", "0".repeat(56));
+        let tracks = [entry("9fb4105e", "Unknown"), entry(&full, "A")];
+        assert_eq!(resolve_entry(&tracks, "9fb4"), hash_entry(&full));
+    }
+
+    #[test]
+    fn resolve_entry_prefix_of_only_a_legacy_short_entity_is_not_canonical() {
+        let tracks = [entry("9fb4105e", "Legacy")];
+        assert_eq!(
+            resolve_entry(&tracks, "9fb4"),
+            unresolved(EntryError::NotCanonical {
+                hash: ContentHash::new("9fb4"),
+                found: ContentHash::new("9fb4105e"),
+            })
+        );
+    }
+
     // ---- split-point property (ADR-014 §14) -------------------------------------
 
     /// A fixture log covering merges with `Replaces`, retracts by source identity (a
@@ -2285,6 +2998,12 @@ mod tests {
             assert_fact(b, title("B"), 2, &ingest1),
             assert_fact(b, MusicValue::FilePath(PathBuf::from("b.mp3")), 2, &ingest1),
             assert_fact(b, bpm(128.0), 2, &user),
+            assert_fact(
+                b,
+                MusicValue::CoverArtPath("cover-art/b.jpg".into()),
+                2,
+                &ingest1,
+            ),
             assert_fact(b, started.clone(), 4, &play),
             assert_fact(b, stopped.clone(), 5, &play),
             // Retract by source identity: ingest 2.0.0 cancels what ingest 1.0.0 wrote.
@@ -2296,6 +3015,12 @@ mod tests {
             assert_fact(a, MusicValue::Replaces(ContentHash::new(b)), 8, &ingest1),
             retract_fact(b, title("B"), 9, &ingest2),
             retract_fact(b, bpm(128.0), 9, &user),
+            retract_fact(
+                b,
+                MusicValue::CoverArtPath("cover-art/b.jpg".into()),
+                9,
+                &ingest1,
+            ),
             // Retracting an entity that is already gone.
             retract_fact(b, title("B"), 10, &ingest2),
             assert_fact(c, title("C"), 10, &ingest1),
@@ -2351,6 +3076,45 @@ mod tests {
             assert_fact(j, MusicValue::Replaces(ContentHash::new(l)), 26, &ingest1),
             retract_fact(j, MusicValue::Replaces(ContentHash::new(l)), 27, &ingest1),
         ]
+        .into_iter()
+        .chain(cover_lineage_fixture())
+        .collect()
+    }
+
+    /// Covers along `Replaces` (ADR-013, amendment 2026-11-17), as the merges leave the
+    /// log: a quality-ordered chain where the winner's cover is older than the loser's
+    /// and the next heir shows the one replaced last, and a cover the user retracted
+    /// before the merge, which nobody inherits.
+    fn cover_lineage_fixture() -> Vec<MusicFact> {
+        let ingest1 = src("ingest", "1.0.0");
+        let (qa, qb, qc) = (
+            "sha256:7777777777777777",
+            "sha256:8888888888888888",
+            "sha256:9999999999999999",
+        );
+        let (qd, qe) = ("sha256:dadadadadadadada", "sha256:cececececececece");
+        vec![
+            assert_fact(qa, title("QA"), 10, &ingest1),
+            assert_fact(qa, cover("cover-art/qa.jpg"), 10, &ingest1),
+            assert_fact(qb, title("QB"), 11, &ingest1),
+            assert_fact(qb, cover("cover-art/qb.jpg"), 11, &ingest1),
+            assert_fact(qa, MusicValue::Replaces(ContentHash::new(qb)), 12, &ingest1),
+            retract_fact(qb, title("QB"), 13, &ingest1),
+            retract_fact(qb, cover("cover-art/qb.jpg"), 13, &ingest1),
+            assert_fact(qc, title("QC"), 14, &ingest1),
+            assert_fact(qc, MusicValue::Replaces(ContentHash::new(qa)), 15, &ingest1),
+            assert_fact(qc, MusicValue::Replaces(ContentHash::new(qb)), 15, &ingest1),
+            retract_fact(qa, title("QA"), 16, &ingest1),
+            retract_fact(qa, cover("cover-art/qa.jpg"), 16, &ingest1),
+            retract_fact(qa, MusicValue::Replaces(ContentHash::new(qb)), 16, &ingest1),
+            // A cover retracted before the `Replaces`.
+            assert_fact(qd, title("QD"), 17, &ingest1),
+            assert_fact(qd, cover("cover-art/qd.jpg"), 17, &ingest1),
+            retract_fact(qd, cover("cover-art/qd.jpg"), 18, &ingest1),
+            assert_fact(qe, title("QE"), 19, &ingest1),
+            assert_fact(qe, MusicValue::Replaces(ContentHash::new(qd)), 20, &ingest1),
+            retract_fact(qd, title("QD"), 21, &ingest1),
+        ]
     }
 
     fn sorted(mut tracks: Vec<IndexedTrackInfo>) -> Vec<IndexedTrackInfo> {
@@ -2368,7 +3132,7 @@ mod tests {
                      duration={:?} bpm={:?} key={:?} year={:?} source={:?} blob={:?} cover={:?} \
                      track={:?} disc={:?} started={:?} stopped={:?} added={:?} item={:?} \
                      deleted={:?} role={:?} energy={:?} grid={:?} cues={:?} raw={:?} \
-                     retired_by={:?} prov={:?}",
+                     retired_by={:?} inherited_cover={:?} prov={:?}",
                     t.content_hash.as_str(),
                     t.title,
                     t.artist,
@@ -2396,6 +3160,7 @@ mod tests {
                     t.memory_cues,
                     t.raw_file_path,
                     t.retired_by,
+                    t.inherited_cover_art_path,
                     t.provenance
                         .iter()
                         .map(|(v, s)| format!("{v}|{:?}", s.identity()))
@@ -2435,16 +3200,16 @@ mod tests {
 
     fn whole_log(facts: &[MusicFact]) -> Whole {
         let mut whole = project(facts.to_vec());
-        PlayLog::from_facts(facts).apply_to(&mut whole.tracks);
+        LineageLog::from_facts(facts).apply_to(&mut whole.tracks);
         let tracks = sorted(whole.tracks);
         Whole {
             rendered: render(&tracks),
             fact_index: whole.fact_index,
-            histories: whole.plays.histories(&tracks),
+            histories: whole.lineage.histories(&tracks),
         }
     }
 
-    fn assert_matches_whole(mut part: Projection, log: &PlayLog, expected: &Whole, label: &str) {
+    fn assert_matches_whole(mut part: Projection, log: &LineageLog, expected: &Whole, label: &str) {
         log.apply_to(&mut part.tracks);
         let tracks = sorted(part.tracks);
         assert_eq!(
@@ -2475,9 +3240,9 @@ mod tests {
 
             // Bulk projection of the prefix, then incremental application of the suffix.
             let mut part = project(prefix.to_vec());
-            let mut events = PlayLog::from_facts(prefix);
+            let mut events = LineageLog::from_facts(prefix);
             fold_incrementally(&mut part, suffix);
-            events.merge(PlayLog::from_facts(suffix));
+            events.merge(LineageLog::from_facts(suffix));
             assert_matches_whole(part, &events, &expected, &format!("split {k}"));
         }
     }
@@ -2494,11 +3259,11 @@ mod tests {
 
                 // prefix bulk, then mid incrementally and swept, then tail incrementally.
                 let mut part = project(prefix.to_vec());
-                let mut events = PlayLog::from_facts(prefix);
+                let mut events = LineageLog::from_facts(prefix);
                 fold_incrementally(&mut part, mid);
-                events.merge(PlayLog::from_facts(mid));
+                events.merge(LineageLog::from_facts(mid));
                 fold_incrementally(&mut part, tail);
-                events.merge(PlayLog::from_facts(tail));
+                events.merge(LineageLog::from_facts(tail));
                 assert_matches_whole(part, &events, &expected, &format!("splits {i}/{j}"));
             }
         }
@@ -2522,7 +3287,7 @@ mod tests {
         ];
         let mut tracks = project(facts.clone()).tracks;
         assert_eq!(tracks.len(), 1);
-        PlayLog::from_facts(&facts).apply_to(&mut tracks);
+        LineageLog::from_facts(&facts).apply_to(&mut tracks);
         assert_eq!(tracks[0].last_started, Some(ts(4)));
     }
 
@@ -2530,7 +3295,7 @@ mod tests {
     fn the_fixture_exercises_what_it_claims() {
         let facts = fixture();
         let mut p = project(facts.clone());
-        PlayLog::from_facts(&facts).apply_to(&mut p.tracks);
+        LineageLog::from_facts(&facts).apply_to(&mut p.tracks);
         let tracks = sorted(p.tracks);
         let hashes: Vec<_> = tracks.iter().map(|t| t.content_hash.as_str()).collect();
         // B was merged away, D never live.
@@ -2543,8 +3308,10 @@ mod tests {
                 "sha256:3333333333333333",
                 "sha256:4444444444444444",
                 "sha256:5555555555555555",
+                "sha256:9999999999999999",
                 "sha256:aaaaaaaaaaaaaaaa",
                 "sha256:cccccccccccccccc",
+                "sha256:cececececececece",
                 "sha256:eeeeeeeeeeeeeeee",
                 "sha256:ffffffffffffffff",
             ]
@@ -2561,9 +3328,26 @@ mod tests {
         // A carries B's plays through the lineage, and its own.
         assert_eq!(a.last_started, Some(ts(4)));
         assert_eq!(a.last_stopped, Some(ts(5)));
-        let history = p.plays.resolved(&tracks).history(a);
+        let history = p.lineage.resolved(&tracks).history(a);
         assert_eq!(shape(&history), ["3-", "4-5"]);
         assert_eq!(a.blob_path, PathBuf::from("blobs/aa/aaaaaaaaaaaaaaaa.flac"));
+        // A has no cover of its own; B's, retracted by the merge, is the one it shows.
+        assert_eq!(a.cover_art_path, None);
+        assert_eq!(
+            a.effective_cover_art_path(),
+            Some(Path::new("cover-art/b.jpg"))
+        );
+        // The heir of the quality-ordered chain shows the cover of the one it replaced
+        // last (qa's), not qb's, which was asserted later; a cover retracted before the
+        // merge is not inherited.
+        assert_eq!(
+            by("sha256:9999999999999999").effective_cover_art_path(),
+            Some(Path::new("cover-art/qa.jpg"))
+        );
+        assert_eq!(
+            by("sha256:cececececececece").effective_cover_art_path(),
+            None
+        );
         // C was reset on retract-to-empty, then re-asserted.
         let c = by("sha256:cccccccccccccccc");
         assert_eq!(c.title.as_deref(), Some("C again"));

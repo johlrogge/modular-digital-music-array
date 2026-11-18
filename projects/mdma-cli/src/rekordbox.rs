@@ -10,10 +10,12 @@ use crate::transfer::{
     export_extension, path_cost, DownloadOutcome, ExportFormat, MAX_LOCATION_URI_BYTES,
 };
 use bpaf::{construct, Parser};
+use client_facts::Facts;
 use color_eyre::eyre::{bail, eyre};
 use color_eyre::Result;
 use hicli::Arg;
-use library_ipc_client::{ContentHash, TrackInfo};
+use library_ipc_client::{track_hashes, unresolved_entries};
+use library_ipc_client::{ContentHash, PlaylistEntry, TrackInfo};
 use music_facts::MusicValue;
 use playlist_import::{format_write_outcome, write_playlist, LibraryTrackLookup};
 use rekordbox_xml::{parse_xml, RekordboxTrack};
@@ -171,9 +173,17 @@ fn build_rekordbox_track(
     }
 }
 
+/// The full hash of each available entry of a playlist, in order.
+fn entry_hashes(entries: &[PlaylistEntry]) -> Vec<ContentHash> {
+    track_hashes(entries)
+        .into_iter()
+        .map(ContentHash::from)
+        .collect()
+}
+
 /// Locations to list in a playlist: the `hashes` that resolve to a location
-/// which made it into `refreshed_locations`. Unresolved hashes (failed
-/// downloads) are dropped.
+/// which made it into `refreshed_locations`. Hashes of tracks that failed to
+/// download are dropped.
 ///
 /// Normalises case at the lookup boundary only; the URI written to
 /// rekordbox.xml preserves its original case.
@@ -221,14 +231,14 @@ pub(crate) fn export(args: RekordboxExportArgs, ctx: &Ctx) -> Result<()> {
         ExportSource::Playlists(playlists) => playlists,
         ExportSource::Stdin => Vec::new(),
     };
-    let library = ctx.library()?;
+    let library = ctx.node().library()?;
     let output = output.unwrap_or_else(|| {
         dirs::audio_dir()
             .map(|p| p.join("mdma_rekordbox"))
             .unwrap_or_else(|| std::path::PathBuf::from("./rekordbox-export/"))
     });
 
-    let (node, node_ip) = ctx.require_node()?;
+    let (node, node_ip) = ctx.node().require_node()?;
 
     // Collect hashes per playlist, or from stdin when no playlists given.
     //
@@ -238,8 +248,12 @@ pub(crate) fn export(args: RekordboxExportArgs, ctx: &Ctx) -> Result<()> {
         let mut result = Vec::with_capacity(playlists.len());
         for PlaylistArg(name) in &playlists {
             let pname = name.as_str();
-            let hashes = library.playlist_get(name).map_err(library_error)?;
-            result.push((pname.to_string(), hashes));
+            let entries = library.playlist_entries(name).map_err(library_error)?;
+            // An entry that does not resolve is left out of the export, never silently.
+            for unavailable in unresolved_entries(&entries) {
+                eprintln!("warning: playlist '{}': {}", pname, unavailable);
+            }
+            result.push((pname.to_string(), entry_hashes(&entries)));
         }
         result
     } else {
@@ -587,7 +601,6 @@ pub(crate) fn import(args: RekordboxImportArgs, ctx: &Ctx) -> Result<()> {
         dry_run: DryRun(dry_run),
         path,
     } = args;
-    let library = ctx.library()?;
 
     // 1. Read and parse XML file
     let ExistingFileArg(path) = path;
@@ -601,8 +614,12 @@ pub(crate) fn import(args: RekordboxImportArgs, ctx: &Ctx) -> Result<()> {
         return Ok(());
     }
 
-    // 2. Create lookup and match tracks
-    let lookup = LibraryTrackLookup::new(|q| library.search(q));
+    // 2. Create lookup and match tracks. The matches become writes to the node, so
+    // they are asked of the node whatever --facts says (ADR-030 §5): a stale replica
+    // would give fewer matches and the import would replace a good playlist with a
+    // partial one.
+    let facts = Facts::Node(ctx.node());
+    let lookup = LibraryTrackLookup::new(|q| facts.search(q));
 
     let mut matched: Vec<(&RekordboxTrack, ContentHash)> = Vec::new();
     let mut ambiguous: Vec<(&RekordboxTrack, Vec<ContentHash>)> = Vec::new();
@@ -643,6 +660,9 @@ pub(crate) fn import(args: RekordboxImportArgs, ctx: &Ctx) -> Result<()> {
 
     // A failed library search must not look like "not in library"
     lookup.check()?;
+
+    // The writes (playlists, enrichment) go through the node too.
+    let library = ctx.node().library()?;
 
     // 3. Print summary
     println!("Matched:   {:3} tracks", matched.len());
@@ -1130,6 +1150,41 @@ mod tests {
             Some("Note: playlist name sanitized from 'My Set!' to 'My-Set'")
         );
         assert_eq!(playlist.name().as_str(), "My-Set");
+    }
+
+    // ── playlist entries ─────────────────────────────────────────────────────────
+
+    /// A playlist line stored short resolves, through the library, to the track's full
+    /// hash; the locations are looked up by that, and an unresolved entry has none.
+    #[test]
+    fn rekordbox_playlist_locations_use_canonical_hashes() {
+        use library_ipc_client::{CanonicalHash, EntryError, PlaylistEntry};
+        let full = ContentHash::new(format!("sha256:{}", "a".repeat(64)));
+        let location = "file://localhost/tmp/export/a.aiff".to_string();
+        let hash_to_location =
+            rekordbox_roundtrip::build_hash_to_location(&[rekordbox_roundtrip::HashLocation {
+                hash: full.clone(),
+                location: location.clone(),
+            }]);
+        let refreshed: std::collections::HashSet<String> = [location.clone()].into_iter().collect();
+        let entries = [
+            PlaylistEntry::Unresolved {
+                error: EntryError::Unknown {
+                    hash: ContentHash::new("bbbbbbbb"),
+                },
+            },
+            PlaylistEntry::Track {
+                hash: CanonicalHash::try_from(full).unwrap(),
+            },
+        ];
+        assert_eq!(
+            playlist_locations(
+                &super::entry_hashes(&entries),
+                &hash_to_location,
+                &refreshed
+            ),
+            [location]
+        );
     }
 
     // ── case-insensitive location URI matching ───────────────────────────────────

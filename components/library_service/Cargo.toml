@@ -20,6 +20,8 @@ thiserror = "1.0"
 # Internal components
 library-search = { workspace = true }
 library-projection = { workspace = true }
+playlist-edit = { workspace = true }
+private-file = { workspace = true }
 library-ingestion = { workspace = true }
 music-facts = { workspace = true }
 music-primitives = { workspace = true }
@@ -45,4 +47,7 @@ notify = "6.1"
 pretty_assertions = "1"
 rstest = "0.26"
 tempfile = "3"
+playlist-edit = { workspace = true, features = ["test-support"] }
 acid-service = { workspace = true }
+# Tags the fixture blobs of the cover heal tests with a picture
+lofty = "0.18"
