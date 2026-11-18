@@ -98,6 +98,11 @@ main{padding:0 var(--gutter) calc(var(--tabbar-h) + var(--bar-h) + 40px + env(sa
 .art{position:relative;aspect-ratio:1;border-radius:var(--r-sm);overflow:hidden;flex:none;display:flex;align-items:flex-end;padding:8%;color:var(--art-ink);font-weight:800;letter-spacing:-.04em;line-height:.9;background:var(--surface-2);user-select:none;box-shadow:inset 0 0 0 1px var(--art-line)}
 .art.round{border-radius:50%;align-items:center;justify-content:center;padding:0}
 .art img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
+.art.mosaic img{inset:auto;width:50%;height:50%;box-shadow:0 0 0 .5px var(--surface)}
+.art.mosaic .q1{top:0;left:0}
+.art.mosaic .q2{top:0;left:50%}
+.art.mosaic .q3{top:50%;left:0}
+.art.mosaic .q4{top:50%;left:50%}
 
 /* ================= SECTIONS / CARDS ================= */
 .section{margin-top:var(--s-6)}

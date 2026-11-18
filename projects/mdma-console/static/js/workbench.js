@@ -24,14 +24,15 @@
 // expands into a timeline (timeline.js): seek, cues, bar lines and beat steps.
 import { $, $$, h, icon, route, store, api, enc, playlistHref, plural, toast, catalogue, loadPlaylists, actions } from "./core.js";
 import { trackTitle } from "./logic.js";
-import { narrowedTracks, emptyNote, dragList } from "./lists.js";
+import { narrowedTracks, emptyNote, dragList, STEP } from "./lists.js";
 import { NO_MUSIC, NONE, backLink } from "./collections.js";
 import { load, notes, rowsOf, PLAYLIST_ROW } from "./playlist.js";
 import { timeline } from "./timeline.js";
 
 const LIB_KEY = "workbench-lib";
 const PL_KEY = "workbench-pl";
-const STEP = { ArrowUp: -1, ArrowDown: 1 };
+/** Add `keys` to the row's aria-keyshortcuts (lists.js gave it the row navigation keys). */
+const addKeys = (row, keys) => row.setAttribute("aria-keyshortcuts", [row.getAttribute("aria-keyshortcuts"), keys].filter(Boolean).join(" "));
 const quoted = (t) => "“" + trackTitle(t) + "”";
 
 /** A small button inside a row. It never opens the row's menu. */
@@ -212,7 +213,7 @@ function viewWorkbench(root, params) {
   function editable(li, row, t) {
     li.dataset.at = t.at;
     const reorder = !plPane.narrowed();
-    row.setAttribute("aria-keyshortcuts", reorder ? "Delete Alt+ArrowUp Alt+ArrowDown" : "Delete");
+    addKeys(row, reorder ? "Delete Alt+ArrowUp Alt+ArrowDown" : "Delete");
     if (reorder) drag.item(row, t.at, move);
     row.addEventListener("keydown", (e) => {
       if (e.target !== row) return;

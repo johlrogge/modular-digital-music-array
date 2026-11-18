@@ -1,5 +1,5 @@
 // Album art: a generated "white label" sleeve, with the real cover layered on top when there is one.
-import { fnv, initials } from "./logic.js";
+import { fnv, initials, MOSAIC } from "./logic.js";
 import { h } from "./core.js";
 
 /** CSS background for a name's placeholder sleeve (colours come from theme tokens). */
@@ -47,22 +47,31 @@ export function setCover(el, hash) {
   const old = el.querySelector("img");
   if (old) old.remove();
   if (!hash) return;
-  const img = h("img", { src: coverUrl(hash), alt: "" });
+  el.appendChild(coverImg(hash, false));
+}
+
+/** A cover <img> that removes itself if it fails to load, so the placeholder shows. */
+function coverImg(hash, lazy) {
+  const img = h("img", { src: coverUrl(hash), alt: "", loading: lazy ? "lazy" : null });
   img.onerror = () => img.remove();
-  el.appendChild(img);
+  return img;
 }
 
 /**
  * A sleeve element for `name`. With `opts.cover` (a track hash) a lazy <img> is layered on top;
- * if it fails to load it removes itself and the placeholder shows.
+ * with `opts.covers` (hashes of distinct albums) a 2x2 mosaic when there are MOSAIC of them, else
+ * the first alone. An image that fails to load removes itself and the placeholder shows.
  */
 export function art(name, opts = {}) {
-  const e = h("div", { class: "art" + (opts.round ? " round" : ""), "aria-hidden": "true" });
+  const covers = opts.covers || (opts.cover ? [opts.cover] : []);
+  const mosaic = covers.length >= MOSAIC;
+  const e = h("div", { class: "art" + (opts.round ? " round" : "") + (mosaic ? " mosaic" : ""), "aria-hidden": "true" });
   setArt(e, name);
-  if (opts.cover) {
-    const img = h("img", { src: coverUrl(opts.cover), alt: "", loading: "lazy" });
-    img.onerror = () => img.remove();
+  // A mosaic cell keeps its place (class q1..q4, see app.css) if another fails and removes itself.
+  (mosaic ? covers.slice(0, MOSAIC) : covers.slice(0, 1)).forEach((hash, i) => {
+    const img = coverImg(hash, true);
+    if (mosaic) img.className = "q" + (i + 1);
     e.appendChild(img);
-  }
+  });
   return e;
 }

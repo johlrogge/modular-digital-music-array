@@ -25,7 +25,7 @@ function drawRail() {
   const list = $("#rail-playlists");
   if (!list) return;
   const items = store.playlists.slice().sort((a, b) => collate(a.name, b.name));
-  list.replaceChildren(...items.map((p) => playlistTile(p, { "data-name": p.name })));
+  list.replaceChildren(...items.map((p) => playlistTile(p, { "data-name": p.name }, { mosaic: false })));
   markCurrent();
 }
 

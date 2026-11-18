@@ -455,6 +455,12 @@ function narrowBar(o) {
     clearTimeout(timer);
     timer = setTimeout(o.onChange, 120);
   });
+  // Esc lets go of the field so row keys like j/k work next. preventDefault: Chromium would clear a search field's text, un-narrowing the list.
+  input.addEventListener("keydown", (e) => {
+    if (e.key !== "Escape") return;
+    e.preventDefault();
+    input.blur();
+  });
   const row = h("div", { class: "search-row" }, [h("label", { class: "search-field" }, [icon("search", "sm"), input])]);
   if (o.sort) {
     const sb = h("button", { class: "btn sort-btn", "aria-label": "Sort" }, [icon("sort", "sm"), h("span", { class: "lbl", text: sortLabel() })]);

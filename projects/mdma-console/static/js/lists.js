@@ -3,9 +3,9 @@
 // playback route. A plain tap on a row or card opens a menu or a page and NEVER plays; the one
 // exception is a preview row (opts.preview, the playlist workbench), which can always go Back.
 // Play now is offered only when logic.isIdle(store.player) (paused counts as playing).
-import { $$, h, icon, store, actions, setOf, enc, fmt, fmtTotal, plural, openMenu, on, onView, playlistHref, marksOf, macroForKey, keyText } from "./core.js";
+import { $$, typing, h, icon, store, actions, setOf, enc, fmt, fmtTotal, plural, openMenu, on, onView, playlistHref, marksOf, macroForKey, keyText } from "./core.js";
 import { art } from "./art.js";
-import { isIdle, groupAlbums, trackTitle, sortTracks, placeholderTrack, coverOf, LIKED, markLabel } from "./logic.js";
+import { isIdle, groupAlbums, trackTitle, sortTracks, placeholderTrack, albumCovers, coverOf, LIKED, markLabel } from "./logic.js";
 import { narrowedView, matchSet, setSort, SEARCH_FAILED_NOTE, FILTERS_EMPTY_NOTE } from "./narrow.js";
 
 const PAGE = 60;
@@ -167,7 +167,7 @@ function unavailableRow(t, opts, index) {
   return h("li", { style: "position:relative" }, [
     h(
       "div",
-      { class: "trow unavailable" + (numbered ? " numbered" : ""), tabindex: opts.end ? "0" : null, "aria-label": title + ", unavailable. " + t.reason },
+      { class: "trow unavailable" + (numbered ? " numbered" : ""), "data-token": t.token, tabindex: opts.end ? "-1" : null, "aria-label": title + ", unavailable. " + t.reason },
       [
         h("span", { class: "no", text: numbered ? String(opts.number(t)) : "" }),
         h("div", { style: "min-width:0" }, [h("div", { class: "t", text: title }), h("div", { class: "m", text: t.reason })]),
@@ -226,8 +226,9 @@ function resolvedRow(t, opts, index) {
     {
       class: "trow" + (numbered ? " numbered" : "") + (current ? " current" : "") + (previewing ? " previewing" : ""),
       "data-mid": t.hash,
-      tabindex: "0",
+      tabindex: "-1", // pagedList makes one row per list the Tab stop (setRove)
       role: "button",
+      "aria-keyshortcuts": ROW_KEYS,
       "aria-haspopup": start ? null : "menu",
       "aria-label": title + (t.artist ? " by " + t.artist : "") + (start ? (previewing ? ". Previewing. Click to " + (playing ? "pause" : "resume") + "." : ". Click to preview.") : ". Opens actions."),
     },
@@ -417,6 +418,10 @@ export function pagedList(container, tracks, opts = {}) {
     const end = Math.min(tracks.length, shown + n);
     for (let i = shown; i < end; i++) ul.appendChild(trackRow(tracks[i], opts, i));
     shown = end;
+    if (!ul._rove) {
+      const r = ul.querySelector(NAV);
+      if (r) setRove(r); // a list starts with its first row as the Tab stop
+    }
     more.textContent = shown < tracks.length ? "Showing " + shown + " of " + tracks.length + " · loading more…" : plural(tracks.length, "track");
   };
   page(Math.max(PAGE, opts.initial || 0));
@@ -476,17 +481,104 @@ export function emptyNote(title, text, link) {
   return h("div", { class: "empty" }, [h("b", { text: title }), text, link ? h("a", { class: "link", href: link.href, text: link.text }) : null]);
 }
 
+/* ============================================================ keyboard row navigation */
+
+/** What every track row answers to for moving between rows (aria-keyshortcuts). */
+export const ROW_KEYS = "ArrowUp ArrowDown j k Home End g Shift+G";
+
+/** Up/Down as a step along a list: shared with the workbench's Alt+Up/Down move. */
+export const STEP = { ArrowUp: -1, ArrowDown: 1 };
+const VI_STEP = { j: 1, k: -1 };
+
+/** Rows that can take the focus: track rows, and unavailable lines that have buttons. A row with no actions has no tabindex. */
+const NAV = ".trow[tabindex]";
+const shownRows = (scope) => $$(NAV, scope).filter((r) => r.offsetParent !== null);
+const isShown = (el) => !!el && el.isConnected && el.offsetParent !== null;
+
+/**
+ * Roving tabindex: a ul.trows has exactly one row in the Tab order (tabindex 0), the rest are -1,
+ * so Tab passes through a list in one stop and comes back to the row it left. `row` becomes it.
+ */
+function setRove(row) {
+  const ul = row.closest("ul.trows");
+  if (!ul) return;
+  if (ul._rove && ul._rove !== row) ul._rove.setAttribute("tabindex", "-1");
+  row.setAttribute("tabindex", "0");
+  ul._rove = row;
+}
+
+/** The list the focus was last in: where j/k/g/G begin from the bare page. */
+let lastList = null;
+
+const focusRowEl = (r) => {
+  r.focus({ preventScroll: true });
+  r.scrollIntoView({ block: "nearest" });
+};
+
+/**
+ * The one place row keys live. From a row, Up/Down and j/k step along its list, Home/End and g/G go
+ * to its ends, and Esc lets go of it. From the bare page (nothing has the focus) only j, k, g and G
+ * enter a list (the arrows and Home/End stay the browser's, to scroll): the one last used, else the
+ * first shown, j/k at its roving row. j and k ignore case; g and G do not (vim: G is the end).
+ * Tab, h and l are not taken: Tab moves between lists natively (l is Queue last, Left/Right beat
+ * steps). A key a row or the page already handled (defaultPrevented), one with Ctrl, Alt or Meta,
+ * and any key while typing, are left alone. The row's own keys (M, N, L, P, Delete ...) are theirs.
+ */
+function rowNav(e) {
+  if (e.defaultPrevented || e.ctrlKey || e.metaKey || e.altKey || typing()) return;
+  if (e.shiftKey && e.key !== "G") return;
+  const a = document.activeElement;
+  const cur = a && a.closest(NAV);
+  if (a && a !== document.body && !cur) return; // a button, link or other control has the keys
+  if (e.key === "Escape") {
+    if (cur) cur.blur();
+    return;
+  }
+  const vi = e.key.toLowerCase();
+  const step = STEP[e.key] ?? VI_STEP[vi];
+  const first = e.key === "Home" || e.key === "g";
+  const end = e.key === "End" || e.key === "G";
+  if (!cur && !(vi in VI_STEP || e.key === "g" || e.key === "G")) return;
+  if (!step && !first && !end) return;
+  const list = cur ? cur.closest("ul.trows") : isShown(lastList) && shownRows(lastList).length ? lastList : $$("ul.trows").find((u) => isShown(u) && shownRows(u).length);
+  if (!list) return;
+  const rows = shownRows(list);
+  const last = rows.length - 1;
+  let to;
+  if (step) to = cur ? rows[Math.max(0, Math.min(last, rows.indexOf(cur) + step))] : rows.includes(list._rove) ? list._rove : rows[0];
+  else to = first ? rows[0] : rows[last];
+  if (!to) return;
+  e.preventDefault();
+  focusRowEl(to);
+}
+document.addEventListener("keydown", rowNav);
+document.addEventListener("focusin", (e) => {
+  const r = e.target.closest && e.target.closest(NAV);
+  if (!r) return;
+  setRove(r);
+  lastList = r.closest("ul.trows");
+});
+
 /* ============================================================ narrowed track pane */
 
-/** The rows of `hash` drawn in `region`, in order (a list may hold a track twice). */
-const rowsOfHash = (region, hash) => $$(".trow", region).filter((r) => r.dataset.mid === hash);
+/** What a row is: its track's hash, or for an unavailable line its token (the two cannot collide). */
+const rowKey = (r) => (r.dataset.mid !== undefined ? "track:" + r.dataset.mid : "token:" + r.dataset.token);
 
-/** Which row of `region` has the focus: { hash, nth } (the nth row of that track), or null. */
-function rowFocus(region) {
-  const row = document.activeElement && document.activeElement.closest(".trow[data-mid]");
+/** The focusable rows of `key` drawn in `region`, in order (a list may hold a track twice). */
+const rowsOfKey = (region, key) => $$(NAV, region).filter((r) => rowKey(r) === key);
+
+/** Which row of `region` is `row`: { key, nth } (the nth row of that key), or null if it is not in it. */
+function rowPlace(region, row) {
   if (!row || !region.contains(row)) return null;
-  return { hash: row.dataset.mid, nth: rowsOfHash(region, row.dataset.mid).indexOf(row) };
+  const key = rowKey(row);
+  return { key, nth: rowsOfKey(region, key).indexOf(row) };
 }
+
+/** Which row of `region` has the focus, or null. */
+const rowFocus = (region) => rowPlace(region, document.activeElement && document.activeElement.closest(NAV));
+
+/** Which row of `region` is in the Tab order (the roving one), or null. */
+const rowRove = (region) => rowPlace(region, region.querySelector(NAV + '[tabindex="0"]'));
 
 /**
  * A narrowing bar and a track list, with no page chrome: what an album, artist or playlist page
@@ -555,6 +647,7 @@ export function narrowedTracks(o) {
       // A row that has the focus gets it back once the rows are drawn anew (a preview changes the
       // player, which redraws, and the keyboard goes on from the row it was on), if it is still there.
       const focused = rowFocus(region);
+      const roving = rowRove(region);
       if (list) list.destroy();
       list = null;
       region.innerHTML = "";
@@ -569,7 +662,12 @@ export function narrowedTracks(o) {
         list = pagedList(region, rows, { ...row, initial });
       }
       if (keep) window.scrollTo(0, scrollY);
-      if (focused) rowsOfHash(region, focused.hash)[focused.nth]?.focus({ preventScroll: true });
+      // The Tab stop stays on its row (the focus, when a row had it, takes it there by itself).
+      if (roving) {
+        const r = rowsOfKey(region, roving.key)[roving.nth];
+        if (r) setRove(r);
+      }
+      if (focused) rowsOfKey(region, focused.key)[focused.nth]?.focus({ preventScroll: true });
       report({ all: everything, rows, narrowed: isNarrowed, failed });
     }
 
@@ -650,12 +748,17 @@ export function albumCard(a) {
 /** Card for a playlist ({ name, hashes, unavailable }). */
 export function playlistCard(pl) {
   const tracks = playlistTracks(pl);
-  return card(pl.name, songCounts(pl.hashes.length, pl.unavailable), { cover: coverOf(tracks) }, () => playlistTracks(pl), playlistHref(pl.name));
+  return card(pl.name, songCounts(pl.hashes.length, pl.unavailable), { covers: albumCovers(tracks) }, () => playlistTracks(pl), playlistHref(pl.name));
 }
 
-/** A link to a playlist's page: its art and its name (the Home quick tiles, the rail). `attrs` are added to the <a>. */
-export function playlistTile(pl, attrs) {
-  return h("a", { href: playlistHref(pl.name), ...attrs }, [art(pl.name, { cover: coverOf(playlistTracks(pl)) }), h("span", { class: "pl-name", text: pl.name })]);
+/**
+ * A link to a playlist's page: its art and its name (the Home quick tiles, the rail). `attrs` are
+ * added to the <a>. `mosaic: false` is for tiles too small for four covers (the rail): one cover.
+ */
+export function playlistTile(pl, attrs, { mosaic = true } = {}) {
+  const tracks = playlistTracks(pl);
+  const cover = mosaic ? { covers: albumCovers(tracks) } : { cover: coverOf(tracks) };
+  return h("a", { href: playlistHref(pl.name), ...attrs }, [art(pl.name, cover), h("span", { class: "pl-name", text: pl.name })]);
 }
 
 /** Card for an artist as grouped by logic.groupArtists. */

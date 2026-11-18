@@ -7,7 +7,7 @@
 // (logic.js placeholderTrack). The page is read-only; its Edit link opens the workbench
 // (workbench.js), which uses the server's edit routes (ADR-027 §9).
 import { h, icon, route, store, api, enc, playlistHref, toast, loadPlaylists, ofPlaylist, setOf } from "./core.js";
-import { playlistRows, coverOf } from "./logic.js";
+import { playlistRows, albumCovers } from "./logic.js";
 import { songCounts } from "./lists.js";
 import { collectionPage, missing, LIBRARY_LINK, NO_MUSIC, NONE } from "./collections.js";
 
@@ -50,7 +50,7 @@ function drawPlaylist(root, name, state) {
       actions: () => (state.status === "ready" ? [h("a", { class: "btn", href: playlistHref(name, "edit"), style: "text-decoration:none" }, [icon("wrench", "sm"), "Edit"])] : []),
       label: "Playlist",
       name,
-      art: { round: false, cover: coverOf },
+      art: { round: false, covers: albumCovers },
       stats: (all) => {
         const unavailable = all.filter((r) => r.kind === "unresolved").length;
         return songCounts(all.length - unavailable, unavailable);

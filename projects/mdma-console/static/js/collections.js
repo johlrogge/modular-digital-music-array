@@ -13,7 +13,7 @@ export const LIBRARY_LINK = { href: "#/library", text: "Back to Library" };
 
 /**
  * Header of a collection page.
- * cfg: { label (kicker), name, art: { round, cover(all) -> hash|null }, byline(all) -> node|text|null,
+ * cfg: { label (kicker), name, art: { round, cover(all) -> hash|null, covers(all) -> [hash] (a mosaic when enough) }, byline(all) -> node|text|null,
  * stats(all) -> text, queueSet(rows, narrowed) -> set, actions() -> fresh buttons that end the button row }. `all`: every track of the collection (for
  * the facts). `rows`: the tracks displayed, in displayed order. `narrowed`: rows are a subset.
  * The buttons act on `queueSet(rows, narrowed)`, by default exactly the displayed rows.
@@ -26,7 +26,7 @@ export function collectionHeader(cfg, all, rows, narrowed) {
   for (const a of cfg.actions ? cfg.actions() : []) btns.appendChild(a);
   const byline = cfg.byline ? cfg.byline(all) : null;
   return h("div", { class: "coll" }, [
-    art(cfg.name, { round: cfg.art && cfg.art.round, cover: cfg.art && cfg.art.cover ? cfg.art.cover(all) : null }),
+    art(cfg.name, { round: cfg.art && cfg.art.round, cover: cfg.art && cfg.art.cover ? cfg.art.cover(all) : null, covers: cfg.art && cfg.art.covers ? cfg.art.covers(all) : null }),
     h("div", { style: "min-width:0" }, [
       h("span", { class: "kicker", text: cfg.label }),
       h("h1", { text: cfg.name }),

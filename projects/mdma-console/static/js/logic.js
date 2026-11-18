@@ -189,6 +189,27 @@ export function coverOf(tracks) {
   return t ? t.hash : null;
 }
 
+/** Distinct album covers a 2x2 mosaic needs; with fewer, one cover shows alone. */
+export const MOSAIC = 4;
+
+/**
+ * Up to `max` cover hashes of `tracks`, one per distinct album (a track without an album counts as
+ * its own), in the order of the tracks: the first track of each album that has a cover.
+ */
+export function albumCovers(tracks, max = MOSAIC) {
+  const seen = new Set();
+  const out = [];
+  for (const t of tracks) {
+    if (out.length >= max) break;
+    if (!t.has_cover) continue;
+    const key = t.album || "\0" + t.hash;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(t.hash);
+  }
+  return out;
+}
+
 /**
  * The rows of a playlist page, one per line of GET /api/playlists/{name} in file order (duplicates
  * kept), each tagged by `kind`. `entries` is [{ status: "Track", hash } | { status: "Unresolved",
