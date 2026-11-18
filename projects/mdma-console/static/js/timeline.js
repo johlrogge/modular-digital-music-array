@@ -6,8 +6,9 @@
 //
 // Step size n (1, 4, 8, 16 or 32 beats, default 8) is a per-device preference, kept in localStorage
 // like the theme. While previewing and no text field has the focus: Left / Right step n beats,
-// [ and ] cycle n, 1..8 jump to hot cue n (hot cues count from the pad: pad 1 is index 0).
+// Shift+Left / Shift+Right go to the previous / next bar start (logic.js barTarget), [ and ] cycle n, 1..8 jump to hot cue n (hot cues count from the pad: pad 1 is index 0).
 import { $, $$, actions, api, enc, fmt, h, on, plural, store, toast, typing } from "./core.js";
+import { barTarget } from "./logic.js";
 import { onProgress, position, seekAt, transport } from "./player.js";
 
 const STEPS = [1, 4, 8, 16, 32];
@@ -46,7 +47,7 @@ function paintSteps(el) {
     const back = Number(b.dataset.beats) < 0;
     b.textContent = (back ? "−" : "+") + step;
     b.disabled = !el._data.grid;
-    b.title = el._data.grid ? (back ? "Back " : "Forward ") + plural(step, "beat") + (back ? " (←)" : " (→)") : NO_GRID;
+    b.title = el._data.grid ? (back ? "Back " : "Forward ") + plural(step, "beat") + (back ? " (←" : " (→") + " · Shift+" + (back ? "←" : "→") + " for a bar)" : NO_GRID;
   }
 }
 
@@ -76,7 +77,8 @@ on("player", () => {
 // Every seek names the track the timeline is of (`hash`): one sent as the preview ends is refused
 // by the node instead of moving the track that comes back.
 const beats = (hash, dir) => transport(() => actions.seek({ by_beats: dir * step, hash }));
-const jump = (hash, cue) => transport(() => actions.seek({ to_ms: cue.at_ms, placement: "free", hash }));
+const jump = (hash, cue) => seekMs(hash, cue.at_ms);
+const seekMs = (hash, ms) => transport(() => actions.seek({ to_ms: ms, placement: "free", hash }));
 
 // A player event redraws the rows and so the timeline, which drops the keyboard focus with the old
 // control. The control that had it (by its data attribute) is remembered here and focused again in
@@ -165,14 +167,21 @@ export function timeline(li, t) {
 }
 
 document.addEventListener("keydown", (e) => {
-  if (!store.player.preview || e.ctrlKey || e.metaKey || e.altKey || e.shiftKey) return;
+  if (!store.player.preview || e.ctrlKey || e.metaKey || e.altKey) return;
   if (typing()) return;
   const tl = $(".tl");
   if (!tl || !tl._data) return;
-  if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
+  const arrow = e.key === "ArrowLeft" || e.key === "ArrowRight";
+  if (e.shiftKey && !arrow) return;
+  if (arrow) {
     e.preventDefault();
-    if (tl._data.grid) beats(tl._hash, e.key === "ArrowLeft" ? -1 : 1);
-    else if (!e.repeat) toast(NO_GRID);
+    const dir = e.key === "ArrowLeft" ? -1 : 1;
+    if (!tl._data.grid) {
+      if (!e.repeat) toast(NO_GRID);
+    } else if (e.shiftKey) {
+      const to = barTarget(tl._data.grid.bars_ms, position().pos, dir);
+      if (to !== null) seekMs(tl._hash, to);
+    } else beats(tl._hash, dir);
   } else if (e.key === "[" || e.key === "]") {
     e.preventDefault();
     if (!e.repeat) cycle(e.key === "[" ? -1 : 1);

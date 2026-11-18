@@ -269,6 +269,24 @@ export function isNarrowedBy(text, f) {
   return !!String(text || "").trim() || filterGroups(f) > 0;
 }
 
+/** How far past a bar start still counts as "on" it when stepping back a bar (ms). */
+export const BAR_TOLERANCE_MS = 150;
+
+/**
+ * Where a bar step from `pos` (ms) lands, given the ascending bar starts `bars` (ms). Forward (dir > 0)
+ * is the first bar start after `pos`, or null when there is none. Back is the last bar start more than
+ * `tol` before `pos`, so a position just past a bar start goes to the bar before it and repeated presses
+ * keep moving; with none before, the start of the track (0).
+ */
+export function barTarget(bars, pos, dir, tol = BAR_TOLERANCE_MS) {
+  if (dir > 0) {
+    const next = bars.find((b) => b > pos);
+    return next === undefined ? null : next;
+  }
+  for (let i = bars.length - 1; i >= 0; i--) if (bars[i] < pos - tol) return bars[i];
+  return 0;
+}
+
 /** Queue edits by index. All return new arrays; the input is never mutated. */
 export function removeAt(queue, i) {
   return queue.filter((_, j) => j !== i);
