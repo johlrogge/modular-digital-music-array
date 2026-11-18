@@ -5,6 +5,7 @@ use crate::playback_state::{
 use acid_client::AcidClient;
 use color_eyre::Result;
 use event_protocol::{to_topic_message, PlaybackEvent};
+use library_ipc_client::{resolve_full_hash, ClientError, LibraryClient, ResolveError, TrackInfo};
 use media_protocol::{
     require_canonical, CanonicalHash, Command, ContentHash, Held, PreviewStatus, Response,
     ResponseData, SourceName, Transport, TransportStatus,
@@ -17,7 +18,7 @@ use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use stream_source_protocol::{OutputHealth, StreamPlaybackState, StreamTrackInfo};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
@@ -78,6 +79,219 @@ pub struct Server {
     seek_epoch: SeekEpoch,
 }
 
+/// How long one library request may take before it counts as unreachable.
+pub const LIBRARY_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The queue read from the queue file at startup; see [`restore`].
+#[derive(Default)]
+pub struct RestoredQueue(VecDeque<QueueEntry>);
+
+/// Read the persisted queue, resolving entries written as prefixes through the
+/// library (ADR-026, amendment 2026-11-18). Blocks, possibly for a minute, so
+/// run it before the command socket is bound: a
+/// request that arrived meanwhile would be served after its client gave up.
+pub fn restore(queue_file: &Path, library: &LibraryClient) -> RestoredQueue {
+    RestoredQueue(restore_queue(
+        queue_file,
+        &|hash| library.get_track(hash),
+        &ResolveRetry::startup(),
+    ))
+}
+
+/// How long and how often [`restore_queue`] asks an unreachable library again.
+struct ResolveRetry {
+    /// Waits between the first attempts.
+    initial: Vec<Duration>,
+    /// The wait after `initial` is used up, repeated.
+    steady: Duration,
+    /// How long one request may take, at worst.
+    request_timeout: Duration,
+    /// Total time after which the library counts as unreachable, counting the
+    /// request that is still running at the end.
+    deadline: Duration,
+}
+
+impl ResolveRetry {
+    /// At startup the library may be up but not answering yet: 0.5, 1, 2, 4,
+    /// 8 s, then every 8 s, for at most 60 s.
+    fn startup() -> Self {
+        Self {
+            initial: [500, 1000, 2000, 4000]
+                .into_iter()
+                .map(Duration::from_millis)
+                .collect(),
+            steady: Duration::from_secs(8),
+            request_timeout: LIBRARY_REQUEST_TIMEOUT,
+            deadline: Duration::from_secs(60),
+        }
+    }
+
+    fn delay(&self, attempt: usize) -> Duration {
+        self.initial.get(attempt).copied().unwrap_or(self.steady)
+    }
+}
+
+/// Where the original of a queue file is kept when it could not be restored as
+/// written.
+fn rejected_path(queue_file: &Path) -> PathBuf {
+    let mut name = queue_file.as_os_str().to_owned();
+    name.push(".rejected");
+    PathBuf::from(name)
+}
+
+/// Resolve `prefix` through the library's resolver, asking again while the
+/// library cannot be reached and `retry` allows it. Stops at the first answer
+/// that is not a transport failure.
+fn resolve_with_retry(
+    prefix: &ContentHash,
+    resolve: &dyn Fn(&ContentHash) -> Result<TrackInfo, ClientError>,
+    retry: &ResolveRetry,
+    started: Instant,
+) -> Result<CanonicalHash, ResolveError> {
+    let mut attempt = 0;
+    loop {
+        match resolve_full_hash(prefix, resolve) {
+            Err(e) if e.is_transport() => {
+                let delay = retry.delay(attempt);
+                if started.elapsed() + delay + retry.request_timeout > retry.deadline {
+                    return Err(e);
+                }
+                warn!("Library unreachable resolving {prefix}; retrying in {delay:?}");
+                std::thread::sleep(delay);
+                attempt += 1;
+            }
+            answer => return answer,
+        }
+    }
+}
+
+/// Write `data` to `rejected` unless it exists: the first original is kept,
+/// and a later one never replaces it. An existing file counts as success.
+fn keep_original(data: &[u8], rejected: &Path) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut file = match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(rejected)
+    {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    let written = file.write_all(data).and_then(|()| file.sync_all());
+    if written.is_err() {
+        // Do not leave half a copy that would stop the next try.
+        let _ = std::fs::remove_file(rejected);
+    }
+    written
+}
+
+/// Read the persisted queue. Entries that are not canonical (written as
+/// prefixes by playback up to 0.38) are resolved through the library, in file
+/// order, so a mixed file keeps its order. Entries the library cannot resolve
+/// are dropped with a warning.
+///
+/// A file with any such entry is first copied to `<file>.rejected`, and a
+/// corrupt file is moved to it, so the original is never lost. An existing
+/// `.rejected` is never overwritten: the first original wins. This runs
+/// before anything can persist the queue again.
+fn restore_queue(
+    queue_file: &Path,
+    resolve: &dyn Fn(&ContentHash) -> Result<TrackInfo, ClientError>,
+    retry: &ResolveRetry,
+) -> VecDeque<QueueEntry> {
+    let data = match std::fs::read(queue_file) {
+        Ok(d) => d,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return VecDeque::new();
+        }
+        Err(e) => {
+            warn!("Failed to read queue file {:?}: {}", queue_file, e);
+            return VecDeque::new();
+        }
+    };
+    let rejected = rejected_path(queue_file);
+
+    let entries: Vec<PersistEntry> = match serde_json::from_slice(&data) {
+        Ok(e) => e,
+        Err(e) => {
+            // Remove the original only once its copy is safe. If a `.rejected`
+            // already exists, the earlier original wins and this file's bytes
+            // are discarded.
+            match keep_original(&data, &rejected) {
+                Ok(()) => {
+                    warn!("Queue file corrupt ({e}); original kept at {rejected:?}");
+                    if let Err(e) = std::fs::remove_file(queue_file) {
+                        warn!("Failed to remove the corrupt queue file: {e}");
+                    }
+                }
+                Err(keep) => {
+                    warn!("Queue file corrupt ({e}); failed to keep it at {rejected:?}: {keep}")
+                }
+            }
+            return VecDeque::new();
+        }
+    };
+
+    let entries: Vec<_> = entries
+        .into_iter()
+        .map(|e| {
+            let hash = ContentHash::new(e.hash);
+            (CanonicalHash::try_from(hash).map_err(|n| n.0), e.source)
+        })
+        .collect();
+    // Resolving loses nothing; only a later persist does. So a failed copy is
+    // a warning, and the restore goes on as usual.
+    if entries.iter().any(|(hash, _)| hash.is_err()) {
+        if let Err(e) = keep_original(&data, &rejected) {
+            warn!("Failed to keep the original queue file at {rejected:?}: {e}");
+        }
+    }
+
+    let started = Instant::now();
+    // Set once the library has not answered in time, so that each remaining
+    // prefix does not cost another request timeout.
+    let mut unreachable = false;
+    let mut dropped = 0usize;
+    let mut queue = VecDeque::new();
+    for (hash, source) in entries {
+        let hash = match hash {
+            Ok(hash) => hash,
+            Err(_) if unreachable => {
+                dropped += 1;
+                continue;
+            }
+            Err(prefix) => match resolve_with_retry(&prefix, resolve, retry, started) {
+                Ok(hash) => hash,
+                Err(e) => {
+                    dropped += 1;
+                    if e.is_transport() {
+                        unreachable = true;
+                        warn!(
+                            "Library unreachable; original kept at {:?}: {}",
+                            rejected, e
+                        );
+                    } else {
+                        warn!(
+                            hash = %prefix,
+                            error = %e,
+                            "Dropping persisted queue entry"
+                        );
+                    }
+                    continue;
+                }
+            },
+        };
+        queue.push_back(QueueEntry { hash, source });
+    }
+    info!(
+        "Restored {} track(s) from queue file, dropped {}",
+        queue.len(),
+        dropped
+    );
+    queue
+}
+
 impl Server {
     pub fn new(
         audio: Arc<Mutex<StreamClient>>,
@@ -85,11 +299,12 @@ impl Server {
         queue_file: PathBuf,
         event_pub: Socket,
         acid_client: Arc<AcidClient>,
+        restored: RestoredQueue,
     ) -> Self {
         Self {
             audio,
             socket,
-            queue: Arc::new(Mutex::new(VecDeque::new())),
+            queue: Arc::new(Mutex::new(restored.0)),
             state: Arc::new(Mutex::new(PlaybackStateMachine::new())),
             queue_file,
             event_pub,
@@ -156,48 +371,8 @@ impl Server {
         }
     }
 
-    /// Load the queue from disk. Returns an empty queue on first start or corruption.
-    async fn load_queue(&self) -> VecDeque<QueueEntry> {
-        let data = match std::fs::read(&self.queue_file) {
-            Ok(d) => d,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return VecDeque::new();
-            }
-            Err(e) => {
-                warn!("Failed to read queue file {:?}: {}", self.queue_file, e);
-                return VecDeque::new();
-            }
-        };
-
-        let entries: Vec<PersistEntry> = match serde_json::from_slice(&data) {
-            Ok(e) => e,
-            Err(e) => {
-                warn!("Queue file corrupt ({}), discarding", e);
-                let _ = std::fs::remove_file(&self.queue_file);
-                return VecDeque::new();
-            }
-        };
-
-        let mut queue = VecDeque::new();
-        for e in entries {
-            match CanonicalHash::try_from(ContentHash::new(e.hash)) {
-                Ok(hash) => queue.push_back(QueueEntry {
-                    hash,
-                    source: e.source,
-                }),
-                Err(e) => warn!("Dropping persisted queue entry: {e}"),
-            }
-        }
-        info!("Restored {} track(s) from queue file", queue.len());
-        queue
-    }
-
     pub async fn run(&self) -> Result<(), ServerError> {
         info!("Playback server starting...");
-
-        // Restore queue from disk.
-        let restored = self.load_queue().await;
-        *self.queue.lock().await = restored;
 
         // Background task: auto-advance to next queued track when current track finishes.
         tokio::spawn(auto_advance_task(self.poll_task()));
@@ -1350,6 +1525,7 @@ async fn poll_once(task: &PollTask, poll: &mut PollState) {
 mod tests {
     use super::*;
     use acid_client::AcidClient;
+    use library_ipc_client::ProtocolError;
     use std::sync::atomic::AtomicU64;
     use stream_source_protocol::{StreamCommand, StreamResponse};
 
@@ -1440,6 +1616,7 @@ mod tests {
             )),
             event_pub,
             acid_client,
+            RestoredQueue::default(),
         );
         Harness {
             server,
@@ -1693,24 +1870,276 @@ mod tests {
         assert_eq!(queued(&server).await, vec![full("d")]);
     }
 
-    #[tokio::test]
-    async fn load_queue_drops_persisted_entries_that_are_not_canonical() {
-        let server = make_server();
-        let persisted = [
-            PersistEntry {
-                hash: full("a").to_string(),
+    type LibraryAnswer = Result<TrackInfo, ClientError>;
+
+    fn track_with(hash: ContentHash) -> TrackInfo {
+        TrackInfo {
+            content_hash: hash,
+            title: None,
+            artist: None,
+            album: None,
+            duration: None,
+            bpm: None,
+            key: None,
+            blob_path: None,
+            cover_art_path: None,
+            track_number: None,
+            disc_number: None,
+            added: None,
+            started: None,
+            stopped: None,
+            memory_cues: vec![],
+            beat_grid: None,
+            role: None,
+            energy: None,
+            genre: None,
+            label: None,
+            styles: vec![],
+            marks: vec![],
+        }
+    }
+
+    /// The full hash a fake library answers for a prefix.
+    fn expanded(prefix: &str) -> ContentHash {
+        ContentHash::new(format!("sha256:{prefix:0<64}"))
+    }
+
+    fn canonical(prefix: &str) -> CanonicalHash {
+        CanonicalHash::try_from(expanded(prefix)).unwrap()
+    }
+
+    /// A fake library that knows every prefix.
+    fn knows_all(hash: &ContentHash) -> LibraryAnswer {
+        Ok(track_with(expanded(hash.as_str())))
+    }
+
+    fn unreachable_library() -> ClientError {
+        ClientError::from(nng::Error::TimedOut)
+    }
+
+    fn quick_retry() -> ResolveRetry {
+        ResolveRetry {
+            initial: vec![],
+            steady: Duration::from_millis(1),
+            request_timeout: Duration::ZERO,
+            deadline: Duration::from_secs(5),
+        }
+    }
+
+    fn persisted_json(hashes: &[&str]) -> Vec<u8> {
+        let entries: Vec<_> = hashes
+            .iter()
+            .map(|hash| PersistEntry {
+                hash: (*hash).to_string(),
                 source: SourceName::audio(),
-            },
-            PersistEntry {
-                hash: short().to_string(),
-                source: SourceName::audio(),
-            },
-        ];
-        std::fs::write(&server.queue_file, serde_json::to_vec(&persisted).unwrap()).unwrap();
-        let loaded = server.load_queue().await;
-        let _ = std::fs::remove_file(&server.queue_file);
-        let hashes: Vec<_> = loaded.iter().map(|e| e.hash.clone()).collect();
-        assert_eq!(hashes, vec![h("a")]);
+            })
+            .collect();
+        serde_json::to_vec(&entries).unwrap()
+    }
+
+    fn restored_hashes(queue: &VecDeque<QueueEntry>) -> Vec<CanonicalHash> {
+        queue.iter().map(|e| e.hash.clone()).collect()
+    }
+
+    /// Restore a queue file holding `data` with `resolve`; returns the queue
+    /// and the file's path (the directory lives as long as the guard).
+    fn restore_from(
+        data: &[u8],
+        resolve: &dyn Fn(&ContentHash) -> LibraryAnswer,
+        retry: &ResolveRetry,
+    ) -> (VecDeque<QueueEntry>, PathBuf, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("queue.json");
+        std::fs::write(&file, data).unwrap();
+        let queue = restore_queue(&file, resolve, retry);
+        (queue, file, dir)
+    }
+
+    #[test]
+    fn restore_queue_migrates_a_queue_written_by_0_38() {
+        let fixture = include_bytes!("../tests/fixtures/queue-0.38.json");
+        let (queue, file, _dir) = restore_from(fixture, &knows_all, &quick_retry());
+        assert_eq!(
+            restored_hashes(&queue),
+            vec![
+                canonical("c7ef816a7705"),
+                canonical("0123456789ab"),
+                canonical("fedcba987654"),
+            ]
+        );
+        assert_eq!(std::fs::read(rejected_path(&file)).unwrap(), fixture);
+    }
+
+    #[test]
+    fn restore_queue_keeps_the_order_of_a_mixed_file() {
+        let data = persisted_json(&[
+            expanded("a1").as_str(),
+            "9fb4105e0a1b",
+            expanded("b2").as_str(),
+        ]);
+        let (queue, _file, _dir) = restore_from(&data, &knows_all, &quick_retry());
+        assert_eq!(
+            restored_hashes(&queue),
+            vec![canonical("a1"), canonical("9fb4105e0a1b"), canonical("b2")]
+        );
+    }
+
+    #[test]
+    fn restore_queue_drops_unknown_and_ambiguous_prefixes_and_keeps_the_original() {
+        let resolve = |hash: &ContentHash| -> LibraryAnswer {
+            match hash.as_str() {
+                "aaaaaaaaaaaa" => Err(ClientError::Protocol(ProtocolError::TrackNotFound {
+                    hash: hash.to_string(),
+                })),
+                "bbbbbbbbbbbb" => Err(ClientError::Protocol(ProtocolError::AmbiguousHash {
+                    hash: hash.to_string(),
+                    candidates: vec![expanded("b1").to_string(), expanded("b2").to_string()],
+                })),
+                _ => knows_all(hash),
+            }
+        };
+        let data = persisted_json(&[
+            "aaaaaaaaaaaa",
+            expanded("d1").as_str(),
+            "bbbbbbbbbbbb",
+            "cccccccccccc",
+        ]);
+        let (queue, file, _dir) = restore_from(&data, &resolve, &quick_retry());
+        assert_eq!(
+            restored_hashes(&queue),
+            vec![canonical("d1"), canonical("cccccccccccc")]
+        );
+        assert_eq!(std::fs::read(rejected_path(&file)).unwrap(), data);
+    }
+
+    #[test]
+    fn restore_queue_retries_while_the_library_is_unreachable() {
+        let asked = std::cell::Cell::new(0);
+        let resolve = |hash: &ContentHash| -> LibraryAnswer {
+            asked.set(asked.get() + 1);
+            if asked.get() <= 2 {
+                Err(unreachable_library())
+            } else {
+                knows_all(hash)
+            }
+        };
+        let data = persisted_json(&["c7ef816a7705", "0123456789ab"]);
+        let (queue, _file, _dir) = restore_from(&data, &resolve, &quick_retry());
+        assert_eq!(
+            restored_hashes(&queue),
+            vec![canonical("c7ef816a7705"), canonical("0123456789ab")]
+        );
+        assert_eq!(asked.get(), 4);
+    }
+
+    #[test]
+    fn restore_queue_gives_up_within_the_deadline_and_keeps_canonical_entries() {
+        let resolve = |_: &ContentHash| -> LibraryAnswer { Err(unreachable_library()) };
+        let retry = ResolveRetry {
+            initial: vec![],
+            steady: Duration::from_millis(10),
+            request_timeout: Duration::from_millis(20),
+            deadline: Duration::from_millis(100),
+        };
+        let data = persisted_json(&[
+            expanded("a1").as_str(),
+            "c7ef816a7705",
+            expanded("b2").as_str(),
+            "0123456789ab",
+        ]);
+        let started = std::time::Instant::now();
+        let (queue, file, _dir) = restore_from(&data, &resolve, &retry);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(
+            restored_hashes(&queue),
+            vec![canonical("a1"), canonical("b2")]
+        );
+        assert_eq!(std::fs::read(rejected_path(&file)).unwrap(), data);
+    }
+
+    #[test]
+    fn restore_queue_of_canonical_entries_writes_no_copy_and_asks_nothing() {
+        let asked = std::cell::Cell::new(0);
+        let resolve = |hash: &ContentHash| -> LibraryAnswer {
+            asked.set(asked.get() + 1);
+            knows_all(hash)
+        };
+        let data = persisted_json(&[expanded("a1").as_str(), expanded("b2").as_str()]);
+        let (queue, file, _dir) = restore_from(&data, &resolve, &quick_retry());
+        assert_eq!(
+            restored_hashes(&queue),
+            vec![canonical("a1"), canonical("b2")]
+        );
+        assert_eq!(asked.get(), 0);
+        assert!(!rejected_path(&file).exists());
+    }
+
+    #[test]
+    fn restore_queue_moves_a_corrupt_file_instead_of_deleting_it() {
+        let (queue, file, _dir) = restore_from(b"not json", &knows_all, &quick_retry());
+        assert!(queue.is_empty());
+        assert!(!file.exists());
+        assert_eq!(std::fs::read(rejected_path(&file)).unwrap(), b"not json");
+    }
+
+    #[test]
+    fn restore_queue_never_overwrites_an_existing_rejected_file_for_corrupt_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("queue.json");
+        std::fs::write(rejected_path(&file), b"the first original").unwrap();
+        std::fs::write(&file, b"not json").unwrap();
+        let queue = restore_queue(&file, &knows_all, &quick_retry());
+        assert!(queue.is_empty());
+        assert!(!file.exists());
+        assert_eq!(
+            std::fs::read(rejected_path(&file)).unwrap(),
+            b"the first original"
+        );
+    }
+
+    #[test]
+    fn restore_queue_keeps_the_original_through_a_persist_and_a_second_restore() {
+        let fixture = include_bytes!("../tests/fixtures/queue-0.38.json");
+        let (queue, file, _dir) = restore_from(fixture, &knows_all, &quick_retry());
+        persist_queue_to_file(&file, &queue);
+        let again = restore_queue(&file, &knows_all, &quick_retry());
+        assert_eq!(restored_hashes(&again), restored_hashes(&queue));
+        assert_eq!(std::fs::read(rejected_path(&file)).unwrap(), fixture);
+    }
+
+    #[test]
+    fn restore_queue_still_resolves_when_the_original_cannot_be_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("queue.json");
+        let data = persisted_json(&[expanded("a1").as_str(), "c7ef816a7705"]);
+        std::fs::write(&file, &data).unwrap();
+        // A read-only directory makes creating the copy fail with an error
+        // other than AlreadyExists.
+        use std::os::unix::fs::PermissionsExt;
+        let dir_mode = |mode| {
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(mode)).unwrap()
+        };
+        dir_mode(0o555);
+        let asked = std::cell::Cell::new(0);
+        let resolve = |hash: &ContentHash| -> LibraryAnswer {
+            asked.set(asked.get() + 1);
+            knows_all(hash)
+        };
+        let queue = restore_queue(&file, &resolve, &quick_retry());
+        dir_mode(0o755);
+        assert_eq!(
+            restored_hashes(&queue),
+            vec![canonical("a1"), canonical("c7ef816a7705")]
+        );
+        assert_eq!(asked.get(), 1);
+        assert!(!rejected_path(&file).exists());
+    }
+
+    #[test]
+    fn restore_queue_of_a_missing_file_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue = restore_queue(&dir.path().join("queue.json"), &knows_all, &quick_retry());
+        assert!(queue.is_empty());
     }
 
     fn entry(s: &str) -> QueueEntry {
