@@ -14,6 +14,7 @@ interface = "playlist-edit"
 [dependencies]
 library-ipc-protocol = { workspace = true }
 library-projection = { workspace = true }
+sequence-merge = { workspace = true }
 thiserror = { workspace = true }
 track-formatter = { workspace = true }
 
@@ -23,3 +24,4 @@ test-support = []
 
 [dev-dependencies]
 pretty_assertions = { workspace = true }
+proptest = { workspace = true }

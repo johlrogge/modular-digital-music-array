@@ -29,9 +29,9 @@ Builds on ADR-027 (CAS playlist edits, `EditOp`, revert), ADR-026 (playlists hol
 
 ### 2. Rules
 
-1. **Added on Bandcamp:** the item is added only if it is not in base, so a local deletion stays deleted. It goes after its nearest predecessor in theirs that is present in ours; if there is none, at the end.
+1. **Added on Bandcamp:** the item is added only if it is not in base, so a local deletion stays deleted. It goes after its nearest predecessor in theirs that is present in the result. An item that is first in theirs goes first; otherwise, with no such predecessor, it goes at the end.
 2. **Removed on Bandcamp:** the item is removed if that occurrence is still present in ours.
-3. **Moved on Bandcamp:** the move is applied only if the item is unmoved locally. Unmoved means its predecessor among the items common to base and ours is the same in ours as in base.
+3. **Moved on Bandcamp:** Bandcamp's moved tracks are the shared tracks outside the longest sequence Bandcamp kept in order. A track you reordered locally keeps your order; Bandcamp's reorderings apply to tracks you didn't touch. You touched a track if you moved it past a track that neither you nor Bandcamp moved. Moving a track past one Bandcamp has since removed doesn't count. Reordering only among tracks Bandcamp also moved is not detected, and Bandcamp's order wins there. A move is placed like an add. A move whose anchor is gone stays where it is in ours.
 
 ### 3. Identity
 
@@ -57,6 +57,7 @@ Items are identified by occurrence keys `(key, n)`: the n-th occurrence of `key`
 2. `playlist_edit::ops_between(current, target) -> Vec<EditOp>` turns the target into ADR-027 ops.
 3. The ops are sent with `PlaylistEdit { version }`. That gives CAS, comment and short-ID preservation, an atomic write, and Undo via revert.
 4. On Conflict: re-snapshot and retry, up to 3 times. Base is saved only on Applied.
+   With duplicate items, a crash between the PlaylistEdit being applied and the new base being saved can add a duplicate copy on the next sync. Phase 3 must close that window, for example by recording the pending target or version in the link state before writing.
 5. The same merge is meant for rebasing offline edits (the ADR-016 outbox).
 
 ### 7. First sync with no base
@@ -75,9 +76,12 @@ Undo reverts the file but keeps the new base. Undone additions therefore count a
 
 - theirs == base implies the result is ours;
 - ours == base implies the result is theirs;
+- ours == theirs implies the result is ours;
 - local deletions never come back;
-- local-only items keep their relative order;
-- the merge is idempotent;
+- a track removed on Bandcamp is absent;
+- a track added on Bandcamp is present, unless you deleted it or already have it;
+- tracks only in the local playlist keep their relative order;
+- the merge is idempotent: `merge3(base, theirs, merge3(base, theirs, ours))` equals `merge3(base, theirs, ours)`. This holds for unique keys. With duplicates occurrences are renumbered from the result's order and it can fail;
 - every result item is in ours union theirs.
 
 ## Phased plan

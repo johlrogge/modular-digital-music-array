@@ -1,0 +1,17 @@
+[package]
+name = "sequence-merge"
+version.workspace = true
+edition = "2021"
+authors = ["MDMA Development Team"]
+repository = "https://github.com/johlrogge/modular-digital-music-array"
+license = "MIT"
+
+[package.metadata]
+
+[package.metadata.polylith]
+interface = "sequence-merge"
+
+[dependencies]
+
+[dev-dependencies]
+proptest = { workspace = true }
