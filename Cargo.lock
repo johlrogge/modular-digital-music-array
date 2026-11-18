@@ -6268,6 +6268,7 @@ dependencies = [
  "clap",
  "color-eyre",
  "event-protocol",
+ "library-ipc-client",
  "media-protocol",
  "music-facts",
  "nng",

@@ -4,13 +4,14 @@ mod server;
 pub(crate) mod stream_client;
 
 use acid_client::AcidClient;
-use server::Server;
+use server::{Server, LIBRARY_REQUEST_TIMEOUT};
 use service::{ServiceConfig, ServiceSockets};
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::Parser;
 use color_eyre::Result;
+use library_ipc_client::LibraryClient;
 use stream_client::StreamClient;
 use tokio::runtime::Runtime;
 use tracing::info;
@@ -41,6 +42,15 @@ struct Args {
     /// Socket address of the mdma-audio source
     #[arg(long, default_value = "ipc:///run/mdma/streams/audio.sock")]
     audio_socket: String,
+
+    /// Library service socket address, used only to migrate a persisted queue
+    /// written with short hashes (ADR-026)
+    #[arg(
+        long,
+        env = "MDMA_LIBRARY_SOCKET",
+        default_value = "ipc:///run/mdma/library.sock"
+    )]
+    library_socket: String,
 }
 
 fn main() -> Result<()> {
@@ -61,6 +71,14 @@ fn main() -> Result<()> {
     let audio_client = StreamClient::connect(&args.audio_socket)?;
     let audio = Arc::new(tokio::sync::Mutex::new(audio_client));
 
+    // Restore the queue before the command socket exists: a request that
+    // arrived during the restore would be served after its client gave up. The
+    // dial does not wait for the library; each request is bounded.
+    let library =
+        LibraryClient::connect_with_timeout(&args.library_socket, LIBRARY_REQUEST_TIMEOUT)?;
+    // Blocking is fine: nothing else runs on the runtime yet.
+    let restored = server::restore(&args.queue_file, &library);
+
     let ServiceSockets {
         rep_socket: socket,
         event_socket: event_pub_opt,
@@ -73,7 +91,14 @@ fn main() -> Result<()> {
     info!("Event publishing on {}", args.event_socket);
 
     let acid_client = Arc::new(AcidClient::connect(&args.acid_socket)?);
-    let server = Server::new(audio, socket, args.queue_file, event_pub, acid_client);
+    let server = Server::new(
+        audio,
+        socket,
+        args.queue_file,
+        event_pub,
+        acid_client,
+        restored,
+    );
     runtime.block_on(server.run())?;
 
     Ok(())

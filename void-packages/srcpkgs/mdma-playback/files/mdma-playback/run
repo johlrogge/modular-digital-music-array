@@ -10,4 +10,5 @@ export RUST_LOG=info
 exec chpst -u mdma:mdma /usr/bin/mdma-playback \
 	--socket ipc:///run/mdma/playback.sock \
 	--acid-socket ipc:///run/mdma/acid.sock \
-	--audio-socket ipc:///run/mdma/streams/audio.sock
+	--audio-socket ipc:///run/mdma/streams/audio.sock \
+	--library-socket ipc:///run/mdma/library.sock

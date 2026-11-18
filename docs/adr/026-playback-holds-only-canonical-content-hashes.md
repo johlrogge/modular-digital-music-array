@@ -45,13 +45,13 @@ An old CLI sends prefixes; a new playback refuses them. Roll out the clients (CL
 - A client that sends a prefix to the new playback gets an error that names the fix, instead of silent corruption.
 - A prefix for a track the library no longer knows cannot be sent through `queue edit` or `queue replace`: resolution fails on the first, naming it. Remove that line and save again. A full hash passes through unchanged. (**Superseded by the amendment 2026-11-16**: full hashes are resolved too.)
 - The console answers 422 with the resolver's message when the library refuses the hash (unknown, ambiguous, or answering with a non-full hash), and 503 when the library cannot be reached (a transport failure), before playback is contacted. The CLI reports both as the error text.
-- Persisted queue entries that were prefixes are dropped at the first start of the new playback, with a warning.
+- Persisted queue entries that were prefixes are dropped at the first start of the new playback, with a warning. (Amended 2026-11-18, B1: they are resolved through the library instead.)
 - `queue edit` writes the full hash for entries the library cannot show, so they survive the round-trip. When a save is rejected, the edited text is kept in a file whose path is in the error.
 - ADR-017's claim that short-hash entities came from "older playback" is corrected in its Context and §6.4.
 
 ## Alternatives considered
 
-- **Playback resolves prefixes itself** (calls the library). Rejected: a second resolver is a second place the rule can drift, and playback would gain a dependency and fail when the library is down.
+- **Playback resolves prefixes itself** (calls the library). Rejected (Amended 2026-11-18, B1: playback calls the library resolver, but only to migrate a persisted queue file at startup; commands are still refused): a second resolver is a second place the rule can drift, and playback would gain a dependency and fail when the library is down.
 - **Resolve in the gateway.** Rejected: the gateway forwards `Command` unchanged (ADR-017), and direct IPC clients bypass it.
 - **Normalise a prefix in playback by zero-padding or guessing.** Rejected: a prefix is only unique with the library's whole track set in view.
 - **Keep accepting prefixes and only widen the reader workaround.** Rejected: plays recorded under a prefix can move to another track later, so no reader can make them right.
@@ -112,3 +112,27 @@ The first unresolved entry fails the whole batch with its 1-based position (`Unp
 ### A8. Deploy
 
 Gateway, library and console together, because they decode the new types (see ADR-004). Then the CLI and TUI. There is no PlaylistGet fallback.
+
+## Amendment 2026-11-18: playback migrates a persisted queue through the library
+
+Updates §2.3 ("Playback has no library dependency") and §2.4 ("`load_queue` drops persisted entries that are not canonical"). Both stay above as written. Found in 0.39.0: a prod queue of 30 tracks written by 0.38.1 (12-hex short hashes in `/metadata/queue.json`) was emptied at the first start, one "Dropping persisted queue entry" warning per track. Fixed in 0.39.1.
+
+### B1. One call, at startup only
+
+1. **Decided:** playback depends on `library-ipc-client` for one purpose: migrating the persisted queue file (`server::restore`), before the command socket is bound, so no request is served late. Each entry that is not canonical is resolved with `library_ipc_client::resolve_full_hash`, in file order, so a mixed file keeps its order. Entries that already are canonical are not looked up. This does not contradict A1.1 ("Full hashes are resolved too, with no canonical shortcut"): A1 resolves against the set the command works on, and a canonical entry of the persisted queue already belongs to that set, whose own Replace and Remove rules keep stale entries (A1.2). Looking canonical entries up in the library would drop tracks the library has lost, and would empty the queue whenever the library is down.
+2. **Commands are still refused.** A prefix in QueueNext, QueueAppend, QueueReplace, QueueRemove or Preview gets the §2.2 error. Playback does not resolve on behalf of clients.
+3. **There is no second resolver.** Playback holds no prefix matching; unknown and ambiguous prefixes come back typed from the library's resolver and the entry is dropped with `warn!(hash, error)`. `info!` reports how many entries were restored and how many dropped.
+4. `--library-socket` (env `MDMA_LIBRARY_SOCKET`, default `ipc:///run/mdma/library.sock`) names the library. The dial does not wait for the library, so playback starts without it.
+
+### B2. The original is kept
+
+- A file with any entry that is not canonical is copied to `queue.json.rejected` (same directory) before anything is resolved, so a later persist of the queue cannot lose it.
+- A file that is not valid JSON is moved to `queue.json.rejected` (copied, then removed) instead of deleted.
+- An existing `.rejected` is never overwritten: it is created exclusively, so the first original wins. For a corrupt file this means the earlier original stays and the corrupt file is discarded.
+- If the copy cannot be made, playback warns with the reason and restores as usual: resolving loses nothing, so only the entries the library cannot resolve are lost, and only once the queue is persisted again.
+- A file whose entries are all canonical writes no copy.
+- To recover by hand, stop playback, copy `queue.json.rejected` over `queue.json`, and start playback again, once the library is answering. Remove `.rejected` first if a fresh original should be kept next time.
+
+### B3. Waiting for the library
+
+Under runit playback depends on mdma-audio, which depends on mdma-library, so the library is started before playback. The waiting covers a library that is up but not answering yet, or one that restarts during startup. While a lookup fails with a transport error (`ResolveError::is_transport`), playback asks again after 0.5, 1, 2, 4 and 8 s, then every 8 s. The 60 s cap counts the next wait and one request timeout (5 s), so the restore ends after about 60 s (one request can take up to its send and receive timeouts). The first answer that is not a transport error ends the waiting. If the library stays unreachable, the canonical entries are kept, the others dropped, and playback warns "Library unreachable; original kept at queue.json.rejected". It starts either way and never panics. The restore runs before the command socket is bound, so clients get a refused connection rather than a late answer while it waits.
