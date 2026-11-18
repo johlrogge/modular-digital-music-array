@@ -3,9 +3,9 @@
 // playback route. A plain tap on a row or card opens a menu or a page and NEVER plays; the one
 // exception is a preview row (opts.preview, the playlist workbench), which can always go Back.
 // Play now is offered only when logic.isIdle(store.player) (paused counts as playing).
-import { $$, typing, h, icon, store, actions, setOf, enc, fmt, fmtTotal, plural, openMenu, on, onView, playlistHref, marksOf, macroForKey, keyText } from "./core.js";
+import { $$, typing, h, icon, store, actions, setOf, enc, fmt, fmtTotal, plural, openMenu, on, onView, playlistHref, marksOf, macroForKey, keyText, api, toast, loadPlaylists, editPlaylist, revertPlaylist } from "./core.js";
 import { art } from "./art.js";
-import { isIdle, groupAlbums, trackTitle, sortTracks, placeholderTrack, albumCovers, coverOf, LIKED, markLabel } from "./logic.js";
+import { isIdle, groupAlbums, trackTitle, sortTracks, placeholderTrack, albumCovers, coverOf, LIKED, markLabel, appendOps, editOutcome, addedAndSkipped } from "./logic.js";
 import { narrowedView, matchSet, setSort, SEARCH_FAILED_NOTE, FILTERS_EMPTY_NOTE } from "./narrow.js";
 
 const PAGE = 60;
@@ -129,7 +129,8 @@ export function trackMenu(anchor, track, extra, opts) {
   const flip = (m) => () => (marks.includes(m) ? actions.unmark : actions.mark)(track.hash, label, m);
   items.push("-", ["heart", marks.includes(LIKED) ? "Unlike (M)" : "Like (M)", flip(LIKED)]);
   store.macros.forEach((m, i) => items.push(["tag", (marks.includes(m) ? "Remove " + markLabel(m) + " mark" : "Mark as " + markLabel(m)) + " (Shift+" + (i + 1) + ")", flip(m)]));
-  items.push(["sliders", "Set energy…", () => energyMenu(anchor, [track], label)]);
+  items.push(["sliders", "Set energy ›", () => energyMenu(anchor, [track], label)]);
+  items.push(["plus", "Add to playlist ›", () => playlistMenu(anchor, [track], label)]);
   const nav = [];
   if (track.album) nav.push(["disc", "Go to album", () => (location.hash = "#/album/" + enc(track.album))]);
   if (track.artist) nav.push(["user", "Go to artist", () => (location.hash = "#/artist/" + enc(track.artist))]);
@@ -154,6 +155,74 @@ export function energyMenu(anchor, tracks, label) {
   }
   if (now.some((e) => e !== null)) items.push("-", ["close", "Clear energy", () => actions.setEnergy(tracks, null, label)]);
   openMenu(anchor, items, ["Energy", label]);
+}
+
+/** How many times an add tries: a stale version (409) comes with the playlist as it is now, and the add goes again against that. */
+const ADD_ATTEMPTS = 2;
+
+/** Send the append of `hashes` to `name`, read first; a 409 retries against the `current` it carries (ADR-027 §5.1), up to ADD_ATTEMPTS. */
+async function appendTo(name, hashes, duplicates) {
+  let snap = await api("/api/playlists/" + enc(name));
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await editPlaylist(name, snap.version, appendOps(snap, hashes, duplicates));
+    } catch (e) {
+      if (e.status !== 409 || !e.body || !e.body.current || attempt >= ADD_ATTEMPTS) throw e;
+      snap = e.body.current;
+    }
+  }
+}
+
+/**
+ * Append `hashes` to playlist `name` at its end (ADR-027 §9): the same Insert the workbench sends.
+ * `duplicates` is "Skip" (the default) or "Keep". The toast offers Undo (a revert to the file as it
+ * was before, at the new version) and, when some were skipped as duplicates, "Add again". `before`
+ * is the file before an earlier add of the same pick: Add again hands it on, so one Undo takes
+ * both adds back.
+ */
+export async function addToPlaylist(name, hashes, duplicates = "Skip", before = null) {
+  let res;
+  try {
+    res = await appendTo(name, hashes, duplicates);
+  } catch (e) {
+    toast(e.status === 409 ? "“" + name + "” changed elsewhere. Try again." : "Couldn't add to “" + name + "”: " + e.message);
+    return;
+  }
+  loadPlaylists();
+  const { wrote, skipped } = editOutcome(res);
+  const back = before ?? res.previous;
+  const undo = [
+    "Undo",
+    async () => {
+      try {
+        await revertPlaylist(name, res.snapshot.version, back);
+        loadPlaylists();
+        toast("Removed from " + name);
+      } catch (e) {
+        toast(e.status === 409 ? "“" + name + "” changed since; can't undo" : "Couldn't undo");
+      }
+    },
+  ];
+  const again = ["Add again", () => addToPlaylist(name, skipped, "Keep", back)];
+  if (skipped.length) {
+    if (wrote) toast(addedAndSkipped(hashes.length - skipped.length, skipped.length, name), [undo, again]);
+    else toast(plural(skipped.length, "track") + " already in " + name, [again]);
+  } else if (wrote) toast("Added to " + name, [undo]);
+  else toast("Nothing changed");
+}
+
+/**
+ * Second-level menu: every playlist by name, picking one appends `tracks` to it. The playlist on
+ * screen (its page or workbench) is disabled: the workbench holds its own version of it.
+ */
+export function playlistMenu(anchor, tracks, label) {
+  const names = (store.playlists || []).map((p) => p.name).sort((a, b) => a.localeCompare(b));
+  const items = names.map((name) => {
+    const here = location.hash === playlistHref(name) || location.hash.startsWith(playlistHref(name) + "/");
+    return ["plus", name + (here ? " (this playlist)" : ""), () => addToPlaylist(name, tracks.map((t) => t.hash)), null, here];
+  });
+  if (!items.length) items.push([null, "No playlists yet", () => {}, null, true]);
+  openMenu(anchor, items, ["Add to playlist", label]);
 }
 
 /** Menu for a set of tracks (a card or a collection): Play now only when idle, Queue next, Queue last, Replace queue. */
@@ -495,8 +564,9 @@ export function queueButtons(set, subject, { suffix = "" } = {}) {
 export function bulkBar(tracks) {
   if (!tracks.length) return null;
   const what = plural(tracks.length, "track");
-  const energy = h("button", { class: "btn", "aria-haspopup": "menu", onclick: (e) => energyMenu(e.currentTarget, tracks, what) }, [icon("sliders", "sm"), "Set energy…"]);
-  return h("div", { class: "bulk" }, [h("span", { class: "kicker", text: what + " match" }), queueButtons(setOf(tracks), what), energy]);
+  const energy = h("button", { class: "btn", "aria-haspopup": "menu", onclick: (e) => energyMenu(e.currentTarget, tracks, what) }, [icon("sliders", "sm"), "Set energy ›"]);
+  const add = h("button", { class: "btn", "aria-haspopup": "menu", onclick: (e) => playlistMenu(e.currentTarget, tracks, what) }, [icon("plus", "sm"), "Add to playlist ›"]);
+  return h("div", { class: "bulk" }, [h("span", { class: "kicker", text: what + " match" }), queueButtons(setOf(tracks), what), energy, add]);
 }
 
 /** A page's heading row: title, an optional line under it, an optional `link` node, and the Settings gear on phones. */

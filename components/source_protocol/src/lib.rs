@@ -370,7 +370,8 @@ pub enum SyncWaitEnd {
 pub enum ImportTrackOutcome {
     /// Exactly one library track matched.
     Matched { hash: String },
-    /// Several library tracks matched; never written.
+    /// Several library tracks matched; every candidate is written, side by
+    /// side, for the user to prune.
     Ambiguous { candidates: Vec<String> },
     /// Artist and title match but the duration is outside tolerance
     /// (probably a different version); never written.
@@ -482,6 +483,37 @@ pub struct PlaylistLinkInfo {
     pub pending: Vec<PendingPlaylistTrack>,
     /// Unix seconds of the last completed sync; `None` before the first.
     pub last_synced: Option<u64>,
+    /// The Bandcamp playlist's stable id, which a listing carries as the
+    /// summary's `id` whatever spelling the URL has. `None` for a link made
+    /// before ids were kept, until its next link or sync.
+    #[serde(default)]
+    pub bandcamp_id: Option<BandcampPlaylistId>,
+}
+
+/// A Bandcamp playlist by its id: `PlaylistSummary.id` of the fan's listing
+/// and `Playlist.id` of a fetched playlist are the same number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct BandcampPlaylistId(u64);
+
+impl BandcampPlaylistId {
+    pub fn new(id: u64) -> Self {
+        Self(id)
+    }
+}
+
+impl std::str::FromStr for BandcampPlaylistId {
+    type Err = std::num::ParseIntError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        s.parse().map(Self)
+    }
+}
+
+impl fmt::Display for BandcampPlaylistId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.0, f)
+    }
 }
 
 /// What it takes to undo a sync with `PlaylistRevert` (ADR-027).
@@ -1119,6 +1151,18 @@ mod tests {
     }
 
     #[test]
+    fn a_link_without_an_id_still_parses() {
+        let old = r#"{"local":"friday","source":"s","pending":[],"last_synced":null}"#;
+        let info: PlaylistLinkInfo = serde_json::from_str(old).unwrap();
+        assert_eq!(info.bandcamp_id, None);
+        assert_eq!(
+            "982341".parse::<BandcampPlaylistId>().unwrap().to_string(),
+            "982341"
+        );
+        assert!("pl1".parse::<BandcampPlaylistId>().is_err());
+    }
+
+    #[test]
     fn source_error_invalid_request_roundtrip() {
         let resp = SourceResponse::Error(SourceError::InvalidRequest {
             message: "bad name".to_string(),
@@ -1267,6 +1311,7 @@ mod tests {
                 artist: "N".to_string(),
             }],
             last_synced: Some(1_700_000_000),
+            bandcamp_id: Some(BandcampPlaylistId::new(982341)),
         };
         let report = PlaylistSyncReport {
             local,

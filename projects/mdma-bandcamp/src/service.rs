@@ -738,6 +738,7 @@ impl BandcampService {
         source: &str,
     ) -> Result<PlaylistLinkInfo, SourceError> {
         let fetched = self.fetch_playlist(source).await?;
+        let id = fetched.id.parse().ok();
         let socket = self.library_socket.clone();
         let (store, lock) = (self.links.clone(), Arc::clone(&self.link_lock));
         tokio::task::spawn_blocking(move || -> Result<PlaylistLinkInfo, PlaylistSyncError> {
@@ -748,7 +749,7 @@ impl BandcampService {
                 .map_err(|e| library_error(&local, e))?;
             let _held = lock.lock();
             let mut links = store.load()?;
-            let info = links.link(local, fetched.url);
+            let info = links.link(local, fetched.url, id);
             store.save(&links)?;
             Ok(info)
         })
@@ -854,6 +855,7 @@ impl BandcampService {
         on_phase: impl Fn(PlaylistSyncPhase),
         on_progress: impl Fn(ImportSyncProgress),
     ) -> Result<PlaylistSyncReport, SourceError> {
+        let playlist_id = fetched.id.parse().ok();
         let tracks: Arc<[SourcePlaylistTrack]> = fetched.tracks.into();
         let outcomes = self
             .resolve_outcomes(
@@ -883,6 +885,13 @@ impl BandcampService {
             let client = LibraryClient::connect(&socket)
                 .map_err(|e| PlaylistSyncError::Library(e.to_string()))?;
             let _held = lock.lock();
+            // A link made before ids were kept learns its id here.
+            if let Some(id) = playlist_id {
+                let mut links = store.load()?;
+                if links.set_playlist_id(&local, &source, id) {
+                    store.save(&links)?;
+                }
+            }
             sync_playlist(&client, &store, &local, &source, &items, unix_now())
         })
         .await
@@ -983,16 +992,39 @@ impl BandcampService {
         };
 
         match client.list_playlists(&username).await {
-            Ok(playlists) => SourceResponse::Playlists(
-                playlists
+            Ok(playlists) => {
+                let summaries: Vec<SourcePlaylistSummary> = playlists
                     .into_iter()
                     .map(to_source_playlist_summary)
-                    .collect(),
-            ),
+                    .collect();
+                self.backfill_link_ids(&summaries).await;
+                SourceResponse::Playlists(summaries)
+            }
             Err(e) => {
                 tracing::error!(error = %e, "Failed to list playlists");
                 SourceResponse::Error(playlist_error(&e, None))
             }
+        }
+    }
+
+    /// One-time migration: links made before ids were kept learn their id
+    /// from the listing. A failure is logged; the listing still goes out.
+    async fn backfill_link_ids(&self, listed: &[SourcePlaylistSummary]) {
+        let (store, lock) = (self.links.clone(), Arc::clone(&self.link_lock));
+        let listed = listed.to_vec();
+        let result = tokio::task::spawn_blocking(move || -> Result<(), String> {
+            let _held = lock.lock();
+            let mut links = store.load().map_err(|e| e.to_string())?;
+            if links.backfill_ids(&listed) {
+                store.save(&links).map_err(|e| e.to_string())?;
+            }
+            Ok(())
+        })
+        .await;
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::warn!(error = %e, "Could not backfill playlist link ids"),
+            Err(e) => tracing::warn!(error = %e, "Playlist link id backfill task failed"),
         }
     }
 
@@ -3453,6 +3485,11 @@ mod tests {
                     assert_eq!(links[0].pending[0].title, "Nothing");
                     assert_eq!(links[0].pending[0].source_track_id, "2");
                     assert!(links[0].last_synced.is_some());
+                    // The link was made without an id: the sync fills it in.
+                    assert_eq!(
+                        links[0].bandcamp_id,
+                        Some(source_protocol::BandcampPlaylistId::new(1))
+                    );
                 }
                 other => panic!("expected PlaylistLinks, got {other:?}"),
             }

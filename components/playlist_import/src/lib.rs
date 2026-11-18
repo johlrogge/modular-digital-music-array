@@ -16,7 +16,7 @@ mod write;
 mod fixtures;
 
 pub use lookup::{LibraryTrackLookup, LookupError};
-pub use matching::{match_source_playlist, matched_hashes, TrackOutcome};
+pub use matching::{match_source_playlist, matched_hashes, Candidates, TrackOutcome};
 pub use naming::{default_import_name, sanitize_playlist_name};
 pub use report::{format_import_status, format_write_outcome};
 pub use wire::{has_owned_missing, to_import_reports};

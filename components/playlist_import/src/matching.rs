@@ -3,11 +3,28 @@
 use library_ipc_client::ContentHash;
 use track_matcher::{CandidateTrack, MatchConfidence, MatchResult, TrackLookup};
 
+/// The library tracks an ambiguous item matched: at least two, in the order
+/// the matcher returned them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Candidates(Vec<ContentHash>);
+
+impl Candidates {
+    /// `None` unless there are at least two hashes: fewer is not ambiguous.
+    pub fn new(hashes: Vec<ContentHash>) -> Option<Self> {
+        (hashes.len() >= 2).then_some(Self(hashes))
+    }
+
+    pub fn as_slice(&self) -> &[ContentHash] {
+        &self.0
+    }
+}
+
 /// Result of matching one source playlist track against the library.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TrackOutcome {
     Matched(ContentHash),
-    Ambiguous(Vec<ContentHash>),
+    /// Several library tracks matched; every candidate is written.
+    Ambiguous(Candidates),
     /// Artist and title match but every library duration is outside the
     /// matcher's tolerance: probably a different version (e.g. a radio edit).
     /// Never written to the playlist.
@@ -47,11 +64,23 @@ pub fn match_source_playlist(
                     }
                 }
                 MatchResult::Definitive(hash, _) => TrackOutcome::Matched(hash),
-                MatchResult::Ambiguous(hashes, _) => TrackOutcome::Ambiguous(hashes),
+                MatchResult::Ambiguous(hashes, _) => from_candidates(hashes),
                 MatchResult::NoMatch => TrackOutcome::Missing,
             }
         })
         .collect()
+}
+
+/// The outcome for the library tracks the matcher called ambiguous. The
+/// matcher gives at least two; fewer are not ambiguous.
+fn from_candidates(mut hashes: Vec<ContentHash>) -> TrackOutcome {
+    if hashes.len() == 1 {
+        return TrackOutcome::Matched(hashes.remove(0));
+    }
+    match Candidates::new(hashes) {
+        Some(candidates) => TrackOutcome::Ambiguous(candidates),
+        None => TrackOutcome::Missing,
+    }
 }
 
 /// The matcher fell back to artist+title although the source has a duration,
@@ -80,18 +109,23 @@ fn definitive_with_duration(
             library_secs,
             source_secs,
         },
-        // Cannot tell how it differs: do not write it silently.
-        None => TrackOutcome::Ambiguous(vec![hash]),
+        // The matcher treats an unknown library duration as passing its
+        // duration filter, so such a track is a match.
+        None => TrackOutcome::Matched(hash),
     }
 }
 
-/// Content hashes of the definitive matches, in playlist order.
+/// Content hashes to write, in playlist order: a matched item
+/// gives its hash, an ambiguous item gives every candidate, in the order the
+/// matcher returned them, side by side where the item sits (the user removes
+/// the unwanted ones). Duration mismatches and missing tracks give none.
 pub fn matched_hashes(outcomes: &[TrackOutcome]) -> Vec<ContentHash> {
     outcomes
         .iter()
-        .filter_map(|o| match o {
-            TrackOutcome::Matched(h) => Some(h.clone()),
-            _ => None,
+        .flat_map(|o| match o {
+            TrackOutcome::Matched(h) => vec![h.clone()],
+            TrackOutcome::Ambiguous(candidates) => candidates.as_slice().to_vec(),
+            TrackOutcome::DurationMismatch { .. } | TrackOutcome::Missing => Vec::new(),
         })
         .collect()
 }
@@ -107,7 +141,7 @@ mod tests {
         let outcomes = match_source_playlist(&sample_tracks(), &sample_lookup());
         assert_eq!(outcomes.len(), 4);
         assert_eq!(outcomes[0], TrackOutcome::Matched(hash("1111111111111111")));
-        assert!(matches!(&outcomes[1], TrackOutcome::Ambiguous(h) if h.len() == 2));
+        assert!(matches!(&outcomes[1], TrackOutcome::Ambiguous(c) if c.as_slice().len() == 2));
         assert_eq!(outcomes[2], TrackOutcome::Missing);
         assert_eq!(outcomes[3], TrackOutcome::Matched(hash("4444444444444444")));
     }
@@ -132,6 +166,30 @@ mod tests {
     }
 
     #[test]
+    fn a_library_track_without_a_duration_is_matched_and_written() {
+        let candidate = CandidateTrack {
+            isrc: None,
+            artist: Some("A".into()),
+            title: Some("One".into()),
+            duration_secs: Some(545),
+        };
+        let lookup = FakePlaylistLookup {
+            entries: vec![("a", "one", vec![(hash("5555555555555555"), None)])],
+        };
+        let outcome = definitive_with_duration(&candidate, hash("5555555555555555"), 545, &lookup);
+        assert_eq!(outcome, TrackOutcome::Matched(hash("5555555555555555")));
+        assert_eq!(matched_hashes(&[outcome]), [hash("5555555555555555")]);
+    }
+
+    #[test]
+    fn candidates_need_at_least_two_hashes() {
+        assert!(Candidates::new(vec![]).is_none());
+        assert!(Candidates::new(vec![hash("11")]).is_none());
+        let two = Candidates::new(vec![hash("11"), hash("22")]).unwrap();
+        assert_eq!(two.as_slice(), [hash("11"), hash("22")]);
+    }
+
+    #[test]
     fn unknown_source_duration_still_matches_on_artist_title() {
         let lookup = FakePlaylistLookup {
             entries: vec![("a", "one", vec![(hash("5555555555555555"), Some(210))])],
@@ -144,11 +202,16 @@ mod tests {
     }
 
     #[test]
-    fn matched_hashes_keeps_only_definitive_in_order() {
+    fn matched_hashes_adds_every_ambiguous_candidate_in_place() {
         let outcomes = match_source_playlist(&sample_tracks(), &sample_lookup());
         assert_eq!(
             matched_hashes(&outcomes),
-            [hash("1111111111111111"), hash("4444444444444444")]
+            [
+                hash("1111111111111111"),
+                hash("2222222222222222"),
+                hash("3333333333333333"),
+                hash("4444444444444444")
+            ]
         );
     }
 }

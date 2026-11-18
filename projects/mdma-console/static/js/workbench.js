@@ -22,8 +22,8 @@
 // the toast's Back action ends it. What a preview holds and goes back to is the node's (ADR-031),
 // and so is which track is the preview: every row of it shows as previewing. The previewing row
 // expands into a timeline (timeline.js): seek, cues, bar lines and beat steps.
-import { $, $$, h, icon, route, store, api, enc, playlistHref, plural, toast, catalogue, loadPlaylists, actions } from "./core.js";
-import { trackTitle } from "./logic.js";
+import { $, $$, h, icon, route, store, playlistHref, plural, toast, catalogue, loadPlaylists, actions, editPlaylist, revertPlaylist } from "./core.js";
+import { trackTitle, appendOps, editOutcome, insertedCount, addedAndSkipped } from "./logic.js";
 import { narrowedTracks, emptyNote, dragList, STEP } from "./lists.js";
 import { NO_MUSIC, NONE, backLink } from "./collections.js";
 import { load, notes, rowsOf, PLAYLIST_ROW } from "./playlist.js";
@@ -65,7 +65,6 @@ function historyButton(name, iconId, stack, run, busy) {
 
 function viewWorkbench(root, params) {
   const name = params.name;
-  const path = "/api/playlists/" + enc(name);
   const undo = [];
   const redo = [];
   const wb = h("div", { class: "wb", "data-show": "lib", "aria-busy": "false" });
@@ -129,13 +128,13 @@ function viewWorkbench(root, params) {
   }
 
   /**
-   * POST `makeBody()` to /api/playlists/{name}/{action} at the version last seen. Resolves the body
-   * of an applied answer, else null: after a failure, and for a call made while another is out.
-   * On 409 the playlist is redrawn from `current`, the history is dropped, and a toast offers
-   * `retry` when there is one. `at`: the row to focus afterwards (see show). `makeBody` runs here,
-   * once the call is let through, so it sees the snapshot the request is sent against.
+   * Run `call(version)` (core.js editPlaylist or revertPlaylist) at the version last seen. Resolves
+   * the body of an applied answer, else null: after a failure, and for a call made while another
+   * is out. On 409 the playlist is redrawn from `current`, the history is dropped, and a toast
+   * offers `retry` when there is one. `at`: the row to focus afterwards (see show). `call` runs
+   * here, once the call is let through, so it sees the snapshot the request is sent against.
    */
-  async function send(action, makeBody, retry, at) {
+  async function send(call, retry, at) {
     if (busy) return null;
     busy = true;
     wb.setAttribute("aria-busy", "true");
@@ -143,7 +142,7 @@ function viewWorkbench(root, params) {
     try {
       let res;
       try {
-        res = await api(path + "/" + action, { body: { version: snap.version, ...makeBody() } });
+        res = await call(snap.version);
       } catch (e) {
         if (e.status === 409 && e.body && e.body.current) {
           undo.length = redo.length = 0;
@@ -165,26 +164,28 @@ function viewWorkbench(root, params) {
 
   /** Send the ops `ops()` returns. `said` is the toast for a change; `retry` is offered after a conflict. */
   async function edit(ops, said, retry, at) {
-    const res = await send("edit", () => ({ ops: ops() }), retry, at);
+    let sent = [];
+    const res = await send((version) => editPlaylist(name, version, (sent = ops())), retry, at);
     if (!res) return;
-    const wrote = res.previous != null;
+    const { wrote, skipped } = editOutcome(res);
     if (wrote) {
       undo.push(res.previous);
       redo.length = 0;
       paintHistory();
     }
-    const skipped = res.skipped.map((s) => s.hash);
-    // The toast has one action. With some tracks added and some skipped, "Add again" gets it and
-    // Undo stays on the toolbar.
-    if (skipped.length) toast(plural(skipped.length, "track") + " already in the playlist", () => add(skipped, "Keep", "Added again"), "Add again");
-    else if (wrote) toast(said, undoIt);
+    // Each edit is a step of the history, so Undo here takes back the newest one only: after
+    // "Add again" it is the toast's, or the toolbar's, once more for the first.
+    if (skipped.length) {
+      const text = wrote ? addedAndSkipped(insertedCount(sent) - skipped.length, skipped.length, name) : plural(skipped.length, "track") + " already in " + name;
+      toast(text, [...(wrote ? [["Undo", undoIt]] : []), ["Add again", () => add(skipped, "Keep", "Added again")]]);
+    } else if (wrote) toast(said, undoIt);
     else toast("Nothing changed");
   }
 
   /** Put the newest of `from` back as the playlist; what it replaced goes on `to`. */
   async function travel(from, to, said, back, label) {
     if (!from.length) return;
-    const res = await send("revert", () => ({ content: from[from.length - 1] }));
+    const res = await send((version) => revertPlaylist(name, version, from[from.length - 1]));
     if (!res) return;
     from.pop();
     if (res.previous != null) to.push(res.previous);
@@ -197,7 +198,7 @@ function viewWorkbench(root, params) {
   // The ops. Rows carry their own position (`at`, 0-based, as the server counts), so they are
   // right even in a narrowed pane. The server says whether an op is valid.
   const add = (hashes, duplicates, said) =>
-    edit(() => [{ op: "Insert", at: snap.entries.length, hashes, duplicates }], said, () => add(hashes, duplicates, said));
+    edit(() => appendOps(snap, hashes, duplicates), said, () => add(hashes, duplicates, said));
   const addTrack = (t) => add([t.hash], "Skip", "Added " + quoted(t));
   const remove = (t) => edit(() => [{ op: "Remove", at: t.at }], "Removed " + quoted(t), undefined, t.at);
   const move = (from, to) => edit(() => [{ op: "Move", from, to }], "Moved to position " + (to + 1), undefined, to);

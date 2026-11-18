@@ -8,7 +8,7 @@
 // (workbench.js), which uses the server's edit routes (ADR-027 §9). A playlist linked to Bandcamp
 // shows a badge and a Sync button (ADR-032): the sync is a job the page starts and polls, and its
 // toast offers Undo; an unlinked one offers "Link to Bandcamp…".
-import { h, icon, route, store, api, enc, playlistHref, toast, loadPlaylists, ofPlaylist, setOf, askName, askText } from "./core.js";
+import { h, icon, route, store, api, enc, plural, playlistHref, toast, loadPlaylists, ofPlaylist, setOf, askName, askText, openMenu, closeMenu, revertPlaylist } from "./core.js";
 import { playlistRows, albumCovers } from "./logic.js";
 import { songCounts } from "./lists.js";
 import { restoreBinned } from "./bin.js";
@@ -46,18 +46,16 @@ export const notes = (name) => ({
 /**
  * Delete playlist `name` (at `version`) into the bin, at once: no confirm, because the toast's Undo
  * restores it by the bin id the server answers. Then back to the playlist list. A stale version
- * (409) changes nothing and says so.
+ * (409) changes nothing and says so. Resolves true when the playlist was binned.
  */
-async function binPlaylist(button, name, version) {
+async function binPlaylist(name, version) {
   const path = "/api/playlists/" + enc(name) + "?version=" + enc(version);
   let binned;
-  button.disabled = true;
   try {
     binned = await api(path, { method: "DELETE" });
   } catch (e) {
-    button.disabled = false;
     toast(e.status === 409 ? "This playlist changed elsewhere. Open it again to delete it." : "Couldn't delete: " + e.message);
-    return;
+    return false;
   }
   await loadPlaylists();
   location.hash = "#/library/playlists";
@@ -72,6 +70,7 @@ async function binPlaylist(button, name, version) {
       location.hash = playlistHref(res.name);
     }
   });
+  return true;
 }
 
 /* ============================================================ Bandcamp link and sync (ADR-032) */
@@ -85,6 +84,7 @@ const LOST_AFTER = 4;
 const PHASES = { fetching: "Fetching", matching: "Matching", syncing: "Downloading", rematching: "Matching", merging: "Merging" };
 const playlistPath = (name, sub) => "/api/playlists/" + enc(name) + "/" + sub;
 const SYNC_JOB = "/api/bandcamp/playlist-sync";
+const BANDCAMP_LIST = "/api/bandcamp/playlists";
 
 /** What a failed Bandcamp call says, by status; `own` has the sentences of the call itself. */
 const COMMON_SAY = { 0: "Couldn't reach the console", 400: "That is not a playlist name", 401: "Bandcamp is not signed in", 429: "Bandcamp asked to slow down. Try again in a minute.", 502: "Couldn't reach Bandcamp", 503: "Couldn't reach Bandcamp" };
@@ -123,7 +123,7 @@ const reportText = (r) => "Synced from Bandcamp: +" + r.added + " −" + r.remov
 /** Undo a sync: revert the playlist to its `undo.previous` if it is still at `undo.version` (the library refuses to overwrite a later edit). */
 async function undoSync(name, undo) {
   try {
-    await api(playlistPath(name, "revert"), { body: { version: undo.version, content: undo.previous } });
+    await revertPlaylist(name, undo.version, undo.previous);
     toast("Sync undone");
     tell(name, { reload: true });
   } catch (e) {
@@ -173,7 +173,7 @@ async function follow(mine) {
   }
 }
 
-/** Start the sync of `name`, unless one is being followed. */
+/** Start the sync of `name`, unless one is being followed. A sync that does not start is told in a toast. */
 async function startSync(name) {
   if (follower) {
     toast("A sync is already running");
@@ -252,23 +252,81 @@ function paintSync(button, text) {
   else button.removeAttribute("aria-disabled");
 }
 
-/** Ask for the Bandcamp playlist to link `name` to, in `slot`; `linked(link)` hears of the link made. */
+/** Link `name` to the Bandcamp playlist at `source`: its link, or null once `fail(text)` has been told why not. */
+async function makeLink(name, source, fail = toast) {
+  try {
+    return await api(playlistPath(name, "link"), { body: { source } });
+  } catch (e) {
+    fail(say(LINK_SAY, e, "Couldn't link this playlist"));
+    return null;
+  }
+}
+
+/** Link `name` to `source` for a page that asked: `linked(link)` hears of it, and the toast says so. True when linked. */
+async function linkNow(name, source, linked) {
+  const link = await makeLink(name, source);
+  if (!link) return false;
+  linked(link);
+  toast("Linked to Bandcamp");
+  return true;
+}
+
+/** Ask for the address of the Bandcamp playlist to link `name` to, in `slot`; `linked(link)` hears of the link made. */
 function askLink(slot, opener, name, linked) {
   askText(slot, opener, {
     label: "Bandcamp playlist URL",
     placeholder: "Bandcamp playlist URL",
     hint: "The address of your Bandcamp playlist",
-    submit: async (source) => {
-      try {
-        linked(await api(playlistPath(name, "link"), { body: { source } }));
-        toast("Linked to Bandcamp");
-        return true;
-      } catch (e) {
-        toast(say(LINK_SAY, e, "Couldn't link this playlist"));
-        return false;
-      }
-    },
+    submit: (source) => linkNow(name, source, linked),
   });
+}
+
+const NOTHING = (text) => [null, text, () => {}, null, true];
+
+/**
+ * Open a menu at `anchor` of the fan's Bandcamp playlists (GET /api/bandcamp/playlists): the title
+ * and the track count of each; one that is linked to a local playlist says so and is disabled.
+ * `unlinkedOnly` leaves those out; `extra` ([icon, label, fn]) is one more item below the list.
+ * A status line shows while the list loads, and a failure is told as a toast. `picked(playlist)`
+ * hears the pick ({ source, title, ... }).
+ */
+async function pickBandcamp(anchor, { head, unlinkedOnly, extra }, picked) {
+  let dismissed = false;
+  openMenu(anchor, [NOTHING("Loading your Bandcamp playlists…")], [head], { onClose: () => (dismissed = true) });
+  let lists;
+  try {
+    lists = await api(BANDCAMP_LIST);
+  } catch (e) {
+    if (!dismissed) closeMenu();
+    toast(say({}, e, "Couldn't list your Bandcamp playlists"));
+    return;
+  }
+  if (dismissed) return;
+  const shown = unlinkedOnly ? lists.filter((l) => !l.linked_to) : lists;
+  const rows = shown.map((l) => {
+    const text = l.title + " · " + plural(l.track_count, "track");
+    return l.linked_to ? NOTHING(text + " · linked to " + l.linked_to) : ["cloud", text, () => picked(l)];
+  });
+  const none = NOTHING(unlinkedOnly ? "No unlinked playlists on Bandcamp" : "No playlists on Bandcamp");
+  openMenu(anchor, [...(rows.length ? rows : [none]), ...(extra ? ["-", extra] : [])], [head]);
+}
+
+/** Bin the playlist `name` that a failed link left behind, as any delete: at once, with Undo. */
+async function binLeftBehind(name) {
+  const read = await load(name);
+  if (read.status !== "ready") {
+    toast("Couldn't find “" + name + "” to bin it");
+    return;
+  }
+  await binPlaylist(name, read.version);
+}
+
+/** Link the new playlist `name` to `source` and sync it; the follower shows the progress and the end. A link that fails says that the playlist is there, empty, and offers to bin it. A sync that does not start is startSync's toast: the page then shows Sync. */
+async function linkAndSync(name, source) {
+  const leftBehind = (reason) => toast(reason + ". “" + name + "” was created and is still empty.", () => binLeftBehind(name), "Bin it");
+  if (!(await makeLink(name, source, leftBehind))) return;
+  tell(name, { reload: true });
+  await startSync(name);
 }
 
 /**
@@ -286,7 +344,9 @@ function drawPlaylist(root, name, state, page, act) {
   const bandcampButtons = () => (page.link ? [syncButton()] : page.link === null ? linkButton() : []);
   const linkButton = () => {
     const slot = h("span");
-    const opener = h("button", { class: "btn", "aria-expanded": "false", onclick: () => askLink(slot, opener, name, act.linked) }, [icon("cloud", "sm"), "Link to Bandcamp…"]);
+    const paste = [null, "Paste a URL…", () => askLink(slot, opener, name, act.linked)];
+    const choose = () => pickBandcamp(opener, { head: "Link to Bandcamp", extra: paste }, (playlist) => linkNow(name, playlist.source, act.linked));
+    const opener = h("button", { class: "btn", "aria-expanded": "false", onclick: choose }, [icon("cloud", "sm"), "Link to Bandcamp…"]);
     return [opener, slot];
   };
   return collectionPage(root, {
@@ -299,7 +359,18 @@ function drawPlaylist(root, name, state, page, act) {
           ? [
               h("a", { class: "btn", href: playlistHref(name, "edit"), style: "text-decoration:none" }, [icon("wrench", "sm"), "Edit"]),
               ...bandcampButtons(),
-              h("button", { class: "btn danger", onclick: (e) => binPlaylist(e.currentTarget, name, state.version) }, [icon("trash", "sm"), "Delete"]),
+              h(
+                "button",
+                {
+                  class: "btn danger",
+                  onclick: async (e) => {
+                    const button = e.currentTarget;
+                    button.disabled = true;
+                    if (!(await binPlaylist(name, state.version))) button.disabled = false;
+                  },
+                },
+                [icon("trash", "sm"), "Delete"],
+              ),
             ]
           : [],
       label: "Playlist",
@@ -327,26 +398,56 @@ function drawPlaylist(root, name, state, page, act) {
 }
 
 /**
- * Ask for the name of a new playlist with an input in `slot` (no browser prompt); `opener` is the
- * button that asked (it shows aria-expanded and gets the focus back on Esc). Enter creates it
- * (POST /api/playlists), reloads the playlists and opens the new one in the workbench; Esc, or
- * leaving the field empty, cancels. A name the field's pattern refuses is reported by the field;
- * any other refusal shows as a toast with the server's message, and the input stays.
+ * Offer the two ways to a new playlist in a menu at `opener`, the button that asked: an empty one,
+ * or one from the Bandcamp playlists that are not linked yet. Both ask for the name with an input
+ * in `slot` (no browser prompt); the opener shows aria-expanded and gets the focus back on Esc.
  */
 export function askNewPlaylist(slot, opener) {
+  const empty = () => askEmptyPlaylist(slot, opener);
+  const fromBandcamp = () => pickBandcamp(opener, { head: "New playlist from Bandcamp", unlinkedOnly: true }, (playlist) => askBandcampName(slot, opener, playlist));
+  openMenu(opener, [["plus", "Empty playlist…", empty], ["cloud", "From Bandcamp…", fromBandcamp]], ["New playlist"]);
+}
+
+/**
+ * Create the playlist `name` (POST /api/playlists) and reload the playlists: the created name, or
+ * null once the server's message has been toasted (a name taken is 409). The caller keeps its input.
+ */
+async function createPlaylist(name) {
+  try {
+    const made = await api("/api/playlists", { body: { name } });
+    await loadPlaylists();
+    return made.name;
+  } catch (e) {
+    toast(e.message);
+    return null;
+  }
+}
+
+/** Ask for the name of an empty playlist. Enter creates it and opens it in the workbench; Esc, or leaving the field empty, cancels. A name the field's pattern refuses is reported by the field; any other refusal shows as a toast with the server's message, and the input stays. */
+function askEmptyPlaylist(slot, opener) {
   askName(slot, opener, {
     label: "New playlist name",
     placeholder: "New playlist name",
     submit: async (name) => {
-      try {
-        const made = await api("/api/playlists", { body: { name } });
-        await loadPlaylists();
-        location.hash = playlistHref(made.name, "edit");
-        return true;
-      } catch (e) {
-        toast(e.message);
-        return false;
-      }
+      const made = await createPlaylist(name);
+      if (made) location.hash = playlistHref(made, "edit");
+      return !!made;
+    },
+  });
+}
+
+/** Ask for the local name of the Bandcamp `playlist`, proposed by the server (`playlist.name`, its naming rule). Enter creates the playlist, links it and starts the sync; the input stays for a name that is taken. */
+function askBandcampName(slot, opener, playlist) {
+  askName(slot, opener, {
+    label: "Name of the new playlist",
+    placeholder: "Name of the new playlist",
+    value: playlist.name,
+    submit: async (name) => {
+      const made = await createPlaylist(name);
+      if (!made) return false;
+      location.hash = playlistHref(made);
+      linkAndSync(made, playlist.source);
+      return true;
     },
   });
 }

@@ -220,6 +220,18 @@ export function albumCovers(tracks, max = MOSAIC) {
   return out;
 }
 
+/** The ops that append `hashes` to the playlist `snap` ({ entries }); `duplicates` is "Skip" or "Keep". The workbench and the track menu's "Add to playlist" send this. */
+export const appendOps = (snap, hashes, duplicates) => [{ op: "Insert", at: snap.entries.length, hashes, duplicates }];
+
+/** What an edit's answer `res` did: `wrote` (the server gives a `previous` only when it wrote) and `skipped`, the hashes it left out as duplicates. */
+export const editOutcome = (res) => ({ wrote: res.previous != null, skipped: res.skipped.map((s) => s.hash) });
+
+/** How many tracks the Insert ops `ops` ask to add. */
+export const insertedCount = (ops) => ops.reduce((n, o) => n + (o.op === "Insert" ? o.hashes.length : 0), 0);
+
+/** The toast for an add that wrote some tracks and left `skipped` out as already in the playlist `name`. */
+export const addedAndSkipped = (added, skipped, name) => "Added " + added + " · " + skipped + " already in " + name;
+
 /**
  * The rows of a playlist page, one per line of GET /api/playlists/{name} in file order (duplicates
  * kept), each tagged by `kind`. `entries` is [{ status: "Track", hash } | { status: "Unresolved",

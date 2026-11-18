@@ -47,6 +47,10 @@ pub fn routes() -> Router<Arc<AppState>> {
             "/api/playlists/:name",
             get(library::playlist).delete(playlists::delete),
         )
+        .route(
+            "/api/bandcamp/playlists",
+            get(playlists::bandcamp_playlists),
+        )
         .route("/api/bandcamp/playlist-links", get(playlists::links))
         .route("/api/bandcamp/playlist-sync", get(playlists::sync_job))
         .route("/api/playlists/:name/link", post(playlists::link))
