@@ -26,7 +26,7 @@
 // Non-2xx rejects with ApiError (status 0 means the network failed, 409 means busy or stale).
 // Every /api/queue/* mutation returns the resulting { queue: [hash] }; pass it to applyQueue().
 
-import { LIKED, markLabel, trackTitle } from "./logic.js";
+import { LIKED, markLabel, plural, trackTitle } from "./logic.js";
 
 /* ============================================================ store + events */
 
@@ -161,7 +161,7 @@ export function setKeyNotation(n) {
 /** A track's key ({ musical, camelot, open_key } or null) in the chosen notation; "" when it has none. */
 export const keyText = (k) => (k && k[keyNotation]) || "";
 
-export const plural = (n, w) => n + " " + w + (n === 1 ? "" : "s");
+export { plural }; // defined in logic.js; the other modules keep importing it via core.js
 export const enc = (s) => encodeURIComponent(s);
 /** The address of playlist `name`'s page, or of its sub page (`sub`: "edit"). */
 export const playlistHref = (name, sub) => "#/playlist/" + enc(name) + (sub ? "/" + sub : "");
@@ -382,7 +382,9 @@ export class ApiError extends Error {
  */
 export async function api(path, opts = {}) {
   const init = { method: opts.method || (opts.body !== undefined ? "POST" : "GET"), headers: {} };
-  if (opts.body !== undefined) {
+  if (opts.body instanceof FormData) {
+    init.body = opts.body; // multipart: the browser sets the content type and boundary
+  } else if (opts.body !== undefined) {
     init.headers["content-type"] = "application/json";
     init.body = JSON.stringify(opts.body);
   }
