@@ -12,6 +12,7 @@
 //!   an import (ADR-034)
 
 use std::collections::{hash_map::Entry, HashMap};
+use std::num::NonZeroU8;
 
 use music_facts::{Bpm, ContentHash, CueKind, EnergyLevel, MusicValue};
 use rekordbox_xml::xml::{PositionMark, TempoAnchor};
@@ -102,20 +103,40 @@ pub fn location_to_hash(entries: &[HashLocation]) -> HashMap<String, String> {
 
 /// Convert a Rekordbox `<TEMPO>` anchor and BPM value to a `BeatGrid` fact.
 ///
-/// The anchor's `inizio_seconds` is converted to milliseconds by **rounding**
-/// (not truncating) to preserve sub-millisecond precision in the source data.
-/// `beats_per_bar` is always 4 (4/4 time — Rekordbox does not export the
-/// time signature separately in the single-anchor grid format).
+/// - BPM: the TEMPO `Bpm` (rounded to hundredths), else `average_bpm`; `None`
+///   when neither exists. This is deliberate: the grid describes the first
+///   tempo section, so on a variable-tempo track the grid BPM (TEMPO `Bpm`) can
+///   differ from the `Bpm` fact (rekordbox's `AverageBpm`).
+/// - `beats_per_bar`: the numerator of `Metro`, 4 when missing, unparsable or 0.
+/// - Anchor: Rekordbox's first TEMPO may sit on any beat of the bar (`Battito`,
+///   1-based), but `BeatGrid` anchors on a downbeat. The anchor is moved to the
+///   first downbeat at or after `Inizio`:
+///   `inizio + ((bpb - battito + 1).rem_euclid(bpb)) * beat_len`, computed in
+///   f64 seconds and **rounded** to ms once. A `Battito` outside `1..=bpb`
+///   still wraps into the bar (it never panics); a missing or 0 `Battito` counts as 1.
 ///
 /// Rekordbox is the beat-grid master; MDMA never writes `<TEMPO>` grid data
 /// back on export.
-pub fn grid_from_tempo(anchor: &TempoAnchor, bpm: Bpm) -> MusicValue {
-    let first_beat_ms = (anchor.inizio_seconds * 1000.0).round() as u32;
-    MusicValue::BeatGrid {
+pub fn grid_from_tempo(anchor: &TempoAnchor, average_bpm: Option<Bpm>) -> Option<MusicValue> {
+    let bpm = anchor
+        .bpm
+        .and_then(|b| Bpm::from_f32(b).ok())
+        .or(average_bpm)?;
+    let beats_per_bar = anchor.metro_numerator.map_or(4, NonZeroU8::get);
+    let battito = anchor.battito.filter(|&b| b >= 1).unwrap_or(1);
+    // Beats from the anchor up to the next downbeat (0 when the anchor is one).
+    let beats_to_downbeat =
+        (i32::from(beats_per_bar) + 1 - i32::from(battito)).rem_euclid(i32::from(beats_per_bar));
+    let beat_len_seconds = 6_000.0 / f64::from(bpm.as_hundredths());
+    let downbeat_seconds = anchor.inizio_seconds + f64::from(beats_to_downbeat) * beat_len_seconds;
+    // Round to ms once, at the end. `BeatGrid` handles beats before the anchor
+    // (negative beat numbers), so moving the anchor later loses nothing.
+    let first_beat_ms = (downbeat_seconds * 1000.0).round().max(0.0) as u32;
+    Some(MusicValue::BeatGrid {
         first_beat_ms,
         bpm,
-        beats_per_bar: 4,
-    }
+        beats_per_bar,
+    })
 }
 
 // =============================================================================
@@ -533,13 +554,118 @@ mod tests {
 
     // ── grid_from_tempo ───────────────────────────────────────────────────────
 
+    fn first_beat_ms_of(grid: Option<MusicValue>) -> u32 {
+        match grid {
+            Some(MusicValue::BeatGrid { first_beat_ms, .. }) => first_beat_ms,
+            other => panic!("expected BeatGrid, got {other:?}"),
+        }
+    }
+
+    fn tempo(inizio: f64, bpm: Option<f32>, metro: Option<u8>, battito: Option<u8>) -> TempoAnchor {
+        TempoAnchor {
+            inizio_seconds: inizio,
+            bpm,
+            metro_numerator: metro.and_then(NonZeroU8::new),
+            battito,
+        }
+    }
+
+    #[test]
+    fn battito_above_the_bar_length_wraps_into_the_bar() {
+        // bpb 3, battito 4 is the downbeat of the next bar: no shift.
+        let anchor = tempo(1.0, Some(120.0), Some(3), Some(4));
+        assert_eq!(first_beat_ms_of(grid_from_tempo(&anchor, None)), 1_000);
+    }
+
+    #[test]
+    fn battito_zero_is_treated_as_a_downbeat() {
+        let anchor = tempo(1.0, Some(120.0), Some(4), Some(0));
+        assert_eq!(first_beat_ms_of(grid_from_tempo(&anchor, None)), 1_000);
+    }
+
+    /// 120 BPM: a beat is 500 ms. The anchor on Battito b is normalised to the
+    /// next downbeat: inizio + ((bpb - b + 1) % bpb) * beat_len.
+    #[test]
+    fn battito_1_to_4_normalise_to_the_next_downbeat() {
+        let avg = Some(Bpm::from_f32(120.0).unwrap());
+        for (battito, expected) in [(1, 1_000), (2, 2_500), (3, 2_000), (4, 1_500)] {
+            let anchor = tempo(1.0, Some(120.0), Some(4), Some(battito));
+            assert_eq!(
+                first_beat_ms_of(grid_from_tempo(&anchor, avg)),
+                expected,
+                "battito {battito}"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_battito_is_treated_as_a_downbeat() {
+        let anchor = tempo(1.0, Some(120.0), Some(4), None);
+        assert_eq!(first_beat_ms_of(grid_from_tempo(&anchor, None)), 1_000);
+    }
+
+    #[test]
+    fn tempo_bpm_is_preferred_over_average_bpm() {
+        let anchor = tempo(0.0, Some(127.5), None, Some(1));
+        let avg = Some(Bpm::from_f32(128.0).unwrap());
+        match grid_from_tempo(&anchor, avg) {
+            Some(MusicValue::BeatGrid { bpm, .. }) => {
+                assert_eq!(bpm, Bpm::from_f32(127.5).unwrap())
+            }
+            other => panic!("expected BeatGrid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn average_bpm_is_the_fallback_when_tempo_bpm_is_missing() {
+        let anchor = tempo(0.0, None, None, Some(1));
+        let avg = Bpm::from_f32(128.0).unwrap();
+        match grid_from_tempo(&anchor, Some(avg)) {
+            Some(MusicValue::BeatGrid { bpm, .. }) => assert_eq!(bpm, avg),
+            other => panic!("expected BeatGrid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn no_bpm_anywhere_gives_no_grid() {
+        let anchor = tempo(0.0, None, None, Some(1));
+        assert_eq!(grid_from_tempo(&anchor, None), None);
+    }
+
+    #[test]
+    fn metro_numerator_gives_beats_per_bar_and_shapes_the_downbeat() {
+        let anchor = tempo(1.0, Some(120.0), Some(3), Some(2));
+        // bpb 3, battito 2: (3 - 2 + 1) % 3 = 2 beats on.
+        match grid_from_tempo(&anchor, None) {
+            Some(MusicValue::BeatGrid {
+                first_beat_ms,
+                beats_per_bar,
+                ..
+            }) => {
+                assert_eq!(beats_per_bar, 3);
+                assert_eq!(first_beat_ms, 2_000);
+            }
+            other => panic!("expected BeatGrid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn zero_metro_numerator_defaults_to_four() {
+        let anchor = tempo(0.0, Some(120.0), Some(0), Some(1));
+        match grid_from_tempo(&anchor, None) {
+            Some(MusicValue::BeatGrid { beats_per_bar, .. }) => assert_eq!(beats_per_bar, 4),
+            other => panic!("expected BeatGrid, got {other:?}"),
+        }
+    }
+
     #[test]
     fn grid_from_tempo_seconds_to_ms_basic() {
         let bpm = Bpm::from_f32(128.0).unwrap();
         let anchor = TempoAnchor {
             inizio_seconds: 0.025,
+            ..Default::default()
         };
-        let grid = grid_from_tempo(&anchor, bpm);
+        let grid = grid_from_tempo(&anchor, Some(bpm)).unwrap();
         assert_eq!(
             grid,
             MusicValue::BeatGrid {
@@ -560,8 +686,9 @@ mod tests {
         let bpm = Bpm::from_f32(140.0).unwrap();
         let anchor = TempoAnchor {
             inizio_seconds: 1.0009_f64,
+            ..Default::default()
         };
-        let grid = grid_from_tempo(&anchor, bpm);
+        let grid = grid_from_tempo(&anchor, Some(bpm)).unwrap();
         if let MusicValue::BeatGrid { first_beat_ms, .. } = grid {
             assert_eq!(
                 first_beat_ms, 1001,
@@ -577,8 +704,9 @@ mod tests {
         let bpm = Bpm::from_f32(120.0).unwrap();
         let anchor = TempoAnchor {
             inizio_seconds: 0.0,
+            ..Default::default()
         };
-        let grid = grid_from_tempo(&anchor, bpm);
+        let grid = grid_from_tempo(&anchor, Some(bpm)).unwrap();
         if let MusicValue::BeatGrid {
             first_beat_ms,
             beats_per_bar,
@@ -586,7 +714,7 @@ mod tests {
         } = grid
         {
             assert_eq!(first_beat_ms, 0);
-            assert_eq!(beats_per_bar, 4, "always 4/4");
+            assert_eq!(beats_per_bar, 4, "4/4 when Metro is absent");
         } else {
             panic!("expected BeatGrid");
         }
@@ -597,8 +725,9 @@ mod tests {
         let bpm = Bpm::from_f32(132.0).unwrap();
         let anchor = TempoAnchor {
             inizio_seconds: 1.5,
+            ..Default::default()
         };
-        let grid = grid_from_tempo(&anchor, bpm);
+        let grid = grid_from_tempo(&anchor, Some(bpm)).unwrap();
         if let MusicValue::BeatGrid { first_beat_ms, .. } = grid {
             assert_eq!(first_beat_ms, 1500);
         } else {

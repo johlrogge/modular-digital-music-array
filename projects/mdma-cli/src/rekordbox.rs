@@ -588,6 +588,48 @@ pub(crate) fn export(args: RekordboxExportArgs, ctx: &Ctx) -> Result<()> {
     Ok(())
 }
 
+/// What enrich does with a track's beat grid.
+#[derive(Debug, PartialEq)]
+enum GridUpdate {
+    /// The projected grid is already the new one: write nothing.
+    Current,
+    /// Assert the new grid, first retracting the grid it supersedes (if any) so the
+    /// old one cannot resurface when the new one is later retracted. A retract only
+    /// cancels a grid from the same source, so grids of other sources stay.
+    Write { retract: Option<MusicValue> },
+}
+
+fn plan_grid_update(
+    new_grid: &MusicValue,
+    existing: Option<&library_ipc_client::BeatGridInfo>,
+) -> GridUpdate {
+    let MusicValue::BeatGrid {
+        first_beat_ms,
+        bpm,
+        beats_per_bar,
+    } = new_grid
+    else {
+        return GridUpdate::Write { retract: None };
+    };
+    match existing {
+        Some(old)
+            if old.first_beat_ms == *first_beat_ms
+                && old.bpm == *bpm
+                && old.beats_per_bar == *beats_per_bar =>
+        {
+            GridUpdate::Current
+        }
+        Some(old) => GridUpdate::Write {
+            retract: Some(MusicValue::BeatGrid {
+                first_beat_ms: old.first_beat_ms,
+                bpm: old.bpm,
+                beats_per_bar: old.beats_per_bar,
+            }),
+        },
+        None => GridUpdate::Write { retract: None },
+    }
+}
+
 /// Report the outcome of [`write_playlist`], warning after a replace.
 fn print_write_outcome(name: &str, track_count: usize, created: bool) {
     println!("{}", format_write_outcome(name, track_count, created));
@@ -882,38 +924,35 @@ pub(crate) fn import(args: RekordboxImportArgs, ctx: &Ctx) -> Result<()> {
 
             // Write BeatGrid from tempo anchor (Rekordbox is beat-grid master;
             // MDMA never writes <TEMPO> data back on export).
-            if let (Some(anchor), Some(bpm_f32)) = (&rb_track.tempo_anchor, rb_track.average_bpm) {
-                if let Ok(bpm) = Bpm::from_f32(bpm_f32) {
-                    let new_grid = rekordbox_roundtrip::grid_from_tempo(anchor, bpm);
-                    // Guard: skip if the projected beat_grid is already identical.
-                    let already_current = match (
-                        &new_grid,
-                        existing.as_ref().and_then(|t| t.beat_grid.as_ref()),
-                    ) {
-                        (
-                            MusicValue::BeatGrid {
-                                first_beat_ms,
-                                bpm: new_bpm,
-                                beats_per_bar,
-                            },
-                            Some(existing_grid),
-                        ) => {
-                            existing_grid.first_beat_ms == *first_beat_ms
-                                && existing_grid.bpm == *new_bpm
-                                && existing_grid.beats_per_bar == *beats_per_bar
-                        }
-                        _ => false,
-                    };
-
-                    if already_current {
-                        skipped += 1;
-                    } else if dry_run {
+            let average_bpm = rb_track.average_bpm.and_then(|b| Bpm::from_f32(b).ok());
+            let projected_grid = rb_track
+                .tempo_anchor
+                .as_ref()
+                .and_then(|anchor| rekordbox_roundtrip::grid_from_tempo(anchor, average_bpm));
+            if let Some(new_grid) = projected_grid {
+                // Guard: skip if the projected beat_grid is already identical.
+                let plan = plan_grid_update(
+                    &new_grid,
+                    existing.as_ref().and_then(|t| t.beat_grid.as_ref()),
+                );
+                match plan {
+                    GridUpdate::Current => skipped += 1,
+                    GridUpdate::Write { .. } if dry_run => {
                         println!(
-                            "[dry-run] Would write BeatGrid first_beat={:.3}s bpm={} for {} - {}",
-                            anchor.inizio_seconds, bpm_f32, rb_track.artist, rb_track.name
+                            "[dry-run] Would write {:?} for {} - {}",
+                            new_grid, rb_track.artist, rb_track.name
                         );
-                    } else {
-                        match library.write_fact_as(hash, new_grid, &source) {
+                    }
+                    GridUpdate::Write { retract } => {
+                        // Retract the superseded grid first, so it cannot
+                        // resurface when the new one is retracted later.
+                        let retracted = match retract {
+                            Some(old) => library.retract_fact_as(hash, old, &source).map(|_| ()),
+                            None => Ok(()),
+                        };
+                        match retracted
+                            .and_then(|()| library.write_fact_as(hash, new_grid, &source))
+                        {
                             Ok(()) => enriched += 1,
                             Err(e) => {
                                 eprintln!(
@@ -1012,6 +1051,7 @@ pub(crate) fn import(args: RekordboxImportArgs, ctx: &Ctx) -> Result<()> {
 mod tests {
     use super::playlist_locations;
     use library_ipc_client::ContentHash;
+    use music_facts::MusicValue;
     use pretty_assertions::assert_eq;
 
     // ── argv parsing ─────────────────────────────────────────────────────────────
@@ -1222,6 +1262,50 @@ mod tests {
             );
             assert_eq!(built.rating, rating, "energy {energy:?}");
         }
+    }
+
+    // ── beat grid re-import ──────────────────────────────────────────────────────
+
+    fn grid_value(first_beat_ms: u32) -> MusicValue {
+        MusicValue::BeatGrid {
+            first_beat_ms,
+            bpm: library_ipc_client::Bpm::from_u32(120).unwrap(),
+            beats_per_bar: 4,
+        }
+    }
+
+    fn grid_info(first_beat_ms: u32) -> library_ipc_client::BeatGridInfo {
+        library_ipc_client::BeatGridInfo {
+            first_beat_ms,
+            bpm: library_ipc_client::Bpm::from_u32(120).unwrap(),
+            beats_per_bar: 4,
+        }
+    }
+
+    #[test]
+    fn a_first_grid_is_written_without_a_retract() {
+        assert_eq!(
+            super::plan_grid_update(&grid_value(1_000), None),
+            super::GridUpdate::Write { retract: None }
+        );
+    }
+
+    #[test]
+    fn an_identical_grid_is_current() {
+        assert_eq!(
+            super::plan_grid_update(&grid_value(1_000), Some(&grid_info(1_000))),
+            super::GridUpdate::Current
+        );
+    }
+
+    #[test]
+    fn a_corrected_grid_retracts_the_superseded_one() {
+        assert_eq!(
+            super::plan_grid_update(&grid_value(2_500), Some(&grid_info(1_000))),
+            super::GridUpdate::Write {
+                retract: Some(grid_value(1_000))
+            }
+        );
     }
 
     #[test]

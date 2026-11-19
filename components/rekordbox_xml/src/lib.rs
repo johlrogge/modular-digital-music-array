@@ -209,10 +209,20 @@ pub mod xml {
     /// When `None` on a track, the written TEMPO element defaults to
     /// `Inizio="0.000"` to preserve backward-compatibility with the
     /// existing export format.
-    #[derive(Clone, Debug, PartialEq)]
+    ///
+    /// Only the first `<TEMPO>` of a track is kept; further anchors (variable
+    /// tempo) are ignored.
+    #[derive(Clone, Debug, Default, PartialEq)]
     pub struct TempoAnchor {
-        /// Position of the first beat in seconds.
+        /// Position of the anchor in seconds (`Inizio`).
         pub inizio_seconds: f64,
+        /// The `Bpm` attribute of the TEMPO element, when present and numeric.
+        pub bpm: Option<f32>,
+        /// Numerator of `Metro` (`"3/4"` gives 3), when present, parsable and not 0.
+        pub metro_numerator: Option<std::num::NonZeroU8>,
+        /// `Battito`: the 1-based beat within the bar that the anchor sits on.
+        /// `None` when missing or unparsable (treated as 1).
+        pub battito: Option<u8>,
     }
 
     /// A cue point or loop marker from a Rekordbox `<POSITION_MARK>` element.
@@ -408,16 +418,22 @@ pub mod xml {
         let has_children = track.average_bpm.is_some() || !track.position_marks.is_empty();
         if has_children {
             out.push_str(">\n");
-            if let Some(bpm) = track.average_bpm {
-                // When tempo_anchor is None, default to Inizio="0.000" for
-                // backward-compatibility with the existing export format.
-                let inizio = track
-                    .tempo_anchor
-                    .as_ref()
-                    .map_or(0.0_f64, |a| a.inizio_seconds);
+            if let Some(average_bpm) = track.average_bpm {
+                // When tempo_anchor is None, default to Inizio="0.000", 4/4 and
+                // Battito="1" for backward-compatibility with the existing export
+                // format. An anchor keeps its own Bpm, Metro and Battito.
+                let (inizio, bpm, metro, battito) = match &track.tempo_anchor {
+                    Some(a) => (
+                        a.inizio_seconds,
+                        a.bpm.unwrap_or(average_bpm),
+                        a.metro_numerator.map_or(4, |n| n.get()),
+                        a.battito.unwrap_or(1),
+                    ),
+                    None => (0.0, average_bpm, 4, 1),
+                };
                 out.push_str(&format!(
-                    "      <TEMPO Inizio=\"{:.3}\" Bpm=\"{:.2}\" Metro=\"4/4\" Battito=\"1\"/>\n",
-                    inizio, bpm
+                    "      <TEMPO Inizio=\"{:.3}\" Bpm=\"{:.2}\" Metro=\"{}/4\" Battito=\"{}\"/>\n",
+                    inizio, bpm, metro, battito
                 ));
             }
             for mark in &track.position_marks {
@@ -667,6 +683,7 @@ pub mod xml {
                     location: "file://localhost/music/t.aiff".to_string(),
                     tempo_anchor: Some(TempoAnchor {
                         inizio_seconds: 1.5,
+                        ..Default::default()
                     }),
                     rating: 0,
                     position_marks: vec![],
@@ -946,7 +963,8 @@ pub mod parse {
                         // into the PLAYLISTS section.
                         "TEMPO" if section == Section::Collection && in_collection_track => {
                             if let Some(track) = tracks.last_mut() {
-                                // First TEMPO wins — ignore subsequent ones.
+                                // First TEMPO wins — later anchors (variable tempo) are
+                                // ignored: the grid is one anchor and one BPM.
                                 if track.tempo_anchor.is_none() {
                                     let attrs = e.attributes();
                                     if let Some(inizio) = attr_str(&attrs, b"Inizio")
@@ -954,6 +972,19 @@ pub mod parse {
                                     {
                                         track.tempo_anchor = Some(TempoAnchor {
                                             inizio_seconds: inizio,
+                                            bpm: attr_str(&attrs, b"Bpm")
+                                                .and_then(|s| s.parse::<f32>().ok()),
+                                            metro_numerator: attr_str(&attrs, b"Metro").and_then(
+                                                |s| {
+                                                    s.split_once('/')?
+                                                        .0
+                                                        .trim()
+                                                        .parse::<std::num::NonZeroU8>()
+                                                        .ok()
+                                                },
+                                            ),
+                                            battito: attr_str(&attrs, b"Battito")
+                                                .and_then(|s| s.trim().parse::<u8>().ok()),
                                         });
                                     }
                                 }
@@ -1336,6 +1367,47 @@ pub mod parse {
         }
 
         #[test]
+        fn parse_tempo_reads_bpm_metro_and_battito() {
+            let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<DJ_PLAYLISTS Version="1.0.0">
+  <COLLECTION Entries="1">
+    <TRACK TrackID="1" Name="T" Artist="A" Album="" Genre="" Kind="AIFF File"
+           Size="1000" TotalTime="300" AverageBpm="127.00"
+           Location="file://localhost/music/track.aiff">
+      <TEMPO Inizio="0.250" Bpm="127.50" Metro="3/4" Battito="3"/>
+      <TEMPO Inizio="30.000" Bpm="130.00" Metro="4/4" Battito="1"/>
+    </TRACK>
+  </COLLECTION>
+  <PLAYLISTS><NODE Type="0" Name="ROOT" Count="0"/></PLAYLISTS>
+</DJ_PLAYLISTS>"#;
+            let lib = parse_xml(xml).unwrap();
+            let anchor = lib.tracks[0].tempo_anchor.as_ref().unwrap();
+            assert_eq!(anchor.bpm, Some(127.5));
+            assert_eq!(anchor.metro_numerator, std::num::NonZeroU8::new(3));
+            assert_eq!(anchor.battito, Some(3));
+            assert!((anchor.inizio_seconds - 0.25).abs() < 1e-9);
+        }
+
+        #[test]
+        fn parse_tempo_tolerates_missing_or_bad_bpm_metro_battito() {
+            let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<DJ_PLAYLISTS Version="1.0.0">
+  <COLLECTION Entries="1">
+    <TRACK TrackID="1" Name="T" Artist="A" Album="" Genre="" Kind="AIFF File"
+           Size="1000" TotalTime="300" Location="file://localhost/music/track.aiff">
+      <TEMPO Inizio="1.000" Metro="x/y"/>
+    </TRACK>
+  </COLLECTION>
+  <PLAYLISTS><NODE Type="0" Name="ROOT" Count="0"/></PLAYLISTS>
+</DJ_PLAYLISTS>"#;
+            let lib = parse_xml(xml).unwrap();
+            let anchor = lib.tracks[0].tempo_anchor.as_ref().unwrap();
+            assert_eq!(anchor.bpm, None);
+            assert_eq!(anchor.metro_numerator, None);
+            assert_eq!(anchor.battito, None);
+        }
+
+        #[test]
         fn parse_position_marks_from_children() {
             let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
 <DJ_PLAYLISTS Version="1.0.0">
@@ -1396,6 +1468,9 @@ pub mod parse {
                     location: "file://localhost/music/anchored.aiff".to_string(),
                     tempo_anchor: Some(TempoAnchor {
                         inizio_seconds: 0.25,
+                        bpm: Some(131.5),
+                        metro_numerator: std::num::NonZeroU8::new(3),
+                        battito: Some(2),
                     }),
                     rating: 153,
                     position_marks: vec![
@@ -1443,6 +1518,13 @@ pub mod parse {
                 "inizio round-trips: {}",
                 anchor.inizio_seconds
             );
+            assert_eq!(
+                anchor.bpm,
+                Some(131.5),
+                "TEMPO Bpm survives, not AverageBpm"
+            );
+            assert_eq!(anchor.metro_numerator, std::num::NonZeroU8::new(3));
+            assert_eq!(anchor.battito, Some(2));
 
             assert_eq!(t.rating, 153, "the rating survives the round-trip");
             assert_eq!(t.position_marks.len(), 3, "all 3 marks survive round-trip");
