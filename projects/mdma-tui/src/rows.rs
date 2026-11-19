@@ -112,29 +112,10 @@ pub(crate) fn make_track_info(
 ) -> TrackInfo {
     use library_ipc_protocol::DurationSeconds;
     TrackInfo {
-        content_hash: ContentHash::new(hash),
         title: Some(title.to_string()),
         artist: Some(artist.to_string()),
-        album: None,
         duration: Some(DurationSeconds::new(duration_secs)),
-        duration_ms: None,
-        bpm: None,
-        key: None,
-        blob_path: None,
-        cover_art_path: None,
-        track_number: None,
-        disc_number: None,
-        added: None,
-        started: None,
-        stopped: None,
-        memory_cues: vec![],
-        beat_grid: None,
-        role: None,
-        energy: None,
-        genre: None,
-        label: None,
-        styles: vec![],
-        marks: vec![],
+        ..TrackInfo::new(ContentHash::new(hash))
     }
 }
 

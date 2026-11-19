@@ -75,8 +75,9 @@ pub struct IndexedTrackInfo {
     pub genre: Option<String>,
     pub styles: Vec<String>,
     pub duration_seconds: Option<u32>,
-    /// Exact duration in milliseconds (the `DurationMs` fact), when known.
-    pub duration_ms: Option<u64>,
+    /// The properties measured from the file (exact duration, ...); one group, folded
+    /// by `take_audio_property` and `recompute_audio`.
+    pub audio: library_ipc_protocol::AudioProperties,
     pub bpm: Option<f32>,
     pub key: Option<music_facts::Key>,
     pub year: Option<u32>,
@@ -172,7 +173,7 @@ impl IndexedTrackInfo {
             genre: None,
             styles: vec![],
             duration_seconds: None,
-            duration_ms: None,
+            audio: library_ipc_protocol::AudioProperties::default(),
             bpm: None,
             key: None,
             year: None,
@@ -450,6 +451,39 @@ pub fn is_provenance_tracked(value: &MusicValue) -> bool {
     !(is_play_event(value) || matches!(value, MusicValue::FilePath(_) | MusicValue::AddedAt(_)))
 }
 
+/// Whether `v` is one of the facts folded into [`library_ipc_protocol::AudioProperties`].
+/// The variant list lives here and in [`take_audio_property`] only.
+fn is_audio_property(v: &MusicValue) -> bool {
+    matches!(
+        v,
+        MusicValue::DurationMs(_) | MusicValue::Bitrate(_) | MusicValue::SampleRate(_)
+    )
+}
+
+/// Take `v` into `audio` when it is one of its properties (latest assertion wins).
+/// Returns whether it was.
+fn take_audio_property(audio: &mut library_ipc_protocol::AudioProperties, v: &MusicValue) -> bool {
+    match v {
+        MusicValue::DurationMs(d) => audio.duration_ms = Some(*d),
+        MusicValue::Bitrate(b) => audio.bitrate = Some(*b),
+        MusicValue::SampleRate(s) => audio.sample_rate = Some(*s),
+        _ => return false,
+    }
+    true
+}
+
+/// Rebuild every audio property from the assertions still live, the last of each
+/// winning. What a retract needs.
+fn recompute_audio(
+    audio: &mut library_ipc_protocol::AudioProperties,
+    provenance: &[(MusicValue, music_facts::FactSource)],
+) {
+    *audio = library_ipc_protocol::AudioProperties::default();
+    for (value, _) in provenance {
+        take_audio_property(audio, value);
+    }
+}
+
 /// Apply an Assert fact to the scalar fields of `IndexedTrackInfo`.
 fn apply_assert_scalar(
     entry: &mut IndexedTrackInfo,
@@ -464,7 +498,9 @@ fn apply_assert_scalar(
         MusicValue::MainGenre(v) => entry.genre = Some(v.clone()),
         MusicValue::StyleDescriptor(v) => push_unique(&mut entry.styles, v.clone()),
         MusicValue::DurationSeconds(v) => entry.duration_seconds = Some(v.value()),
-        MusicValue::DurationMs(v) => entry.duration_ms = Some(v.value()),
+        v if is_audio_property(v) => {
+            take_audio_property(&mut entry.audio, v);
+        }
         MusicValue::Bpm(v) => entry.bpm = Some(v.as_f32()),
         MusicValue::Key(v) => entry.key = Some(*v),
         MusicValue::Year(v) => entry.year = Some(v.value()),
@@ -616,12 +652,7 @@ fn apply_retract_scalar(entry: &mut IndexedTrackInfo, retracted: &MusicValue) {
                 _ => None,
             });
         }
-        MusicValue::DurationMs(_) => {
-            entry.duration_ms = last_surviving_map(&entry.provenance, |v| match v {
-                MusicValue::DurationMs(d) => Some(d.value()),
-                _ => None,
-            });
-        }
+        v if is_audio_property(v) => recompute_audio(&mut entry.audio, &entry.provenance),
         MusicValue::Bpm(_) => {
             entry.bpm = last_surviving_map(&entry.provenance, |v| match v {
                 MusicValue::Bpm(b) => Some(b.as_f32()),
@@ -2976,6 +3007,38 @@ mod tests {
             // Retract by source identity: ingest 2.0.0 cancels what ingest 1.0.0 wrote.
             retract_fact(a, bpm(120.0), 6, &ingest2),
             assert_fact(a, bpm(122.0), 6, &user),
+            // The audio properties: a later assertion wins, and a retract of it falls
+            // back to the one before.
+            assert_fact(
+                a,
+                MusicValue::DurationMs(music_facts::DurationMs::new(1_000)),
+                6,
+                &ingest1,
+            ),
+            assert_fact(
+                a,
+                MusicValue::Bitrate(music_facts::Bitrate::new(1411)),
+                6,
+                &ingest1,
+            ),
+            assert_fact(
+                a,
+                MusicValue::SampleRate(music_facts::SampleRate::new(44100)),
+                6,
+                &ingest1,
+            ),
+            assert_fact(
+                a,
+                MusicValue::Bitrate(music_facts::Bitrate::new(320)),
+                6,
+                &ingest2,
+            ),
+            retract_fact(
+                a,
+                MusicValue::Bitrate(music_facts::Bitrate::new(320)),
+                6,
+                &ingest2,
+            ),
             // Retract of a value another source asserted: no effect.
             retract_fact(b, bpm(128.0), 7, &ingest1),
             // Merge: A replaces B; B's tracked facts are retracted, its plays stay.
@@ -3096,7 +3159,7 @@ mod tests {
             .map(|t| {
                 format!(
                     "{} title={:?} artist={:?} album={:?} label={:?} genre={:?} styles={:?} \
-                     duration={:?} duration_ms={:?} bpm={:?} key={:?} year={:?} source={:?} blob={:?} cover={:?} \
+                     duration={:?} audio={:?} bpm={:?} key={:?} year={:?} source={:?} blob={:?} cover={:?} \
                      track={:?} disc={:?} started={:?} stopped={:?} added={:?} item={:?} \
                      deleted={:?} role={:?} energy={:?} grid={:?} cues={:?} raw={:?} \
                      retired_by={:?} inherited_cover={:?} prov={:?}",
@@ -3108,7 +3171,7 @@ mod tests {
                     t.genre,
                     t.styles,
                     t.duration_seconds,
-                    t.duration_ms,
+                    t.audio,
                     t.bpm,
                     t.key,
                     t.year,

@@ -6,8 +6,8 @@
 
 // Re-export types used in the protocol so clients don't need to depend on music-facts
 pub use music_facts::{
-    Bpm, ContentHash, CueKind, DurationMs, DurationSeconds, FactKind, FactSource, Key, Mark,
-    MarkFilter, MarkName, MarkNameError, MusicValue,
+    Bitrate, Bpm, ContentHash, CueKind, DurationMs, DurationSeconds, FactKind, FactSource, Key,
+    Mark, MarkFilter, MarkName, MarkNameError, MusicValue, SampleRate,
 };
 pub use music_primitives::{BeatGrid, CanonicalHash, EnergyLevel, Mode, TrackRole};
 // Re-export query types so clients can use them without depending on library-search directly
@@ -1152,14 +1152,62 @@ impl BeatGridInfo {
     }
 }
 
+/// The audio properties of a track's file, as the facts the library measures from it.
+///
+/// One group for the facts that are only ever read from the file. Plain data: the
+/// projection folds the facts into it (in `library_projection`) and [`TrackInfo`]
+/// carries it flat, so each field is a top-level key on the wire. Every field is
+/// absent from nodes that predate it, which reads as unknown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AudioProperties {
+    /// Exact duration (the `DurationMs` fact). For MP3 an estimate. Prefer
+    /// [`TrackInfo::length_ms`].
+    pub duration_ms: Option<DurationMs>,
+    /// The `Bitrate` fact (kbps).
+    pub bitrate: Option<Bitrate>,
+    /// The `SampleRate` fact (Hz).
+    pub sample_rate: Option<SampleRate>,
+}
+
 impl TrackInfo {
+    /// A track with only its hash known: everything else is `None` or empty.
+    pub fn new(content_hash: ContentHash) -> Self {
+        Self {
+            content_hash,
+            title: None,
+            artist: None,
+            album: None,
+            duration: None,
+            audio: AudioProperties::default(),
+            bpm: None,
+            key: None,
+            blob_path: None,
+            cover_art_path: None,
+            track_number: None,
+            disc_number: None,
+            added: None,
+            started: None,
+            stopped: None,
+            memory_cues: Vec::new(),
+            beat_grid: None,
+            role: None,
+            energy: None,
+            genre: None,
+            label: None,
+            styles: Vec::new(),
+            marks: Vec::new(),
+        }
+    }
+
     /// The track's length in milliseconds: the exact `DurationMs` when the library has
     /// it, else the whole seconds times 1000. `None` when neither is known.
     ///
     /// For MP3 the exact value is the tag reader's estimate (Xing/VBRI header, or the
     /// bitrate for CBR), so it can be off by tens of milliseconds.
     pub fn length_ms(&self) -> Option<u64> {
-        self.duration_ms
+        self.audio
+            .duration_ms
             .map(DurationMs::value)
             .or_else(|| self.duration.map(|d| u64::from(d.value()) * 1000))
     }
@@ -1173,10 +1221,9 @@ pub struct TrackInfo {
     pub artist: Option<String>,
     pub album: Option<String>,
     pub duration: Option<DurationSeconds>,
-    /// Exact duration (the `DurationMs` fact). None when not known. Absent on the
-    /// wire from nodes that predate it. Prefer [`TrackInfo::length_ms`].
-    #[serde(default)]
-    pub duration_ms: Option<DurationMs>,
+    /// What the library measured from the file. Flat on the wire.
+    #[serde(flatten)]
+    pub audio: AudioProperties,
     pub bpm: Option<Bpm>,
     pub key: Option<Key>,
     /// Relative blob path (no absolute paths in protocol).
@@ -3040,29 +3087,18 @@ mod tests {
     #[test]
     fn track_info_roundtrip() {
         let track = TrackInfo {
-            content_hash: ContentHash::new("sha256:abc123"),
             title: Some("Test Track".to_string()),
             artist: Some("Test Artist".to_string()),
-            album: None,
             duration: Some(DurationSeconds::new(180)),
-            duration_ms: Some(DurationMs::new(180_250)),
+            audio: AudioProperties {
+                duration_ms: Some(DurationMs::new(180_250)),
+                bitrate: Some(Bitrate::new(320)),
+                sample_rate: Some(SampleRate::new(48000)),
+            },
             bpm: Some(Bpm::from_u32(128).unwrap()),
-            key: None,
             blob_path: Some("ab/abc123.flac".to_string()),
-            cover_art_path: None,
-            track_number: None,
-            disc_number: None,
-            added: None,
-            started: None,
-            stopped: None,
-            memory_cues: vec![],
-            beat_grid: None,
-            role: None,
-            energy: None,
-            genre: None,
-            label: None,
-            styles: vec![],
             marks: vec![Mark::Default, "banger".parse().unwrap()],
+            ..TrackInfo::new(ContentHash::new("sha256:abc123"))
         };
 
         let json = serde_json::to_string(&track).unwrap();
@@ -3072,6 +3108,31 @@ mod tests {
         assert_eq!(parsed.memory_cues, track.memory_cues);
         assert_eq!(parsed.beat_grid, track.beat_grid);
         assert_eq!(parsed.marks, track.marks);
+        assert_eq!(parsed.audio, track.audio);
+    }
+
+    /// The audio properties are embedded flat: on the wire `duration_ms` is a
+    /// top-level key of the track, not nested under `audio`.
+    #[test]
+    fn audio_properties_stay_flat_on_the_wire() {
+        let track = TrackInfo {
+            audio: AudioProperties {
+                duration_ms: Some(DurationMs::new(367_123)),
+                bitrate: Some(Bitrate::new(1411)),
+                sample_rate: Some(SampleRate::new(44100)),
+            },
+            ..TrackInfo::new(ContentHash::new("sha256:abc123"))
+        };
+        let json = serde_json::to_value(&track).unwrap();
+        assert_eq!(json["duration_ms"], serde_json::json!(367_123));
+        assert_eq!(json["bitrate"], serde_json::json!(1411));
+        assert_eq!(json["sample_rate"], serde_json::json!(44100));
+        assert!(json.get("audio").is_none(), "{json}");
+        assert_eq!(
+            serde_json::to_value(TrackInfo::new(ContentHash::new("sha256:abc123"))).unwrap()
+                ["duration_ms"],
+            serde_json::Value::Null
+        );
     }
 
     /// A node that predates `marks` sends none: the track decodes as unmarked.
@@ -3092,11 +3153,11 @@ mod tests {
             "duration":367,"bpm":null,"key":null,"blob_path":null,"cover_art_path":null,
             "track_number":null,"disc_number":null,"added":null}"#;
         let decoded: TrackInfo = serde_json::from_str(old).unwrap();
-        assert_eq!(decoded.duration_ms, None);
+        assert_eq!(decoded.audio.duration_ms, None);
 
         let new = old.replace(r#""added":null"#, r#""added":null,"duration_ms":367123"#);
         let decoded: TrackInfo = serde_json::from_str(&new).unwrap();
-        assert_eq!(decoded.duration_ms, Some(DurationMs::new(367_123)));
+        assert_eq!(decoded.audio.duration_ms, Some(DurationMs::new(367_123)));
         assert_eq!(decoded.length_ms(), Some(367_123));
     }
 
@@ -3107,10 +3168,10 @@ mod tests {
             "track_number":null,"disc_number":null,"added":null}"#;
         let mut t: TrackInfo = serde_json::from_str(json).unwrap();
         assert_eq!(t.length_ms(), Some(5_000));
-        t.duration_ms = Some(DurationMs::new(4_050));
+        t.audio.duration_ms = Some(DurationMs::new(4_050));
         assert_eq!(t.length_ms(), Some(4_050));
         t.duration = None;
-        t.duration_ms = None;
+        t.audio.duration_ms = None;
         assert_eq!(t.length_ms(), None);
     }
 
@@ -3135,21 +3196,7 @@ mod tests {
     #[test]
     fn track_info_with_cues_and_grid_roundtrip() {
         let track = TrackInfo {
-            content_hash: ContentHash::new("sha256:cuegrid01"),
             title: Some("Cued Track".to_string()),
-            artist: None,
-            album: None,
-            duration: None,
-            duration_ms: None,
-            bpm: None,
-            key: None,
-            blob_path: None,
-            cover_art_path: None,
-            track_number: None,
-            disc_number: None,
-            added: None,
-            started: None,
-            stopped: None,
             memory_cues: vec![
                 CueInfo {
                     position_ms: 5500,
@@ -3169,12 +3216,7 @@ mod tests {
                 bpm: Bpm::from_u32(128).unwrap(),
                 beats_per_bar: 4,
             }),
-            role: None,
-            energy: None,
-            genre: None,
-            label: None,
-            styles: vec![],
-            marks: vec![],
+            ..TrackInfo::new(ContentHash::new("sha256:cuegrid01"))
         };
 
         let json = serde_json::to_string(&track).unwrap();

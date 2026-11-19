@@ -52,29 +52,10 @@ mod tests {
 
     fn make_track(artist: Option<&str>, album: Option<&str>, title: Option<&str>) -> TrackInfo {
         TrackInfo {
-            content_hash: ContentHash::new("sha256:test"),
             title: title.map(String::from),
             artist: artist.map(String::from),
             album: album.map(String::from),
-            duration: None,
-            duration_ms: None,
-            bpm: None,
-            key: None,
-            blob_path: None,
-            cover_art_path: None,
-            track_number: None,
-            disc_number: None,
-            added: None,
-            started: None,
-            stopped: None,
-            memory_cues: vec![],
-            beat_grid: None,
-            role: None,
-            energy: None,
-            genre: None,
-            label: None,
-            styles: vec![],
-            marks: vec![],
+            ..TrackInfo::new(ContentHash::new("sha256:test"))
         }
     }
 

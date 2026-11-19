@@ -6,6 +6,10 @@ All notable changes to MDMA are documented here.
 
 ## [Unreleased]
 
+### Fixed
+
+- `mdma rekordbox export` wrote `BitRate` and `SampleRate` as 0. It parsed the display strings ("1411 kbps", "44100 Hz") as numbers; it now takes both from the track's projected audio properties (#122).
+
 ---
 
 ## [0.40.0] — 2026-11-18

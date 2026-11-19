@@ -64,7 +64,7 @@ pub fn track_info(t: &IndexedTrackInfo, covers: &AlbumCovers) -> TrackInfo {
         artist: t.artist.clone(),
         album: t.album.clone(),
         duration: t.duration_seconds.map(DurationSeconds::new),
-        duration_ms: t.duration_ms.map(music_facts::DurationMs::new),
+        audio: t.audio,
         bpm: t.bpm.and_then(|b| Bpm::from_f32(b).ok()),
         key: t.key,
         blob_path: Some(t.blob_path.to_string_lossy().to_string()),
@@ -306,7 +306,7 @@ mod tests {
         let source = FactSource::new("test", "1.0.0", "Unknown");
         let at = chrono::Utc::now();
         let mut t = indexed("h1");
-        assert_eq!(info(&t).duration_ms, None);
+        assert_eq!(info(&t).audio.duration_ms, None);
 
         for v in [
             MusicValue::DurationSeconds(Secs::new(367)),
@@ -315,12 +315,47 @@ mod tests {
             crate::apply_fact_to_track(&mut t, &v, at, Operation::Assert, &source);
         }
         let got = info(&t);
-        assert_eq!(got.duration_ms, Some(DurationMs::new(367_123)));
+        assert_eq!(got.audio.duration_ms, Some(DurationMs::new(367_123)));
         assert_eq!(got.duration.map(|d| d.value()), Some(367));
 
         let retract = MusicValue::DurationMs(DurationMs::new(367_123));
         crate::apply_fact_to_track(&mut t, &retract, at, Operation::Retract, &source);
-        assert_eq!(info(&t).duration_ms, None);
+        assert_eq!(info(&t).audio.duration_ms, None);
+    }
+
+    #[test]
+    fn track_info_carries_the_bitrate_and_sample_rate_and_drops_them_on_retract() {
+        use music_facts::{Bitrate, SampleRate};
+        let source = FactSource::new("test", "1.0.0", "Unknown");
+        let at = chrono::Utc::now();
+        let mut t = indexed("h1");
+        let (rate, hz) = (Bitrate::new(1411), SampleRate::new(44100));
+        for v in [MusicValue::Bitrate(rate), MusicValue::SampleRate(hz)] {
+            crate::apply_fact_to_track(&mut t, &v, at, Operation::Assert, &source);
+        }
+        let got = info(&t);
+        assert_eq!(got.audio.bitrate, Some(rate));
+        assert_eq!(got.audio.sample_rate, Some(hz));
+
+        crate::apply_fact_to_track(
+            &mut t,
+            &MusicValue::Bitrate(rate),
+            at,
+            Operation::Retract,
+            &source,
+        );
+        let got = info(&t);
+        assert_eq!(got.audio.bitrate, None);
+        assert_eq!(got.audio.sample_rate, Some(hz), "the other property stays");
+
+        crate::apply_fact_to_track(
+            &mut t,
+            &MusicValue::SampleRate(hz),
+            at,
+            Operation::Retract,
+            &source,
+        );
+        assert_eq!(info(&t).audio.sample_rate, None);
     }
 
     // ---- marks ------------------------------------------------------------------

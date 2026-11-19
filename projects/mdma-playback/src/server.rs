@@ -1873,31 +1873,7 @@ mod tests {
     type LibraryAnswer = Result<TrackInfo, ClientError>;
 
     fn track_with(hash: ContentHash) -> TrackInfo {
-        TrackInfo {
-            content_hash: hash,
-            title: None,
-            artist: None,
-            album: None,
-            duration: None,
-            duration_ms: None,
-            bpm: None,
-            key: None,
-            blob_path: None,
-            cover_art_path: None,
-            track_number: None,
-            disc_number: None,
-            added: None,
-            started: None,
-            stopped: None,
-            memory_cues: vec![],
-            beat_grid: None,
-            role: None,
-            energy: None,
-            genre: None,
-            label: None,
-            styles: vec![],
-            marks: vec![],
-        }
+        TrackInfo::new(hash)
     }
 
     /// The full hash a fake library answers for a prefix.

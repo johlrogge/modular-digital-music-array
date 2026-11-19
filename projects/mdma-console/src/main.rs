@@ -2991,29 +2991,14 @@ mod tests {
     #[test]
     fn track_info_json_from_full_track() {
         let track = TrackInfo {
-            content_hash: ContentHash::new("sha256:abc123"),
             title: Some("Test Track".to_string()),
             artist: Some("Test Artist".to_string()),
             album: Some("Test Album".to_string()),
             duration: Some(DurationSeconds::new(180)),
-            duration_ms: None,
             bpm: Some(Bpm::from_u32(128).unwrap()),
             key: Some(Key::from_traditional("C Major").unwrap()),
             blob_path: Some("ab/abc123.flac".to_string()),
-            cover_art_path: None,
-            track_number: None,
-            disc_number: None,
-            added: None,
-            started: None,
-            stopped: None,
-            memory_cues: vec![],
-            beat_grid: None,
-            role: None,
-            energy: None,
-            genre: None,
-            label: None,
-            styles: vec![],
-            marks: vec![],
+            ..TrackInfo::new(ContentHash::new("sha256:abc123"))
         };
         let json = TrackInfoJson::from_track_info(&track);
         assert_eq!(json.content_hash, "sha256:abc123");
@@ -3029,31 +3014,7 @@ mod tests {
 
     #[test]
     fn track_info_json_from_minimal_track() {
-        let track = TrackInfo {
-            content_hash: ContentHash::new("sha256:deadbeef"),
-            title: None,
-            artist: None,
-            album: None,
-            duration: None,
-            duration_ms: None,
-            bpm: None,
-            key: None,
-            blob_path: None,
-            cover_art_path: None,
-            track_number: None,
-            disc_number: None,
-            added: None,
-            started: None,
-            stopped: None,
-            memory_cues: vec![],
-            beat_grid: None,
-            role: None,
-            energy: None,
-            genre: None,
-            label: None,
-            styles: vec![],
-            marks: vec![],
-        };
+        let track = TrackInfo::new(ContentHash::new("sha256:deadbeef"));
         let json = TrackInfoJson::from_track_info(&track);
         assert_eq!(json.content_hash, "sha256:deadbeef");
         assert!(json.title.is_none());
@@ -3069,29 +3030,9 @@ mod tests {
     #[test]
     fn track_info_json_populates_disc_number_and_added() {
         let track = TrackInfo {
-            content_hash: ContentHash::new("sha256:abc"),
-            title: None,
-            artist: None,
-            album: None,
-            duration: None,
-            duration_ms: None,
-            bpm: None,
-            key: None,
-            blob_path: None,
-            cover_art_path: None,
-            track_number: None,
             disc_number: Some(2),
             added: Some("2024-01-15T12:00:00Z".to_string()),
-            started: None,
-            stopped: None,
-            memory_cues: vec![],
-            beat_grid: None,
-            role: None,
-            energy: None,
-            genre: None,
-            label: None,
-            styles: vec![],
-            marks: vec![],
+            ..TrackInfo::new(ContentHash::new("sha256:abc"))
         };
         let json = TrackInfoJson::from_track_info(&track);
         assert_eq!(json.disc_number, Some(2));
