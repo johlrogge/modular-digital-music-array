@@ -4,16 +4,26 @@ All notable changes to MDMA are documented here.
 
 ---
 
-## [Unreleased]
+## [0.41.0] — 2026-11-19
+
+### Added
+
+- **Bandcamp playlist picker in the console.** Pick from your Bandcamp playlists when linking a local playlist, and choose "New playlist" from an unlinked Bandcamp playlist.
+- **"Add to playlist ›" in the track menu.** A partial add skips duplicates and offers Undo.
+- **Unlink from Bandcamp:** a menu item, and `DELETE /api/playlists/:name/link` (#123).
+- **Exact `DurationMs` fact.** `mdma library identity backfill --duration` fills it in for existing tracks, and the console timeline uses it.
+- **Console Settings pages.** Settings is split into Playback, Library and System. The new Speakers page picks the audio output; the theme is Dark or Light, and key notation lives here too.
+- **The full player shows album, BPM, key and duration** under the title.
+- **ADR-035 accepted** (service-owned facts on library subjects). Planned, not implemented.
+
+### Changed
+
+- Ambiguous Bandcamp matches add every candidate track instead of skipping the entry.
+- `mdma rekordbox import --enrich` builds the beat grid from the first TEMPO: it is anchored on the true downbeat (`Battito`), takes the BPM from the TEMPO element (average BPM only as fallback) and beats per bar from `Metro`. Importing again retracts the superseded grid, which is how grids already in the library are corrected.
 
 ### Fixed
 
-- `mdma rekordbox import --enrich` now builds the beat grid from the first
-  TEMPO's `Bpm`, `Metro` and `Battito`: the grid BPM is the TEMPO BPM (average
-  BPM only as fallback), bars follow the Metro numerator, and an anchor that
-  sits on beat 2-4 of a bar is moved to the next downbeat, so bar lines no
-  longer land 1-3 beats off. Grids already in the library are corrected only by
-  importing the rekordbox XML again.
+- A Bandcamp link whose playlist no longer exists is pruned, and (re)linking always starts a fresh sync base (#123).
 - `mdma rekordbox export` wrote `BitRate` and `SampleRate` as 0. It parsed the display strings ("1411 kbps", "44100 Hz") as numbers; it now takes both from the track's projected audio properties (#122).
 
 ---
