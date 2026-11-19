@@ -681,10 +681,8 @@ export function startRouter() {
 
 // The ONLY ways a click may change what is heard. Each one calls the API, applies the returned
 // { queue } with applyQueue(), and shows a toast (with Undo where a queue change can be undone).
-// Nothing here may call the raw /player/play-queue: playNow and start go through the server's
-// idle guard. Each action resolves true when the server did what was asked, false otherwise.
-
-const count = (n) => (n === 1 ? "1 track" : n + " tracks");
+// playNow and start go through the server's idle guard (/api/start, /api/queue); there is no
+// unguarded play route. Each action resolves true when the server did what was asked, false otherwise.
 
 // What a queue action acts on is a "set": a function from the action ("next", "last", "replace",
 // "now") to the request that does it. The server holds every rule about which tracks can play.
@@ -747,7 +745,7 @@ function settle(body, done) {
 function said(body, subject, done) {
   const skipped = (body.skipped || []).map((s) => s.position + 1);
   const note = skipped.length ? " (unavailable skipped: " + skipped.join(", ") + ")" : "";
-  return (body.queued ? done(subject || count(body.queued), body.queued) : "Nothing to queue") + note;
+  return (body.queued ? done(subject || plural(body.queued, "track"), body.queued) : "Nothing to queue") + note;
 }
 
 /** Toast with an Undo that puts back `before`, the queue the server replaced, but only if it is still as the server returned it (`after`). */

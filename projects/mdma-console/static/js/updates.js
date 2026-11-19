@@ -27,7 +27,7 @@ export function viewUpdates(root) {
     table.querySelectorAll("button").forEach((b) => (b.disabled = on));
   }
 
-  async function load() {
+  async function load(hadFocus = false) {
     const mine = ++loads;
     let rows;
     try {
@@ -35,13 +35,13 @@ export function viewUpdates(root) {
     } catch (e) {
       if (!gone && mine === loads) {
         summary.textContent = "";
-        table.replaceChildren(...failedNote("Couldn't load the packages", e, load));
+        table.replaceChildren(...failedNote("Couldn't load the packages", e, () => load()));
       }
       return;
     }
     if (gone || mine !== loads) return;
     summary.textContent = updatesSummary(rows);
-    const hadFocus = table.contains(document.activeElement); // the button that was pressed is about to go
+    hadFocus = hadFocus || table.contains(document.activeElement); // the button that was pressed is about to go
     if (!rows.length) table.replaceChildren(emptyNote("No MDMA packages installed", "Nothing on this node can be updated."));
     else {
       table.replaceChildren(
@@ -63,6 +63,7 @@ export function viewUpdates(root) {
 
   async function checkNow() {
     if (busy) return;
+    const hadFocus = table.contains(document.activeElement);
     hold(true);
     try {
       await api("/check-updates", { method: "POST" });
@@ -71,7 +72,7 @@ export function viewUpdates(root) {
     } finally {
       hold(false);
     }
-    if (!gone) load();
+    if (!gone) load(hadFocus);
   }
 
   function update(r) {
@@ -82,6 +83,7 @@ export function viewUpdates(root) {
 
   async function run(r) {
     if (busy) return;
+    const hadFocus = table.contains(document.activeElement);
     hold(true);
     let reload = false;
     try {
@@ -97,7 +99,7 @@ export function viewUpdates(root) {
     }
     if (reload) return reloadWhenBack();
     hold(false);
-    if (!gone) load();
+    if (!gone) load(hadFocus);
   }
 
   // Wait for the restarted console to answer, then load the page again (new assets and all).

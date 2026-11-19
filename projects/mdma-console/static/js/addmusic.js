@@ -56,7 +56,7 @@ export function viewAddMusic(root) {
     input.disabled = true;
     results.replaceChildren(h("div", { class: "empty", text: "Uploading " + plural(files.length, "file") + "…" }));
     const form = new FormData();
-    for (const f of files) form.append("files", f); // the field name the classic form uses
+    for (const f of files) form.append("files", f); // the field name `/upload` reads
     try {
       const rows = uploadRows(await api("/upload", { body: form }));
       if (!gone) {

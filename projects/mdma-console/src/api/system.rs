@@ -1,5 +1,5 @@
 //! Node-level reads for the settings pages. `GET /api/inbox` lists the files waiting in the inbox
-//! (the same queue the classic page renders), as paths relative to the inbox. `GET /api/packages`
+//! (the same queue the library reports), as paths relative to the inbox. `GET /api/packages`
 //! lists the installed packages and the updates the last check found.
 
 use super::{gw, json_or_failure, library, unexpected_library_response};
@@ -28,7 +28,7 @@ pub async fn inbox(State(state): State<Arc<AppState>>) -> Response {
 
 /// `GET /api/packages`: the installed MDMA packages, each with the version an update would bring
 /// (`update_version`, null when it is current). The installed list is read afresh; when that fails
-/// the last one read is used, as the classic page does. Updates are those the last check found.
+/// the last one read is used. Updates are those the last check found.
 pub async fn packages(State(state): State<Arc<AppState>>) -> Response {
     match crate::packages::list_installed().await {
         Ok(pkgs) => *state.packages.lock().await = pkgs,
