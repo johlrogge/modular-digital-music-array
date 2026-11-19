@@ -3,6 +3,7 @@ import { ApiError, KEY_NOTATIONS, api, getKeyNotation, h, icon, route, setKeyNot
 import { backLink } from "./collections.js";
 import { emptyNote, topbar } from "./lists.js";
 import { speakerRows } from "./logic.js";
+import { viewAddMusic } from "./addmusic.js";
 
 /* ------------------------------------------------------------ theme */
 
@@ -150,7 +151,7 @@ const SECTIONS = [
   [
     "Library",
     [
-      { id: "add", icon: "upload", title: "Add music", sub: "Upload tracks", view: null },
+      { id: "add", icon: "upload", title: "Add music", sub: "Upload tracks", view: (root) => viewAddMusic(root, subHead) },
       { id: "bandcamp", icon: "cloud", title: "Bandcamp", sub: "Your collection and playlists", view: null },
     ],
   ],

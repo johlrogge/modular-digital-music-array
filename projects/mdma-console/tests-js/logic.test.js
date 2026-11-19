@@ -1,5 +1,5 @@
 // Run with `deno test projects/mdma-console/tests-js/`. Kept out of static/, which is all served.
-import { barTarget, appendOps, editOutcome, insertedCount, addedAndSkipped, speakerRows, metaLine } from "../static/js/logic.js";
+import { barTarget, appendOps, editOutcome, insertedCount, addedAndSkipped, speakerRows, metaLine, uploadRows, ingestSummary } from "../static/js/logic.js";
 
 function eq(actual, expected) {
   if (actual !== expected) throw new Error("expected " + expected + ", got " + actual);
@@ -25,6 +25,23 @@ Deno.test("meta line: missing fields leave no gaps or separators", () => {
   eq(metaLine({ album: "Alb", bpm: 0 }, "", ""), "Alb · 0 BPM");
   eq(metaLine({}, "", ""), "");
   eq(metaLine(null, "", "1:00"), "");
+});
+
+Deno.test("upload rows: a file is ok unless it carries an error", () => {
+  const rows = uploadRows({ files: [{ file: "a.flac", success: true }, { file: "b.txt", error: "Not a supported audio file or ZIP" }] });
+  eq(JSON.stringify(rows), JSON.stringify([{ name: "a.flac", ok: true, text: "Added to the inbox" }, { name: "b.txt", ok: false, text: "Not a supported audio file or ZIP" }]));
+});
+
+Deno.test("upload rows: anything but a files list is no rows", () => {
+  eq(uploadRows(null).length, 0);
+  eq(uploadRows({}).length, 0);
+});
+
+Deno.test("ingest summary: counts ingested and failed, plural-aware", () => {
+  eq(ingestSummary([{ success: true }, { success: true }, { success: false }]), "Ingested 2 files, 1 failed");
+  eq(ingestSummary([{ success: true }]), "Ingested 1 file");
+  eq(ingestSummary([]), "Nothing to ingest");
+  eq(ingestSummary(null), "Nothing to ingest");
 });
 
 Deno.test("speakers: anything but a list is no devices", () => {

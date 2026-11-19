@@ -62,6 +62,20 @@ export function speakerRows(outputs, config) {
   return (Array.isArray(outputs) ? outputs : []).map((s) => ({ name: s.name, label: s.description || s.name, current: cur !== null && s.name === cur }));
 }
 
+/** Rows for the upload result list from POST /upload ({ files: [{ file, success?, error? }] }): [{ name, ok, text }]. */
+export function uploadRows(data) {
+  return (data && Array.isArray(data.files) ? data.files : []).map((f) => ({ name: f.file, ok: !f.error, text: f.error || "Added to the inbox" }));
+}
+
+/** One line for POST /ingest-all's answer ([{ path, success, message }]). */
+export function ingestSummary(results) {
+  const all = Array.isArray(results) ? results : [];
+  if (!all.length) return "Nothing to ingest";
+  const ok = all.filter((r) => r.success).length;
+  const failed = all.length - ok;
+  return "Ingested " + ok + (ok === 1 ? " file" : " files") + (failed ? ", " + failed + " failed" : "");
+}
+
 /**
  * True when something is loaded but the audio output is not there or not pulling samples.
  * Idle shows nothing: "absent" is normal before the first load.
