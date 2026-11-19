@@ -60,6 +60,7 @@ pub fn routes() -> Router<Arc<AppState>> {
         )
         .route("/api/playlists/:name/sync", post(playlists::sync))
         .route("/api/inbox", get(system::inbox))
+        .route("/api/packages", get(system::packages))
         .route("/api/bin", get(bin::list).delete(bin::empty))
         .route("/api/bin/:id", delete(bin::purge))
         .route("/api/bin/:id/restore", post(bin::restore))
