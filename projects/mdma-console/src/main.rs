@@ -149,7 +149,8 @@ impl AppState {
 // Templates
 // =============================================================================
 
-/// Package view for template (includes pre-computed update info)
+/// Package view for template and `/api/packages` (includes pre-computed update info)
+#[derive(serde::Serialize)]
 struct PackageView {
     name: String,
     version: String,
@@ -360,6 +361,12 @@ async fn check_updates(State(state): State<Arc<AppState>>) -> impl IntoResponse 
     }
 }
 
+/// `POST /update/:name`: install the package, then restart its service.
+///
+/// Self-restart contract: updating `mdma-console` restarts this very process. There is no graceful
+/// shutdown and runsv kills it, so the handler can never answer; a client sees the connection drop.
+/// A 200 for `mdma-console` therefore means the restart did not happen (or failed, which is only
+/// logged), and the new version is installed but not running.
 async fn update_package(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
@@ -391,10 +398,18 @@ async fn update_package(
         }
     }
 
-    // Clear cached updates
-    state.updates.lock().await.clear();
+    forget_update(&state, &pkg).await;
 
     StatusCode::OK.into_response()
+}
+
+/// Drop `pkg` from the cached pending updates; the other packages' updates stay pending.
+async fn forget_update(state: &AppState, pkg: &PackageName) {
+    state
+        .updates
+        .lock()
+        .await
+        .retain(|u| u.name != pkg.as_str());
 }
 
 #[derive(serde::Serialize)]

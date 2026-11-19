@@ -97,6 +97,24 @@ export function bandcampSummary(s) {
   };
 }
 
+/** The package that is this console: updating it restarts the page's own server. */
+const SELF_PACKAGE = "mdma-console";
+
+/** Rows for the Updates page from GET /api/packages ([{ name, version, update_version }]): [{ name, version, update, self }], the console last (updating it restarts the page's server). */
+export function packageRows(list) {
+  const rows = (Array.isArray(list) ? list : []).map((p) => ({ name: p.name, version: p.version, update: p.update_version || null, self: p.name === SELF_PACKAGE }));
+  return [...rows.filter((r) => !r.self), ...rows.filter((r) => r.self)];
+}
+
+/** Whether the console has an update while other packages do too: those should go first. */
+export const consoleLast = (rows) => rows.some((r) => r.self && r.update) && rows.some((r) => !r.self && r.update);
+
+/** One line over the package rows: how many updates wait. */
+export function updatesSummary(rows) {
+  const n = rows.filter((r) => r.update).length;
+  return n ? plural(n, "update") + " available" : "No updates found. Check for newer versions.";
+}
+
 export const RESTART_TIMEOUT_MS = 30000;
 
 /**

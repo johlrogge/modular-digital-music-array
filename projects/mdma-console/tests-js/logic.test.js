@@ -1,9 +1,33 @@
 // Run with `deno test projects/mdma-console/tests-js/`. Kept out of static/, which is all served.
-import { barTarget, appendOps, editOutcome, insertedCount, addedAndSkipped, speakerRows, metaLine, bandcampSummary, restartPhase, RESTART_TIMEOUT_MS, uploadRows, ingestSummary, plural } from "../static/js/logic.js";
+import { barTarget, appendOps, editOutcome, insertedCount, addedAndSkipped, speakerRows, metaLine, bandcampSummary, restartPhase, RESTART_TIMEOUT_MS, uploadRows, ingestSummary, plural, packageRows, updatesSummary, consoleLast } from "../static/js/logic.js";
 
 function eq(actual, expected) {
   if (actual !== expected) throw new Error("expected " + expected + ", got " + actual);
 }
+
+Deno.test("package rows: a null update stays null, only the console is self, and it comes last", () => {
+  const rows = packageRows([{ name: "mdma-console", version: "1", update_version: "2" }, { name: "mdma-library", version: "1", update_version: null }]);
+  eq(JSON.stringify(rows), JSON.stringify([{ name: "mdma-library", version: "1", update: null, self: false }, { name: "mdma-console", version: "1", update: "2", self: true }]));
+});
+
+Deno.test("console last: only a console update next to other updates asks for the hint", () => {
+  const row = (name, update_version) => ({ name, version: "1", update_version });
+  eq(consoleLast(packageRows([row("mdma-console", "2"), row("mdma-library", "2")])), true);
+  eq(consoleLast(packageRows([row("mdma-console", "2"), row("mdma-library", null)])), false);
+  eq(consoleLast(packageRows([row("mdma-console", null), row("mdma-library", "2")])), false);
+});
+
+Deno.test("package rows: anything but a list is no packages", () => {
+  eq(packageRows(null).length, 0);
+  eq(packageRows({}).length, 0);
+});
+
+Deno.test("updates summary: counts the updates, plural-aware, or says all is current", () => {
+  eq(updatesSummary(packageRows([{ name: "a", version: "1", update_version: null }])), "No updates found. Check for newer versions.");
+  eq(updatesSummary(packageRows([{ name: "a", version: "1", update_version: "2" }])), "1 update available");
+  eq(updatesSummary(packageRows([{ name: "a", version: "1", update_version: "2" }, { name: "b", version: "1", update_version: "3" }])), "2 updates available");
+  eq(updatesSummary([]), "No updates found. Check for newer versions.");
+});
 
 Deno.test("speakers: the current device is marked, labels fall back to the name", () => {
   const rows = speakerRows([{ name: "a", description: "Desk" }, { name: "b", description: null }], { device_name: "b" });

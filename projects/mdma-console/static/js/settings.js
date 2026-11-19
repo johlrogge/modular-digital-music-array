@@ -3,8 +3,10 @@ import { KEY_NOTATIONS, api, getKeyNotation, h, icon, route, setKeyNotation, toa
 import { SETTINGS_LINK, pageHead } from "./collections.js";
 import { emptyNote, failedNote, topbar } from "./lists.js";
 import { speakerRows } from "./logic.js";
+import { viewAbout } from "./about.js";
 import { viewAddMusic } from "./addmusic.js";
 import { viewBandcamp } from "./bandcamp.js";
+import { viewUpdates } from "./updates.js";
 
 /* ------------------------------------------------------------ theme */
 
@@ -127,10 +129,23 @@ function viewTheme(root) {
   root.appendChild(h("div", { class: "section" }, [seg("Theme", THEMES, getTheme(), setTheme)]));
 }
 
+// Service mode and reboot live on a page of their own (/admin), which comes back here.
+function viewAdvanced(root) {
+  pageHead(root, SETTINGS_LINK, "Advanced");
+  root.appendChild(
+    h("div", { class: "settings-wrap" }, [
+      h("div", { class: "section" }, [
+        h("p", { class: "sub", text: "Service mode and rebooting the node. Music stops while the node restarts." }),
+        h("a", { class: "btn", href: "/admin" }, ["Open the admin page", icon("right", "sm")]),
+      ]),
+    ]),
+  );
+}
+
 /* ------------------------------------------------------------ index */
 
-// Every entry the settings will have. One without a `view` is not built yet: the index hides it and the
-// route ignores it until its phase lands and gives it a view.
+// Every entry the settings have. One without a `view` is not built yet: the index hides it and the
+// route ignores it until it gets a view.
 const SECTIONS = [
   [
     "Playback",
@@ -150,9 +165,9 @@ const SECTIONS = [
   [
     "System",
     [
-      { id: "updates", icon: "download", title: "Updates", sub: "Software on this node", view: null },
-      { id: "about", icon: "info", title: "About", sub: "Versions and status", view: null },
-      { id: "advanced", icon: "wrench", title: "Advanced", sub: "For tinkering", view: null },
+      { id: "updates", icon: "download", title: "Updates", sub: "Software on this node", view: viewUpdates },
+      { id: "about", icon: "info", title: "About", sub: "Versions and status", view: viewAbout },
+      { id: "advanced", icon: "wrench", title: "Advanced", sub: "For tinkering", view: viewAdvanced },
     ],
   ],
 ];
@@ -180,11 +195,6 @@ function viewIndex(root) {
         ),
       ]),
     );
-  }
-  const pending = ENTRIES.filter((e) => !e.view).map((e) => e.title);
-  if (pending.length) {
-    const last = pending.length > 1 ? " and " + pending.pop() : "";
-    root.appendChild(h("div", { class: "section" }, [h("a", { class: "link", href: "/classic", text: pending.join(", ") + last + " are still in the classic console →" })]));
   }
 }
 

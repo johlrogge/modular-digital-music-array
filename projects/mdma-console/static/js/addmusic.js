@@ -1,8 +1,8 @@
 // Settings > Add music: upload tracks to the inbox and ingest what waits there.
-import { api, h, icon, toast } from "./core.js";
+import { api, h, icon, plural, toast } from "./core.js";
 import { SETTINGS_LINK, pageHead } from "./collections.js";
 import { emptyNote, failReason, failedNote } from "./lists.js";
-import { ingestSummary, plural, uploadRows } from "./logic.js";
+import { ingestSummary, uploadRows } from "./logic.js";
 
 const ACCEPT = ".flac,.mp3,.wav,.m4a,.zip";
 const MAX_ROWS = 200; // the inbox list shows this many; the rest is a count
@@ -43,10 +43,9 @@ export function viewAddMusic(root) {
     if (!paths.length) return inbox.replaceChildren(emptyNote("The inbox is empty", "Uploaded files wait here until they are ingested."));
     ingest.disabled = false;
     const row = (text) => h("div", { role: "listitem" }, [h("span", { class: "ico" }, [icon("upload")]), h("span", { class: "ttl", text })]);
-    const rows = paths.slice(0, MAX_ROWS).map(row);
-    if (paths.length > MAX_ROWS) rows.push(row("and " + (paths.length - MAX_ROWS) + " more"));
     inbox.replaceChildren(
-      h("div", { class: "list", role: "list", "aria-label": "Inbox" }, rows),
+      h("div", { class: "list", role: "list", "aria-label": "Inbox" }, paths.slice(0, MAX_ROWS).map(row)),
+      paths.length > MAX_ROWS ? h("div", { class: "sub", text: "and " + (paths.length - MAX_ROWS) + " more" }) : null,
       h("div", { class: "btn-row", style: "margin-top:var(--s-4)" }, [ingest]),
     );
   }
