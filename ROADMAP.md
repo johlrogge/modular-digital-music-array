@@ -329,6 +329,15 @@ User-authored metadata written as facts through ACID:
 
 ---
 
+### 19. Service-owned Facts on Library Subjects (ADR-035) — planned
+
+**Why:** An interim fix prunes orphan Bandcamp links on read; the lasting design gives a link the life of its playlist.
+
+- Service-owned facts on library subjects: Bandcamp links as playlist facts, playlist-life id
+- Replaces the interim orphan pruning from ADR-032/033 amendments 2026-11-19
+
+---
+
 ## Post-Beta: Party Modes (placeholder — needs design discussion)
 
 See `documents/vision/The_Art_of_Shared_Listening_-_Party_Modes_Marketing_Copy.md` for initial thinking.
