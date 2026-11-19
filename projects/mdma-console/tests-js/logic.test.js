@@ -22,7 +22,7 @@ Deno.test("package rows: anything but a list is no packages", () => {
   eq(packageRows({}).length, 0);
 });
 
-Deno.test("updates summary: counts the updates, plural-aware, or says all is current", () => {
+Deno.test("updates summary: counts the updates, plural-aware, or says no updates were found", () => {
   eq(updatesSummary(packageRows([{ name: "a", version: "1", update_version: null }])), "No updates found. Check for newer versions.");
   eq(updatesSummary(packageRows([{ name: "a", version: "1", update_version: "2" }])), "1 update available");
   eq(updatesSummary(packageRows([{ name: "a", version: "1", update_version: "2" }, { name: "b", version: "1", update_version: "3" }])), "2 updates available");

@@ -266,33 +266,25 @@ mod tests {
     use super::*;
     use axum::http::StatusCode;
     use gateway_client::Response as PlaybackResponse;
-    use media_protocol::ResponseData;
 
     #[tokio::test]
     async fn fake_gateway_answers_from_script_and_records_commands() {
         let gw = FakeGateway::start(|req| match req {
             GatewayRequest::Playback {
-                request: Command::GetSession,
+                request: Command::GetAudioOutput,
             } => GatewayResponse::Playback {
-                response: PlaybackResponse::Ok {
-                    data: Some(ResponseData::Session(Some("s-1".into()))),
-                },
+                response: PlaybackResponse::Ok { data: None },
             },
             other => GatewayResponse::Error {
                 message: format!("unexpected {other:?}"),
             },
         });
 
-        let res = send_get(test_app_with(gw.addr()), "/player/session", None).await;
-        assert_eq!(res.status(), StatusCode::OK);
-        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(json["session"], "s-1");
+        let res = send_get(test_app_with(gw.addr()), "/player/audio-output", None).await;
+        assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
 
         let commands = gw.commands();
         assert_eq!(commands.len(), 1);
-        assert!(matches!(commands[0], Command::GetSession));
+        assert!(matches!(commands[0], Command::GetAudioOutput));
     }
 }

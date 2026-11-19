@@ -220,7 +220,7 @@ async fn shell() -> Response {
     render_shell(NODE_NAME.clone())
 }
 
-/// Routes for the new UI: the shell at `/` (the old UI lives at `/classic`) and the assets.
+/// Routes for the UI: the shell at `/` and the assets.
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/", get(shell))

@@ -2,8 +2,8 @@
 //
 // Everything shown comes from store.player (state, now, queue, output, offline, position, preview) joined with
 // store.tracks by hash. Nothing here starts or stops audio except an explicit click on a transport
-// button: play/pause toggles pause/resume, and Play while idle goes through actions.start() (never
-// the raw /player/play-queue). While previewing, Back (button or B) takes Next's place.
+// button: play/pause toggles pause/resume, and Play while idle goes through actions.start() (the
+// server's idle guard). While previewing, Back (button or B) takes Next's place.
 import { isIdle, outputDown, trackTitle, metaLine, LIKED, markLabel } from "./logic.js";
 import { artBg, setArt, setCover } from "./art.js";
 import { $, $$, ApiError, actions, api, enc, fmt, h, icon, macroForKey, keyText, marksOf, on, openMenu, refreshPlayer, store, toast, typing } from "./core.js";
