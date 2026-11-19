@@ -10,6 +10,7 @@ pub fn info(hash: String, title: &str) -> TrackInfo {
         artist: Some("Artist".to_string()),
         album: None,
         duration: None,
+        duration_ms: None,
         bpm: None,
         key: None,
         blob_path: None,

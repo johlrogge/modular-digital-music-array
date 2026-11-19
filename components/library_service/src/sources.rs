@@ -69,6 +69,15 @@ impl LibrarySources {
             user_default: crate::ipc::user_fact_source(v),
         }
     }
+
+    /// The sources the facts of a blob are written under: hashes are derived, the
+    /// duration is measured from the file (as ingest stamps it).
+    pub(crate) fn blob_facts(&self) -> crate::identity::BlobFactSources {
+        crate::identity::BlobFactSources {
+            derived: self.derived.clone(),
+            measured: self.scan.clone(),
+        }
+    }
 }
 
 #[cfg(test)]

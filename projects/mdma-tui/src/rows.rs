@@ -117,6 +117,7 @@ pub(crate) fn make_track_info(
         artist: Some(artist.to_string()),
         album: None,
         duration: Some(DurationSeconds::new(duration_secs)),
+        duration_ms: None,
         bpm: None,
         key: None,
         blob_path: None,

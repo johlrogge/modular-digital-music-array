@@ -3,8 +3,8 @@
 use audio_metadata::{discover_all_fields, extract_metadata, TrackMetadata};
 use music_facts::{
     Album, AlbumArtPresence, Artist, BitDepth, Bitrate, Channels, ContentHash, DiscNumber,
-    DurationSeconds, FactSource, FileSizeBytes, Isrc, MusicFormat, MusicValue, SampleRate, Title,
-    TrackNumber, Year,
+    DurationMs, DurationSeconds, FactSource, FileSizeBytes, Isrc, MusicFormat, MusicValue,
+    SampleRate, Title, TrackNumber, Year,
 };
 use music_primitives::{Bpm, Key};
 use std::collections::HashMap;
@@ -246,6 +246,10 @@ fn generate_facts_from_metadata(
             MusicValue::DurationSeconds(DurationSeconds::new(duration.as_secs() as u32)),
             library.clone(),
         ));
+        facts.push((
+            MusicValue::DurationMs(DurationMs::from_duration(duration)),
+            library.clone(),
+        ));
     }
 
     if let Some(bitrate) = metadata.bitrate {
@@ -430,6 +434,24 @@ mod tests {
             .iter()
             .any(|(v, _)| matches!(v, MusicValue::SampleRate(_))));
         assert!(facts.iter().any(|(v, _)| matches!(v, MusicValue::Title(_))));
+    }
+
+    #[test]
+    fn exact_duration_is_emitted_next_to_the_whole_seconds() {
+        let mut metadata = make_metadata(Some("T"), None, None, "/music/inbox/x.flac");
+        metadata.duration = Some(std::time::Duration::from_millis(367_123));
+        let library = FactSource::new("mdma-library", "test", "FilesystemScan");
+        let facts = generate_facts_from_metadata(
+            &ContentHash::new("sha256:abc".to_string()),
+            &metadata,
+            &std::collections::HashMap::new(),
+            &library,
+            &library,
+        )
+        .unwrap();
+        let values: Vec<&MusicValue> = facts.iter().map(|(v, _)| v).collect();
+        assert!(values.contains(&&MusicValue::DurationMs(DurationMs::new(367_123))));
+        assert!(values.contains(&&MusicValue::DurationSeconds(DurationSeconds::new(367))));
     }
 
     #[test]

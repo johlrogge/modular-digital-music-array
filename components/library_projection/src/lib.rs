@@ -75,6 +75,8 @@ pub struct IndexedTrackInfo {
     pub genre: Option<String>,
     pub styles: Vec<String>,
     pub duration_seconds: Option<u32>,
+    /// Exact duration in milliseconds (the `DurationMs` fact), when known.
+    pub duration_ms: Option<u64>,
     pub bpm: Option<f32>,
     pub key: Option<music_facts::Key>,
     pub year: Option<u32>,
@@ -170,6 +172,7 @@ impl IndexedTrackInfo {
             genre: None,
             styles: vec![],
             duration_seconds: None,
+            duration_ms: None,
             bpm: None,
             key: None,
             year: None,
@@ -461,6 +464,7 @@ fn apply_assert_scalar(
         MusicValue::MainGenre(v) => entry.genre = Some(v.clone()),
         MusicValue::StyleDescriptor(v) => push_unique(&mut entry.styles, v.clone()),
         MusicValue::DurationSeconds(v) => entry.duration_seconds = Some(v.value()),
+        MusicValue::DurationMs(v) => entry.duration_ms = Some(v.value()),
         MusicValue::Bpm(v) => entry.bpm = Some(v.as_f32()),
         MusicValue::Key(v) => entry.key = Some(*v),
         MusicValue::Year(v) => entry.year = Some(v.value()),
@@ -544,6 +548,15 @@ fn unique<T: PartialEq>(items: impl IntoIterator<Item = T>) -> Vec<T> {
     out
 }
 
+/// The field value held by the last (most recent) surviving assertion that `pick`
+/// accepts: `pick` selects the variant and extracts the field in one step.
+fn last_surviving_map<T>(
+    provenance: &[(MusicValue, music_facts::FactSource)],
+    pick: impl Fn(&MusicValue) -> Option<T>,
+) -> Option<T> {
+    provenance.iter().rev().find_map(|(v, _)| pick(v))
+}
+
 /// Re-resolve a single scalar field after removing a provenance entry.
 ///
 /// For fields that map to a scalar `Option<T>`, we scan the remaining provenance
@@ -554,70 +567,37 @@ fn unique<T: PartialEq>(items: impl IntoIterator<Item = T>) -> Vec<T> {
 /// retract of the current value clears: `TrackStarted`/`TrackStopped` are history and
 /// `AddedAt` is latest-wins.
 fn apply_retract_scalar(entry: &mut IndexedTrackInfo, retracted: &MusicValue) {
-    // Helper: find last surviving value for a given variant discriminant.
-    // Returns a clone of the last provenance entry whose variant matches `matcher`.
-    let last_surviving = |provenance: &[(MusicValue, music_facts::FactSource)],
-                          matcher: &dyn Fn(&MusicValue) -> bool|
-     -> Option<MusicValue> {
-        provenance
-            .iter()
-            .filter(|(v, _)| matcher(v))
-            .last()
-            .map(|(v, _)| v.clone())
-    };
-
+    // One closure both selects the variant and extracts the field from the last
+    // surviving assertion of it.
     match retracted {
         MusicValue::Title(_) => {
-            entry.title = last_surviving(&entry.provenance, &|v| matches!(v, MusicValue::Title(_)))
-                .and_then(|v| {
-                    if let MusicValue::Title(t) = v {
-                        Some(t.as_str().to_string())
-                    } else {
-                        None
-                    }
-                });
+            entry.title = last_surviving_map(&entry.provenance, |v| match v {
+                MusicValue::Title(t) => Some(t.as_str().to_string()),
+                _ => None,
+            });
         }
         MusicValue::Artist(_) => {
-            entry.artist =
-                last_surviving(&entry.provenance, &|v| matches!(v, MusicValue::Artist(_)))
-                    .and_then(|v| {
-                        if let MusicValue::Artist(a) = v {
-                            Some(a.as_str().to_string())
-                        } else {
-                            None
-                        }
-                    });
+            entry.artist = last_surviving_map(&entry.provenance, |v| match v {
+                MusicValue::Artist(a) => Some(a.as_str().to_string()),
+                _ => None,
+            });
         }
         MusicValue::Album(_) => {
-            entry.album = last_surviving(&entry.provenance, &|v| matches!(v, MusicValue::Album(_)))
-                .and_then(|v| {
-                    if let MusicValue::Album(a) = v {
-                        Some(a.as_str().to_string())
-                    } else {
-                        None
-                    }
-                });
+            entry.album = last_surviving_map(&entry.provenance, |v| match v {
+                MusicValue::Album(a) => Some(a.as_str().to_string()),
+                _ => None,
+            });
         }
         MusicValue::Label(_) => {
-            entry.label = last_surviving(&entry.provenance, &|v| matches!(v, MusicValue::Label(_)))
-                .and_then(|v| {
-                    if let MusicValue::Label(l) = v {
-                        Some(l.clone())
-                    } else {
-                        None
-                    }
-                });
+            entry.label = last_surviving_map(&entry.provenance, |v| match v {
+                MusicValue::Label(l) => Some(l.clone()),
+                _ => None,
+            });
         }
         MusicValue::MainGenre(_) => {
-            entry.genre = last_surviving(&entry.provenance, &|v| {
-                matches!(v, MusicValue::MainGenre(_))
-            })
-            .and_then(|v| {
-                if let MusicValue::MainGenre(g) = v {
-                    Some(g.clone())
-                } else {
-                    None
-                }
+            entry.genre = last_surviving_map(&entry.provenance, |v| match v {
+                MusicValue::MainGenre(g) => Some(g.clone()),
+                _ => None,
             });
         }
         MusicValue::StyleDescriptor(_) => {
@@ -631,153 +611,95 @@ fn apply_retract_scalar(entry: &mut IndexedTrackInfo, retracted: &MusicValue) {
             }));
         }
         MusicValue::DurationSeconds(_) => {
-            entry.duration_seconds = last_surviving(&entry.provenance, &|v| {
-                matches!(v, MusicValue::DurationSeconds(_))
-            })
-            .and_then(|v| {
-                if let MusicValue::DurationSeconds(d) = v {
-                    Some(d.value())
-                } else {
-                    None
-                }
+            entry.duration_seconds = last_surviving_map(&entry.provenance, |v| match v {
+                MusicValue::DurationSeconds(d) => Some(d.value()),
+                _ => None,
+            });
+        }
+        MusicValue::DurationMs(_) => {
+            entry.duration_ms = last_surviving_map(&entry.provenance, |v| match v {
+                MusicValue::DurationMs(d) => Some(d.value()),
+                _ => None,
             });
         }
         MusicValue::Bpm(_) => {
-            entry.bpm = last_surviving(&entry.provenance, &|v| matches!(v, MusicValue::Bpm(_)))
-                .and_then(|v| {
-                    if let MusicValue::Bpm(b) = v {
-                        Some(b.as_f32())
-                    } else {
-                        None
-                    }
-                });
+            entry.bpm = last_surviving_map(&entry.provenance, |v| match v {
+                MusicValue::Bpm(b) => Some(b.as_f32()),
+                _ => None,
+            });
         }
         MusicValue::Key(_) => {
-            entry.key = last_surviving(&entry.provenance, &|v| matches!(v, MusicValue::Key(_)))
-                .and_then(|v| {
-                    if let MusicValue::Key(k) = v {
-                        Some(k)
-                    } else {
-                        None
-                    }
-                });
+            entry.key = last_surviving_map(&entry.provenance, |v| match v {
+                MusicValue::Key(k) => Some(*k),
+                _ => None,
+            });
         }
         MusicValue::Year(_) => {
-            entry.year = last_surviving(&entry.provenance, &|v| matches!(v, MusicValue::Year(_)))
-                .and_then(|v| {
-                    if let MusicValue::Year(y) = v {
-                        Some(y.value())
-                    } else {
-                        None
-                    }
-                });
+            entry.year = last_surviving_map(&entry.provenance, |v| match v {
+                MusicValue::Year(y) => Some(y.value()),
+                _ => None,
+            });
         }
         MusicValue::TrackNumber(_) => {
-            entry.track_number = last_surviving(&entry.provenance, &|v| {
-                matches!(v, MusicValue::TrackNumber(_))
-            })
-            .and_then(|v| {
-                if let MusicValue::TrackNumber(n) = v {
-                    Some(n.value())
-                } else {
-                    None
-                }
+            entry.track_number = last_surviving_map(&entry.provenance, |v| match v {
+                MusicValue::TrackNumber(n) => Some(n.value()),
+                _ => None,
             });
         }
         MusicValue::DiscNumber(_) => {
-            entry.disc_number = last_surviving(&entry.provenance, &|v| {
-                matches!(v, MusicValue::DiscNumber(_))
-            })
-            .and_then(|v| {
-                if let MusicValue::DiscNumber(n) = v {
-                    Some(n.value())
-                } else {
-                    None
-                }
+            entry.disc_number = last_surviving_map(&entry.provenance, |v| match v {
+                MusicValue::DiscNumber(n) => Some(n.value()),
+                _ => None,
             });
         }
         MusicValue::Source(_) => {
-            entry.source =
-                last_surviving(&entry.provenance, &|v| matches!(v, MusicValue::Source(_)))
-                    .and_then(|v| {
-                        if let MusicValue::Source(s) = v {
-                            Some(s.clone())
-                        } else {
-                            None
-                        }
-                    });
+            entry.source = last_surviving_map(&entry.provenance, |v| match v {
+                MusicValue::Source(s) => Some(s.clone()),
+                _ => None,
+            });
         }
         MusicValue::CoverArtPath(_) => {
-            let surviving = last_surviving(&entry.provenance, &|v| {
-                matches!(v, MusicValue::CoverArtPath(_))
+            entry.cover_art_path = last_surviving_map(&entry.provenance, |v| match v {
+                MusicValue::CoverArtPath(p) => Some(PathBuf::from(p)),
+                _ => None,
             });
-            match surviving {
-                Some(MusicValue::CoverArtPath(p)) => {
-                    entry.cover_art_path = Some(PathBuf::from(&p));
-                }
-                _ => entry.cover_art_path = None,
-            }
         }
         MusicValue::Format(_) => {}
         MusicValue::ItemId(_) => {
-            entry.item_id =
-                last_surviving(&entry.provenance, &|v| matches!(v, MusicValue::ItemId(_)))
-                    .and_then(|v| {
-                        if let MusicValue::ItemId(id) = v {
-                            Some(id.clone())
-                        } else {
-                            None
-                        }
-                    });
+            entry.item_id = last_surviving_map(&entry.provenance, |v| match v {
+                MusicValue::ItemId(id) => Some(id.clone()),
+                _ => None,
+            });
         }
         MusicValue::Replaces(_) => {
             // No scalar field for Replaces; provenance removal is sufficient.
         }
         MusicValue::Deleted { .. } => {
-            let surviving = last_surviving(&entry.provenance, &|v| {
-                matches!(v, MusicValue::Deleted { .. })
-            });
-            entry.deleted_at = match surviving {
-                Some(MusicValue::Deleted { timestamp }) => Some(timestamp),
+            entry.deleted_at = last_surviving_map(&entry.provenance, |v| match v {
+                MusicValue::Deleted { timestamp } => Some(*timestamp),
                 _ => None,
-            };
+            });
         }
         MusicValue::Role(_) => {
-            entry.role = last_surviving(&entry.provenance, &|v| matches!(v, MusicValue::Role(_)))
-                .and_then(|v| {
-                    if let MusicValue::Role(r) = v {
-                        Some(r)
-                    } else {
-                        None
-                    }
-                });
+            entry.role = last_surviving_map(&entry.provenance, |v| match v {
+                MusicValue::Role(r) => Some(*r),
+                _ => None,
+            });
         }
         MusicValue::Energy(_) => {
-            entry.energy =
-                last_surviving(&entry.provenance, &|v| matches!(v, MusicValue::Energy(_)))
-                    .and_then(|v| {
-                        if let MusicValue::Energy(e) = v {
-                            Some(e)
-                        } else {
-                            None
-                        }
-                    });
+            entry.energy = last_surviving_map(&entry.provenance, |v| match v {
+                MusicValue::Energy(e) => Some(*e),
+                _ => None,
+            });
         }
         MusicValue::BeatGrid { .. } => {
-            entry.beat_grid = last_surviving(&entry.provenance, &|v| {
-                matches!(v, MusicValue::BeatGrid { .. })
-            })
-            .and_then(|v| {
-                if let MusicValue::BeatGrid {
+            entry.beat_grid = last_surviving_map(&entry.provenance, |v| match v {
+                MusicValue::BeatGrid {
                     first_beat_ms,
                     bpm,
                     beats_per_bar,
-                } = v
-                {
-                    Some((first_beat_ms, bpm.as_f32(), beats_per_bar))
-                } else {
-                    None
-                }
+                } => Some((*first_beat_ms, bpm.as_f32(), *beats_per_bar)),
+                _ => None,
             });
         }
         MusicValue::MemoryCue { .. } => {
@@ -3174,7 +3096,7 @@ mod tests {
             .map(|t| {
                 format!(
                     "{} title={:?} artist={:?} album={:?} label={:?} genre={:?} styles={:?} \
-                     duration={:?} bpm={:?} key={:?} year={:?} source={:?} blob={:?} cover={:?} \
+                     duration={:?} duration_ms={:?} bpm={:?} key={:?} year={:?} source={:?} blob={:?} cover={:?} \
                      track={:?} disc={:?} started={:?} stopped={:?} added={:?} item={:?} \
                      deleted={:?} role={:?} energy={:?} grid={:?} cues={:?} raw={:?} \
                      retired_by={:?} inherited_cover={:?} prov={:?}",
@@ -3186,6 +3108,7 @@ mod tests {
                     t.genre,
                     t.styles,
                     t.duration_seconds,
+                    t.duration_ms,
                     t.bpm,
                     t.key,
                     t.year,

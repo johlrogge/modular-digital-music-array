@@ -8,9 +8,9 @@ use library_ipc_client::{
     interpret_identity_backfill_status, interpret_playlist_entries, resolve_full_hash,
     resolve_full_hashes, ArchiveEmptyReport, ArchiveListing, CanonicalHash, ClientError,
     ContentHash, DedupApplyReport, DedupScanReport, EnergyLevel, FactSource, FactType,
-    IdentityBackfillStart, IdentityBackfillStatus, InboxPath, IngestAllItem, IngestResult,
-    IngestSource, LibraryClient, LibraryRequest, LibraryResponse, Mark, MarkFilter, MarkWrite,
-    MusicValue, OrphanInfo, PlaylistEntry, PlaylistName, ProtocolError, ResolveError,
+    IdentityBackfillScope, IdentityBackfillStart, IdentityBackfillStatus, InboxPath, IngestAllItem,
+    IngestResult, IngestSource, LibraryClient, LibraryRequest, LibraryResponse, Mark, MarkFilter,
+    MarkWrite, MusicValue, OrphanInfo, PlaylistEntry, PlaylistName, ProtocolError, ResolveError,
     ServiceStatus, TrackInfo, TrackQuery, Unmark,
 };
 use playlist_import::PlaylistWriteOps;
@@ -527,13 +527,13 @@ impl LibraryBackend {
     /// Start the identity-hash backfill (or learn that one is already running).
     pub fn identity_backfill(
         &self,
-        include_pcm: bool,
+        scope: IdentityBackfillScope,
     ) -> Result<IdentityBackfillStart, ClientError> {
         match self {
-            LibraryBackend::Direct(c) => c.identity_backfill(include_pcm),
-            LibraryBackend::Gateway(_) => interpret_identity_backfill(
-                self.request(&LibraryRequest::IdentityBackfill { include_pcm })?,
-            ),
+            LibraryBackend::Direct(c) => c.identity_backfill(scope),
+            LibraryBackend::Gateway(_) => {
+                interpret_identity_backfill(self.request(&LibraryRequest::IdentityBackfill(scope))?)
+            }
         }
     }
 

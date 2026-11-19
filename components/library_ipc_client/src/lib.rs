@@ -661,11 +661,9 @@ impl LibraryClient {
     /// Start the identity-hash backfill (or learn that one is already running).
     pub fn identity_backfill(
         &self,
-        include_pcm: bool,
+        scope: IdentityBackfillScope,
     ) -> Result<IdentityBackfillStart, ClientError> {
-        interpret_identity_backfill(
-            self.request(&LibraryRequest::IdentityBackfill { include_pcm })?,
-        )
+        interpret_identity_backfill(self.request(&LibraryRequest::IdentityBackfill(scope))?)
     }
 
     /// Report progress of the identity-hash backfill.
@@ -972,6 +970,7 @@ mod tests {
             artist: None,
             album: None,
             duration: None,
+            duration_ms: None,
             bpm: None,
             key: None,
             blob_path: None,

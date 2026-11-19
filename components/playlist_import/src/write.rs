@@ -85,6 +85,7 @@ mod tests {
             artist: Some(artist.to_string()),
             album: None,
             duration: Some(DurationSeconds::new(duration_secs)),
+            duration_ms: None,
             bpm: None,
             key: None,
             blob_path: None,

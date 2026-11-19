@@ -1,4 +1,5 @@
-//! Explicit identity-hash backfill (ADR-010, ADR-012).
+//! Explicit blob backfill: the identity hashes (ADR-010, ADR-012) and, when the scope
+//! asks for it, the exact `DurationMs` for tracks that lack it.
 //!
 //! Started only by an `IdentityBackfill` request, never at startup. Runs on a
 //! dedicated low-priority worker thread so it cannot block library requests or
@@ -7,7 +8,9 @@
 
 use super::*;
 use crate::identity::{drop_page_cache, lower_current_thread_priority};
-use crate::ipc::{IdentityBackfillProgress, IdentityBackfillStart, IdentityBackfillStatus};
+use crate::ipc::{
+    IdentityBackfillProgress, IdentityBackfillScope, IdentityBackfillStart, IdentityBackfillStatus,
+};
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
@@ -22,7 +25,7 @@ const CANCEL_POLL: Duration = Duration::from_millis(100);
 struct Work {
     hash: ContentHash,
     blob: PathBuf,
-    opts: IdentityOpts,
+    opts: BlobFactSet,
 }
 
 /// Result of re-checking a planned track right before writing.
@@ -58,14 +61,14 @@ impl LibraryService {
     }
 
     /// Plan the run: tracks with a blob that lack a requested hash fact.
-    fn plan_identity_backfill(&self, include_pcm: bool) -> Vec<Work> {
+    fn plan_identity_backfill(&self, scope: IdentityBackfillScope) -> Vec<Work> {
         let tracks = self.tracks.lock().unwrap();
         tracks
             .iter()
             .filter(|t| !t.is_retired())
             .filter(|t| !t.blob_path.as_os_str().is_empty())
             .filter_map(|t| {
-                let opts = IdentityOpts::missing(include_pcm, t.provenance.iter().map(|(v, _)| v))?;
+                let opts = BlobFactSet::missing(scope, t.provenance.iter().map(|(v, _)| v))?;
                 Some(Work {
                     hash: t.content_hash.clone(),
                     blob: self.music_dir.join(&t.blob_path),
@@ -79,7 +82,7 @@ impl LibraryService {
     /// If the worker thread cannot be spawned the status is left as it was.
     pub(super) fn start_identity_backfill(
         &self,
-        include_pcm: bool,
+        scope: IdentityBackfillScope,
     ) -> Result<IdentityBackfillStart, ProtocolError> {
         let mut status = self.identity_backfill.lock().unwrap();
         if let IdentityBackfillStatus::Running(p) = &*status {
@@ -91,9 +94,9 @@ impl LibraryService {
             .upgrade()
             .expect("the service is alive while it handles a request");
 
-        let work = self.plan_identity_backfill(include_pcm);
+        let work = self.plan_identity_backfill(scope);
         let progress = IdentityBackfillProgress {
-            include_pcm,
+            scope,
             total: work.len(),
             done: 0,
             failed: 0,
@@ -180,8 +183,10 @@ impl LibraryService {
         if track.is_retired() {
             return Recheck::Retired;
         }
-        let Some(missing) = IdentityOpts::missing(true, track.provenance.iter().map(|(v, _)| v))
-        else {
+        let Some(missing) = BlobFactSet::missing(
+            IdentityBackfillScope::ALL,
+            track.provenance.iter().map(|(v, _)| v),
+        ) else {
             return Recheck::Write(Vec::new());
         };
         Recheck::Write(
@@ -190,6 +195,7 @@ impl LibraryService {
                 .filter(|(v, _)| match v {
                     MusicValue::AudioHash(_) => missing.audio_hash,
                     MusicValue::PcmHash(_) => missing.pcm_hash,
+                    MusicValue::DurationMs(_) => missing.duration_ms,
                     _ => false,
                 })
                 .collect(),
@@ -223,7 +229,7 @@ impl LibraryService {
                 return;
             }
         };
-        let source = self.sources.derived.clone();
+        let sources = self.sources.blob_facts();
 
         // One projection for the whole run, also on unwind: the fact subscriber
         // projects writes in production anyway, so nothing needs them sooner.
@@ -234,7 +240,7 @@ impl LibraryService {
                 }
 
                 let started = Instant::now();
-                let computed = identity_facts_for_blob(&w.blob, w.opts, &source);
+                let computed = identity_facts_for_blob(&w.blob, w.opts, &sources);
                 drop_page_cache(&w.blob);
                 let hash_failed = !computed.errors.is_empty();
 

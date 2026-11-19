@@ -2389,6 +2389,7 @@ mod tests {
             artist: Some(artist.to_string()),
             album: Some(album.to_string()),
             duration: None,
+            duration_ms: None,
             bpm: None,
             key: None,
             blob_path: None,

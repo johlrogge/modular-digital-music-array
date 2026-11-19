@@ -64,6 +64,7 @@ pub fn track_info(t: &IndexedTrackInfo, covers: &AlbumCovers) -> TrackInfo {
         artist: t.artist.clone(),
         album: t.album.clone(),
         duration: t.duration_seconds.map(DurationSeconds::new),
+        duration_ms: t.duration_ms.map(music_facts::DurationMs::new),
         bpm: t.bpm.and_then(|b| Bpm::from_f32(b).ok()),
         key: t.key,
         blob_path: Some(t.blob_path.to_string_lossy().to_string()),
@@ -297,6 +298,29 @@ mod tests {
 
         assert_eq!(info(&with).genre.as_deref(), Some("Techno"));
         assert_eq!(info(&indexed("h2")).genre, None);
+    }
+
+    #[test]
+    fn track_info_carries_the_exact_duration_next_to_the_seconds() {
+        use music_facts::{DurationMs, DurationSeconds as Secs};
+        let source = FactSource::new("test", "1.0.0", "Unknown");
+        let at = chrono::Utc::now();
+        let mut t = indexed("h1");
+        assert_eq!(info(&t).duration_ms, None);
+
+        for v in [
+            MusicValue::DurationSeconds(Secs::new(367)),
+            MusicValue::DurationMs(DurationMs::new(367_123)),
+        ] {
+            crate::apply_fact_to_track(&mut t, &v, at, Operation::Assert, &source);
+        }
+        let got = info(&t);
+        assert_eq!(got.duration_ms, Some(DurationMs::new(367_123)));
+        assert_eq!(got.duration.map(|d| d.value()), Some(367));
+
+        let retract = MusicValue::DurationMs(DurationMs::new(367_123));
+        crate::apply_fact_to_track(&mut t, &retract, at, Operation::Retract, &source);
+        assert_eq!(info(&t).duration_ms, None);
     }
 
     // ---- marks ------------------------------------------------------------------

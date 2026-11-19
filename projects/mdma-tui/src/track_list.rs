@@ -428,6 +428,7 @@ mod tests {
             artist: artist.map(str::to_string),
             album: None,
             duration: duration_secs.map(DurationSeconds::new),
+            duration_ms: None,
             bpm: bpm.map(|b| Bpm::from_u32(b).unwrap()),
             key,
             blob_path: None,

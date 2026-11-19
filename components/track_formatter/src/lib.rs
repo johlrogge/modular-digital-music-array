@@ -393,6 +393,7 @@ mod tests {
             artist: artist.map(String::from),
             album: None,
             duration: duration.map(library_ipc_protocol::DurationSeconds::new),
+            duration_ms: None,
             bpm: None,
             key: None,
             blob_path: None,

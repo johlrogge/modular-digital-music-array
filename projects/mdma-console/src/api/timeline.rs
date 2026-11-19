@@ -68,7 +68,7 @@ pub struct ApiTimeline {
 
 impl From<&TrackInfo> for ApiTimeline {
     fn from(t: &TrackInfo) -> Self {
-        let duration_ms = t.duration.map(|d| u64::from(d.value()) * 1000);
+        let duration_ms = t.length_ms();
         let grid = t
             .beat_grid
             .as_ref()
@@ -109,7 +109,7 @@ mod tests {
     };
     use axum::http::StatusCode;
     use gateway_client::{GatewayRequest, GatewayResponse, LibraryRequest, LibraryResponse};
-    use library_ipc_client::{BeatGridInfo, Bpm, DurationSeconds};
+    use library_ipc_client::{BeatGridInfo, Bpm, DurationMs, DurationSeconds};
     use serde_json::json;
 
     /// A 5 s track at 120 BPM in 4/4 with the first beat at 100 ms: a beat every 500 ms, a bar
@@ -216,6 +216,34 @@ mod tests {
         let timeline = ApiTimeline::from(&t);
         assert_eq!(timeline.duration_ms, None);
         assert_eq!(timeline.grid.unwrap().bars_ms, Vec::<u64>::new());
+    }
+
+    #[test]
+    fn the_exact_duration_wins_over_whole_seconds_and_clips_the_bars() {
+        // 5 s by the seconds fact, but 4.05 s exactly: the bar at 4100 ms is
+        // past the end.
+        let mut t = gridded();
+        t.duration_ms = Some(DurationMs::new(4_050));
+        let timeline = ApiTimeline::from(&t);
+        assert_eq!(timeline.duration_ms, Some(4_050));
+        assert_eq!(timeline.grid.unwrap().bars_ms, vec![100, 2100]);
+    }
+
+    #[test]
+    fn the_exact_duration_alone_is_enough() {
+        let mut t = gridded();
+        t.duration = None;
+        t.duration_ms = Some(DurationMs::new(5_000));
+        let timeline = ApiTimeline::from(&t);
+        assert_eq!(timeline.duration_ms, Some(5_000));
+        assert_eq!(timeline.grid.unwrap().bars_ms, vec![100, 2100, 4100]);
+    }
+
+    #[test]
+    fn without_the_exact_duration_the_seconds_are_used() {
+        let t = gridded();
+        assert_eq!(t.duration_ms, None);
+        assert_eq!(ApiTimeline::from(&t).duration_ms, Some(5_000));
     }
 
     #[test]

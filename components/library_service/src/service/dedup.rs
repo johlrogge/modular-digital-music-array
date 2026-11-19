@@ -86,6 +86,7 @@ fn carry_rule(v: &MusicValue) -> CarryRule {
         | V::PcmHash(_)
         | V::Format(_)
         | V::DurationSeconds(_)
+        | V::DurationMs(_)
         | V::Bitrate(_)
         | V::FileSizeBytes(_)
         | V::HasAlbumArt(_)

@@ -6,8 +6,8 @@
 
 // Re-export types used in the protocol so clients don't need to depend on music-facts
 pub use music_facts::{
-    Bpm, ContentHash, CueKind, DurationSeconds, FactKind, FactSource, Key, Mark, MarkFilter,
-    MarkName, MarkNameError, MusicValue,
+    Bpm, ContentHash, CueKind, DurationMs, DurationSeconds, FactKind, FactSource, Key, Mark,
+    MarkFilter, MarkName, MarkNameError, MusicValue,
 };
 pub use music_primitives::{BeatGrid, CanonicalHash, EnergyLevel, Mode, TrackRole};
 // Re-export query types so clients can use them without depending on library-search directly
@@ -823,12 +823,14 @@ pub enum LibraryRequest {
     ReindexCovers,
 
     /// Start the explicit identity-hash backfill (AudioHash, and PcmHash when
-    /// `include_pcm`) for tracks that lack the requested hash fact.
+    /// `include_pcm`) for tracks that lack the requested hash fact. When
+    /// `include_duration`, tracks that lack the exact `DurationMs` fact get it too
+    /// (read from the tags, no decode). The scope's fields sit flat in the request.
     ///
     /// Runs on a low-priority background worker in the library service and never
     /// blocks other requests. If a run is already in progress it is left alone and
     /// the response says so. Poll with `GetIdentityBackfillStatus`.
-    IdentityBackfill { include_pcm: bool },
+    IdentityBackfill(IdentityBackfillScope),
 
     /// Report progress of the identity-hash backfill.
     GetIdentityBackfillStatus,
@@ -1150,6 +1152,19 @@ impl BeatGridInfo {
     }
 }
 
+impl TrackInfo {
+    /// The track's length in milliseconds: the exact `DurationMs` when the library has
+    /// it, else the whole seconds times 1000. `None` when neither is known.
+    ///
+    /// For MP3 the exact value is the tag reader's estimate (Xing/VBRI header, or the
+    /// bitrate for CBR), so it can be off by tens of milliseconds.
+    pub fn length_ms(&self) -> Option<u64> {
+        self.duration_ms
+            .map(DurationMs::value)
+            .or_else(|| self.duration.map(|d| u64::from(d.value()) * 1000))
+    }
+}
+
 /// Track information for display.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrackInfo {
@@ -1158,6 +1173,10 @@ pub struct TrackInfo {
     pub artist: Option<String>,
     pub album: Option<String>,
     pub duration: Option<DurationSeconds>,
+    /// Exact duration (the `DurationMs` fact). None when not known. Absent on the
+    /// wire from nodes that predate it. Prefer [`TrackInfo::length_ms`].
+    #[serde(default)]
+    pub duration_ms: Option<DurationMs>,
     pub bpm: Option<Bpm>,
     pub key: Option<Key>,
     /// Relative blob path (no absolute paths in protocol).
@@ -1240,6 +1259,39 @@ pub struct IngestAllItem {
     pub result: IngestResult,
 }
 
+/// What a blob backfill run computes. AudioHash is always wanted; the rest is opt-in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct IdentityBackfillScope {
+    /// Also PcmHash (full decode; lossless only).
+    pub include_pcm: bool,
+    /// Also the exact `DurationMs`, read from the tags. Absent from clients and
+    /// nodes that predate it.
+    #[serde(default)]
+    pub include_duration: bool,
+}
+
+impl IdentityBackfillScope {
+    /// Everything a run can compute.
+    pub const ALL: Self = Self {
+        include_pcm: true,
+        include_duration: true,
+    };
+}
+
+impl std::fmt::Display for IdentityBackfillScope {
+    /// `AudioHash [+ PcmHash] [+ DurationMs]`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AudioHash")?;
+        if self.include_pcm {
+            f.write_str(" + PcmHash")?;
+        }
+        if self.include_duration {
+            f.write_str(" + DurationMs")?;
+        }
+        Ok(())
+    }
+}
+
 /// Progress counters of one identity-hash backfill run.
 ///
 /// `total` counts the tracks that lacked a requested hash when the run started
@@ -1249,7 +1301,10 @@ pub struct IngestAllItem {
 /// and writing; nothing is written for them and they are not errors.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IdentityBackfillProgress {
-    pub include_pcm: bool,
+    /// What the run computes. Flat on the wire; a node that predates
+    /// `include_duration` reports none.
+    #[serde(flatten)]
+    pub scope: IdentityBackfillScope,
     pub total: usize,
     pub done: usize,
     pub failed: usize,
@@ -1910,13 +1965,52 @@ mod tests {
 
     fn progress() -> IdentityBackfillProgress {
         IdentityBackfillProgress {
-            include_pcm: true,
+            scope: IdentityBackfillScope::ALL,
             total: 5,
             done: 3,
             failed: 1,
             skipped: 1,
             last_error: Some("boom".into()),
         }
+    }
+
+    /// The scope's fields stay flat in the request, so the pre-scope request and
+    /// the pre-duration progress still decode, and ours is the same shape.
+    #[test]
+    fn identity_backfill_scope_keeps_the_old_wire_shape() {
+        let old = parse_request(br#"{"type":"IdentityBackfill","include_pcm":true}"#).unwrap();
+        match old {
+            LibraryRequest::IdentityBackfill(scope) => assert_eq!(
+                scope,
+                IdentityBackfillScope {
+                    include_pcm: true,
+                    include_duration: false
+                }
+            ),
+            other => panic!("unexpected request: {other:?}"),
+        }
+        let json =
+            serde_json::to_value(LibraryRequest::IdentityBackfill(IdentityBackfillScope::ALL))
+                .unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"type":"IdentityBackfill","include_pcm":true,"include_duration":true})
+        );
+
+        let old_progress: IdentityBackfillProgress = serde_json::from_str(
+            r#"{"include_pcm":true,"total":1,"done":0,"failed":0,"skipped":0,"last_error":null}"#,
+        )
+        .unwrap();
+        assert!(old_progress.scope.include_pcm && !old_progress.scope.include_duration);
+    }
+
+    #[test]
+    fn identity_backfill_scope_displays_what_it_computes() {
+        assert_eq!(IdentityBackfillScope::default().to_string(), "AudioHash");
+        assert_eq!(
+            IdentityBackfillScope::ALL.to_string(),
+            "AudioHash + PcmHash + DurationMs"
+        );
     }
 
     #[test]
@@ -2951,6 +3045,7 @@ mod tests {
             artist: Some("Test Artist".to_string()),
             album: None,
             duration: Some(DurationSeconds::new(180)),
+            duration_ms: Some(DurationMs::new(180_250)),
             bpm: Some(Bpm::from_u32(128).unwrap()),
             key: None,
             blob_path: Some("ab/abc123.flac".to_string()),
@@ -2989,6 +3084,36 @@ mod tests {
         assert_eq!(decoded.marks, Vec::<Mark>::new());
     }
 
+    /// A node that predates `duration_ms` sends no such field: the track still
+    /// decodes, with no exact duration. A node that sends it is read back exactly.
+    #[test]
+    fn track_info_duration_ms_is_optional_on_the_wire() {
+        let old = r#"{"content_hash":"sha256:abc123","title":null,"artist":null,"album":null,
+            "duration":367,"bpm":null,"key":null,"blob_path":null,"cover_art_path":null,
+            "track_number":null,"disc_number":null,"added":null}"#;
+        let decoded: TrackInfo = serde_json::from_str(old).unwrap();
+        assert_eq!(decoded.duration_ms, None);
+
+        let new = old.replace(r#""added":null"#, r#""added":null,"duration_ms":367123"#);
+        let decoded: TrackInfo = serde_json::from_str(&new).unwrap();
+        assert_eq!(decoded.duration_ms, Some(DurationMs::new(367_123)));
+        assert_eq!(decoded.length_ms(), Some(367_123));
+    }
+
+    #[test]
+    fn length_ms_prefers_the_exact_duration_then_the_seconds() {
+        let json = r#"{"content_hash":"sha256:abc123","title":null,"artist":null,"album":null,
+            "duration":5,"bpm":null,"key":null,"blob_path":null,"cover_art_path":null,
+            "track_number":null,"disc_number":null,"added":null}"#;
+        let mut t: TrackInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(t.length_ms(), Some(5_000));
+        t.duration_ms = Some(DurationMs::new(4_050));
+        assert_eq!(t.length_ms(), Some(4_050));
+        t.duration = None;
+        t.duration_ms = None;
+        assert_eq!(t.length_ms(), None);
+    }
+
     /// A node that predates `genre` sends no such field: the track still decodes,
     /// with no genre. And a node that sends it is read by a client that has it.
     #[test]
@@ -3015,6 +3140,7 @@ mod tests {
             artist: None,
             album: None,
             duration: None,
+            duration_ms: None,
             bpm: None,
             key: None,
             blob_path: None,

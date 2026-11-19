@@ -113,6 +113,7 @@ pub fn bare_track(hash: &str) -> library_ipc_client::TrackInfo {
         artist: None,
         album: None,
         duration: None,
+        duration_ms: None,
         bpm: None,
         key: None,
         blob_path: None,

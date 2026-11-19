@@ -318,6 +318,7 @@ pub(crate) fn track(hash: &str) -> TrackInfo {
         styles: vec![],
         marks: vec![],
         duration: None,
+        duration_ms: None,
         bpm: None,
         key: None,
         blob_path: None,

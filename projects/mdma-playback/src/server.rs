@@ -1879,6 +1879,7 @@ mod tests {
             artist: None,
             album: None,
             duration: None,
+            duration_ms: None,
             bpm: None,
             key: None,
             blob_path: None,

@@ -57,6 +57,7 @@ mod tests {
             artist: artist.map(String::from),
             album: album.map(String::from),
             duration: None,
+            duration_ms: None,
             bpm: None,
             key: None,
             blob_path: None,
