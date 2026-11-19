@@ -13,7 +13,7 @@ pub async fn inbox(State(state): State<Arc<AppState>>) -> Response {
         gw(&state, |client| {
             match library(client, &LibraryRequest::GetInboxQueue)? {
                 LibraryResponse::InboxQueue(paths) => {
-                    Ok(paths.iter().map(|p| p.to_string()).collect::<Vec<_>>())
+                    Ok(paths.into_iter().map(String::from).collect::<Vec<_>>())
                 }
                 _ => Err(unexpected_library_response()),
             }

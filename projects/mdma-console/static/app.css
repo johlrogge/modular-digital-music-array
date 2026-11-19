@@ -315,6 +315,8 @@ input[type=range].slider:disabled{cursor:default;opacity:.5}
 .dot{width:8px;height:8px;border-radius:50%;background:var(--ok);display:inline-block}
 .dot.warn{background:var(--warn)}.dot.bad{background:var(--danger)}
 .settings-wrap{max-width:720px}
+.settings-wrap .sub{color:var(--text-2);font-size:var(--fs-sm)}
+.settings-form{display:grid;gap:var(--s-3)}
 .panel{background:var(--surface);border-radius:var(--r-md);box-shadow:var(--shadow-1);padding:var(--s-5);margin-top:var(--s-4)}
 .panel h3{margin:0 0 4px;font-size:var(--fs-lg)}
 .panel p{margin:0 0 var(--s-4);color:var(--text-2);font-size:var(--fs-sm)}

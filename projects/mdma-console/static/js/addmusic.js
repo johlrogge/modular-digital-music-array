@@ -1,71 +1,52 @@
 // Settings > Add music: upload tracks to the inbox and ingest what waits there.
-// settings.js gives the view its sub page head, so this module does not import settings.js.
-import { ApiError, api, h, icon, toast } from "./core.js";
-import { emptyNote } from "./lists.js";
-import { ingestSummary, uploadRows } from "./logic.js";
+import { api, h, icon, toast } from "./core.js";
+import { SETTINGS_LINK, pageHead } from "./collections.js";
+import { emptyNote, failReason, failedNote } from "./lists.js";
+import { ingestSummary, plural, uploadRows } from "./logic.js";
 
 const ACCEPT = ".flac,.mp3,.wav,.m4a,.zip";
+const MAX_ROWS = 200; // the inbox list shows this many; the rest is a count
 
-/** POST the files as the classic form does (multipart, field "files"); the parsed answer, or an Error. */
-async function upload(files) {
-  const form = new FormData();
-  for (const f of files) form.append("files", f);
-  let res;
-  try {
-    res = await fetch("/upload", { method: "POST", body: form });
-  } catch (e) {
-    throw new ApiError(0, { error: "offline" });
-  }
-  let body = null;
-  try {
-    body = await res.json();
-  } catch (e) {
-    /* not JSON: the status says enough */
-  }
-  if (!res.ok) throw new ApiError(res.status, body);
-  return body;
-}
-
-/** `head(root, title)` draws the sub page's back link and title. */
-export function viewAddMusic(root, head) {
-  head(root, "Add music");
+export function viewAddMusic(root) {
+  pageHead(root, SETTINGS_LINK, "Add music");
   const results = h("div", { "aria-live": "polite" });
   const inbox = h("div");
+  const head = h("div", { class: "section-head" });
   const input = h("input", { type: "file", id: "add-music-files", multiple: "", accept: ACCEPT, onchange: () => send() });
   const ingest = h("button", { class: "btn primary", onclick: () => ingestAll() }, [icon("download", "sm"), "Ingest all"]);
   const uploadBox = h("div", { class: "section" }, [
     h("label", { class: "field", for: "add-music-files" }, ["Upload FLAC, MP3, WAV, M4A or ZIP", input]),
     results,
   ]);
-  const inboxBox = h("div", { class: "section" }, [h("div", { class: "section-head" }, [h("h2", { text: "Inbox" })]), inbox]);
-  root.appendChild(h("div", { class: "settings-wrap" }, [uploadBox, inboxBox]));
+  const heading = (count) => head.replaceChildren(h("h2", {}, ["Inbox", count == null ? null : " ", count == null ? null : h("span", { class: "kicker", text: String(count).padStart(2, "0") })]));
+  heading(null);
+  root.appendChild(h("div", { class: "settings-wrap" }, [uploadBox, h("div", { class: "section" }, [head, inbox])]));
   let gone = false;
-
-  const failed = (e) =>
-    inbox.replaceChildren(
-      emptyNote("Couldn't load the inbox", e instanceof ApiError && e.status === 0 ? "The node did not answer." : e.message),
-      h("button", { class: "link", text: "Try again", onclick: loadInbox }),
-    );
+  let loads = 0; // the newest loadInbox wins when an upload and an ingest overlap
 
   async function loadInbox() {
+    const mine = ++loads;
     inbox.replaceChildren(h("div", { class: "empty", text: "Loading…" }));
     ingest.disabled = true;
     let paths;
     try {
       paths = await api("/api/inbox");
     } catch (e) {
-      if (!gone) failed(e);
+      if (!gone && mine === loads) {
+        heading(null);
+        inbox.replaceChildren(...failedNote("Couldn't load the inbox", e, loadInbox));
+      }
       return;
     }
-    if (gone) return;
+    if (gone || mine !== loads) return;
+    heading(paths.length);
     if (!paths.length) return inbox.replaceChildren(emptyNote("The inbox is empty", "Uploaded files wait here until they are ingested."));
     ingest.disabled = false;
+    const row = (text) => h("div", { role: "listitem" }, [h("span", { class: "ico" }, [icon("upload")]), h("span", { class: "ttl", text })]);
+    const rows = paths.slice(0, MAX_ROWS).map(row);
+    if (paths.length > MAX_ROWS) rows.push(row("and " + (paths.length - MAX_ROWS) + " more"));
     inbox.replaceChildren(
-      h(
-        "div",
-        { class: "list", role: "list", "aria-label": "Inbox" },
-        paths.map((p) => h("div", { role: "listitem" }, [h("span", { class: "ico" }, [icon("upload")]), h("span", { class: "ttl", text: p })])),
-      ),
+      h("div", { class: "list", role: "list", "aria-label": "Inbox" }, rows),
       h("div", { class: "btn-row", style: "margin-top:var(--s-4)" }, [ingest]),
     );
   }
@@ -74,9 +55,11 @@ export function viewAddMusic(root, head) {
     const files = Array.from(input.files);
     if (!files.length) return;
     input.disabled = true;
-    results.replaceChildren(h("div", { class: "empty", text: "Uploading " + files.length + (files.length === 1 ? " file…" : " files…") }));
+    results.replaceChildren(h("div", { class: "empty", text: "Uploading " + plural(files.length, "file") + "…" }));
+    const form = new FormData();
+    for (const f of files) form.append("files", f); // the field name the classic form uses
     try {
-      const rows = uploadRows(await upload(files));
+      const rows = uploadRows(await api("/upload", { body: form }));
       if (!gone) {
         results.replaceChildren(
           h(
@@ -92,7 +75,7 @@ export function viewAddMusic(root, head) {
         );
       }
     } catch (e) {
-      if (!gone) results.replaceChildren(emptyNote("Upload failed", e instanceof ApiError && e.status === 0 ? "The node did not answer." : e.message));
+      if (!gone) results.replaceChildren(emptyNote("Upload failed", failReason(e)));
     } finally {
       input.disabled = false;
       input.value = "";
