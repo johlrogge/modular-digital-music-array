@@ -661,11 +661,9 @@ impl LibraryClient {
     /// Start the identity-hash backfill (or learn that one is already running).
     pub fn identity_backfill(
         &self,
-        include_pcm: bool,
+        scope: IdentityBackfillScope,
     ) -> Result<IdentityBackfillStart, ClientError> {
-        interpret_identity_backfill(
-            self.request(&LibraryRequest::IdentityBackfill { include_pcm })?,
-        )
+        interpret_identity_backfill(self.request(&LibraryRequest::IdentityBackfill(scope))?)
     }
 
     /// Report progress of the identity-hash backfill.
@@ -966,30 +964,7 @@ mod tests {
     use super::*;
 
     fn track_with(hash: &str) -> TrackInfo {
-        TrackInfo {
-            content_hash: ContentHash::new(hash),
-            title: None,
-            artist: None,
-            album: None,
-            duration: None,
-            bpm: None,
-            key: None,
-            blob_path: None,
-            cover_art_path: None,
-            track_number: None,
-            disc_number: None,
-            added: None,
-            started: None,
-            stopped: None,
-            memory_cues: vec![],
-            beat_grid: None,
-            role: None,
-            energy: None,
-            genre: None,
-            label: None,
-            styles: vec![],
-            marks: vec![],
-        }
+        TrackInfo::new(ContentHash::new(hash))
     }
 
     fn full(tag: &str) -> String {

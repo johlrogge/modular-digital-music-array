@@ -295,6 +295,11 @@ music_value_enum! {
     /// Duration in seconds
     DurationSeconds(DurationSeconds),
 
+    /// Exact duration in milliseconds, read from the tags at ingest (no decode).
+    /// Exact for FLAC/WAV/AIFF; an estimate for MP3 (see [`DurationMs`]). Added
+    /// beside `DurationSeconds`, which stays; old fact files simply lack it.
+    DurationMs(DurationMs),
+
     /// Bitrate in kbps
     Bitrate(Bitrate),
 
@@ -433,6 +438,7 @@ impl MusicValue {
         "Channels",
         "SampleRate",
         "Duration",
+        "DurationMs",
         "Bitrate",
         "FileSize",
         "HasAlbumArt",
@@ -485,6 +491,7 @@ impl MusicValue {
             MusicValue::Channels(_) => "Channels",
             MusicValue::SampleRate(_) => "SampleRate",
             MusicValue::DurationSeconds(_) => "Duration",
+            MusicValue::DurationMs(_) => "DurationMs",
             MusicValue::Bitrate(_) => "Bitrate",
             MusicValue::FileSizeBytes(_) => "FileSize",
             MusicValue::HasAlbumArt(_) => "HasAlbumArt",
@@ -581,6 +588,7 @@ impl fmt::Display for MusicValue {
             MusicValue::Channels(c) => write!(f, "{}", c),
             MusicValue::SampleRate(s) => write!(f, "{}", s),
             MusicValue::DurationSeconds(d) => write!(f, "{}", d),
+            MusicValue::DurationMs(d) => write!(f, "{}", d),
             MusicValue::Bitrate(b) => write!(f, "{}", b),
             MusicValue::FileSizeBytes(s) => write!(f, "{}", s),
             MusicValue::HasAlbumArt(p) => write!(
@@ -679,6 +687,7 @@ mod tests {
             | MusicValue::Channels(_)
             | MusicValue::SampleRate(_)
             | MusicValue::DurationSeconds(_)
+            | MusicValue::DurationMs(_)
             | MusicValue::Bitrate(_)
             | MusicValue::FileSizeBytes(_)
             | MusicValue::HasAlbumArt(_)
@@ -742,6 +751,7 @@ mod tests {
             MusicValue::Channels(Channels::new(2)),
             MusicValue::SampleRate(SampleRate::new(44100)),
             MusicValue::DurationSeconds(DurationSeconds::new(1)),
+            MusicValue::DurationMs(DurationMs::new(1)),
             MusicValue::Bitrate(Bitrate::new(320)),
             MusicValue::FileSizeBytes(FileSizeBytes::new(1)),
             MusicValue::HasAlbumArt(AlbumArtPresence::Present),
@@ -923,6 +933,27 @@ mod tests {
             MusicValue::FileSizeBytes(FileSizeBytes::new(1024)).display_name(),
             "FileSize"
         );
+    }
+
+    #[test]
+    fn duration_ms_is_its_own_fact_with_a_distinct_name_and_precise_display() {
+        let v = MusicValue::DurationMs(DurationMs::new(367_123));
+        assert_eq!(v.display_name(), "DurationMs");
+        assert_eq!(v.to_string(), "6:07.123");
+        assert_eq!(
+            MusicValue::DurationMs(DurationMs::new(5_007)).to_string(),
+            "0:05.007"
+        );
+        assert_fact_value_format!(v);
+    }
+
+    #[test]
+    fn duration_ms_roundtrips_and_converts_from_std_duration() {
+        let d = DurationMs::from_duration(std::time::Duration::new(367, 123_999_999));
+        assert_eq!(d.value(), 367_123);
+        let v = MusicValue::DurationMs(d);
+        let back: MusicValue = serde_json::from_str(&serde_json::to_string(&v).unwrap()).unwrap();
+        assert_eq!(back, v);
     }
 
     #[test]

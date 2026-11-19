@@ -48,6 +48,10 @@ ContentHash (SHA-256 of the whole file) is the entity key (ADR-003, ADR-004). Re
 - Changing the algorithm requires v2, coexisting v1/v2 facts, and a re-backfill.
 - MusicValue gains a variant: per ADR-004, every service embedding `library_ipc_protocol` (gateway, library, console) must be redeployed together.
 
+## Amendments
+
+- 2026-11-19: the explicit blob backfill (`mdma library identity backfill --duration`) also fills `DurationMs`, the exact tag-read duration, for tracks that lack it. It is stamped with the library's `FilesystemScan` source, as ingest stamps it.
+
 ## Related
 
 - ADR-003 — content hash as entity key; work-identity model deferred

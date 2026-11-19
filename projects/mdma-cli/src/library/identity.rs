@@ -3,15 +3,22 @@ use crate::ctx::Ctx;
 use crate::output::{display_error, lost_contact};
 use color_eyre::Result;
 use hicli::Arg;
+use library_ipc_client::IdentityBackfillScope;
 
 /// Also compute PcmHash (decodes every lossless track; slow)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Arg)]
 #[arg(long = "pcm")]
 pub(crate) struct Pcm(pub bool);
 
+/// Also add the exact duration (DurationMs, read from the tags) to tracks that lack it
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Arg)]
+#[arg(long = "duration")]
+pub(crate) struct WithDuration(pub bool);
+
 #[derive(Debug, PartialEq, Arg)]
 pub(crate) struct BackfillArgs {
     pcm: Pcm,
+    duration: WithDuration,
     /// Start the job and return immediately
     no_wait: NoWait,
 }
@@ -31,12 +38,7 @@ fn format_identity_status(status: &library_ipc_client::IdentityBackfillStatus) -
         S::Done(p) => ("Done", p),
         S::Cancelled(p) => ("Cancelled", p),
     };
-    let hashes = if p.include_pcm {
-        "AudioHash + PcmHash"
-    } else {
-        "AudioHash"
-    };
-    let mut line = format!("{label} ({hashes}): {}/{} tracks", p.done, p.total);
+    let mut line = format!("{label} ({}): {}/{} tracks", p.scope, p.done, p.total);
     if p.failed > 0 {
         line.push_str(&format!(", {} failed", p.failed));
     }
@@ -51,23 +53,32 @@ fn format_identity_status(status: &library_ipc_client::IdentityBackfillStatus) -
 
 /// What to tell the user when a backfill is already running. The running job keeps
 /// its own mode, so say so when it differs from what was just asked for.
-fn identity_already_running_message(running_pcm: bool, requested_pcm: bool) -> String {
-    let mode = |pcm| {
-        if pcm {
-            "AudioHash + PcmHash"
-        } else {
-            "AudioHash"
-        }
-    };
+fn identity_already_running_message(
+    running: IdentityBackfillScope,
+    requested: IdentityBackfillScope,
+) -> String {
     let mut msg = "An identity backfill is already running; not starting another.".to_string();
-    if running_pcm != requested_pcm {
+    if running != requested {
         msg.push_str(&format!(
-            " The running job computes {}, not the requested {}.",
-            mode(running_pcm),
-            mode(requested_pcm)
+            " The running job computes {running}, not the requested {requested}."
         ));
     }
     msg
+}
+
+/// A node that predates `--duration` ignores it and answers with a scope without
+/// it. The job it started is still useful, but the user asked for more: fail loudly.
+fn check_duration_honoured(
+    requested: IdentityBackfillScope,
+    started: IdentityBackfillScope,
+) -> Result<()> {
+    if requested.include_duration && !started.include_duration {
+        return Err(color_eyre::eyre::eyre!(
+            "this node's library service predates --duration; only {started} is being \
+             backfilled — upgrade mdma-library"
+        ));
+    }
+    Ok(())
 }
 
 /// The failure for a backfill whose status could not be polled any more.
@@ -75,26 +86,36 @@ fn lost_contact_with_library(cause: &dyn std::fmt::Display) -> color_eyre::Repor
     lost_contact("the library service", cause, "mdma library identity status")
 }
 
-/// Compute identity hashes for tracks that don't have them yet
+/// Compute identity hashes (and with --duration the exact length) for tracks that lack them
 ///
-/// New tracks get an AudioHash when they are ingested; this covers the tracks
-/// already in the library. It runs as a low-priority background job in the
-/// library service and can be re-run: tracks that already have the hash are
-/// skipped. By default the command follows the job until it finishes.
+/// New tracks get an AudioHash and their exact duration when they are ingested;
+/// this covers the tracks already in the library. It runs as a low-priority
+/// background job in the library service and can be re-run: tracks that already
+/// have the facts are skipped. By default the command follows the job until it
+/// finishes.
 #[hicli::command]
 pub(crate) fn backfill(args: BackfillArgs, ctx: &Ctx) -> Result<()> {
     use library_ipc_client::IdentityBackfillStart;
     let BackfillArgs {
         pcm: Pcm(pcm),
+        duration: WithDuration(duration),
         no_wait: NoWait(no_wait),
     } = args;
     let library = ctx.node().library()?;
-    match library.identity_backfill(pcm).map_err(display_error)? {
+    let requested = IdentityBackfillScope {
+        include_pcm: pcm,
+        include_duration: duration,
+    };
+    match library
+        .identity_backfill(requested)
+        .map_err(display_error)?
+    {
         IdentityBackfillStart::Started(p) => {
-            println!("Identity backfill started: {} tracks to process", p.total)
+            println!("Identity backfill started: {} tracks to process", p.total);
+            check_duration_honoured(requested, p.scope)?;
         }
         IdentityBackfillStart::AlreadyRunning(p) => {
-            println!("{}", identity_already_running_message(p.include_pcm, pcm))
+            println!("{}", identity_already_running_message(p.scope, requested))
         }
     }
     if no_wait {
@@ -173,15 +194,17 @@ mod tests {
 
     #[test]
     fn identity_backfill_parses_flags() {
-        for (args, pcm, no_wait) in [
-            (vec![], false, false),
-            (vec!["--pcm"], true, false),
-            (vec!["--pcm", "--no-wait"], true, true),
+        for (args, pcm, duration, no_wait) in [
+            (vec![], false, false, false),
+            (vec!["--pcm"], true, false, false),
+            (vec!["--duration"], false, true, false),
+            (vec!["--pcm", "--duration", "--no-wait"], true, true, true),
         ] {
             assert_eq!(
                 run_arg::<BackfillArgs>(&args),
                 Ok(BackfillArgs {
                     pcm: Pcm(pcm),
+                    duration: WithDuration(duration),
                     no_wait: NoWait(no_wait)
                 }),
                 "{args:?}"
@@ -202,13 +225,44 @@ mod tests {
 
     #[test]
     fn already_running_message_names_the_mode_only_when_it_differs() {
-        let same = identity_already_running_message(true, true);
+        let scope = |include_pcm, include_duration| IdentityBackfillScope {
+            include_pcm,
+            include_duration,
+        };
+        let same = identity_already_running_message(scope(true, false), scope(true, false));
         assert!(!same.contains("requested"), "{same}");
-        let differs = identity_already_running_message(false, true);
+        let differs = identity_already_running_message(scope(false, false), scope(true, false));
         assert!(
             differs.contains("computes AudioHash, not the requested AudioHash + PcmHash"),
             "{differs}"
         );
+        let duration = identity_already_running_message(scope(false, false), scope(false, true));
+        assert!(
+            duration.contains("computes AudioHash, not the requested AudioHash + DurationMs"),
+            "{duration}"
+        );
+    }
+
+    #[test]
+    fn an_older_node_that_ignores_duration_is_a_loud_failure() {
+        let asked = IdentityBackfillScope {
+            include_pcm: false,
+            include_duration: true,
+        };
+        assert_eq!(
+            failure_text::<()>(check_duration_honoured(
+                asked,
+                IdentityBackfillScope::default()
+            )),
+            "this node's library service predates --duration; only AudioHash is being \
+             backfilled — upgrade mdma-library"
+        );
+        assert!(check_duration_honoured(asked, asked).is_ok());
+        assert!(check_duration_honoured(
+            IdentityBackfillScope::default(),
+            IdentityBackfillScope::default()
+        )
+        .is_ok());
     }
 
     #[test]
@@ -223,7 +277,7 @@ mod tests {
     fn identity_status_formats_progress_failures_and_skips() {
         use library_ipc_client::{IdentityBackfillProgress, IdentityBackfillStatus};
         let p = IdentityBackfillProgress {
-            include_pcm: true,
+            scope: IdentityBackfillScope::ALL,
             total: 10,
             done: 10,
             failed: 2,
@@ -232,7 +286,7 @@ mod tests {
         };
         assert_eq!(
             format_identity_status(&IdentityBackfillStatus::Done(p.clone())),
-            "Done (AudioHash + PcmHash): 10/10 tracks, 2 failed, 1 skipped (last error: boom)"
+            "Done (AudioHash + PcmHash + DurationMs): 10/10 tracks, 2 failed, 1 skipped (last error: boom)"
         );
         assert!(
             format_identity_status(&IdentityBackfillStatus::Cancelled(p)).starts_with("Cancelled")

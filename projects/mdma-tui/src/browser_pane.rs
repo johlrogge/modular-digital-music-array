@@ -657,55 +657,18 @@ mod tests {
         title: Option<&str>,
     ) -> TrackInfo {
         TrackInfo {
-            content_hash: ContentHash::new(hash),
             title: title.map(String::from),
             artist: artist.map(String::from),
             album: album.map(String::from),
-            duration: None,
-            bpm: None,
-            key: None,
-            blob_path: None,
-            cover_art_path: None,
-            track_number: None,
-            disc_number: None,
-            added: None,
-            started: None,
-            stopped: None,
-            memory_cues: vec![],
-            beat_grid: None,
-            role: None,
-            energy: None,
-            genre: None,
-            label: None,
-            styles: vec![],
-            marks: vec![],
+            ..TrackInfo::new(ContentHash::new(hash))
         }
     }
 
     fn make_track_with_disc_track(hash: &str, disc: Option<u32>, track: Option<u32>) -> TrackInfo {
         TrackInfo {
-            content_hash: ContentHash::new(hash),
-            title: None,
-            artist: None,
-            album: None,
-            duration: None,
-            bpm: None,
-            key: None,
-            blob_path: None,
-            cover_art_path: None,
             track_number: track,
             disc_number: disc,
-            added: None,
-            started: None,
-            stopped: None,
-            memory_cues: vec![],
-            beat_grid: None,
-            role: None,
-            energy: None,
-            genre: None,
-            label: None,
-            styles: vec![],
-            marks: vec![],
+            ..TrackInfo::new(ContentHash::new(hash))
         }
     }
 

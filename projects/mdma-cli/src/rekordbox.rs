@@ -118,8 +118,8 @@ fn build_rekordbox_track(
             .map(|(_, v)| v.clone())
     };
 
-    let bitrate = find_fact("Bitrate").and_then(|v| v.parse::<u32>().ok());
-    let sample_rate = find_fact("SampleRate").and_then(|v| v.parse::<u32>().ok());
+    let bitrate = track.audio.bitrate.map(|b| b.value());
+    let sample_rate = track.audio.sample_rate.map(|s| s.value());
     let year = find_fact("Year").or_else(|| find_fact("RecordingYear"));
     let label = find_fact("Label");
     let comment = find_fact("Comment");
@@ -1306,6 +1306,38 @@ mod tests {
                 retract: Some(grid_value(1_000))
             }
         );
+    }
+
+    /// #122: the bit rate and sample rate come from the projected track, not from
+    /// the display strings of `get_facts` ("1411 kbps", "44100 Hz"), which do not
+    /// parse as numbers and used to be written as 0.
+    #[test]
+    fn export_writes_the_bitrate_and_sample_rate_of_the_track() {
+        use library_ipc_client::{AudioProperties, Bitrate, SampleRate};
+        let hash = format!("sha256:{}", "a".repeat(64));
+        let track = library_ipc_client::TrackInfo {
+            audio: AudioProperties {
+                bitrate: Some(Bitrate::new(1411)),
+                sample_rate: Some(SampleRate::new(44100)),
+                ..AudioProperties::default()
+            },
+            ..crate::test_support::track(&hash)
+        };
+        // The facts as `get_facts` renders them: display strings, not numbers.
+        let facts = [
+            ("Bitrate".to_string(), "1411 kbps".to_string()),
+            ("SampleRate".to_string(), "44100 Hz".to_string()),
+        ];
+        let built = super::build_rekordbox_track(
+            &track,
+            std::path::Path::new("/x/a.aiff"),
+            "aiff",
+            1,
+            &facts,
+        );
+        let xml = rekordbox_xml::merge_export(None, vec![built], &[]).to_xml();
+        assert!(xml.contains("BitRate=\"1411\""), "{xml}");
+        assert!(xml.contains("SampleRate=\"44100\""), "{xml}");
     }
 
     #[test]

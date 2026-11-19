@@ -14,6 +14,7 @@ All notable changes to MDMA are documented here.
   sits on beat 2-4 of a bar is moved to the next downbeat, so bar lines no
   longer land 1-3 beats off. Grids already in the library are corrected only by
   importing the rekordbox XML again.
+- `mdma rekordbox export` wrote `BitRate` and `SampleRate` as 0. It parsed the display strings ("1411 kbps", "44100 Hz") as numbers; it now takes both from the track's projected audio properties (#122).
 
 ---
 
