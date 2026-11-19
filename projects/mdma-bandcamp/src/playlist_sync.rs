@@ -12,8 +12,9 @@
 //!
 //! The new base can only be saved after the edit is applied, and the edit
 //! cannot be undone by us. Before it writes, a sync therefore saves the edit as
-//! `pending_base`: the entries the playlist will hold, and the new base. The next sync settles a leftover
-//! `pending_base` against the current entries before it merges, by one rule:
+//! `pending_base`: the entries the playlist will hold, and the new base. The
+//! next sync settles a leftover `pending_base` against the current entries
+//! before it merges, by one rule:
 //!
 //! - the entries are exactly the target: the edit landed, so adopt `new_base`;
 //! - anything else: discard it and keep the old base.
@@ -74,15 +75,46 @@ pub fn library_error(name: &PlaylistName, e: ClientError) -> PlaylistSyncError {
     }
 }
 
+/// What the library made of one item of the Bandcamp list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Resolution {
+    /// No library track to link (Missing, DurationMismatch, or a track with
+    /// null fields): the item waits.
+    Pending,
+    /// One library track.
+    Matched(CanonicalHash),
+    /// Several library tracks (ADR-032 §4, amendment 2026-11-18): the first
+    /// is the item's linked copy, the others follow it once as local entries,
+    /// in the matcher's order. `extras` is never empty.
+    Ambiguous {
+        linked: CanonicalHash,
+        extras: Vec<CanonicalHash>,
+    },
+}
+
+impl Resolution {
+    /// The resolution for `candidates` in the matcher's order: none is
+    /// pending, one is a match, more are ambiguous.
+    pub fn from_candidates(candidates: Vec<CanonicalHash>) -> Self {
+        let mut candidates = candidates.into_iter();
+        match (candidates.next(), candidates.next()) {
+            (None, _) => Resolution::Pending,
+            (Some(hash), None) => Resolution::Matched(hash),
+            (Some(linked), Some(second)) => Resolution::Ambiguous {
+                linked,
+                extras: std::iter::once(second).chain(candidates).collect(),
+            },
+        }
+    }
+}
+
 /// One item of the Bandcamp list as the library sees it now.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedItem {
     pub id: BandcampTrackId,
     pub title: String,
     pub artist: String,
-    /// The library track it matched; `None` for a pending item (Missing,
-    /// Ambiguous, DurationMismatch, or a track with null fields).
-    pub hash: Option<CanonicalHash>,
+    pub resolution: Resolution,
 }
 
 /// The Bandcamp list in order, with what the matcher made of each item. A
@@ -97,14 +129,23 @@ pub fn resolve_items(
         .iter()
         .zip(outcomes)
         .map(|(track, outcome)| {
+            // Only full hashes count: of the candidates of an ambiguous item
+            // the ones that are not are dropped, and one left is a match.
+            let candidates = match outcome {
+                TrackOutcome::Matched(hash) => vec![hash.clone()],
+                TrackOutcome::Ambiguous(candidates) => candidates.as_slice().to_vec(),
+                TrackOutcome::DurationMismatch { .. } | TrackOutcome::Missing => Vec::new(),
+            };
             Ok(ResolvedItem {
                 id: track.source_track_id.parse()?,
                 title: track.title.clone(),
                 artist: track.artist.clone(),
-                hash: match outcome {
-                    TrackOutcome::Matched(hash) => CanonicalHash::try_from(hash.clone()).ok(),
-                    _ => None,
-                },
+                resolution: Resolution::from_candidates(
+                    candidates
+                        .into_iter()
+                        .filter_map(|hash| CanonicalHash::try_from(hash).ok())
+                        .collect(),
+                ),
             })
         })
         .collect()
@@ -173,6 +214,14 @@ pub fn settle(link: &mut PlaylistLink, entries: &[PlaylistEntry]) -> bool {
 /// was applied before, and a track that only turned ambiguous or went missing
 /// must not read as removed on Bandcamp. Any other item without a match is
 /// pending and left out of theirs, so it is never recorded as applied.
+///
+/// An ambiguous item is not pending (ADR-032 §4, amendment 2026-11-18): its
+/// first candidate is its linked copy, and the other candidates are inserted
+/// right after it as local entries, once, when the item first becomes applied
+/// (is not yet in base). Later syncs find it in base and add nothing. An extra
+/// is left out when the result already holds that track: as the linked copy
+/// of any item of theirs or base, as an entry of the playlist, or as an extra
+/// emitted before it.
 pub fn plan(
     link: &PlaylistLink,
     items: &[ResolvedItem],
@@ -181,14 +230,31 @@ pub fn plan(
     let mut known: BTreeMap<BandcampTrackId, CanonicalHash> = BTreeMap::new();
     let mut theirs: Vec<BandcampTrackId> = Vec::new();
     let mut pending: Vec<PendingTrack> = Vec::new();
+    // The extra candidates of ambiguous items that become applied now, by the
+    // Bandcamp item whose linked copy they follow.
+    let mut extras: HashMap<BandcampTrackId, &[CanonicalHash]> = HashMap::new();
     for item in items {
-        let cached = || {
-            link.base
-                .contains(&item.id)
-                .then(|| link.matches.get(&item.id).cloned())
-                .flatten()
+        let applied = link.base.contains(&item.id);
+        let cached = applied
+            .then(|| link.matches.get(&item.id).cloned())
+            .flatten();
+        let linked = match &item.resolution {
+            // A fresh match beats the cache.
+            Resolution::Matched(hash) => Some(hash.clone()),
+            // An ambiguous item already applied keeps its cached copy: the
+            // matcher's first candidate may differ from what was applied.
+            Resolution::Ambiguous {
+                linked,
+                extras: more,
+            } => {
+                if !applied {
+                    extras.insert(item.id, more);
+                }
+                Some(cached.unwrap_or_else(|| linked.clone()))
+            }
+            Resolution::Pending => cached,
         };
-        match item.hash.clone().or_else(cached) {
+        match linked {
             Some(hash) => {
                 known.insert(item.id, hash);
                 theirs.push(item.id);
@@ -243,18 +309,38 @@ pub fn plan(
 
     // Every Bandcamp key of the result comes from theirs or from a local
     // entry mapped through `by_hash`, and both are in `known`.
-    let target: Vec<PlaylistEntry> = merge3(&base_keys, &theirs_keys, &ours_keys)
-        .into_iter()
-        .map(|key| match key {
-            SyncKey::Local(entry) => entry,
-            SyncKey::Bandcamp(id) => PlaylistEntry::Track {
-                hash: known
-                    .get(&id)
-                    .expect("a Bandcamp key of the merge is a known track")
-                    .clone(),
-            },
-        })
-        .collect();
+    let target = {
+        // The tracks the result holds, or never will add as an extra. Base
+        // items Bandcamp dropped are not held: the merge removes them.
+        let mut held: HashSet<&CanonicalHash> =
+            theirs.iter().filter_map(|id| known.get(id)).collect();
+        held.extend(entries.iter().filter_map(|entry| match entry {
+            PlaylistEntry::Track { hash } => Some(hash),
+            PlaylistEntry::Unresolved { .. } => None,
+        }));
+        let mut target: Vec<PlaylistEntry> = Vec::new();
+        for key in merge3(&base_keys, &theirs_keys, &ours_keys) {
+            match key {
+                SyncKey::Local(entry) => target.push(entry),
+                SyncKey::Bandcamp(id) => {
+                    target.push(PlaylistEntry::Track {
+                        hash: known
+                            .get(&id)
+                            .expect("a Bandcamp key of the merge is a known track")
+                            .clone(),
+                    });
+                    // The other candidates of an ambiguous item follow its
+                    // linked copy as plain local entries.
+                    for hash in extras.get(&id).copied().unwrap_or_default() {
+                        if held.insert(hash) {
+                            target.push(PlaylistEntry::Track { hash: hash.clone() });
+                        }
+                    }
+                }
+            }
+        }
+        target
+    };
     let ops = ops_between(entries, &target)?;
     Ok(Plan {
         target,
@@ -416,6 +502,7 @@ mod tests {
     use super::*;
     use library_ipc_client::{ContentHash, Duplicates, FactSource};
     use music_facts::{Artist, ContentHash as MusicContentHash, MusicValue, Title};
+    use playlist_import::Candidates;
     use pretty_assertions::assert_eq;
     use stainless_facts::{Fact, FactStreamWriter, Operation};
     use std::cell::Cell;
@@ -496,7 +583,7 @@ mod tests {
         client.playlist_new(&local, String::new()).unwrap();
         let store = LinkStore::new(dir.path().join("playlist-links.json"));
         let mut links = PlaylistLinks::default();
-        links.link(local.clone(), SOURCE.to_string());
+        links.link(local.clone(), SOURCE.to_string(), None);
         store.save(&links).unwrap();
         World {
             _dir: dir,
@@ -517,7 +604,22 @@ mod tests {
             id: BandcampTrackId::new(id),
             title: format!("Track {tag}"),
             artist: "Artist".to_string(),
-            hash: matched.then(|| hash(tag)),
+            resolution: if matched {
+                Resolution::Matched(hash(tag))
+            } else {
+                Resolution::Pending
+            },
+        }
+    }
+
+    /// Bandcamp item `id` the matcher found ambiguous: one candidate per tag
+    /// of `tags`, in that order.
+    fn ambiguous_item(id: u64, tags: &str) -> ResolvedItem {
+        ResolvedItem {
+            id: BandcampTrackId::new(id),
+            title: "Venus Flux".to_string(),
+            artist: "Artist".to_string(),
+            resolution: Resolution::from_candidates(tags.chars().map(hash).collect()),
         }
     }
 
@@ -674,17 +776,21 @@ mod tests {
     }
 
     #[test]
-    fn linking_the_same_playlist_again_keeps_a_local_deletion_deleted() {
+    fn linking_again_starts_fresh_so_a_deleted_track_comes_back_once() {
         let w = world("relink");
         w.sync("123");
         w.edit(vec![EditOp::Remove { at: 1 }]);
 
         let mut links = w.store.load().unwrap();
-        links.link(w.local.clone(), SOURCE.to_string());
+        links.link(w.local.clone(), SOURCE.to_string(), None);
         w.store.save(&links).unwrap();
+        assert!(w.link().base.is_empty(), "no stale base survives a link");
         w.sync("123");
 
-        assert_eq!(w.order(), "13");
+        // A first sync adds what is missing and skips what is present.
+        assert_eq!(w.order(), "123");
+        w.sync("123");
+        assert_eq!(w.order(), "123", "added once, not twice");
     }
 
     #[test]
@@ -724,7 +830,7 @@ mod tests {
         let w = world("turns-pending");
         w.sync("123");
 
-        // 2 turned ambiguous: the matcher no longer answers, the cache does.
+        // 2 turned pending: the matcher no longer answers, the cache does.
         let report = w.sync("1-23");
 
         assert_eq!(w.order(), "123");
@@ -754,6 +860,106 @@ mod tests {
 
         let report = sync(&[both[0].clone(), both[2].clone()]);
         assert_eq!((report.added, report.removed, report.moved), (0, 0, 0));
+    }
+
+    /// Bandcamp item 1, an ambiguous item 20 (library tracks a and b), item 3.
+    fn with_ambiguous() -> Vec<ResolvedItem> {
+        vec![
+            item_as(1, '1', true),
+            ambiguous_item(20, "ab"),
+            item_as(3, '3', true),
+        ]
+    }
+
+    #[test]
+    fn the_first_application_of_an_ambiguous_item_adds_the_linked_copy_and_a_local_one() {
+        let w = world("ambiguous-first");
+        let items = with_ambiguous();
+
+        let report = sync_playlist(&w.client, &w.store, &w.local, SOURCE, &items, 42).unwrap();
+
+        assert_eq!(w.order(), "1ab3");
+        assert_eq!((report.added, report.removed, report.pending), (4, 0, 0));
+        assert_eq!(
+            w.base(),
+            vec![
+                BandcampTrackId::new(1),
+                BandcampTrackId::new(20),
+                BandcampTrackId::new(3)
+            ],
+            "the item is applied: in base, not pending"
+        );
+        assert_eq!(w.link().pending, vec![]);
+        assert_eq!(w.link().matches[&BandcampTrackId::new(20)], hash('a'));
+    }
+
+    #[test]
+    fn a_resync_does_not_add_the_other_candidates_again() {
+        let w = world("ambiguous-resync");
+        let items = with_ambiguous();
+        sync_playlist(&w.client, &w.store, &w.local, SOURCE, &items, 42).unwrap();
+
+        let report = sync_playlist(&w.client, &w.store, &w.local, SOURCE, &items, 43).unwrap();
+
+        assert_eq!(w.order(), "1ab3");
+        assert_eq!((report.added, report.removed, report.moved), (0, 0, 0));
+        assert_eq!(report.undo, None);
+    }
+
+    #[test]
+    fn deleting_the_linked_copy_keeps_the_other_and_stays_deleted() {
+        let w = world("ambiguous-delete-linked");
+        let items = with_ambiguous();
+        sync_playlist(&w.client, &w.store, &w.local, SOURCE, &items, 42).unwrap();
+
+        w.edit(vec![EditOp::Remove { at: 1 }]);
+        assert_eq!(w.order(), "1b3");
+        for now in [43, 44] {
+            sync_playlist(&w.client, &w.store, &w.local, SOURCE, &items, now).unwrap();
+            assert_eq!(w.order(), "1b3", "a deleted linked copy is not restored");
+        }
+    }
+
+    #[test]
+    fn deleting_the_extra_copy_is_simply_kept() {
+        let w = world("ambiguous-delete-extra");
+        let items = with_ambiguous();
+        sync_playlist(&w.client, &w.store, &w.local, SOURCE, &items, 42).unwrap();
+
+        w.edit(vec![EditOp::Remove { at: 2 }]);
+        sync_playlist(&w.client, &w.store, &w.local, SOURCE, &items, 43).unwrap();
+
+        assert_eq!(w.order(), "1a3");
+    }
+
+    #[test]
+    fn an_applied_item_that_turns_ambiguous_keeps_its_cached_copy_and_adds_nothing() {
+        let w = world("ambiguous-after-applied");
+        w.sync("123");
+
+        // 2 now matches both b and 2; it was applied as 2 before.
+        let items = vec![
+            item_as(1, '1', true),
+            ambiguous_item(2, "b2"),
+            item_as(3, '3', true),
+        ];
+        let report = sync_playlist(&w.client, &w.store, &w.local, SOURCE, &items, 43).unwrap();
+
+        assert_eq!(w.order(), "123");
+        assert_eq!((report.added, report.removed, report.moved), (0, 0, 0));
+    }
+
+    #[test]
+    fn an_extra_candidate_the_playlist_already_has_is_not_added_twice() {
+        let w = world("ambiguous-has-extra");
+        w.edit(vec![insert(0, 'b')]);
+
+        let items = [ambiguous_item(20, "ab")];
+        sync_playlist(&w.client, &w.store, &w.local, SOURCE, &items, 42).unwrap();
+
+        let mut order: Vec<char> = w.order().chars().collect();
+        order.sort_unstable();
+        assert_eq!(order, vec!['a', 'b'], "b was there already: one copy each");
     }
 
     #[test]
@@ -947,7 +1153,7 @@ mod tests {
     fn a_sync_of_a_link_that_changed_since_the_fetch_is_refused() {
         let w = world("link-changed");
         let mut links = w.store.load().unwrap();
-        links.link(w.local.clone(), "another".to_string());
+        links.link(w.local.clone(), "another".to_string(), None);
         w.store.save(&links).unwrap();
         let before = std::fs::read(w.store.path()).unwrap();
 
@@ -971,7 +1177,7 @@ mod tests {
         let w = world("missing");
         let gone = PlaylistName::new("gone").unwrap();
         let mut links = w.store.load().unwrap();
-        links.link(gone.clone(), SOURCE.to_string());
+        links.link(gone.clone(), SOURCE.to_string(), None);
         w.store.save(&links).unwrap();
         let before = std::fs::read(w.store.path()).unwrap();
 
@@ -984,8 +1190,70 @@ mod tests {
         assert_eq!(std::fs::read(w.store.path()).unwrap(), before);
     }
 
+    /// X is ambiguous between a and b, and Z is matched to b: the result holds
+    /// b once, as Z's.
     #[test]
-    fn resolve_items_keeps_only_definitive_full_hashes_and_rejects_a_bad_id() {
+    fn an_extra_that_is_another_items_linked_copy_is_not_added() {
+        let w = world("extra-is-linked");
+        let items = [ambiguous_item(20, "ab"), item_as(21, 'b', true)];
+
+        let report = sync_playlist(&w.client, &w.store, &w.local, SOURCE, &items, 42).unwrap();
+
+        assert_eq!(w.order(), "ab");
+        assert_eq!(report.added, 2);
+        assert_eq!(w.link().matches[&BandcampTrackId::new(21)], hash('b'));
+    }
+
+    /// B was Bandcamp's and is gone from it in this sync, and gone locally: it
+    /// is not held by anything, so another item's extra b is added.
+    #[test]
+    fn an_extra_is_not_suppressed_by_a_base_item_bandcamp_removed() {
+        let w = world("extra-base-removed");
+        w.sync("b");
+        w.edit(vec![EditOp::Remove { at: 0 }]);
+        assert_eq!(w.order(), "");
+
+        sync_playlist(
+            &w.client,
+            &w.store,
+            &w.local,
+            SOURCE,
+            &[ambiguous_item(20, "ab")],
+            43,
+        )
+        .unwrap();
+
+        assert_eq!(w.order(), "ab");
+    }
+
+    #[test]
+    fn two_ambiguous_items_sharing_a_candidate_add_it_once() {
+        let w = world("extras-shared");
+        let items = [ambiguous_item(20, "ab"), ambiguous_item(21, "cb")];
+
+        sync_playlist(&w.client, &w.store, &w.local, SOURCE, &items, 42).unwrap();
+
+        assert_eq!(w.order(), "abc", "b follows a once; c has no extra left");
+    }
+
+    #[test]
+    fn candidates_make_a_resolution_by_how_many_there_are() {
+        assert_eq!(Resolution::from_candidates(vec![]), Resolution::Pending);
+        assert_eq!(
+            Resolution::from_candidates(vec![hash('a')]),
+            Resolution::Matched(hash('a'))
+        );
+        assert_eq!(
+            Resolution::from_candidates(vec![hash('b'), hash('a'), hash('c')]),
+            Resolution::Ambiguous {
+                linked: hash('b'),
+                extras: vec![hash('a'), hash('c')],
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_items_keeps_only_full_hashes_and_rejects_a_bad_id() {
         let track = |id: &str| SourcePlaylistTrack {
             position: 1,
             source_track_id: id.to_string(),
@@ -995,19 +1263,59 @@ mod tests {
             duration_secs: 1.0,
             owned: true,
         };
-        let mut tracks = vec![track("10"), track("11"), track("12"), track("13")];
+        let candidates = |hashes: Vec<ContentHash>| Candidates::new(hashes).unwrap();
+        let mut tracks = vec![
+            track("10"),
+            track("11"),
+            track("12"),
+            track("13"),
+            track("14"),
+            track("15"),
+        ];
         let mut outcomes = vec![
             TrackOutcome::Matched(hash('1').into()),
             TrackOutcome::Matched(ContentHash::new("abcd")),
-            TrackOutcome::Ambiguous(vec![hash('2').into()]),
+            // Only one of the two candidates is a full hash: matched.
+            TrackOutcome::Ambiguous(candidates(vec![hash('2').into(), ContentHash::new("abcd")])),
             TrackOutcome::Missing,
+            TrackOutcome::Matched(hash('4').into()),
+            TrackOutcome::DurationMismatch {
+                hash: hash('5').into(),
+                library_secs: 1,
+                source_secs: 2,
+            },
         ];
 
         let items = resolve_items(&tracks, &outcomes).unwrap();
 
-        let matched: Vec<bool> = items.iter().map(|i| i.hash.is_some()).collect();
-        assert_eq!(matched, vec![true, false, false, false]);
+        let resolutions: Vec<Resolution> = items.iter().map(|i| i.resolution.clone()).collect();
+        assert_eq!(
+            resolutions,
+            vec![
+                Resolution::Matched(hash('1')),
+                Resolution::Pending,
+                Resolution::Matched(hash('2')),
+                Resolution::Pending,
+                Resolution::Matched(hash('4')),
+                Resolution::Pending,
+            ]
+        );
         assert_eq!(items[0].id, BandcampTrackId::new(10));
+
+        // An ambiguous item keeps every candidate: the first is its linked
+        // copy, the rest are its extras, in the matcher's order.
+        let two = [TrackOutcome::Ambiguous(candidates(vec![
+            hash('b').into(),
+            hash('a').into(),
+        ]))];
+        let items = resolve_items(&[track("10")], &two).unwrap();
+        assert_eq!(
+            items[0].resolution,
+            Resolution::Ambiguous {
+                linked: hash('b'),
+                extras: vec![hash('a')],
+            }
+        );
 
         tracks.push(track("x"));
         outcomes.push(TrackOutcome::Matched(hash('3').into()));

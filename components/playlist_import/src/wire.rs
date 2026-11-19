@@ -12,8 +12,12 @@ fn to_import_report(track: &SourcePlaylistTrack, outcome: &TrackOutcome) -> Impo
         TrackOutcome::Matched(hash) => ImportTrackOutcome::Matched {
             hash: hash.as_str().to_string(),
         },
-        TrackOutcome::Ambiguous(hashes) => ImportTrackOutcome::Ambiguous {
-            candidates: hashes.iter().map(|h| h.as_str().to_string()).collect(),
+        TrackOutcome::Ambiguous(candidates) => ImportTrackOutcome::Ambiguous {
+            candidates: candidates
+                .as_slice()
+                .iter()
+                .map(|h| h.as_str().to_string())
+                .collect(),
         },
         TrackOutcome::DurationMismatch {
             hash,
@@ -64,6 +68,7 @@ pub fn has_owned_missing(tracks: &[SourcePlaylistTrack], outcomes: &[TrackOutcom
 mod tests {
     use super::*;
     use crate::fixtures::{hash, pl_track};
+    use crate::Candidates;
     use pretty_assertions::assert_eq;
 
     #[test]
@@ -88,7 +93,7 @@ mod tests {
         let track = pl_track(1, "B", "Two", 200.0);
         let report = to_import_report(
             &track,
-            &TrackOutcome::Ambiguous(vec![hash("2222"), hash("3333")]),
+            &TrackOutcome::Ambiguous(Candidates::new(vec![hash("2222"), hash("3333")]).unwrap()),
         );
         assert_eq!(
             report.outcome,

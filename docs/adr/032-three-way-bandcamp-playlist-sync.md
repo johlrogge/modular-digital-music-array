@@ -62,7 +62,7 @@ Items are identified by occurrence keys `(key, n)`: the n-th occurrence of `key`
    - the entries equal `target`: the edit landed, so base becomes `new_base`;
    - anything else: `pending_base` is discarded and base stays.
 
-   An edit that changes nothing writes no `pending_base`. After the third Conflict the staged `pending_base` is cleared, since nothing was written. A sound rule would need the library's version history, to tell "our edit landed, then the user changed the playlist" from "our edit never landed"; that was rejected for a two-fault case (see Consequences). Discarding after a landed edit is safe: the merge adds only items ours does not have, so it adds no duplicate. What is lost is the memory of what the sync added, so an item the user deleted in the meantime comes back once, and a Bandcamp removal of an item the sync added is not applied. The match cache and the pending list are saved with `pending_base`: they only describe Bandcamp and the library, so they are right whether or not the edit landed.
+   An edit that changes nothing writes no `pending_base`. After the third Conflict the staged `pending_base` is cleared, since nothing was written. A sound rule would need the library's version history, to tell "our edit landed, then the user changed the playlist" from "our edit never landed"; that was rejected for a two-fault case (see Consequences). Discarding after a landed edit is safe: the merge adds only items ours does not have, so it adds no duplicate. What is lost is the memory of what the sync added, so an item or an extra copy (see the amendment on ambiguous items) the user deleted in the meantime comes back once, and a Bandcamp removal of an item the sync added is not applied. The match cache and the pending list are saved with `pending_base`: they only describe Bandcamp and the library, so they are right whether or not the edit landed.
 6. The same merge is meant for rebasing offline edits (the ADR-016 outbox).
 
 ### 7. First sync with no base
@@ -71,9 +71,9 @@ There is no special path. A link starts with an empty base and the sync runs `me
 
 ### 8. Link, rename and delete
 
-Linking a playlist to the Bandcamp playlist it is already linked to keeps the link and its base (a reset would bring back every track the user deleted); linking it to another one replaces the link and starts without a base.
+Linking a playlist to the Bandcamp playlist it is already linked to keeps the link and its base (a reset would bring back every track the user deleted); linking it to another one replaces the link and starts without a base. (Replaced by amendment 2026-11-19: linking always starts fresh.)
 
-Renaming the local playlist updates the link. Deleting it drops the link. Moving it to the bin (ADR-033) deactivates the link. These follow library events, which `mdma-bandcamp` does not subscribe to yet; until it does, a sync of a link whose playlist is gone fails with "not found" and the link stays until it is replaced by a new `LinkPlaylist`.
+Renaming the local playlist updates the link. Deleting it drops the link. Moving it to the bin (ADR-033) deactivates the link. These follow library events, which `mdma-bandcamp` does not subscribe to yet; until it does, a sync of a link whose playlist is gone fails with "not found" and the link stays until it is replaced by a new `LinkPlaylist`. (Superseded by amendment 2026-11-19: no lifecycle handling; orphans are pruned on read.)
 
 ### 9. Undo after a sync
 
@@ -93,11 +93,40 @@ Undo reverts the file but keeps the new base. Undone additions therefore count a
 
 ## Amendment 2026-11-18: delete bins (ADR-033)
 
-§8 changes for delete. A deleted playlist goes to the Bin, and its link stays but is inactive and cannot sync. Restore re-activates the link; restoring under a new name counts as a rename and updates the link. Purge drops the link. Rename is unchanged. See ADR-033.
+Superseded by amendment 2026-11-19. §8 changes for delete. A deleted playlist goes to the Bin, and its link stays but is inactive and cannot sync. Restore re-activates the link; restoring under a new name counts as a rename and updates the link. Purge drops the link. Rename is unchanged. See ADR-033.
 
 ## Amendment 2026-11-18: typed "not linked" and console routes (phase 4)
 
 `SyncPlaylist` for a playlist that is not linked is answered with the typed `SourceError::PlaylistNotLinked { name }`, not `InvalidRequest` with a message to be read. The console maps it to 409; `InvalidRequest` is always 422. The console reads the links and the sync job through `GET /api/bandcamp/playlist-links` and `GET /api/bandcamp/playlist-sync`, so no static path sits under `/api/playlists/`, where `:name` is a user's playlist name.
+
+## Amendment 2026-11-18: ambiguous items add every candidate
+
+§4 item 1 no longer counts Ambiguous as pending: Missing, DurationMismatch and null-field tracks still are. An ambiguous Bandcamp item resolves to **all** its candidate hashes, in the order the matcher returns them.
+
+- **Sync:** the first candidate is the item's linked copy (its Bandcamp key and match in the cache). The other candidates are inserted right after it as local entries (`SyncKey::Local`), so merge3 never removes them. The item is applied: it enters base and is not pending. The extras are inserted only when the item first becomes applied, that is, while it is not yet in base; a later sync finds the key in base and adds nothing. A candidate the result already holds is not added again: one that is the linked copy of any item of theirs, one that is already an entry of the playlist, or one already added as an extra of an earlier item. An item already in base keeps its cached match when it turns ambiguous.
+- **After that** the extra copies are ordinary local entries. Deleting the linked copy is a local deletion and stays deleted; the other copy stays. Deleting an extra copy is simply kept.
+- **Outside §10:** the extras are expanded after `merge3`, from the keys it returns, so they are not keys of the merge and the §10 properties do not speak of them. What still holds: the sync is idempotent (the next sync finds the item in base and adds no extras), and theirs == base still gives ours (every item is in base, so none adds extras). "Every result item is in ours union theirs" does not hold for an extra copy.
+- **Import job:** every candidate is written as consecutive entries where the item sits, and the report says "ambiguous: added N candidates". A library track of unknown duration passes the matcher's duration check and counts as a match; a track whose duration differs is not written.
+- **The user removes the unwanted copies** by hand.
+
+Rejected: keep Ambiguous pending. A silent skip hides the track from the playlist until someone notices and resolves the match, while a visible extra copy is plain to see and one delete away from right. A silent skip is worse than a visible extra copy.
+
+The sync report has no field of its own for this: the extras count in `added`.
+
+## Amendment 2026-11-18: links carry the playlist id
+
+A link also keeps the Bandcamp playlist's id (`bandcamp_id`, optional so older link files still load). The console joins the fan's playlist listing to the links on it, not on the URL, which has several spellings (slug, with or without the user, with a query). The listing's `id` and a fetched playlist's `id` are the same number. A link without an id, made before this, gets it at its next link or sync and joins nothing until then.
+
+## Amendment 2026-11-19 (interim): orphan links are pruned on read; linking starts fresh
+
+Seen on stage2: `chill-openers` was binned, its link stayed in `playlist-links.json`, a new empty `chill-openers` was created and the old link (with the old base) attached to it by name. The merge then read every base item as a local deletion and synced nothing back. Changes:
+
+- **Linking always starts fresh** (replaces §8's first sentence and §7's "keeps"). `LinkPlaylist` resets base, pending, match cache and `pending_base`, also for the playlist `local` is already linked to. The next sync is a first sync (§7): it adds what is missing and skips what is present. Cost: a track the user deleted comes back once after a re-link. A stale base is never reused.
+- **Orphans are unlinked, in one place.** Every read of the links (`ListPlaylistLinks`, the picker's `linked_to`, the linked badge, the up-front check of `SyncPlaylist`) goes through `live_links`, which asks the library which playlists exist and drops (prunes, and saves) every link whose local playlist is not among them. When the library cannot answer, nothing is pruned: a link is never dropped on a guess. This also cleans up links left behind before this amendment.
+- **Unlink.** `UnlinkPlaylist { local }` drops the link and its base; the console has `DELETE /api/playlists/:name/link` and an "Unlink from Bandcamp" item in the menu next to Sync. No confirmation: linking again is a first sync, which only adds what is missing.
+- **No lifecycle messages.** The source is not told when a playlist is binned, restored, purged, emptied or renamed. The orphan rule above is the only handling: a bin leaves an orphan link, which the next read of the links prunes.
+- **Known gaps:** if a same-name playlist is created before the next links read, it inherits the old link. A restore after a prune comes back unlinked. A rename leaves the link behind under the old name, where it is pruned as an orphan.
+- **Superseded by ADR-035 (service-owned facts on library subjects)**, which will replace this lifecycle handling.
 
 ## Phased plan
 
@@ -115,9 +144,9 @@ Undo reverts the file but keeps the new base. Undone additions therefore count a
 - Concurrent edits are safe: the sync goes through ADR-027's version check and a conflict retries.
 - One sync is one atomic write, so one Undo takes it back.
 - The merge is reusable for the outbox rebase, and has no Bandcamp knowledge.
-- One exception to "local deletions stay deleted": if a sync crashes after its edit landed and the user then changes the playlist before the next sync, the edit is not recognised as landed, so an item the user deleted in between comes back once (§6.5). It takes two faults, and the merge adds no duplicate.
+- One exception to "local deletions stay deleted": if a sync crashes after its edit landed and the user then changes the playlist before the next sync, the edit is not recognised as landed, so an item or an extra copy the user deleted in between comes back once (§6.5). It takes two faults, and the merge adds no duplicate.
 - Link state lives outside the library, in `mdma-bandcamp`. A playlist edited on another node does not carry its link.
-- Pending items are shown from the link state, not from the playlist file: the file holds only matched items.
+- Pending items are shown from the link state, not from the playlist file: the file holds the linked copies of applied items, and the extra copies of ambiguous ones.
 
 ## Alternatives considered
 

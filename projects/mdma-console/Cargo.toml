@@ -20,6 +20,7 @@ library-ipc-client = { path = "../../components/library_ipc_client" }
 gateway-client = { path = "../../components/gateway_client" }
 mdma-client = { path = "../../components/mdma_client" }
 source-protocol = { path = "../../components/source_protocol" }
+playlist-import = { workspace = true }
 event-protocol = { path = "../../components/event_protocol" }
 nng-transport = { path = "../../components/nng_transport" }
 media-protocol = { path = "../../components/media_protocol" }

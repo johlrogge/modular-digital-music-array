@@ -103,10 +103,17 @@ pub enum SourceRequest {
     GetCheckStatus,
 
     /// Link the local playlist `local` to a source playlist (a slug or a URL).
-    /// Linking the playlist `local` is already linked to changes nothing; a
-    /// different one replaces the link and starts without a base (ADR-032 §7,
-    /// §8). Answer with `SourceResponse::PlaylistLinked`.
+    /// A link always starts fresh, without a base, pending items or match
+    /// cache: the next sync is a first sync, which only adds what is missing
+    /// (ADR-032 §7, §8, amendment 2026-11-19). Answer with
+    /// `SourceResponse::PlaylistLinked`.
     LinkPlaylist { local: PlaylistName, source: String },
+
+    /// Drop the link of `local`, with its base. Needs no confirmation:
+    /// linking again is a first sync. Answer with
+    /// `SourceResponse::PlaylistLinkUpdated` (`changed` is false when `local`
+    /// had no link).
+    UnlinkPlaylist { local: PlaylistName },
 
     /// Start a background job that three-way syncs the linked local playlist
     /// with its source playlist (ADR-032). Answer with
@@ -201,6 +208,9 @@ pub enum SourceResponse {
 
     /// Result of a ListPlaylistLinks request.
     PlaylistLinks(Vec<PlaylistLinkInfo>),
+
+    /// Result of an unlink: whether a link was dropped.
+    PlaylistLinkUpdated { changed: bool },
 
     /// Error response.
     Error(SourceError),
@@ -370,7 +380,8 @@ pub enum SyncWaitEnd {
 pub enum ImportTrackOutcome {
     /// Exactly one library track matched.
     Matched { hash: String },
-    /// Several library tracks matched; never written.
+    /// Several library tracks matched; every candidate is written, side by
+    /// side, for the user to prune.
     Ambiguous { candidates: Vec<String> },
     /// Artist and title match but the duration is outside tolerance
     /// (probably a different version); never written.
@@ -482,6 +493,37 @@ pub struct PlaylistLinkInfo {
     pub pending: Vec<PendingPlaylistTrack>,
     /// Unix seconds of the last completed sync; `None` before the first.
     pub last_synced: Option<u64>,
+    /// The Bandcamp playlist's stable id, which a listing carries as the
+    /// summary's `id` whatever spelling the URL has. `None` for a link made
+    /// before ids were kept, until its next link or sync.
+    #[serde(default)]
+    pub bandcamp_id: Option<BandcampPlaylistId>,
+}
+
+/// A Bandcamp playlist by its id: `PlaylistSummary.id` of the fan's listing
+/// and `Playlist.id` of a fetched playlist are the same number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct BandcampPlaylistId(u64);
+
+impl BandcampPlaylistId {
+    pub fn new(id: u64) -> Self {
+        Self(id)
+    }
+}
+
+impl std::str::FromStr for BandcampPlaylistId {
+    type Err = std::num::ParseIntError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        s.parse().map(Self)
+    }
+}
+
+impl fmt::Display for BandcampPlaylistId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.0, f)
+    }
 }
 
 /// What it takes to undo a sync with `PlaylistRevert` (ADR-027).
@@ -1119,6 +1161,18 @@ mod tests {
     }
 
     #[test]
+    fn a_link_without_an_id_still_parses() {
+        let old = r#"{"local":"friday","source":"s","pending":[],"last_synced":null}"#;
+        let info: PlaylistLinkInfo = serde_json::from_str(old).unwrap();
+        assert_eq!(info.bandcamp_id, None);
+        assert_eq!(
+            "982341".parse::<BandcampPlaylistId>().unwrap().to_string(),
+            "982341"
+        );
+        assert!("pl1".parse::<BandcampPlaylistId>().is_err());
+    }
+
+    #[test]
     fn source_error_invalid_request_roundtrip() {
         let resp = SourceResponse::Error(SourceError::InvalidRequest {
             message: "bad name".to_string(),
@@ -1252,6 +1306,9 @@ mod tests {
             },
             SourceRequest::GetPlaylistSyncStatus,
             SourceRequest::ListPlaylistLinks,
+            SourceRequest::UnlinkPlaylist {
+                local: local.clone(),
+            },
         ] {
             let json = serde_json::to_string(&req).unwrap();
             let parsed: SourceRequest = serde_json::from_str(&json).unwrap();
@@ -1267,6 +1324,7 @@ mod tests {
                 artist: "N".to_string(),
             }],
             last_synced: Some(1_700_000_000),
+            bandcamp_id: Some(BandcampPlaylistId::new(982341)),
         };
         let report = PlaylistSyncReport {
             local,
@@ -1303,6 +1361,7 @@ mod tests {
             SourceResponse::PlaylistSyncStatus(Some(status(PlaylistSyncPhase::Done(report)))),
             SourceResponse::PlaylistSyncStatus(Some(status(PlaylistSyncPhase::Rematching))),
             SourceResponse::PlaylistLinks(vec![info]),
+            SourceResponse::PlaylistLinkUpdated { changed: true },
             SourceResponse::Error(SourceError::SyncInProgress { job_id: 5 }),
             SourceResponse::Error(SourceError::PlaylistNotLinked {
                 name: PlaylistName::new("friday").unwrap(),

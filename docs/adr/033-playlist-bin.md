@@ -4,7 +4,7 @@
 
 Accepted, 2026-11-18 (Joakim approved the plan and every default)
 
-Amends ADR-027 §6.1 (delete) and ADR-032 §8 (rename and delete). Builds on ADR-027 (CAS edits, one lock, atomic writes), ADR-004 (successor repair on read; the gateway, library and console embed `library_ipc_protocol`), ADR-013 (dedup sweeps playlists). Related: ADR-016 (outbox).
+Amends ADR-027 §6.1 (delete) and ADR-032 §8 (rename and delete) (see amendment 2026-11-19). Builds on ADR-027 (CAS edits, one lock, atomic writes), ADR-004 (successor repair on read; the gateway, library and console embed `library_ipc_protocol`), ADR-013 (dedup sweeps playlists). Related: ADR-016 (outbox).
 
 ## Context
 
@@ -44,7 +44,7 @@ Amends ADR-027 §6.1 (delete) and ADR-032 §8 (rename and delete). Builds on ADR
 3. The library never picks a name by itself and never suggests one. The user types it.
 4. Stale hashes need no special work. The dedup sweep skipped the binned file, so a hash that was merged away meanwhile is fixed by the normal on-read successor repair after Restore (ADR-004).
 
-### 5. Bandcamp links (amends ADR-032 §8)
+### 5. Bandcamp links (amends ADR-032 §8) (Superseded by amendment 2026-11-19)
 
 1. A binned playlist keeps its link, but the link is **inactive** and cannot sync.
 2. Restore re-activates the link.
@@ -74,6 +74,15 @@ Amends ADR-027 §6.1 (delete) and ADR-032 §8 (rename and delete). Builds on ADR
 
 They list through `PlaylistList`, which does not show the Bin.
 
+## Amendment 2026-11-19: a binned playlist's link is pruned
+
+§5 changes: a binned playlist's link is not kept as "inactive" under its name, because a new playlist that reuses the name would inherit it (ADR-032 amendment 2026-11-19).
+
+1. **Unlink and fresh link exist.** `UnlinkPlaylist` drops a link with its base, and `LinkPlaylist` always starts fresh, so a re-link is a first sync.
+2. **Orphan links are pruned on read.** The bin does not tell the source. A link whose playlist is not in the library (a binned one included) is unlinked on the next read of the links.
+3. **Known gaps.** If a same-name playlist is created before the next links read, it inherits the link. A restore after a prune comes back unlinked. A rename leaves the link behind under the old name, where it is pruned as an orphan.
+4. **Superseded by ADR-035 (service-owned facts on library subjects)**, which will replace this handling.
+
 ## Phased plan
 
 - **P0:** this ADR, the amendments to ADR-027 and ADR-032, and a ROADMAP entry.
@@ -99,7 +108,7 @@ They list through `PlaylistList`, which does not show the Bin.
 - Disk is not reclaimed until the user purges. Playlists are small, so this is cheap.
 - Binned playlists are invisible to every reader, so the dedup sweep leaves them alone and Restore relies on on-read repair.
 - Old clients that send `PlaylistDelete` or `PlaylistRemove` get a bin instead of an unlink, with the same answer as before.
-- Link state in `mdma-bandcamp` must learn "inactive" (ADR-032 phase 3).
+- Until ADR-035, a binned playlist's link is pruned as an orphan.
 
 ## Alternatives considered
 
