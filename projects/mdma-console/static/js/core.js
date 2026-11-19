@@ -18,6 +18,7 @@
 //   filters    when store.f[key] was changed by the narrowing UI (emitted by narrow.js).
 //              detail is always the view key whose filters changed.
 //   sort       when store.sort was changed (emitted by narrow.js). No detail: the sort is global.
+//   notation   when the key notation changed (setKeyNotation); no detail.
 //
 // ============================================================ API conventions
 // api() resolves the parsed JSON body of any 2xx response, including 207 partial success
@@ -154,6 +155,7 @@ export function setKeyNotation(n) {
     /* storage is off: the choice lasts until the page reloads */
   }
   renderRoute();
+  emit("notation");
 }
 
 /** A track's key ({ musical, camelot, open_key } or null) in the chosen notation; "" when it has none. */

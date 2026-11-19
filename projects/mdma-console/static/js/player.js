@@ -4,9 +4,9 @@
 // store.tracks by hash. Nothing here starts or stops audio except an explicit click on a transport
 // button: play/pause toggles pause/resume, and Play while idle goes through actions.start() (never
 // the raw /player/play-queue). While previewing, Back (button or B) takes Next's place.
-import { isIdle, outputDown, trackTitle, LIKED, markLabel } from "./logic.js";
+import { isIdle, outputDown, trackTitle, metaLine, LIKED, markLabel } from "./logic.js";
 import { artBg, setArt, setCover } from "./art.js";
-import { $, $$, ApiError, actions, api, enc, fmt, h, icon, macroForKey, marksOf, on, openMenu, refreshPlayer, store, toast, typing } from "./core.js";
+import { $, $$, ApiError, actions, api, enc, fmt, h, icon, macroForKey, keyText, marksOf, on, openMenu, refreshPlayer, store, toast, typing } from "./core.js";
 
 const DESKTOP = 1024; // px, matches the CSS breakpoint
 
@@ -131,6 +131,8 @@ function render() {
     const a = $("#p-artist");
     a.textContent = track ? track.artist || "" : "";
     a.setAttribute("href", track && track.artist ? "#/artist/" + enc(track.artist) : "#/library");
+    const dur = durationMs(); // the same length the remaining-time display counts down from
+    $("#p-meta").textContent = metaLine(track, track ? keyText(track.key) : "", dur ? fmt(dur / 1000) : "");
     $("#p-kick").textContent = pv ? "Previewing" : "Playing from";
     $("#p-from").textContent = pv ? pv.sub : "Up next";
     paintArt($("#p-art"), track);
@@ -304,6 +306,7 @@ function closePlayer() {
 on("tracks", render);
 on("queue", render);
 on("marks", render);
+on("notation", render);
 on("position", (pos) => {
   if (pos.hash !== store.player.now) return; // a late tick of the previous track
   // Equal positions only mean a stall when a tick's worth of time passed between them: a refresh

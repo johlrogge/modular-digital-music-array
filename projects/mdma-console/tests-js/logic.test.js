@@ -1,9 +1,35 @@
 // Run with `deno test projects/mdma-console/tests-js/`. Kept out of static/, which is all served.
-import { barTarget, appendOps, editOutcome, insertedCount, addedAndSkipped } from "../static/js/logic.js";
+import { barTarget, appendOps, editOutcome, insertedCount, addedAndSkipped, speakerRows, metaLine } from "../static/js/logic.js";
 
 function eq(actual, expected) {
   if (actual !== expected) throw new Error("expected " + expected + ", got " + actual);
 }
+
+Deno.test("speakers: the current device is marked, labels fall back to the name", () => {
+  const rows = speakerRows([{ name: "a", description: "Desk" }, { name: "b", description: null }], { device_name: "b" });
+  eq(JSON.stringify(rows), JSON.stringify([{ name: "a", label: "Desk", current: false }, { name: "b", label: "b", current: true }]));
+});
+
+Deno.test("speakers: no current device (auto) marks nothing", () => {
+  const rows = speakerRows([{ name: "a" }], { device_name: null });
+  eq(rows[0].current, false);
+  eq(speakerRows([{ name: "a" }], null)[0].current, false);
+});
+
+Deno.test("meta line: album, BPM, key and duration joined", () => {
+  eq(metaLine({ album: "Alb", bpm: 127.6 }, "8A", "4:05"), "Alb · 128 BPM · 8A · 4:05");
+});
+
+Deno.test("meta line: missing fields leave no gaps or separators", () => {
+  eq(metaLine({ album: null, bpm: null }, "", "1:00"), "1:00");
+  eq(metaLine({ album: "Alb", bpm: 0 }, "", ""), "Alb · 0 BPM");
+  eq(metaLine({}, "", ""), "");
+  eq(metaLine(null, "", "1:00"), "");
+});
+
+Deno.test("speakers: anything but a list is no devices", () => {
+  eq(speakerRows(null, null).length, 0);
+});
 
 Deno.test("appending inserts all hashes in one op at the end, with the duplicates rule", () => {
   const ops = appendOps({ entries: [{}, {}, {}] }, ["h1", "h2"], "Keep");
