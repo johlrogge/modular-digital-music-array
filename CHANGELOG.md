@@ -6,6 +6,15 @@ All notable changes to MDMA are documented here.
 
 ## [Unreleased]
 
+### Fixed
+
+- `mdma rekordbox import --enrich` now builds the beat grid from the first
+  TEMPO's `Bpm`, `Metro` and `Battito`: the grid BPM is the TEMPO BPM (average
+  BPM only as fallback), bars follow the Metro numerator, and an anchor that
+  sits on beat 2-4 of a bar is moved to the next downbeat, so bar lines no
+  longer land 1-3 beats off. Grids already in the library are corrected only by
+  importing the rekordbox XML again.
+
 ---
 
 ## [0.40.0] — 2026-11-18

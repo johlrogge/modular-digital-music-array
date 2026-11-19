@@ -2112,6 +2112,46 @@ mod tests {
         assert_eq!(track(cleared).energy, None);
     }
 
+    /// A re-import retracts the superseded rekordbox grid before asserting the
+    /// corrected one: the corrected grid shows, and retracting it later does not
+    /// resurrect the pre-fix grid.
+    #[test]
+    fn retracting_a_superseded_grid_keeps_it_from_resurfacing() {
+        let ingest = src("ingest", "1.0.0");
+        let rekordbox = FactSource::new("mdma", "1", "Rekordbox");
+        let grid = |first_beat_ms| MusicValue::BeatGrid {
+            first_beat_ms,
+            bpm: music_facts::Bpm::from_u32(120).unwrap(),
+            beats_per_bar: 4,
+        };
+        let track = |facts: Vec<MusicFact>| {
+            let mut all = vec![
+                assert_fact("sha256:aabbcc", title("T"), 1, &ingest),
+                assert_fact(
+                    "sha256:aabbcc",
+                    MusicValue::FilePath(PathBuf::from("x/y.flac")),
+                    1,
+                    &ingest,
+                ),
+            ];
+            all.extend(facts);
+            project(all).tracks.remove(0)
+        };
+        let reimported = vec![
+            assert_fact("sha256:aabbcc", grid(1_000), 2, &rekordbox),
+            retract_fact("sha256:aabbcc", grid(1_000), 3, &rekordbox),
+            assert_fact("sha256:aabbcc", grid(2_500), 4, &rekordbox),
+        ];
+        assert_eq!(
+            track(reimported.clone()).beat_grid.map(|g| g.0),
+            Some(2_500)
+        );
+
+        let mut cleared = reimported;
+        cleared.push(retract_fact("sha256:aabbcc", grid(2_500), 5, &rekordbox));
+        assert_eq!(track(cleared).beat_grid, None);
+    }
+
     #[test]
     fn project_lines_skips_lines_that_are_not_facts() {
         let s = src("ingest", "1.0.0");
