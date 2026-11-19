@@ -4,8 +4,8 @@
 // with an input where the user types a name (core.js askName; the console never suggests one).
 // Purge and Empty bin cannot be undone, so they confirm.
 import { h, icon, route, api, enc, plural, toast, confirmDlg, loadPlaylists, askName, ApiError } from "./core.js";
-import { backLink, LIBRARY_LINK } from "./collections.js";
-import { emptyNote, topbar } from "./lists.js";
+import { pageHead, LIBRARY_LINK } from "./collections.js";
+import { emptyNote } from "./lists.js";
 
 /** "just now", "5 min ago", "3 h ago", "2 days ago", from a time in ms since the epoch. */
 function ago(ms, now = Date.now()) {
@@ -38,12 +38,10 @@ export async function restoreBinned(id, as) {
 
 function viewBin(root) {
   let gone = false;
-  const top = topbar("Bin");
-  const heading = top.querySelector("h1");
+  const heading = pageHead(root, { href: "#/library/playlists", text: "Library" }, "Bin").querySelector("h1");
   const head = h("div", { class: "section-head", style: "margin-top:var(--s-3)" });
   const body = h("div");
-  root.appendChild(h("div", { class: "coll-bar" }, [backLink("#/library/playlists", "Library")]));
-  root.append(top, head, body);
+  root.append(head, body);
 
   /** Draw the bin from the library; `refocus` moves the focus to the heading (a row has just gone). */
   async function draw(refocus) {

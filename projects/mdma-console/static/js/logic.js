@@ -63,6 +63,35 @@ export function speakerRows(outputs, config) {
 }
 
 /**
+ * Texts for the Bandcamp page from GET /bandcamp/status ({ connected, authenticated, downloads_active,
+ * downloads_queued, downloads_completed, downloads_failed, paused, ... }).
+ */
+export function bandcampSummary(s) {
+  const cookies = s && s.cookies_valid === false ? "Cookie file expired or invalid" : "";
+  if (!s || !s.connected) return { connected: false, auth: "Bandcamp is not running", counts: "", cookies, paused: false, pauseLabel: "Pause downloads" };
+  const n = (v) => v || 0;
+  return {
+    connected: true,
+    cookies,
+    auth: s.authenticated ? "Signed in" : "Not signed in",
+    counts: `${n(s.downloads_active)} active · ${n(s.downloads_queued)} queued · ${n(s.downloads_completed)} completed · ${n(s.downloads_failed)} failed`,
+    paused: !!s.paused,
+    pauseLabel: s.paused ? "Resume downloads" : "Pause downloads",
+  };
+}
+
+export const RESTART_TIMEOUT_MS = 30000;
+
+/**
+ * Where a wait for the Bandcamp service to restart stands: "back" once it answers connected, "gave-up"
+ * when RESTART_TIMEOUT_MS has passed since `since` (ms), else "waiting".
+ */
+export function restartPhase(since, now, connected) {
+  if (connected) return "back";
+  return now - since >= RESTART_TIMEOUT_MS ? "gave-up" : "waiting";
+}
+
+/**
  * True when something is loaded but the audio output is not there or not pulling samples.
  * Idle shows nothing: "absent" is normal before the first load.
  */

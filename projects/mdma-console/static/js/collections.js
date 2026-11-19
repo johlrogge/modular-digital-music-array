@@ -7,7 +7,7 @@
 import { h, icon, route, store, catalogue, enc, plural, fmtTotal, setOf } from "./core.js";
 import { art } from "./art.js";
 import { albumOrder, groupAlbums, isIdle, coverOf } from "./logic.js";
-import { queueButtons, narrowedTracks, albumCard } from "./lists.js";
+import { queueButtons, narrowedTracks, albumCard, topbar } from "./lists.js";
 
 export const LIBRARY_LINK = { href: "#/library", text: "Back to Library" };
 
@@ -39,6 +39,15 @@ export function collectionHeader(cfg, all, rows, narrowed) {
 
 /** The link back to the page this one belongs to. */
 export const backLink = (href, text) => h("a", { class: "back", href }, [icon("left", "sm"), text]);
+
+export const SETTINGS_LINK = { href: "#/settings", text: "Settings" };
+
+/** A sub page's head: a back link to `back` ({ href, text }), then the title. Returns the topbar. */
+export function pageHead(root, back, title) {
+  const top = topbar(title);
+  root.append(h("div", { class: "coll-bar" }, [backLink(back.href, back.text)]), top);
+  return top;
+}
 
 /**
  * A collection page drawn into `root`: back link, header, pane. Returns the router's cleanup.

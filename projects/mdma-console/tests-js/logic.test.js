@@ -1,5 +1,5 @@
 // Run with `deno test projects/mdma-console/tests-js/`. Kept out of static/, which is all served.
-import { barTarget, appendOps, editOutcome, insertedCount, addedAndSkipped, speakerRows, metaLine } from "../static/js/logic.js";
+import { barTarget, appendOps, editOutcome, insertedCount, addedAndSkipped, speakerRows, metaLine, bandcampSummary, restartPhase, RESTART_TIMEOUT_MS } from "../static/js/logic.js";
 
 function eq(actual, expected) {
   if (actual !== expected) throw new Error("expected " + expected + ", got " + actual);
@@ -14,6 +14,47 @@ Deno.test("speakers: no current device (auto) marks nothing", () => {
   const rows = speakerRows([{ name: "a" }], { device_name: null });
   eq(rows[0].current, false);
   eq(speakerRows([{ name: "a" }], null)[0].current, false);
+});
+
+Deno.test("bandcamp: a connected, signed in, running source", () => {
+  const s = bandcampSummary({ connected: true, authenticated: true, downloads_active: 2, downloads_queued: 1, downloads_completed: 5, downloads_failed: 0, paused: false });
+  eq(s.auth, "Signed in");
+  eq(s.counts, "2 active · 1 queued · 5 completed · 0 failed");
+  eq(s.paused, false);
+  eq(s.pauseLabel, "Pause downloads");
+});
+
+Deno.test("bandcamp: paused offers resume; not signed in says so", () => {
+  const s = bandcampSummary({ connected: true, authenticated: false, paused: true });
+  eq(s.auth, "Not signed in");
+  eq(s.paused, true);
+  eq(s.pauseLabel, "Resume downloads");
+  eq(s.counts, "0 active · 0 queued · 0 completed · 0 failed");
+});
+
+Deno.test("bandcamp: a source that is not connected has no counts", () => {
+  for (const s of [null, { connected: false }]) {
+    const r = bandcampSummary(s);
+    eq(r.auth, "Bandcamp is not running");
+    eq(r.counts, "");
+    eq(r.connected, false);
+  }
+});
+
+Deno.test("bandcamp: invalid cookies are reported, connected or not", () => {
+  eq(bandcampSummary({ connected: true, authenticated: false, cookies_valid: false }).cookies, "Cookie file expired or invalid");
+  eq(bandcampSummary({ connected: false, cookies_valid: false }).cookies, "Cookie file expired or invalid");
+  eq(bandcampSummary({ connected: true, authenticated: true, cookies_valid: true }).cookies, "");
+  eq(bandcampSummary({ connected: true, authenticated: true }).cookies, "");
+  eq(bandcampSummary(null).cookies, "");
+});
+
+Deno.test("restart: waits, comes back, or gives up after the timeout", () => {
+  eq(restartPhase(1000, 1000, false), "waiting");
+  eq(restartPhase(1000, 1000 + RESTART_TIMEOUT_MS - 1, false), "waiting");
+  eq(restartPhase(1000, 1000 + RESTART_TIMEOUT_MS, false), "gave-up");
+  eq(restartPhase(1000, 1000, true), "back");
+  eq(restartPhase(1000, 1000 + RESTART_TIMEOUT_MS * 2, true), "back");
 });
 
 Deno.test("meta line: album, BPM, key and duration joined", () => {

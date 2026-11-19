@@ -382,7 +382,9 @@ export class ApiError extends Error {
  */
 export async function api(path, opts = {}) {
   const init = { method: opts.method || (opts.body !== undefined ? "POST" : "GET"), headers: {} };
-  if (opts.body !== undefined) {
+  if (opts.body instanceof FormData) {
+    init.body = opts.body; // multipart: the browser sets the content type and boundary
+  } else if (opts.body !== undefined) {
     init.headers["content-type"] = "application/json";
     init.body = JSON.stringify(opts.body);
   }
