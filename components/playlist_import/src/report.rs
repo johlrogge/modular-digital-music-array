@@ -44,7 +44,7 @@ fn render_rows(tracks: &[ImportTrackReport]) -> String {
     use std::fmt::Write;
 
     let mut out = String::new();
-    let (mut matched, mut ambiguous, mut missing) = (0, 0, 0);
+    let (mut matched, mut ambiguous, mut mismatched, mut missing) = (0, 0, 0, 0);
     for t in tracks {
         let label = format!("{} - {}", t.artist, t.title);
         match &t.outcome {
@@ -54,7 +54,13 @@ fn render_rows(tracks: &[ImportTrackReport]) -> String {
             }
             ImportTrackOutcome::Ambiguous { candidates } => {
                 ambiguous += 1;
-                let _ = writeln!(out, "{:3}. ? ambiguous      {}", t.position, label);
+                let _ = writeln!(
+                    out,
+                    "{:3}. ? ambiguous: added {} candidates {}",
+                    t.position,
+                    candidates.len(),
+                    label
+                );
                 for h in candidates.iter().take(3) {
                     let _ = writeln!(out, "         candidate: {}", short_candidate(h));
                 }
@@ -64,7 +70,7 @@ fn render_rows(tracks: &[ImportTrackReport]) -> String {
                 library_secs,
                 source_secs,
             } => {
-                ambiguous += 1;
+                mismatched += 1;
                 let _ = writeln!(
                     out,
                     "{:3}. ? duration differs (library {} vs bandcamp {}) {}",
@@ -84,9 +90,10 @@ fn render_rows(tracks: &[ImportTrackReport]) -> String {
     }
     let _ = write!(
         out,
-        "{} matched, {} ambiguous, {} missing of {}",
+        "{} matched, {} ambiguous, {} duration mismatch, {} missing of {}",
         matched,
         ambiguous,
+        mismatched,
         missing,
         tracks.len()
     );
@@ -164,7 +171,7 @@ pub fn format_import_status(status: &ImportJobStatus) -> String {
         ImportPhase::Done(ImportResult::NothingMatched) => {
             let _ = write!(
                 out,
-                "\nNo definitive matches; playlist '{}' not written",
+                "\nNothing to write: no track matched the library; playlist '{}' not written",
                 name
             );
         }
@@ -276,13 +283,30 @@ mod tests {
         let lines: Vec<&str> = report.lines().skip(1).collect();
         assert!(lines[0].contains("1. ✓ matched") && lines[0].contains("A - One"));
         assert!(lines[1].contains("2. ? ambiguous") && lines[1].contains("B - Two"));
+        assert!(
+            lines[1].contains("ambiguous: added 2 candidates"),
+            "got: {}",
+            lines[1]
+        );
         assert!(lines[2].contains("candidate: sha256:2222"));
         assert!(lines[3].contains("candidate: sha256:3333"));
         assert!(lines[4].contains("3. ✗ not in library") && lines[4].contains("C - Three"));
         assert!(lines[5].contains("4. ✓ matched"));
         assert_eq!(
             lines.last().unwrap(),
-            &"2 matched, 1 ambiguous, 1 missing of 4"
+            &"2 matched, 1 ambiguous, 0 duration mismatch, 1 missing of 4"
+        );
+    }
+
+    #[test]
+    fn the_ambiguous_row_is_single_spaced() {
+        let two = ImportTrackOutcome::Ambiguous {
+            candidates: vec!["sha256:2222".into(), "sha256:3333".into()],
+        };
+        let out = format_import_status(&status_with(ImportPhase::Matching, vec![tr(1, two)]));
+        assert!(
+            out.contains("1. ? ambiguous: added 2 candidates A - T1\n"),
+            "got: {out}"
         );
     }
 
@@ -311,7 +335,7 @@ mod tests {
             report.contains("? duration differs (library 3:30 vs bandcamp 9:05)"),
             "got: {report}"
         );
-        assert!(report.ends_with("0 matched, 1 ambiguous, 0 missing of 1"));
+        assert!(report.ends_with("0 matched, 0 ambiguous, 1 duration mismatch, 0 missing of 1"));
     }
 
     #[test]
@@ -330,7 +354,10 @@ mod tests {
         assert!(lines[6].contains("candidate: sha256:5555"));
         assert!(lines[7].contains("4. ✗ not in library") && !lines[7].contains("not owned"));
         assert!(lines[8].contains("5. ✗ not in library") && lines[8].contains("(not owned)"));
-        assert_eq!(lines[9], "1 matched, 2 ambiguous, 2 missing of 5");
+        assert_eq!(
+            lines[9],
+            "1 matched, 1 ambiguous, 1 duration mismatch, 2 missing of 5"
+        );
         assert_eq!(lines.len(), 10);
     }
 
@@ -350,7 +377,9 @@ mod tests {
     #[test]
     fn done_nothing_matched_says_not_written() {
         let out = format_import_status(&status(ImportPhase::Done(ImportResult::NothingMatched)));
-        assert!(out.ends_with("No definitive matches; playlist 'mix' not written"));
+        assert!(out.ends_with(
+            "Nothing to write: no track matched the library; playlist 'mix' not written"
+        ));
     }
 
     #[test]
@@ -370,7 +399,9 @@ mod tests {
         s.dry_run = true;
         let out = format_import_status(&s);
         assert!(
-            out.ends_with("No definitive matches; playlist 'mix' not written"),
+            out.ends_with(
+                "Nothing to write: no track matched the library; playlist 'mix' not written"
+            ),
             "got: {out}"
         );
         assert!(!out.contains("Would write"));

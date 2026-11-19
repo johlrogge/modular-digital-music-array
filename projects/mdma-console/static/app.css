@@ -230,6 +230,8 @@ input[type=range].slider:disabled{cursor:default;opacity:.5}
 .player .meta h2{margin:0;font-size:var(--fs-2xl);line-height:1.15;letter-spacing:-.025em;font-weight:800}
 .player .meta .a{color:var(--text-2);font-size:var(--fs-md);text-decoration:none}
 .player .meta .a:hover{text-decoration:underline}
+.player .meta .p-meta{color:var(--text-3);font-size:var(--fs-xs);margin-top:2px}
+.player .meta .p-meta:empty{display:none}
 .player .seek{font-size:var(--fs-xs)}
 .player .transport{justify-content:center;gap:var(--s-5)}
 .player .pp-huge{width:72px;height:72px;border-radius:var(--r-md);background:var(--accent);color:var(--accent-ink);display:grid;place-items:center}
@@ -290,6 +292,9 @@ input[type=range].slider:disabled{cursor:default;opacity:.5}
 .menu.open{display:block}
 .menu button{display:flex;width:100%;align-items:center;gap:var(--s-3);min-height:44px;padding:0 var(--s-3);border-radius:var(--r-sm);font-size:var(--fs-sm);font-weight:500;text-align:left}
 .menu button:hover{background:var(--surface-2)}
+.menu button:disabled{color:var(--text-3);cursor:default}
+.menu button:disabled:hover{background:none}
+.menu{max-height:70dvh;overflow:auto}
 .toast{border-radius:var(--r-sm)!important;position:fixed;z-index:95;left:50%;bottom:calc(var(--tabbar-h) + var(--bar-h) + 28px + env(safe-area-inset-bottom));transform:translate(-50%,12px);background:var(--text);color:var(--bg);border-radius:var(--r-pill);padding:10px 10px 10px 18px;font-size:var(--fs-sm);font-weight:500;display:flex;align-items:center;gap:var(--s-3);opacity:0;pointer-events:none;transition:all .24s var(--ease);max-width:calc(100% - 32px)}
 .toast.on{opacity:1;transform:translate(-50%,0);pointer-events:auto}
 .toast button{color:var(--bg);text-decoration:underline;font-weight:700;padding:6px 10px;border-radius:var(--r-xs)}
@@ -305,6 +310,7 @@ input[type=range].slider:disabled{cursor:default;opacity:.5}
 .list .ttl small{display:block;font-weight:400;font-size:var(--fs-sm);color:var(--text-2)}
 .list .val{font-size:var(--fs-sm);color:var(--text-2);text-align:right;display:flex;align-items:center;gap:6px}
 .list .chev{color:var(--text-3)}
+.list > button[aria-pressed="true"] .ttl{font-weight:700;color:var(--text)}
 @media (max-width:599px){.list .ttl small{display:none}}
 .dot{width:8px;height:8px;border-radius:50%;background:var(--ok);display:inline-block}
 .dot.warn{background:var(--warn)}.dot.bad{background:var(--danger)}

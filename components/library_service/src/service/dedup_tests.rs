@@ -2038,7 +2038,9 @@ fn a_concurrent_identity_backfill_does_not_resurrect_a_merged_loser() {
         .recv_timeout(std::time::Duration::from_secs(10))
         .expect("the merge never reached its retire");
 
-    let started = service.handle_request(LibraryRequest::IdentityBackfill { include_pcm: false });
+    let started = service.handle_request(LibraryRequest::IdentityBackfill(
+        library_ipc_protocol::IdentityBackfillScope::default(),
+    ));
     assert!(matches!(
         started,
         LibraryResponse::IdentityBackfillStarted(_)

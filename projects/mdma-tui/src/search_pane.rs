@@ -334,30 +334,7 @@ mod tests {
 
     /// Build a minimal `TrackInfo` with just the content_hash set.
     fn make_track(hash: &str) -> TrackInfo {
-        TrackInfo {
-            content_hash: ContentHash::new(hash),
-            title: None,
-            artist: None,
-            album: None,
-            duration: None,
-            bpm: None,
-            key: None,
-            blob_path: None,
-            cover_art_path: None,
-            track_number: None,
-            disc_number: None,
-            added: None,
-            started: None,
-            stopped: None,
-            memory_cues: vec![],
-            beat_grid: None,
-            role: None,
-            energy: None,
-            genre: None,
-            label: None,
-            styles: vec![],
-            marks: vec![],
-        }
+        TrackInfo::new(ContentHash::new(hash))
     }
 
     /// Reproduce the resolve_selection logic for test purposes.

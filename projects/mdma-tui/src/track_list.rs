@@ -423,28 +423,12 @@ mod tests {
         duration_secs: Option<u32>,
     ) -> TrackInfo {
         TrackInfo {
-            content_hash: ContentHash::new("test-hash"),
             title: title.map(str::to_string),
             artist: artist.map(str::to_string),
-            album: None,
             duration: duration_secs.map(DurationSeconds::new),
             bpm: bpm.map(|b| Bpm::from_u32(b).unwrap()),
             key,
-            blob_path: None,
-            cover_art_path: None,
-            track_number: None,
-            disc_number: None,
-            added: None,
-            started: None,
-            stopped: None,
-            memory_cues: vec![],
-            beat_grid: None,
-            role: None,
-            energy: None,
-            genre: None,
-            label: None,
-            styles: vec![],
-            marks: vec![],
+            ..TrackInfo::new(ContentHash::new("test-hash"))
         }
     }
 

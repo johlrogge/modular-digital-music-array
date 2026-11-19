@@ -177,6 +177,39 @@ impl fmt::Display for DurationSeconds {
     }
 }
 
+/// Exact duration in whole milliseconds, as the tag reader reports it (no decode).
+///
+/// Precision depends on the container. FLAC, WAV and AIFF state their sample count,
+/// so the value is exact. For MP3 the reader estimates it (from the Xing/VBRI
+/// header, or from the bitrate for CBR files), so it can be off by tens of
+/// milliseconds. Kept next to [`DurationSeconds`], which stays for compatibility.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct DurationMs(u64);
+
+impl DurationMs {
+    pub fn new(val: u64) -> Self {
+        Self(val)
+    }
+
+    /// Truncates to whole milliseconds, saturating at `u64::MAX`.
+    pub fn from_duration(d: std::time::Duration) -> Self {
+        Self(u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+    }
+
+    pub fn value(self) -> u64 {
+        self.0
+    }
+}
+
+impl fmt::Display for DurationMs {
+    /// `m:ss.mmm`, e.g. `6:07.123`.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let secs = self.0 / 1000;
+        write!(f, "{}:{:02}.{:03}", secs / 60, secs % 60, self.0 % 1000)
+    }
+}
+
 pub use storage_primitives::ByteSize as FileSizeBytes;
 
 /// Bitrate in kbps

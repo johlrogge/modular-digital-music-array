@@ -11,7 +11,7 @@ use crate::ipc::{
     SourceStatus,
 };
 use crate::job::{spawn_guarded, JobSlot};
-use crate::playlist_links::{LinkStore, PlaylistLink};
+use crate::playlist_links::{LinkStore, PlaylistLink, PlaylistLinks};
 use crate::playlist_sync::{library_error, resolve_items, sync_playlist, PlaylistSyncError};
 use bandcamp_api::{AudioFormat, BandcampClient, CollectionItem, CookieJar};
 use library_ipc_client::PlaylistName;
@@ -714,30 +714,92 @@ impl BandcampService {
                 }
             }
 
-            SourceRequest::SyncPlaylist { local } => self.handle_sync_playlist(local),
+            SourceRequest::SyncPlaylist { local } => self.handle_sync_playlist(local).await,
 
             SourceRequest::GetPlaylistSyncStatus => {
                 SourceResponse::PlaylistSyncStatus(self.playlist_sync_job.snapshot())
             }
 
-            SourceRequest::ListPlaylistLinks => match self.links.load() {
+            SourceRequest::ListPlaylistLinks => match self.live_links().await {
                 Ok(links) => SourceResponse::PlaylistLinks(
                     links.links.iter().map(PlaylistLink::info).collect(),
                 ),
-                Err(e) => SourceResponse::Error(playlist_sync_error(e.into())),
+                Err(e) => SourceResponse::Error(playlist_sync_error(e)),
             },
+
+            SourceRequest::UnlinkPlaylist { local } => {
+                self.update_links(move |links| links.unlink(&local)).await
+            }
         }
+    }
+
+    /// Change the link state under the link lock and save it if `change` says
+    /// it changed something.
+    async fn update_links(
+        &self,
+        change: impl FnOnce(&mut PlaylistLinks) -> bool + Send + 'static,
+    ) -> SourceResponse {
+        let (store, lock) = (self.links.clone(), Arc::clone(&self.link_lock));
+        let result = tokio::task::spawn_blocking(move || -> Result<bool, PlaylistSyncError> {
+            let _held = lock.lock();
+            let mut links = store.load()?;
+            let changed = change(&mut links);
+            if changed {
+                store.save(&links)?;
+            }
+            Ok(changed)
+        })
+        .await;
+        match result {
+            Ok(Ok(changed)) => SourceResponse::PlaylistLinkUpdated { changed },
+            Ok(Err(e)) => SourceResponse::Error(playlist_sync_error(e)),
+            Err(e) => SourceResponse::Error(SourceError::Internal {
+                message: format!("link task failed: {e}"),
+            }),
+        }
+    }
+
+    /// The links with the orphans unlinked (ADR-032 amendment 2026-11-19): a
+    /// link whose local playlist does not exist is dropped from the saved
+    /// state. The one place orphans go; every read of the links comes through
+    /// here. When the library cannot say which playlists exist, nothing is
+    /// pruned: a link is never dropped on a guess.
+    ///
+    /// A safety net, not the design: ADR-035 (service-owned facts on library subjects)
+    /// replaces this lifecycle handling.
+    async fn live_links(&self) -> Result<PlaylistLinks, PlaylistSyncError> {
+        let socket = self.library_socket.clone();
+        let (store, lock) = (self.links.clone(), Arc::clone(&self.link_lock));
+        tokio::task::spawn_blocking(move || -> Result<PlaylistLinks, PlaylistSyncError> {
+            let _held = lock.lock();
+            let mut links = store.load()?;
+            match LibraryClient::connect(&socket).and_then(|client| client.playlist_list()) {
+                Ok(existing) => {
+                    if links.retain_existing(&existing) {
+                        store.save(&links)?;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "Cannot tell which playlists exist, orphan links not pruned")
+                }
+            }
+            Ok(links)
+        })
+        .await
+        .map_err(|e| PlaylistSyncError::Library(format!("link task failed: {e}")))?
     }
 
     /// Link the local playlist `local` to the Bandcamp playlist `source`
     /// (ADR-032 §8). Both playlists must exist; the link keeps the playlist's
-    /// URL. Linking what `local` is already linked to changes nothing.
+    /// URL. A link always starts fresh: base and pending items are reset, so
+    /// the next sync is a first sync.
     async fn link_playlist(
         &self,
         local: PlaylistName,
         source: &str,
     ) -> Result<PlaylistLinkInfo, SourceError> {
         let fetched = self.fetch_playlist(source).await?;
+        let id = fetched.id.parse().ok();
         let socket = self.library_socket.clone();
         let (store, lock) = (self.links.clone(), Arc::clone(&self.link_lock));
         tokio::task::spawn_blocking(move || -> Result<PlaylistLinkInfo, PlaylistSyncError> {
@@ -748,7 +810,7 @@ impl BandcampService {
                 .map_err(|e| library_error(&local, e))?;
             let _held = lock.lock();
             let mut links = store.load()?;
-            let info = links.link(local, fetched.url);
+            let info = links.link(local, fetched.url, id);
             store.save(&links)?;
             Ok(info)
         })
@@ -763,8 +825,8 @@ impl BandcampService {
     ///
     /// Only one job runs at a time. The job ends in Done or Failed, whatever
     /// happens inside it. An unlinked playlist is refused up front.
-    fn handle_sync_playlist(self: &Arc<Self>, local: PlaylistName) -> SourceResponse {
-        let source = match self.links.load() {
+    async fn handle_sync_playlist(self: &Arc<Self>, local: PlaylistName) -> SourceResponse {
+        let source = match self.live_links().await {
             Ok(links) => match links.get(&local) {
                 Some(link) => link.bandcamp.clone(),
                 None => {
@@ -773,7 +835,7 @@ impl BandcampService {
                     ))
                 }
             },
-            Err(e) => return SourceResponse::Error(playlist_sync_error(e.into())),
+            Err(e) => return SourceResponse::Error(playlist_sync_error(e)),
         };
         let job_id = match self
             .playlist_sync_job
@@ -854,6 +916,7 @@ impl BandcampService {
         on_phase: impl Fn(PlaylistSyncPhase),
         on_progress: impl Fn(ImportSyncProgress),
     ) -> Result<PlaylistSyncReport, SourceError> {
+        let playlist_id = fetched.id.parse().ok();
         let tracks: Arc<[SourcePlaylistTrack]> = fetched.tracks.into();
         let outcomes = self
             .resolve_outcomes(
@@ -883,6 +946,13 @@ impl BandcampService {
             let client = LibraryClient::connect(&socket)
                 .map_err(|e| PlaylistSyncError::Library(e.to_string()))?;
             let _held = lock.lock();
+            // A link made before ids were kept learns its id here.
+            if let Some(id) = playlist_id {
+                let mut links = store.load()?;
+                if links.set_playlist_id(&local, &source, id) {
+                    store.save(&links)?;
+                }
+            }
             sync_playlist(&client, &store, &local, &source, &items, unix_now())
         })
         .await
@@ -983,16 +1053,39 @@ impl BandcampService {
         };
 
         match client.list_playlists(&username).await {
-            Ok(playlists) => SourceResponse::Playlists(
-                playlists
+            Ok(playlists) => {
+                let summaries: Vec<SourcePlaylistSummary> = playlists
                     .into_iter()
                     .map(to_source_playlist_summary)
-                    .collect(),
-            ),
+                    .collect();
+                self.backfill_link_ids(&summaries).await;
+                SourceResponse::Playlists(summaries)
+            }
             Err(e) => {
                 tracing::error!(error = %e, "Failed to list playlists");
                 SourceResponse::Error(playlist_error(&e, None))
             }
+        }
+    }
+
+    /// One-time migration: links made before ids were kept learn their id
+    /// from the listing. A failure is logged; the listing still goes out.
+    async fn backfill_link_ids(&self, listed: &[SourcePlaylistSummary]) {
+        let (store, lock) = (self.links.clone(), Arc::clone(&self.link_lock));
+        let listed = listed.to_vec();
+        let result = tokio::task::spawn_blocking(move || -> Result<(), String> {
+            let _held = lock.lock();
+            let mut links = store.load().map_err(|e| e.to_string())?;
+            if links.backfill_ids(&listed) {
+                store.save(&links).map_err(|e| e.to_string())?;
+            }
+            Ok(())
+        })
+        .await;
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::warn!(error = %e, "Could not backfill playlist link ids"),
+            Err(e) => tracing::warn!(error = %e, "Playlist link id backfill task failed"),
         }
     }
 
@@ -2384,28 +2477,10 @@ mod tests {
 
     fn make_track_info(hash: &str, artist: &str, album: &str) -> TrackInfo {
         TrackInfo {
-            content_hash: ContentHash::new(hash),
             title: Some("some track".to_string()),
             artist: Some(artist.to_string()),
             album: Some(album.to_string()),
-            duration: None,
-            bpm: None,
-            key: None,
-            blob_path: None,
-            cover_art_path: None,
-            track_number: None,
-            disc_number: None,
-            added: None,
-            started: None,
-            stopped: None,
-            memory_cues: vec![],
-            beat_grid: None,
-            role: None,
-            energy: None,
-            genre: None,
-            label: None,
-            styles: vec![],
-            marks: vec![],
+            ..TrackInfo::new(ContentHash::new(hash))
         }
     }
 
@@ -3233,14 +3308,28 @@ mod tests {
         fn service_with_library(
             socket_name: &str,
         ) -> (tempfile::TempDir, Arc<BandcampService>, LibraryClient) {
+            service_with_tracks(
+                socket_name,
+                &[("deadbeef", "Carbon Based Lifeforms", "Interloper", "p_1")],
+            )
+        }
+
+        /// Like `service_with_library`, with the given library tracks:
+        /// `(hash prefix, artist, title, item id)`.
+        fn service_with_tracks(
+            socket_name: &str,
+            tracks: &[(&str, &str, &str, &str)],
+        ) -> (tempfile::TempDir, Arc<BandcampService>, LibraryClient) {
             let temp = tempfile::TempDir::new().expect("tempdir");
-            seed_track_with_item_id(
-                temp.path(),
-                &format!("{:0<64}", "deadbeef"),
-                "Carbon Based Lifeforms",
-                "Interloper",
-                "p_1",
-            );
+            for (hash, artist, title, item_id) in tracks {
+                seed_track_with_item_id(
+                    temp.path(),
+                    &format!("{:0<64}", hash),
+                    artist,
+                    title,
+                    item_id,
+                );
+            }
             let socket_path = temp.path().join(socket_name);
             let _srv = start_stub_library(temp.path(), &socket_path);
             std::thread::sleep(std::time::Duration::from_millis(100));
@@ -3453,6 +3542,11 @@ mod tests {
                     assert_eq!(links[0].pending[0].title, "Nothing");
                     assert_eq!(links[0].pending[0].source_track_id, "2");
                     assert!(links[0].last_synced.is_some());
+                    // The link was made without an id: the sync fills it in.
+                    assert_eq!(
+                        links[0].bandcamp_id,
+                        Some(source_protocol::BandcampPlaylistId::new(1))
+                    );
                 }
                 other => panic!("expected PlaylistLinks, got {other:?}"),
             }
@@ -3603,6 +3697,135 @@ mod tests {
 
             assert!(matches!(result, Err(SourceError::SyncFailed { .. })));
             assert_eq!(service.links.load().unwrap(), before);
+        }
+
+        // ---- Orphan links are pruned on read (interim, ADR-035) ----
+
+        const TWO_TRACKS: [(&str, &str, &str, &str); 2] = [
+            ("deadbeef", "Carbon Based Lifeforms", "Interloper", "p_1"),
+            ("cafebabe", "Other Artist", "Other Song", "p_2"),
+        ];
+
+        /// Both tracks of `TWO_TRACKS`, as one Bandcamp playlist.
+        fn both_on_bandcamp() -> SourcePlaylist {
+            source_playlist(vec![
+                source_track(1, "Carbon Based Lifeforms", "Interloper", true),
+                source_track(2, "Other Artist", "Other Song", true),
+            ])
+        }
+
+        async fn sync_mine(service: &Arc<BandcampService>) -> PlaylistSyncReport {
+            service
+                .sync_from_source(mine(), "my-set", both_on_bandcamp(), |_| {}, |_| {})
+                .await
+                .expect("sync")
+        }
+
+        /// Bin `name` in the library only: the source is not told.
+        fn bin_in_library(client: &LibraryClient, name: &PlaylistName) {
+            let version = client.playlist_snapshot(name).unwrap().version;
+            match client
+                .request(&library_ipc_client::LibraryRequest::PlaylistBin {
+                    name: name.clone(),
+                    version,
+                })
+                .unwrap()
+            {
+                library_ipc_client::LibraryResponse::PlaylistBinned { .. } => {}
+                other => panic!("expected PlaylistBinned, got {other:?}"),
+            }
+        }
+
+        /// Send a request that answers `PlaylistLinkUpdated`; whether a link changed.
+        async fn changed(service: &Arc<BandcampService>, request: SourceRequest) -> bool {
+            match service.handle_request(request).await {
+                SourceResponse::PlaylistLinkUpdated { changed } => changed,
+                other => panic!("expected PlaylistLinkUpdated, got {other:?}"),
+            }
+        }
+
+        async fn linked_names(service: &Arc<BandcampService>) -> Vec<PlaylistName> {
+            match service
+                .handle_request(SourceRequest::ListPlaylistLinks)
+                .await
+            {
+                SourceResponse::PlaylistLinks(links) => {
+                    links.into_iter().map(|l| l.local).collect()
+                }
+                other => panic!("expected PlaylistLinks, got {other:?}"),
+            }
+        }
+
+        #[tokio::test]
+        async fn a_name_reused_after_a_links_read_does_not_inherit_the_old_base() {
+            let (_temp, service, client) = service_with_tracks("reuse-name.sock", &TWO_TRACKS);
+            link_mine(&service, &client);
+            let first = sync_mine(&service).await;
+            assert_eq!(first.added, 2);
+            let hashes = client.playlist_get(&mine()).unwrap();
+            assert_eq!(hashes.len(), 2);
+
+            // The playlist is binned; the next links read prunes the orphan.
+            bin_in_library(&client, &mine());
+            assert!(linked_names(&service).await.is_empty(), "orphan pruned");
+
+            // A new playlist of the same name with one track.
+            client
+                .playlist_new(&mine(), format!("{}\n", hashes[1].as_str()))
+                .unwrap();
+            assert!(linked_names(&service).await.is_empty(), "no inherited link");
+            match service
+                .handle_request(SourceRequest::SyncPlaylist { local: mine() })
+                .await
+            {
+                SourceResponse::Error(SourceError::PlaylistNotLinked { .. }) => {}
+                other => panic!("expected PlaylistNotLinked, got {other:?}"),
+            }
+
+            // Linked again, the first sync adds what is missing and removes
+            // nothing: the old base does not read as local deletions.
+            let mut links = service.links.load().unwrap();
+            links.link(mine(), "my-set".to_string(), None);
+            service.links.save(&links).unwrap();
+            let report = sync_mine(&service).await;
+            assert_eq!((report.added, report.removed), (1, 0));
+            let now = client.playlist_get(&mine()).unwrap();
+            assert_eq!(now.len(), 2);
+            assert!(now.contains(&hashes[0]) && now.contains(&hashes[1]));
+        }
+
+        #[tokio::test]
+        async fn a_link_whose_playlist_is_gone_is_unlinked_and_pruned_on_read() {
+            let (_temp, service, client) = service_with_tracks("orphan.sock", &TWO_TRACKS);
+            link_mine(&service, &client);
+            // Binned; the source is never told.
+            bin_in_library(&client, &mine());
+
+            assert!(linked_names(&service).await.is_empty());
+            assert!(service.links.load().unwrap().links.is_empty(), "pruned");
+        }
+
+        #[tokio::test]
+        async fn a_link_is_kept_while_the_library_cannot_say_which_playlists_exist() {
+            let temp = tempfile::TempDir::new().unwrap();
+            let service = make_service(temp.path(), temp.path().join("missing.json"));
+            let mut links = service.links.load().unwrap();
+            links.upsert(PlaylistLink::new(mine(), "my-set".to_string()));
+            service.links.save(&links).unwrap();
+
+            assert_eq!(linked_names(&service).await, vec![mine()]);
+            assert_eq!(service.links.load().unwrap().links.len(), 1);
+        }
+
+        #[tokio::test]
+        async fn unlinking_drops_the_link_and_its_base() {
+            let (_temp, service, client) = service_with_tracks("unlink.sock", &TWO_TRACKS);
+            link_mine(&service, &client);
+            sync_mine(&service).await;
+
+            assert!(changed(&service, SourceRequest::UnlinkPlaylist { local: mine() }).await);
+            assert!(linked_names(&service).await.is_empty());
+            assert!(!changed(&service, SourceRequest::UnlinkPlaylist { local: mine() }).await);
         }
 
         #[test]

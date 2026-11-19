@@ -462,7 +462,7 @@ impl LibraryService {
             LibraryRequest::IngestFile { .. }
             | LibraryRequest::DeleteInboxFile { .. }
             | LibraryRequest::IngestAll
-            | LibraryRequest::IdentityBackfill { .. }
+            | LibraryRequest::IdentityBackfill(_)
             | LibraryRequest::ReindexCovers => LibraryResponse::Error(ProtocolError::Internal {
                 message: "ingestion not supported in stub".to_string(),
             }),

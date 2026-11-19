@@ -45,6 +45,24 @@ export function isIdle(player) {
 }
 
 /**
+ * The quiet line under the full player's title: album, BPM, key and duration, whichever the track has.
+ * `keyLabel` is the key in the chosen notation and `durationText` the formatted length ("" for none).
+ */
+export function metaLine(track, keyLabel, durationText) {
+  if (!track) return "";
+  return [track.album, track.bpm == null ? null : Math.round(track.bpm) + " BPM", keyLabel, durationText].filter(Boolean).join(" · ");
+}
+
+/**
+ * Rows for the speakers page from GET /player/audio-outputs ([{ name, description|null, ... }]) and
+ * GET /player/audio-output ({ device_name|null, ... }): [{ name, label, current }].
+ */
+export function speakerRows(outputs, config) {
+  const cur = (config && config.device_name) || null;
+  return (Array.isArray(outputs) ? outputs : []).map((s) => ({ name: s.name, label: s.description || s.name, current: cur !== null && s.name === cur }));
+}
+
+/**
  * True when something is loaded but the audio output is not there or not pulling samples.
  * Idle shows nothing: "absent" is normal before the first load.
  */
@@ -219,6 +237,18 @@ export function albumCovers(tracks, max = MOSAIC) {
   }
   return out;
 }
+
+/** The ops that append `hashes` to the playlist `snap` ({ entries }); `duplicates` is "Skip" or "Keep". The workbench and the track menu's "Add to playlist" send this. */
+export const appendOps = (snap, hashes, duplicates) => [{ op: "Insert", at: snap.entries.length, hashes, duplicates }];
+
+/** What an edit's answer `res` did: `wrote` (the server gives a `previous` only when it wrote) and `skipped`, the hashes it left out as duplicates. */
+export const editOutcome = (res) => ({ wrote: res.previous != null, skipped: res.skipped.map((s) => s.hash) });
+
+/** How many tracks the Insert ops `ops` ask to add. */
+export const insertedCount = (ops) => ops.reduce((n, o) => n + (o.op === "Insert" ? o.hashes.length : 0), 0);
+
+/** The toast for an add that wrote some tracks and left `skipped` out as already in the playlist `name`. */
+export const addedAndSkipped = (added, skipped, name) => "Added " + added + " · " + skipped + " already in " + name;
 
 /**
  * The rows of a playlist page, one per line of GET /api/playlists/{name} in file order (duplicates

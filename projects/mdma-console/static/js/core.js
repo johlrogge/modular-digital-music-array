@@ -18,6 +18,7 @@
 //   filters    when store.f[key] was changed by the narrowing UI (emitted by narrow.js).
 //              detail is always the view key whose filters changed.
 //   sort       when store.sort was changed (emitted by narrow.js). No detail: the sort is global.
+//   notation   when the key notation changed (setKeyNotation); no detail.
 //
 // ============================================================ API conventions
 // api() resolves the parsed JSON body of any 2xx response, including 207 partial success
@@ -154,6 +155,7 @@ export function setKeyNotation(n) {
     /* storage is off: the choice lasts until the page reloads */
   }
   renderRoute();
+  emit("notation");
 }
 
 /** A track's key ({ musical, camelot, open_key } or null) in the chosen notation; "" when it has none. */
@@ -168,20 +170,27 @@ export const playlistHref = (name, sub) => "#/playlist/" + enc(name) + (sub ? "/
 
 let toastTimer;
 
-/** Show a message; with `act` a button runs it and dismisses the toast. The button says `label` ("Undo" unless told otherwise). */
+/**
+ * Show a message; with `act` a button runs it and dismisses the toast. The button says `label`
+ * ("Undo" unless told otherwise). `act` may also be a list of [label, fn] for several buttons.
+ */
 export function toast(msg, act, label = "Undo") {
+  const acts = Array.isArray(act) ? act : act ? [[label, act]] : [];
   const t = $("#toast");
   $("#toast-msg").textContent = msg;
-  const b = $("#toast-act");
-  b.textContent = label;
-  b.hidden = !act;
-  b.onclick = () => {
-    t.classList.remove("on");
-    if (act) act();
-  };
+  t.querySelectorAll(".extra").forEach((b) => b.remove());
+  const buttons = [$("#toast-act"), ...acts.slice(1).map(() => t.appendChild(h("button", { class: "extra" })))];
+  buttons[0].hidden = !acts.length;
+  acts.forEach(([text, fn], i) => {
+    buttons[i].textContent = text;
+    buttons[i].onclick = () => {
+      t.classList.remove("on");
+      fn();
+    };
+  });
   t.classList.add("on");
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => t.classList.remove("on"), act ? 6000 : 2600);
+  toastTimer = setTimeout(() => t.classList.remove("on"), acts.length ? 6000 : 2600);
 }
 
 /** Modal confirm. Runs `fn` only on the OK button. */
@@ -207,9 +216,10 @@ export const askName = (slot, opener, cfg) => askText(slot, opener, { pattern: "
  * (it shows aria-expanded and gets the focus back on Esc). Enter calls `submit(text)`, which
  * resolves true to close the input or false to keep it open (it reports its own failures); Esc, or
  * leaving the field empty, cancels. A text the field's pattern refuses is reported by the field.
- * cfg: { label (aria-label), placeholder, submit, pattern (none: any text), hint (the field's title) }.
+ * cfg: { label (aria-label), placeholder, submit, pattern (none: any text), hint (the field's title),
+ * value (a text to start with, selected: typing replaces it) }.
  */
-export function askText(slot, opener, { label, placeholder, submit, pattern, hint }) {
+export function askText(slot, opener, { label, placeholder, submit, pattern, hint, value }) {
   const open = slot.querySelector("input");
   if (open) {
     open.focus();
@@ -227,6 +237,7 @@ export function askText(slot, opener, { label, placeholder, submit, pattern, hin
     placeholder,
     title: hint,
     pattern,
+    value,
     "aria-label": label,
     autocomplete: "off",
     spellcheck: "false",
@@ -257,6 +268,7 @@ export function askText(slot, opener, { label, placeholder, submit, pattern, hin
   slot.replaceChildren(input);
   opener.setAttribute("aria-expanded", "true");
   input.focus();
+  input.select();
 }
 
 /* ============================================================ action menu */
@@ -266,8 +278,10 @@ let menuOnClose = null;
 /**
  * Open the action menu (#menu): a bottom sheet on phones, a popover anchored to `anchor` from
  * 600px up (anchor may be null: then it stays where the CSS puts it). items: [icon, label, fn,
- * cls?] (icon may be null) or the string "-" for a separator. head: [title, subtitle?]. opts.onClose runs once when
- * the menu closes, however it closes.
+ * cls?, disabled?] (icon may be null; a disabled item is shown dimmed and does nothing) or the
+ * string "-" for a separator. head: [title, subtitle?]. The first enabled item gets the focus
+ * (the menu itself when none is enabled). opts.onClose runs once when the menu closes, however
+ * it closes.
  */
 export function openMenu(anchor, items, head, opts = {}) {
   if (menuOnClose) closeMenu(); // a menu opened over a menu: finish the first one's cleanup
@@ -293,6 +307,7 @@ export function openMenu(anchor, items, head, opts = {}) {
         {
           role: "menuitem",
           class: it[3] || null,
+          disabled: it[4] ? "" : null,
           onclick: (e) => {
             e.stopPropagation();
             closeMenu();
@@ -313,7 +328,7 @@ export function openMenu(anchor, items, head, opts = {}) {
     m.style.top = (r.bottom + mh + 8 > window.innerHeight ? Math.max(8, r.top - mh - 4) : r.bottom + 4) + "px";
   }
   m.setAttribute("tabindex", "-1");
-  m.focus({ preventScroll: true });
+  (m.querySelector('[role="menuitem"]:not(:disabled)') || m).focus({ preventScroll: true });
 }
 
 const menuIsOpen = () => $("#menu").classList.contains("open");
@@ -387,6 +402,12 @@ export async function api(path, opts = {}) {
   if (!res.ok) throw new ApiError(res.status, body);
   return body;
 }
+
+/** Send the ops (ADR-027 §9) to playlist `name`, read at `version`: the server's answer ({ snapshot, previous?, skipped }). */
+export const editPlaylist = (name, version, ops) => api("/api/playlists/" + enc(name) + "/edit", { body: { version, ops } });
+
+/** Put the whole file `content` back as playlist `name`, if it is still at `version`: the server's answer. */
+export const revertPlaylist = (name, version, content) => api("/api/playlists/" + enc(name) + "/revert", { body: { version, content } });
 
 /* ============================================================ offline + sync */
 

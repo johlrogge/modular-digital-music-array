@@ -2,7 +2,7 @@
 //!
 //! Handles IPC requests and manages library state
 
-use crate::identity::{identity_facts_for_blob, IdentityOpts};
+use crate::identity::{identity_facts_for_blob, BlobFactSet};
 use crate::ipc::{
     bookmark_scope_mark, parse_request, AttributeList, ContentHash, FactType, InboxPath,
     IngestAllItem, IngestResult, IpcServer, LibraryRequest, LibraryResponse, Mark, MarkWrite,
@@ -1619,12 +1619,10 @@ impl LibraryService {
                 })
             }
 
-            LibraryRequest::IdentityBackfill { include_pcm } => {
-                match self.start_identity_backfill(include_pcm) {
-                    Ok(start) => LibraryResponse::IdentityBackfillStarted(start),
-                    Err(e) => LibraryResponse::Error(e),
-                }
-            }
+            LibraryRequest::IdentityBackfill(scope) => match self.start_identity_backfill(scope) {
+                Ok(start) => LibraryResponse::IdentityBackfillStarted(start),
+                Err(e) => LibraryResponse::Error(e),
+            },
 
             LibraryRequest::GetIdentityBackfillStatus => {
                 LibraryResponse::IdentityBackfillStatus(self.identity_backfill_status())
@@ -2887,7 +2885,8 @@ impl LibraryService {
         // Identity: AudioHash v1 (PcmHash is left to the explicit backfill). A failure
         // is logged and simply yields no fact; ingest continues.
         facts.extend(
-            identity_facts_for_blob(&blob_path, IdentityOpts::INGEST, &derived_source).facts,
+            identity_facts_for_blob(&blob_path, BlobFactSet::INGEST, &self.sources.blob_facts())
+                .facts,
         );
 
         // Add the client's provenance facts
@@ -5200,6 +5199,7 @@ mod tests {
             | MusicValue::Channels(_)
             | MusicValue::SampleRate(_)
             | MusicValue::DurationSeconds(_)
+            | MusicValue::DurationMs(_)
             | MusicValue::Bitrate(_)
             | MusicValue::FileSizeBytes(_)
             | MusicValue::HasAlbumArt(_) => Some(sources::SCAN_ORIGIN),
@@ -10517,12 +10517,26 @@ mod tests {
     }
 
     use library_ipc_protocol::{
-        IdentityBackfillProgress, IdentityBackfillStart, IdentityBackfillStatus,
+        IdentityBackfillProgress, IdentityBackfillScope, IdentityBackfillStart,
+        IdentityBackfillStatus,
     };
 
     /// Start a backfill and wait until the worker stops (`Done` or `Cancelled`).
     fn run_backfill_to_end(service: &LibraryService, include_pcm: bool) -> IdentityBackfillStatus {
-        match service.handle_request(LibraryRequest::IdentityBackfill { include_pcm }) {
+        run_backfill_request_to_end(
+            service,
+            IdentityBackfillScope {
+                include_pcm,
+                include_duration: false,
+            },
+        )
+    }
+
+    fn run_backfill_request_to_end(
+        service: &LibraryService,
+        scope: IdentityBackfillScope,
+    ) -> IdentityBackfillStatus {
+        match service.handle_request(LibraryRequest::IdentityBackfill(scope)) {
             LibraryResponse::IdentityBackfillStarted(IdentityBackfillStart::Started(_)) => {}
             other => panic!("expected a started backfill, got {other:?}"),
         }
@@ -10547,6 +10561,66 @@ mod tests {
             IdentityBackfillStatus::Done(p) => p,
             other => panic!("expected Done, got {other:?}"),
         }
+    }
+
+    /// A run that also backfills the exact duration; it must have completed.
+    fn run_duration_backfill(service: &LibraryService) -> IdentityBackfillProgress {
+        let scope = IdentityBackfillScope {
+            include_pcm: false,
+            include_duration: true,
+        };
+        match run_backfill_request_to_end(service, scope) {
+            IdentityBackfillStatus::Done(p) => p,
+            other => panic!("expected Done, got {other:?}"),
+        }
+    }
+
+    /// The `DurationMs` facts stored in ACID for `hash`, with their sources.
+    fn duration_ms_facts_in_acid(
+        service: &LibraryService,
+        hash: &ContentHash,
+    ) -> Vec<(MusicValue, FactSource)> {
+        service
+            .acid_client
+            .read_entity(hash.as_str())
+            .unwrap()
+            .iter()
+            .filter_map(|l| {
+                serde_json::from_str::<Fact<ContentHash, MusicValue, FactSource>>(l).ok()
+            })
+            .map(|f| (f.value().clone(), f.source().clone()))
+            .filter(|(v, _)| matches!(v, MusicValue::DurationMs(_)))
+            .collect()
+    }
+
+    #[test]
+    fn duration_backfill_asserts_the_exact_duration_once() {
+        let (service, _dir, _acid) = make_empty_service();
+        let hash = seed_blob_track(&service, "dur00000000001", FIXTURE_S16_L8);
+        let first = run_duration_backfill(&service);
+        assert_eq!((first.total, first.done, first.failed), (1, 1, 0));
+        assert!(first.scope.include_duration);
+        let facts = duration_ms_facts_in_acid(&service, &hash);
+        assert_eq!(facts.len(), 1, "{facts:?}");
+        // Stamped as ingest stamps a measured fact (ADR-018), so the two agree.
+        assert!(
+            facts[0].1.same_source(&service.sources.scan),
+            "{:?}",
+            facts[0].1
+        );
+
+        // The run projected its write: a second run has nothing to do and writes nothing.
+        let second = run_duration_backfill(&service);
+        assert_eq!((second.total, second.done, second.failed), (0, 0, 0));
+        assert_eq!(duration_ms_facts_in_acid(&service, &hash), facts);
+    }
+
+    #[test]
+    fn a_plain_identity_backfill_leaves_durations_alone() {
+        let (service, _dir, _acid) = make_empty_service();
+        let hash = seed_blob_track(&service, "dur00000000002", FIXTURE_S16_L8);
+        run_backfill(&service, false);
+        assert!(duration_ms_facts_in_acid(&service, &hash).is_empty());
     }
 
     /// Blob that is a recognised FLAC but cut short: hashing it fails.
@@ -10575,7 +10649,7 @@ mod tests {
             (status.total, status.done, status.failed, status.skipped),
             (2, 2, 1, 0)
         );
-        assert!(!status.include_pcm);
+        assert!(!status.scope.include_pcm);
         assert!(status.last_error.as_deref().unwrap().contains("AudioHash"));
         assert_eq!(
             identity_facts_in_acid(&service, &fresh),
@@ -10707,8 +10781,9 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(10))
             .expect("retire never reached its hook");
 
-        let started =
-            service.handle_request(LibraryRequest::IdentityBackfill { include_pcm: false });
+        let started = service.handle_request(LibraryRequest::IdentityBackfill(
+            IdentityBackfillScope::default(),
+        ));
         assert!(matches!(
             started,
             LibraryResponse::IdentityBackfillStarted(IdentityBackfillStart::Started(_))
@@ -10788,7 +10863,7 @@ mod tests {
     fn backfill_request_while_running_reports_already_running() {
         let (service, _dir, _acid) = make_empty_service();
         let running = IdentityBackfillProgress {
-            include_pcm: false,
+            scope: IdentityBackfillScope::default(),
             total: 4,
             done: 1,
             failed: 0,
@@ -10797,7 +10872,11 @@ mod tests {
         };
         *service.identity_backfill.lock().unwrap() =
             IdentityBackfillStatus::Running(running.clone());
-        match service.handle_request(LibraryRequest::IdentityBackfill { include_pcm: true }) {
+        let pcm = IdentityBackfillScope {
+            include_pcm: true,
+            include_duration: false,
+        };
+        match service.handle_request(LibraryRequest::IdentityBackfill(pcm)) {
             LibraryResponse::IdentityBackfillStarted(IdentityBackfillStart::AlreadyRunning(p)) => {
                 assert_eq!(p, running)
             }
