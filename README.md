@@ -105,6 +105,7 @@ mdma source bandcamp import-status
 
 # Compute AudioHash (and PcmHash with --pcm) for existing tracks — new in 0.36.0
 mdma library identity backfill --pcm
+mdma library identity backfill --duration
 mdma library identity status
 
 # Find and merge duplicates; merged-away files go to /music/archive — new in 0.36.0
@@ -170,7 +171,7 @@ This is a [Polylith](https://polylith.gitbook.io/polylith/) workspace. Deployabl
 | `mdma-audio` | Audio playback source — wraps PlaybackEngine (Symphonia + rubato + PipeWire), speaks `stream_source_protocol` over NNG |
 | `mdma-tui` | Terminal UI — multi-pane tabs (nnn-style, `1`–`5`/`6`–`0`), field-aware search grammar (`:artist`, `:bpm`, `:added`, …), DJ shortcuts (`A`, `P`, `d`/`p`, `u`), modal keybindings, command palette, live queue sync, intelligent column compression, own theme colours on every terminal (`MDMA_TUI_COLORS=truecolor\|24bit\|256` overrides detection) |
 | `mdma-bandcamp` | Bandcamp source — collection sync into the library inbox, fan playlist listing/fetching, and background playlist import jobs for `mdma source bandcamp` |
-| `mdma-console` | Web management console — player controls, search with mix-well key filter, queue, playlist workbench with preview timeline and seek, marks/hearts, energy filter/column/editing, playlist bin, Bandcamp playlist sync, key notation setting, upload, export |
+| `mdma-console` | Web management console — player controls, search with mix-well key filter, queue, playlist workbench with preview timeline and seek, marks/hearts, energy filter/column/editing, playlist bin, Bandcamp playlist picker and sync, "Add to playlist", Settings pages (speakers, theme, key notation), upload, export |
 | `mdma-cli` | CLI — search, queue, playlists, playback, export, subscribe, marks, Bandcamp playlist import, play history, local fact replica, offline shell completions |
 | `dj-workspace` | Bevy GUI app (laptop-only, not packaged for Pi) — playlist browser and BPM/Key/Role/Energy candidate finder with sortable results; connects via gateway (`dj-workspace --node <host>`) |
 
@@ -279,7 +280,7 @@ Quick install is at the [top](#install). Every `vX.Y.Z` release publishes `mdma-
 
 ```bash
 # Install a specific release
-curl -fsSL https://raw.githubusercontent.com/johlrogge/modular-digital-music-array/master/scripts/install-mdma.sh | bash -s v0.40.0
+curl -fsSL https://raw.githubusercontent.com/johlrogge/modular-digital-music-array/master/scripts/install-mdma.sh | bash -s v0.41.0
 
 # Install to a user-writable location (no sudo)
 curl -fsSL https://raw.githubusercontent.com/johlrogge/modular-digital-music-array/master/scripts/install-mdma.sh | MDMA_INSTALL_DIR=~/.local/bin bash
@@ -297,6 +298,21 @@ cp target/release/mdma /usr/local/bin/
 ---
 
 See [ROADMAP.md](ROADMAP.md) for detailed status and planned work.
+
+---
+
+## What's new in 0.41
+
+### Bandcamp playlist picker, Settings pages, better rekordbox grids
+
+- **Bandcamp playlist picker:** pick from your Bandcamp playlists when linking, or make a "New playlist" from an unlinked one. Ambiguous matches add every candidate track. A link to a playlist that no longer exists is pruned, "Unlink from Bandcamp" (and `DELETE /api/playlists/:name/link`) removes a link, and (re)linking starts a fresh sync base (#123).
+- **"Add to playlist ›"** in the track menu; partial adds skip duplicates and offer Undo.
+- **Settings pages:** Playback, Library and System, with a Speakers page to pick the audio output, a Dark/Light theme and key notation. The full player shows album, BPM, key and duration under the title.
+- **rekordbox import grids** are anchored on the true downbeat, take BPM from the TEMPO element and beats per bar from Metro; importing again retracts the superseded grid. Export no longer writes `BitRate` and `SampleRate` as 0 (#122).
+- **Exact duration:** `mdma library identity backfill --duration` fills the new `DurationMs` fact; the console timeline uses it.
+- **ADR-035** (service-owned facts on library subjects) is accepted; planned, not implemented.
+
+**Upgrade notes:** none. See CHANGELOG.md.
 
 ---
 
