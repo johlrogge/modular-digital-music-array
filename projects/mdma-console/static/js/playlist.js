@@ -7,7 +7,7 @@
 // (logic.js placeholderTrack). The page is read-only; its Edit link opens the workbench
 // (workbench.js), which uses the server's edit routes (ADR-027 §9). A playlist linked to Bandcamp
 // shows a badge and a Sync button (ADR-032): the sync is a job the page starts and polls, and its
-// toast offers Undo; an unlinked one offers "Link to Bandcamp…".
+// toast offers Undo, and a menu next to it unlinks; an unlinked one offers "Link to Bandcamp…".
 import { h, icon, route, store, api, enc, plural, playlistHref, toast, loadPlaylists, ofPlaylist, setOf, askName, askText, openMenu, closeMenu, revertPlaylist } from "./core.js";
 import { playlistRows, albumCovers } from "./logic.js";
 import { songCounts } from "./lists.js";
@@ -271,6 +271,19 @@ async function linkNow(name, source, linked) {
   return true;
 }
 
+/** Drop the Bandcamp link of `name` (DELETE /api/playlists/{name}/link); `unlinked()` hears of it, and the toast says so. True when unlinked. */
+async function unlinkNow(name, unlinked) {
+  try {
+    await api(playlistPath(name, "link"), { method: "DELETE" });
+  } catch (e) {
+    toast(say({}, e, "Couldn't unlink this playlist"));
+    return false;
+  }
+  unlinked();
+  toast("Unlinked from Bandcamp");
+  return true;
+}
+
 /** Ask for the address of the Bandcamp playlist to link `name` to, in `slot`; `linked(link)` hears of the link made. */
 function askLink(slot, opener, name, linked) {
   askText(slot, opener, {
@@ -333,7 +346,7 @@ async function linkAndSync(name, source) {
  * The page for `state` ({ status, entries }), drawn into `root`. `page` holds the Bandcamp side:
  * `link` (an object; null when not linked; undefined when not known, and then there is neither
  * Sync nor Link), `busy` (the sync's progress text while one runs) and `pendingOpen`.
- * `act`: { sync, linked }. Returns the router's cleanup.
+ * `act`: { sync, linked, unlinked }. Returns the router's cleanup.
  */
 function drawPlaylist(root, name, state, page, act) {
   const syncButton = () => {
@@ -341,7 +354,14 @@ function drawPlaylist(root, name, state, page, act) {
     paintSync(button, page.busy);
     return button;
   };
-  const bandcampButtons = () => (page.link ? [syncButton()] : page.link === null ? linkButton() : []);
+  // The Bandcamp menu of a linked playlist. Unlinking asks for no confirmation: linking again is a
+  // first sync, which only adds what is missing.
+  const linkMenu = () => {
+    const open = () => openMenu(opener, [["close", "Unlink from Bandcamp", () => unlinkNow(name, act.unlinked)]], ["Bandcamp"]);
+    const opener = h("button", { class: "btn", "aria-label": "Bandcamp options", "aria-haspopup": "menu", onclick: open }, [icon("more", "sm")]);
+    return opener;
+  };
+  const bandcampButtons = () => (page.link ? [syncButton(), linkMenu()] : page.link === null ? linkButton() : []);
   const linkButton = () => {
     const slot = h("span");
     const paste = [null, "Paste a URL…", () => askLink(slot, opener, name, act.linked)];
@@ -462,7 +482,7 @@ function viewPlaylist(root, params) {
   const draw = () => {
     stop();
     root.innerHTML = "";
-    stop = drawPlaylist(root, name, state, page, { sync: () => startSync(name), linked });
+    stop = drawPlaylist(root, name, state, page, { sync: () => startSync(name), linked, unlinked });
   };
   const reload = async () => {
     const [read, link] = await Promise.all([load(name), loadLink(name)]);
@@ -482,6 +502,10 @@ function viewPlaylist(root, params) {
   });
   function linked(link) {
     page.link = link;
+    if (!gone) draw();
+  }
+  function unlinked() {
+    page.link = null;
     if (!gone) draw();
   }
   draw();

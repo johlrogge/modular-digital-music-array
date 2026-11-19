@@ -71,9 +71,9 @@ There is no special path. A link starts with an empty base and the sync runs `me
 
 ### 8. Link, rename and delete
 
-Linking a playlist to the Bandcamp playlist it is already linked to keeps the link and its base (a reset would bring back every track the user deleted); linking it to another one replaces the link and starts without a base.
+Linking a playlist to the Bandcamp playlist it is already linked to keeps the link and its base (a reset would bring back every track the user deleted); linking it to another one replaces the link and starts without a base. (Replaced by amendment 2026-11-19: linking always starts fresh.)
 
-Renaming the local playlist updates the link. Deleting it drops the link. Moving it to the bin (ADR-033) deactivates the link. These follow library events, which `mdma-bandcamp` does not subscribe to yet; until it does, a sync of a link whose playlist is gone fails with "not found" and the link stays until it is replaced by a new `LinkPlaylist`.
+Renaming the local playlist updates the link. Deleting it drops the link. Moving it to the bin (ADR-033) deactivates the link. These follow library events, which `mdma-bandcamp` does not subscribe to yet; until it does, a sync of a link whose playlist is gone fails with "not found" and the link stays until it is replaced by a new `LinkPlaylist`. (Superseded by amendment 2026-11-19: no lifecycle handling; orphans are pruned on read.)
 
 ### 9. Undo after a sync
 
@@ -93,7 +93,7 @@ Undo reverts the file but keeps the new base. Undone additions therefore count a
 
 ## Amendment 2026-11-18: delete bins (ADR-033)
 
-§8 changes for delete. A deleted playlist goes to the Bin, and its link stays but is inactive and cannot sync. Restore re-activates the link; restoring under a new name counts as a rename and updates the link. Purge drops the link. Rename is unchanged. See ADR-033.
+Superseded by amendment 2026-11-19. §8 changes for delete. A deleted playlist goes to the Bin, and its link stays but is inactive and cannot sync. Restore re-activates the link; restoring under a new name counts as a rename and updates the link. Purge drops the link. Rename is unchanged. See ADR-033.
 
 ## Amendment 2026-11-18: typed "not linked" and console routes (phase 4)
 
@@ -116,6 +116,17 @@ The sync report has no field of its own for this: the extras count in `added`.
 ## Amendment 2026-11-18: links carry the playlist id
 
 A link also keeps the Bandcamp playlist's id (`bandcamp_id`, optional so older link files still load). The console joins the fan's playlist listing to the links on it, not on the URL, which has several spellings (slug, with or without the user, with a query). The listing's `id` and a fetched playlist's `id` are the same number. A link without an id, made before this, gets it at its next link or sync and joins nothing until then.
+
+## Amendment 2026-11-19 (interim): orphan links are pruned on read; linking starts fresh
+
+Seen on stage2: `chill-openers` was binned, its link stayed in `playlist-links.json`, a new empty `chill-openers` was created and the old link (with the old base) attached to it by name. The merge then read every base item as a local deletion and synced nothing back. Changes:
+
+- **Linking always starts fresh** (replaces §8's first sentence and §7's "keeps"). `LinkPlaylist` resets base, pending, match cache and `pending_base`, also for the playlist `local` is already linked to. The next sync is a first sync (§7): it adds what is missing and skips what is present. Cost: a track the user deleted comes back once after a re-link. A stale base is never reused.
+- **Orphans are unlinked, in one place.** Every read of the links (`ListPlaylistLinks`, the picker's `linked_to`, the linked badge, the up-front check of `SyncPlaylist`) goes through `live_links`, which asks the library which playlists exist and drops (prunes, and saves) every link whose local playlist is not among them. When the library cannot answer, nothing is pruned: a link is never dropped on a guess. This also cleans up links left behind before this amendment.
+- **Unlink.** `UnlinkPlaylist { local }` drops the link and its base; the console has `DELETE /api/playlists/:name/link` and an "Unlink from Bandcamp" item in the menu next to Sync. No confirmation: linking again is a first sync, which only adds what is missing.
+- **No lifecycle messages.** The source is not told when a playlist is binned, restored, purged, emptied or renamed. The orphan rule above is the only handling: a bin leaves an orphan link, which the next read of the links prunes.
+- **Known gaps:** if a same-name playlist is created before the next links read, it inherits the old link. A restore after a prune comes back unlinked. A rename leaves the link behind under the old name, where it is pruned as an orphan.
+- **Superseded by ADR-035 (service-owned facts on library subjects)**, which will replace this lifecycle handling.
 
 ## Phased plan
 

@@ -150,13 +150,16 @@ pub async fn delete(
     Path(name): Path<String>,
     Query(params): Query<DeleteParams>,
 ) -> Response {
-    write(state, name, binned, move |name| {
-        LibraryRequest::PlaylistBin {
-            name,
-            version: params.version,
+    match playlist_name(&name) {
+        Ok(name) => {
+            let request = LibraryRequest::PlaylistBin {
+                name,
+                version: params.version,
+            };
+            forward(&state, request, binned).await
         }
-    })
-    .await
+        Err(response) => response,
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -400,6 +403,28 @@ pub async fn link(
     }
 }
 
+fn unlinked(answer: SourceResponse) -> Option<Reply> {
+    match answer {
+        SourceResponse::PlaylistLinkUpdated { changed } => {
+            Some((StatusCode::OK, serde_json::json!({ "unlinked": changed })))
+        }
+        _ => None,
+    }
+}
+
+/// `DELETE /api/playlists/{name}/link`: drop the link and its base. 200 `{unlinked}`, false when
+/// the playlist had no link. No confirmation: linking again is a first sync, which only adds
+/// what is missing.
+pub async fn unlink(State(state): State<Arc<AppState>>, Path(name): Path<String>) -> Response {
+    match playlist_name(&name) {
+        Ok(local) => {
+            let request = SourceRequest::UnlinkPlaylist { local };
+            source_call(&state, request, unlinked).await
+        }
+        Err(response) => response,
+    }
+}
+
 /// `GET /api/bandcamp/playlist-links`: every link with its pending items.
 pub async fn links(State(state): State<Arc<AppState>>) -> Response {
     source_call(&state, SourceRequest::ListPlaylistLinks, listed_links).await
@@ -429,7 +454,10 @@ mod tests {
         body_json, library_ok, send_json, test_app, test_app_with, FakeGateway,
     };
     use axum::http::StatusCode;
-    use gateway_client::{GatewayRequest, GatewayResponse, LibraryRequest, LibraryResponse};
+    use gateway_client::{
+        GatewayRequest, GatewayResponse, LibraryRequest, LibraryResponse, SourceName,
+        SourceRequest, SourceResponse,
+    };
     use library_ipc_client::{
         CanonicalHash, ContentHash, EditOutcome, EntryError, PlaylistEntry, PlaylistSnapshot,
         PlaylistVersion, ProtocolError, Skipped, StoredPlaylist,
@@ -685,6 +713,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unlinking_is_200_and_asks_the_source_to_drop_the_link() {
+        let gw = source_gateway(SourceResponse::PlaylistLinkUpdated { changed: true });
+        let res = send_json(
+            test_app_with(gw.addr()),
+            "DELETE",
+            "/api/playlists/friday/link",
+            None,
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(body_json(res).await, json!({"unlinked": true}));
+        match &gw.requests()[..] {
+            [GatewayRequest::Source {
+                request: SourceRequest::UnlinkPlaylist { local },
+                ..
+            }] => assert_eq!(local.as_str(), "friday"),
+            other => panic!("{other:?}"),
+        }
+
+        let none = source_gateway(SourceResponse::PlaylistLinkUpdated { changed: false });
+        let res = send_json(
+            test_app_with(none.addr()),
+            "DELETE",
+            "/api/playlists/friday/link",
+            None,
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(body_json(res).await, json!({"unlinked": false}));
+    }
+
+    #[tokio::test]
+    async fn unlinking_a_bad_name_is_400_and_without_a_gateway_503() {
+        let gw = source_gateway(SourceResponse::PlaylistLinkUpdated { changed: true });
+        let res = send_json(
+            test_app_with(gw.addr()),
+            "DELETE",
+            "/api/playlists/bad%20name/link",
+            None,
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert!(gw.requests().is_empty());
+        let res = send_json(test_app(), "DELETE", "/api/playlists/friday/link", None).await;
+        assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
     async fn a_missing_playlist_is_404() {
         let gw = write_gateway(LibraryResponse::Error(ProtocolError::PlaylistNotFound {
             name: "set".into(),
@@ -879,7 +955,6 @@ mod tests {
 
     // ---- Bandcamp link and sync (ADR-032) ----
 
-    use gateway_client::{SourceName, SourceRequest, SourceResponse};
     use source_protocol::{
         BandcampPlaylistId, ImportSyncProgress, PendingPlaylistTrack, PlaylistLinkInfo,
         PlaylistSyncJobStatus, PlaylistSyncPhase, PlaylistSyncReport, PlaylistUndo, SourceError,

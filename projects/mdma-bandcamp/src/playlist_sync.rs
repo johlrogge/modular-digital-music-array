@@ -776,7 +776,7 @@ mod tests {
     }
 
     #[test]
-    fn linking_the_same_playlist_again_keeps_a_local_deletion_deleted() {
+    fn linking_again_starts_fresh_so_a_deleted_track_comes_back_once() {
         let w = world("relink");
         w.sync("123");
         w.edit(vec![EditOp::Remove { at: 1 }]);
@@ -784,9 +784,13 @@ mod tests {
         let mut links = w.store.load().unwrap();
         links.link(w.local.clone(), SOURCE.to_string(), None);
         w.store.save(&links).unwrap();
+        assert!(w.link().base.is_empty(), "no stale base survives a link");
         w.sync("123");
 
-        assert_eq!(w.order(), "13");
+        // A first sync adds what is missing and skips what is present.
+        assert_eq!(w.order(), "123");
+        w.sync("123");
+        assert_eq!(w.order(), "123", "added once, not twice");
     }
 
     #[test]

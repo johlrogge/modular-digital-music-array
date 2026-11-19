@@ -127,6 +127,9 @@ impl PlaylistLink {
 }
 
 /// Every link, in the order they were made.
+///
+/// Links are keyed by playlist name; orphans are pruned on read (see
+/// `retain_existing`) until ADR-035 (service-owned facts on library subjects) gives a link the life of its playlist.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlaylistLinks {
     pub links: Vec<PlaylistLink>,
@@ -137,36 +140,38 @@ impl PlaylistLinks {
         self.links.iter().find(|l| l.local == *local)
     }
 
-    /// Link `local` to the Bandcamp playlist `url` (ADR-032 §8). Linking what
-    /// `local` is already linked to keeps the link, with its base: a reset
-    /// would bring back every track the user deleted; an id the link lacks is
-    /// filled in. A different playlist replaces the link and starts without a
-    /// base.
+    /// Link `local` to the Bandcamp playlist `url` (ADR-032 §8). A link always
+    /// starts fresh, also when `local` is linked to the same playlist already:
+    /// no base, no pending items, no match cache. The next sync is then a
+    /// first sync, which adds what is missing and skips what is present, so a
+    /// stale base can never read as local deletions.
     pub fn link(
         &mut self,
         local: PlaylistName,
         url: String,
         id: Option<BandcampPlaylistId>,
     ) -> PlaylistLinkInfo {
-        // The same playlist when both ids are known and equal (whatever the
-        // spelling of the URL); otherwise when the URLs are equal.
-        let same_playlist = |l: &PlaylistLink| {
-            let same_id = matches!((l.bandcamp_id, id), (Some(a), Some(b)) if a == b);
-            same_id || l.bandcamp == url
-        };
-        if let Some(existing) = self
-            .links
-            .iter_mut()
-            .find(|l| l.local == local && same_playlist(l))
-        {
-            existing.bandcamp_id = id.or(existing.bandcamp_id);
-            return existing.info();
-        }
         let mut link = PlaylistLink::new(local, url);
         link.bandcamp_id = id;
         let info = link.info();
         self.upsert(link);
         info
+    }
+
+    /// Drop the link of `local`, with its base. True when it had one.
+    pub fn unlink(&mut self, local: &PlaylistName) -> bool {
+        let before = self.links.len();
+        self.links.retain(|l| l.local != *local);
+        self.links.len() != before
+    }
+
+    /// Drop the links of playlists that are not in `existing`: an orphan is
+    /// unlinked. True when a link was dropped. The one place orphans go.
+    /// A safety net: ADR-035 (service-owned facts on library subjects) replaces it.
+    pub fn retain_existing(&mut self, existing: &[PlaylistName]) -> bool {
+        let before = self.links.len();
+        self.links.retain(|l| existing.contains(&l.local));
+        self.links.len() != before
     }
 
     /// Record the id of the playlist `source`, if `local` is still linked to
@@ -401,14 +406,22 @@ mod tests {
     }
 
     #[test]
-    fn linking_the_same_playlist_again_keeps_the_base_and_another_resets_it() {
+    fn linking_always_starts_fresh_even_the_same_playlist_again() {
         let mut links = sample();
         let url = "https://bandcamp.com/x/playlist/f".to_string();
 
-        let info = links.link(name("friday"), url, None);
-        assert_eq!(info.pending.len(), 1);
-        assert_eq!(links.get(&name("friday")).unwrap().base.len(), 2);
+        // The same playlist again: base, pending, matches and the unfinished
+        // edit are all gone, so the next sync is a first sync.
+        let info = links.link(name("friday"), url, Some(BandcampPlaylistId::new(7)));
+        assert!(info.pending.is_empty());
+        assert_eq!(info.last_synced, None);
+        assert_eq!(info.bandcamp_id, Some(BandcampPlaylistId::new(7)));
+        let link = links.get(&name("friday")).unwrap();
+        assert!(link.base.is_empty());
+        assert!(link.matches.is_empty());
+        assert_eq!(link.pending_base, None);
 
+        // Another playlist: the same.
         links.link(
             name("friday"),
             "https://bandcamp.com/x/playlist/g".to_string(),
@@ -417,6 +430,29 @@ mod tests {
         let link = links.get(&name("friday")).unwrap();
         assert_eq!(link.bandcamp, "https://bandcamp.com/x/playlist/g");
         assert!(link.base.is_empty());
+        assert_eq!(links.links.len(), 1);
+    }
+
+    #[test]
+    fn unlinking_drops_the_link_and_its_base() {
+        let mut links = sample();
+        assert!(!links.unlink(&name("other")));
+        assert!(links.unlink(&name("friday")));
+        assert!(links.get(&name("friday")).is_none());
+        assert!(!links.unlink(&name("friday")));
+    }
+
+    #[test]
+    fn a_link_to_a_playlist_that_does_not_exist_is_pruned() {
+        let mut links = sample();
+        links.upsert(PlaylistLink::new(name("heavier"), "h".into()));
+
+        assert!(!links.retain_existing(&[name("friday"), name("heavier")]));
+        assert_eq!(links.links.len(), 2);
+
+        assert!(links.retain_existing(&[name("friday")]));
+        assert_eq!(links.links.len(), 1);
+        assert!(links.get(&name("heavier")).is_none());
     }
 
     #[test]
@@ -443,34 +479,6 @@ mod tests {
         std::fs::write(store.path(), serde_json::to_vec(&old).unwrap()).unwrap();
         let loaded = store.load().unwrap();
         assert_eq!(loaded.get(&name("friday")).unwrap().bandcamp_id, None);
-    }
-
-    #[test]
-    fn linking_the_same_playlist_again_fills_in_a_missing_id_and_keeps_the_base() {
-        let mut links = sample();
-        let url = "https://bandcamp.com/x/playlist/f".to_string();
-
-        let info = links.link(name("friday"), url, Some(BandcampPlaylistId::new(7)));
-
-        assert_eq!(info.bandcamp_id, Some(BandcampPlaylistId::new(7)));
-        assert_eq!(links.get(&name("friday")).unwrap().base.len(), 2);
-    }
-
-    #[test]
-    fn linking_the_same_playlist_id_under_another_url_keeps_the_base() {
-        let mut links = sample();
-        let id = BandcampPlaylistId::new(7);
-        links.set_playlist_id(&name("friday"), "https://bandcamp.com/x/playlist/f", id);
-
-        links.link(
-            name("friday"),
-            "https://bandcamp.com/x/playlist/renamed".to_string(),
-            Some(id),
-        );
-
-        let link = links.get(&name("friday")).unwrap();
-        assert_eq!(link.base.len(), 2, "same id: the base is kept");
-        assert_eq!(link.bandcamp_id, Some(id));
     }
 
     fn listed(id: &str, url: &str) -> SourcePlaylistSummary {

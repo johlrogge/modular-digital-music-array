@@ -103,10 +103,17 @@ pub enum SourceRequest {
     GetCheckStatus,
 
     /// Link the local playlist `local` to a source playlist (a slug or a URL).
-    /// Linking the playlist `local` is already linked to changes nothing; a
-    /// different one replaces the link and starts without a base (ADR-032 §7,
-    /// §8). Answer with `SourceResponse::PlaylistLinked`.
+    /// A link always starts fresh, without a base, pending items or match
+    /// cache: the next sync is a first sync, which only adds what is missing
+    /// (ADR-032 §7, §8, amendment 2026-11-19). Answer with
+    /// `SourceResponse::PlaylistLinked`.
     LinkPlaylist { local: PlaylistName, source: String },
+
+    /// Drop the link of `local`, with its base. Needs no confirmation:
+    /// linking again is a first sync. Answer with
+    /// `SourceResponse::PlaylistLinkUpdated` (`changed` is false when `local`
+    /// had no link).
+    UnlinkPlaylist { local: PlaylistName },
 
     /// Start a background job that three-way syncs the linked local playlist
     /// with its source playlist (ADR-032). Answer with
@@ -201,6 +208,9 @@ pub enum SourceResponse {
 
     /// Result of a ListPlaylistLinks request.
     PlaylistLinks(Vec<PlaylistLinkInfo>),
+
+    /// Result of an unlink: whether a link was dropped.
+    PlaylistLinkUpdated { changed: bool },
 
     /// Error response.
     Error(SourceError),
@@ -1296,6 +1306,9 @@ mod tests {
             },
             SourceRequest::GetPlaylistSyncStatus,
             SourceRequest::ListPlaylistLinks,
+            SourceRequest::UnlinkPlaylist {
+                local: local.clone(),
+            },
         ] {
             let json = serde_json::to_string(&req).unwrap();
             let parsed: SourceRequest = serde_json::from_str(&json).unwrap();
@@ -1348,6 +1361,7 @@ mod tests {
             SourceResponse::PlaylistSyncStatus(Some(status(PlaylistSyncPhase::Done(report)))),
             SourceResponse::PlaylistSyncStatus(Some(status(PlaylistSyncPhase::Rematching))),
             SourceResponse::PlaylistLinks(vec![info]),
+            SourceResponse::PlaylistLinkUpdated { changed: true },
             SourceResponse::Error(SourceError::SyncInProgress { job_id: 5 }),
             SourceResponse::Error(SourceError::PlaylistNotLinked {
                 name: PlaylistName::new("friday").unwrap(),
