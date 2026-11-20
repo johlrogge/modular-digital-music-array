@@ -20,6 +20,7 @@ use library_ipc_client::{ContentHash, Key, PlaylistEntry, TrackInfo};
 use music_facts::MusicValue;
 use playlist_import::{format_write_outcome, write_playlist, LibraryTrackLookup};
 use rekordbox_roundtrip::Stars;
+use rekordbox_xml::xml::TempoSet;
 use rekordbox_xml::{parse_xml, RekordboxTrack};
 use track_matcher::{CandidateTrack, MatchResult};
 
@@ -236,6 +237,18 @@ fn build_rekordbox_track(
         .collect();
     let position_marks = rekordbox_roundtrip::position_marks_from_cues(&cues_as_music_values);
 
+    // MDMA owns the grid: its stored grid is the TEMPO; without one, none is written.
+    let tempo = track
+        .beat_grid
+        .as_ref()
+        .map_or_else(TempoSet::default, |g| {
+            TempoSet::single(rekordbox_roundtrip::tempo_from_grid(
+                g.first_beat_ms,
+                g.bpm,
+                g.beats_per_bar,
+            ))
+        });
+
     rekordbox_xml::RefreshedTrack {
         name: track.title.clone().unwrap_or_else(|| "Unknown".to_string()),
         artist: track.artist.clone().unwrap_or_default(),
@@ -255,6 +268,7 @@ fn build_rekordbox_track(
         bitrate,
         sample_rate,
         location,
+        tempo,
         rating: Stars::from_energy(track.energy).to_rating(),
         position_marks,
     }
@@ -675,6 +689,50 @@ pub(crate) fn export(args: RekordboxExportArgs, ctx: &Ctx) -> Result<()> {
     Ok(())
 }
 
+/// What enrich does about the beat grid at one matched rekordbox track.
+#[derive(Debug, PartialEq)]
+enum GridAction {
+    /// Nothing: no usable grid, or the library track was already decided at an
+    /// earlier copy.
+    Nothing,
+    /// Assert this grid (through [`plan_grid_update`]).
+    Write(MusicValue),
+    /// The copies disagree: no grid is written.
+    Conflict { copies: usize },
+    /// Variable tempo: no grid is written, and the library's grid is the first
+    /// anchor alone, a truncation, so it is retracted.
+    RetractTruncation(MusicValue),
+}
+
+/// The grid decision for one library track, taken the first time one of its
+/// rekordbox copies is visited (`decided` remembers which have been), so the grid is
+/// written, retracted or reported once however many copies there are.
+fn plan_grid_action<'a>(
+    decided: &mut std::collections::HashSet<&'a ContentHash>,
+    hash: &'a ContentHash,
+    choice: &rekordbox_report::GridChoice<'_>,
+    current: Option<&library_ipc_client::BeatGridInfo>,
+) -> GridAction {
+    use rekordbox_report::GridChoice;
+    if !decided.insert(hash) {
+        return GridAction::Nothing;
+    }
+    match choice {
+        GridChoice::Keep => GridAction::Nothing,
+        GridChoice::Write(grid) => GridAction::Write(grid.clone()),
+        GridChoice::Conflict(copies) => GridAction::Conflict {
+            copies: copies.len(),
+        },
+        GridChoice::Variable(copies) => copies
+            .iter()
+            .filter_map(|c| c.first_anchor_grid.as_ref())
+            .find(|g| plan_grid_update(g, current) == GridUpdate::Current)
+            .map_or(GridAction::Nothing, |g| {
+                GridAction::RetractTruncation(g.clone())
+            }),
+    }
+}
+
 /// What enrich does with a track's beat grid.
 #[derive(Debug, PartialEq)]
 enum GridUpdate {
@@ -822,6 +880,12 @@ pub(crate) fn import(args: RekordboxImportArgs, ctx: &Ctx) -> Result<()> {
         summary.ambiguous
     );
     println!("Unmatched: {:3} tracks", summary.unmatched);
+    println!(
+        "{} placeholder grids skipped, {} variable tempos, {} grid conflicts (no grid imported for those)",
+        summary.placeholder_grids, summary.variable_tempos, summary.grid_conflicts
+    );
+    // The grid per library track: decided once, from all its rekordbox copies.
+    let grid_choices = rekordbox_report::grid_choices(&results);
 
     // 4. The report rows, from the same match results. The candidates' details are
     // only fetched for a report: they are not needed otherwise.
@@ -868,11 +932,15 @@ pub(crate) fn import(args: RekordboxImportArgs, ctx: &Ctx) -> Result<()> {
         std::fs::write(report_path, rekordbox_report::render_tsv(&report_data))
             .map_err(|e| eyre!("Failed to write report {}: {}", report_path.display(), e))?;
         println!(
-            "{} unmatched, {} ambiguous, {} weak, {} shared \u{2192} report written to {}",
+            "{} unmatched, {} ambiguous, {} weak, {} shared, {} placeholder grids, \
+             {} variable tempos, {} grid conflicts \u{2192} report written to {}",
             summary.unmatched,
             summary.ambiguous,
             summary.weak,
             summary.shared,
+            summary.placeholder_grids,
+            summary.variable_tempos,
+            summary.grid_conflicts,
             report_path.display()
         );
         if lookup_failures > 0 {
@@ -932,6 +1000,20 @@ pub(crate) fn import(args: RekordboxImportArgs, ctx: &Ctx) -> Result<()> {
                  matches are not listed; use --report to see them",
                 summary.weak, summary.shared
             );
+        }
+        // Grid conflicts change what the import writes, so they are listed.
+        let conflicts: Vec<&Problem> = report_data
+            .problems
+            .iter()
+            .filter(|p| matches!(p, Problem::GridConflict { .. }))
+            .collect();
+        if !conflicts.is_empty() {
+            eprintln!();
+            eprintln!("Grid conflicts (copies disagree; no grid imported):");
+            for p in conflicts {
+                let t = p.track();
+                eprintln!("  {} - {}", t.artist, t.name);
+            }
         }
     }
 
@@ -1033,6 +1115,8 @@ pub(crate) fn import(args: RekordboxImportArgs, ctx: &Ctx) -> Result<()> {
         let mut errors = 0usize;
 
         let source = library_ipc_client::rekordbox_source(env!("CARGO_PKG_VERSION"));
+        let mut grid_decided: std::collections::HashSet<&ContentHash> =
+            std::collections::HashSet::new();
 
         for (rb_track, hash) in &matched {
             // Fetch current track facts; on failure fall back to writing (safe default).
@@ -1114,14 +1198,42 @@ pub(crate) fn import(args: RekordboxImportArgs, ctx: &Ctx) -> Result<()> {
                 }
             }
 
-            // Write BeatGrid from tempo anchor (Rekordbox is beat-grid master;
-            // MDMA never writes <TEMPO> data back on export).
-            let average_bpm = rb_track.average_bpm.and_then(|b| Bpm::from_f32(b).ok());
-            let projected_grid = rb_track
-                .tempo_anchor
-                .as_ref()
-                .and_then(|anchor| rekordbox_roundtrip::grid_from_tempo(anchor, average_bpm));
-            if let Some(new_grid) = projected_grid {
+            // The BeatGrid is decided once per library track, from the choice over all
+            // its rekordbox copies (see `plan_grid_action`).
+            let grid_action = plan_grid_action(
+                &mut grid_decided,
+                hash,
+                &grid_choices[hash],
+                existing.as_ref().and_then(|t| t.beat_grid.as_ref()),
+            );
+            match &grid_action {
+                GridAction::Conflict { copies } if dry_run => println!(
+                    "[dry-run] Would write no BeatGrid for {} - {}: {} rekordbox tracks \
+                     have different grids",
+                    rb_track.artist, rb_track.name, copies
+                ),
+                GridAction::RetractTruncation(old) if dry_run => println!(
+                    "[dry-run] Would retract {:?} for {} - {}: variable tempo, the grid is \
+                     only the first anchor",
+                    old, rb_track.artist, rb_track.name
+                ),
+                GridAction::RetractTruncation(old) => {
+                    match library.retract_fact_as(hash, old.clone(), &source) {
+                        Ok(true) => enriched += 1,
+                        // Nothing to retract: the grid came from another source.
+                        Ok(false) => skipped += 1,
+                        Err(e) => {
+                            eprintln!(
+                                "Failed to retract BeatGrid for {} - {}: {}",
+                                rb_track.artist, rb_track.name, e
+                            );
+                            errors += 1;
+                        }
+                    }
+                }
+                GridAction::Conflict { .. } | GridAction::Write(_) | GridAction::Nothing => {}
+            }
+            if let GridAction::Write(new_grid) = grid_action {
                 // Guard: skip if the projected beat_grid is already identical.
                 let plan = plan_grid_update(
                     &new_grid,
@@ -1473,6 +1585,53 @@ mod tests {
         }
     }
 
+    // ── beat grid export ─────────────────────────────────────────────────────────
+
+    fn exported_xml(track: &library_ipc_client::TrackInfo) -> String {
+        let built = super::build_rekordbox_track(
+            track,
+            std::path::Path::new("/x/a.aiff"),
+            "aiff",
+            1,
+            &[],
+            &super::ExportedAudio::of_source(track),
+        );
+        rekordbox_xml::merge_export(None, vec![built], &[]).to_xml()
+    }
+
+    /// ADR-005 (amended 2026-11-20): MDMA owns the grid on export.
+    #[test]
+    fn export_writes_the_stored_grid_as_the_tempo() {
+        let hash = format!("sha256:{}", "a".repeat(64));
+        let track = library_ipc_client::TrackInfo {
+            bpm: library_ipc_client::Bpm::from_u32(128).ok(),
+            beat_grid: Some(library_ipc_client::BeatGridInfo {
+                first_beat_ms: 18,
+                bpm: library_ipc_client::Bpm::from_u32(128).unwrap(),
+                beats_per_bar: 4,
+            }),
+            ..crate::test_support::track(&hash)
+        };
+        let xml = exported_xml(&track);
+        assert!(
+            xml.contains("<TEMPO Inizio=\"0.018\" Bpm=\"128.00\" Metro=\"4/4\" Battito=\"1\"/>"),
+            "{xml}"
+        );
+    }
+
+    #[test]
+    fn export_of_a_track_without_a_grid_writes_no_tempo_even_with_a_bpm() {
+        let hash = format!("sha256:{}", "a".repeat(64));
+        let track = library_ipc_client::TrackInfo {
+            bpm: library_ipc_client::Bpm::from_u32(128).ok(),
+            beat_grid: None,
+            ..crate::test_support::track(&hash)
+        };
+        let xml = exported_xml(&track);
+        assert!(xml.contains("AverageBpm=\"128.00\""), "{xml}");
+        assert!(!xml.contains("<TEMPO"), "no placeholder: {xml}");
+    }
+
     // ── beat grid re-import ──────────────────────────────────────────────────────
 
     fn grid_value(first_beat_ms: u32) -> MusicValue {
@@ -1489,6 +1648,105 @@ mod tests {
             bpm: library_ipc_client::Bpm::from_u32(120).unwrap(),
             beats_per_bar: 4,
         }
+    }
+
+    // ── the grid decision per library track ──────────────────────────────────────
+
+    use crate::rekordbox_report::{GridChoice, VariableCopy};
+    use rekordbox_xml::xml::{Deviation, DeviationCause, TempoSet};
+    use rekordbox_xml::RekordboxTrack;
+
+    fn hash_of(c: char) -> ContentHash {
+        ContentHash::new(format!("sha256:{}", c.to_string().repeat(64)))
+    }
+
+    #[test]
+    fn the_grid_is_decided_once_per_library_track_however_many_copies() {
+        let (one, two) = (hash_of('a'), hash_of('b'));
+        let mut decided = std::collections::HashSet::new();
+        let choice = GridChoice::Write(grid_value(1_000));
+
+        // Two rekordbox copies of library track `one`: only the first acts.
+        assert_eq!(
+            super::plan_grid_action(&mut decided, &one, &choice, None),
+            super::GridAction::Write(grid_value(1_000))
+        );
+        assert_eq!(
+            super::plan_grid_action(&mut decided, &one, &choice, None),
+            super::GridAction::Nothing,
+            "the second copy of the same library track does nothing"
+        );
+        // Another library track is decided on its own.
+        assert_eq!(
+            super::plan_grid_action(&mut decided, &two, &choice, None),
+            super::GridAction::Write(grid_value(1_000))
+        );
+    }
+
+    #[test]
+    fn a_conflict_is_reported_once_and_writes_nothing() {
+        let one = hash_of('a');
+        let (a, b) = (RekordboxTrack::default(), RekordboxTrack::default());
+        let choice = GridChoice::Conflict(vec![&a, &b]);
+        let mut decided = std::collections::HashSet::new();
+        assert_eq!(
+            super::plan_grid_action(&mut decided, &one, &choice, None),
+            super::GridAction::Conflict { copies: 2 }
+        );
+        assert_eq!(
+            super::plan_grid_action(&mut decided, &one, &choice, None),
+            super::GridAction::Nothing
+        );
+    }
+
+    #[test]
+    fn keeping_the_library_grid_does_nothing() {
+        let one = hash_of('a');
+        let mut decided = std::collections::HashSet::new();
+        assert_eq!(
+            super::plan_grid_action(
+                &mut decided,
+                &one,
+                &GridChoice::Keep,
+                Some(&grid_info(1_000))
+            ),
+            super::GridAction::Nothing
+        );
+    }
+
+    #[test]
+    fn a_variable_tempo_retracts_the_library_grid_only_if_it_is_the_first_anchor() {
+        let track = RekordboxTrack::default();
+        let copy = VariableCopy {
+            track: &track,
+            deviation: Deviation {
+                anchor: 1,
+                cause: DeviationCause::OffGrid,
+                worst_offset_ms: 20.0,
+            },
+            first_anchor_grid: Some(grid_value(1_000)),
+        };
+        let choice = GridChoice::Variable(vec![copy]);
+        let one = hash_of('a');
+
+        // The library has the truncated grid an earlier import wrote: it goes.
+        let mut decided = std::collections::HashSet::new();
+        assert_eq!(
+            super::plan_grid_action(&mut decided, &one, &choice, Some(&grid_info(1_000))),
+            super::GridAction::RetractTruncation(grid_value(1_000))
+        );
+        // A different library grid (corrected by hand, or another source) stays.
+        let mut decided = std::collections::HashSet::new();
+        assert_eq!(
+            super::plan_grid_action(&mut decided, &one, &choice, Some(&grid_info(2_500))),
+            super::GridAction::Nothing
+        );
+        // No library grid: nothing to retract.
+        let mut decided = std::collections::HashSet::new();
+        assert_eq!(
+            super::plan_grid_action(&mut decided, &one, &choice, None),
+            super::GridAction::Nothing
+        );
     }
 
     #[test]
@@ -1782,7 +2040,7 @@ mod tests {
                 bitrate: None,
                 sample_rate: None,
                 location: loc_mixed.clone(),
-                tempo_anchor: None,
+                tempo: TempoSet::default(),
                 rating: 0,
                 position_marks: vec![],
             }],
@@ -1809,6 +2067,7 @@ mod tests {
             bitrate: None,
             sample_rate: None,
             location: loc_lower.clone(),
+            tempo: TempoSet::default(),
             rating: 0,
             position_marks: vec![],
         };
