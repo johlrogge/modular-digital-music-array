@@ -16,6 +16,14 @@
 //!   version); it is still written to playlists. `shared`: several rekordbox tracks
 //!   matched the same library track; one row per rekordbox track, the candidate
 //!   being the shared library track.
+//! - `placeholder-grid` rows: a matched track whose only TEMPO is the placeholder that
+//!   old MDMA exports wrote (one anchor at 0.000, beat 1); its grid is not imported.
+//!   An annotation on a matched track, not a class of [`Summary`].
+//! - `variable-tempo` rows: a matched track with several TEMPO anchors that the first
+//!   anchor's grid does not reproduce (another Bpm or Metro, more than 5 ms off its
+//!   beats, or a Battito that breaks the bar position); no grid is imported.
+//! - `grid-conflict` rows: rekordbox tracks matching one library track have different
+//!   real grids; none is imported. One row per library track, listing every candidate.
 //! - `dropped-from-playlist` rows are per playlist, with the counts in `reason`.
 //! - `skipped-playlist` rows: a playlist that is not imported at all (bad name).
 //! - `playlist-name-collision` rows: several rekordbox playlists become one MDMA
@@ -25,7 +33,9 @@
 //! quoting), so every row stays one line of exactly [`COLUMNS`] cells.
 
 use crate::args::SanitizedPlaylistName;
-use library_ipc_client::{ContentHash, PlaylistName, TrackInfo};
+use library_ipc_client::{Bpm, ContentHash, PlaylistName, TrackInfo};
+use music_facts::MusicValue;
+use rekordbox_xml::xml::{Deviation, DeviationCause, TempoKind};
 use rekordbox_xml::{RekordboxPlaylist, RekordboxTrack};
 use std::collections::HashMap;
 use track_matcher::{AmbiguityReason, MatchResult, NoMatchReason};
@@ -49,6 +59,11 @@ pub(crate) fn matched<'a>(results: &Results<'a>) -> Vec<(&'a RekordboxTrack, Con
 /// How many collection tracks are in each class. A track is in exactly one, so
 /// [`Summary::total`] is the collection size. A weak match that is also shared is
 /// counted as shared (its report has both rows).
+///
+/// `placeholder_grids`, `variable_tempos` and `grid_conflicts` are annotations, not
+/// classes: a track with a placeholder grid is matched (or weak, or shared) like any
+/// other and is in one of the classes above as well, so they are not part of
+/// [`Summary::total`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct Summary {
     pub(crate) matched: usize,
@@ -59,6 +74,14 @@ pub(crate) struct Summary {
     pub(crate) unmatched: usize,
     /// The library tracks those `shared` tracks matched.
     pub(crate) shared_groups: usize,
+    /// Matched tracks (any of matched, weak, shared) whose only TEMPO is the
+    /// placeholder of old MDMA exports; their grid is not imported.
+    pub(crate) placeholder_grids: usize,
+    /// Library tracks whose rekordbox copies disagree on the grid; no grid is imported.
+    pub(crate) grid_conflicts: usize,
+    /// Matched tracks with a variable tempo (several TEMPO anchors that the first
+    /// anchor's grid does not reproduce); their grid is not imported.
+    pub(crate) variable_tempos: usize,
 }
 
 impl Summary {
@@ -80,13 +103,131 @@ fn matched_by_hash<'r, 'a>(
     groups
 }
 
+/// The grid the import writes for a library track, decided once from every
+/// rekordbox track that matched it.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum GridChoice<'a> {
+    /// No usable grid: no TEMPO, or only placeholders. MDMA's grid stays.
+    Keep,
+    /// Exactly one distinct real grid among the copies.
+    Write(MusicValue),
+    /// Two or more distinct real grids: none is written. The rekordbox tracks that
+    /// have a real grid, in collection order.
+    Conflict(Vec<&'a RekordboxTrack>),
+    /// At least one copy has a variable tempo that no single grid describes (the
+    /// first anchor's grid would be a truncation): no grid is written, whatever the
+    /// other copies say. The variable copies, in collection order.
+    Variable(Vec<VariableCopy<'a>>),
+}
+
+/// A rekordbox track whose several TEMPO anchors are not one constant grid.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct VariableCopy<'a> {
+    pub(crate) track: &'a RekordboxTrack,
+    pub(crate) deviation: Deviation,
+    /// The grid its first anchor alone would give: what an earlier import may have
+    /// written to the library, and what must go if it is still there.
+    pub(crate) first_anchor_grid: Option<MusicValue>,
+}
+
+/// What one rekordbox track says about the grid.
+enum TrackGrid<'a> {
+    /// No TEMPO, or only the placeholder: no information.
+    Nothing,
+    /// One anchor, or several the first anchor's grid reproduces.
+    Grid(MusicValue),
+    Variable(VariableCopy<'a>),
+}
+
+fn first_anchor_grid(track: &RekordboxTrack) -> Option<MusicValue> {
+    let average_bpm = track.average_bpm.and_then(|b| Bpm::from_f32(b).ok());
+    rekordbox_roundtrip::grid_from_tempo(track.tempo.first()?, average_bpm)
+}
+
+fn track_grid(track: &RekordboxTrack) -> TrackGrid<'_> {
+    match track.tempo.classify(track.average_bpm) {
+        TempoKind::Absent | TempoKind::Placeholder => TrackGrid::Nothing,
+        TempoKind::Constant => first_anchor_grid(track).map_or(TrackGrid::Nothing, TrackGrid::Grid),
+        TempoKind::Variable(deviation) => TrackGrid::Variable(VariableCopy {
+            track,
+            deviation,
+            first_anchor_grid: first_anchor_grid(track),
+        }),
+    }
+}
+
+fn has_placeholder_grid(track: &RekordboxTrack) -> bool {
+    track.tempo.is_placeholder()
+}
+
+fn variable_deviation(track: &RekordboxTrack) -> Option<Deviation> {
+    match track.tempo.classify(track.average_bpm) {
+        TempoKind::Variable(deviation) => Some(deviation),
+        _ => None,
+    }
+}
+
+/// Placeholders are ignored. A variable-tempo copy means no grid. Otherwise one
+/// distinct grid is used and several are a conflict.
+pub(crate) fn choose_grid<'a>(copies: &[&'a RekordboxTrack]) -> GridChoice<'a> {
+    let mut grids: Vec<(&'a RekordboxTrack, MusicValue)> = Vec::new();
+    let mut variable: Vec<VariableCopy<'a>> = Vec::new();
+    for &t in copies {
+        match track_grid(t) {
+            TrackGrid::Nothing => {}
+            TrackGrid::Grid(g) => grids.push((t, g)),
+            TrackGrid::Variable(v) => variable.push(v),
+        }
+    }
+    if !variable.is_empty() {
+        return GridChoice::Variable(variable);
+    }
+    let mut distinct: Vec<&MusicValue> = Vec::new();
+    for (_, grid) in &grids {
+        if !distinct.contains(&grid) {
+            distinct.push(grid);
+        }
+    }
+    match distinct.as_slice() {
+        [] => GridChoice::Keep,
+        [one] => GridChoice::Write((*one).clone()),
+        _ => GridChoice::Conflict(grids.into_iter().map(|(t, _)| t).collect()),
+    }
+}
+
+/// [`choose_grid`] for each library track the results matched, over the same
+/// grouping as the `shared` rows.
+pub(crate) fn grid_choices<'r, 'a>(
+    results: &'r Results<'a>,
+) -> HashMap<&'r ContentHash, GridChoice<'a>> {
+    matched_by_hash(results)
+        .into_iter()
+        .map(|(hash, copies)| (hash, choose_grid(&copies)))
+        .collect()
+}
+
 pub(crate) fn summarize(results: &Results<'_>) -> Summary {
     let groups = matched_by_hash(results);
     let mut summary = Summary {
         shared_groups: groups.values().filter(|g| g.len() >= 2).count(),
+        grid_conflicts: groups
+            .values()
+            .filter(|g| matches!(choose_grid(g), GridChoice::Conflict(_)))
+            .count(),
         ..Summary::default()
     };
-    for (_, result) in results {
+    for (track, result) in results {
+        if matches!(
+            result,
+            MatchResult::Definitive(..) | MatchResult::Weak { .. }
+        ) {
+            if has_placeholder_grid(track) {
+                summary.placeholder_grids += 1;
+            }
+            if variable_deviation(track).is_some() {
+                summary.variable_tempos += 1;
+            }
+        }
         match result {
             MatchResult::Definitive(hash, _) | MatchResult::Weak { hash, .. }
                 if groups[hash].len() >= 2 =>
@@ -176,6 +317,58 @@ pub(crate) enum Problem<'a> {
         same_file: bool,
         candidate: Candidate,
     },
+    /// A matched track whose only TEMPO is the placeholder of old MDMA exports. The
+    /// track is still matched and enriched; only its grid is not imported.
+    PlaceholderGrid { track: &'a RekordboxTrack },
+    /// Rekordbox tracks matching one library track disagree on the grid; none is
+    /// imported. One row per library track, on its first copy with a real grid.
+    GridConflict {
+        track: &'a RekordboxTrack,
+        /// Every copy with a real grid, in collection order.
+        copies: Vec<&'a RekordboxTrack>,
+        candidate: Candidate,
+    },
+    /// A matched track with several TEMPO anchors that the first anchor's grid does
+    /// not reproduce: no single grid describes it, so none is imported (and
+    /// rekordbox keeps its own on export).
+    VariableTempo {
+        track: &'a RekordboxTrack,
+        deviation: Deviation,
+    },
+}
+
+/// `TrackID 12 /music/a.aiff (Inizio 0.018 Battito 1 Bpm 128.00)`: the first anchor.
+fn describe_grid_copy(track: &RekordboxTrack) -> String {
+    let anchor = track.tempo.first();
+    let bpm = anchor
+        .and_then(|a| a.bpm)
+        .or(track.average_bpm)
+        .map_or_else(|| "?".to_string(), |b| format!("{b:.2}"));
+    format!(
+        "TrackID {} {} (Inizio {:.3} Battito {} Bpm {})",
+        track.track_id,
+        location_path(track),
+        anchor.map_or(0.0, |a| a.inizio_seconds),
+        anchor.map_or(1, |a| a.beat_in_bar()),
+        bpm
+    )
+}
+
+fn describe_variable_tempo(track: &RekordboxTrack, deviation: &Deviation) -> String {
+    let cause = match deviation.cause {
+        DeviationCause::Bpm => "changes the Bpm",
+        DeviationCause::Meter => "changes the Metro",
+        DeviationCause::OffGrid => "is off the first anchor's beat grid",
+        DeviationCause::BarPosition => "has a Battito that breaks the bar position",
+    };
+    format!(
+        "variable tempo: {} TEMPO anchors, anchor {} {} (worst offset {:.1} ms from the \
+         first anchor's grid); grid not imported",
+        track.tempo.anchors().len(),
+        deviation.anchor + 1,
+        cause,
+        deviation.worst_offset_ms
+    )
 }
 
 impl<'a> Problem<'a> {
@@ -184,7 +377,10 @@ impl<'a> Problem<'a> {
             Self::Unmatched { track, .. }
             | Self::Ambiguous { track, .. }
             | Self::Weak { track, .. }
-            | Self::Shared { track, .. } => track,
+            | Self::Shared { track, .. }
+            | Self::PlaceholderGrid { track }
+            | Self::GridConflict { track, .. }
+            | Self::VariableTempo { track, .. } => track,
         }
     }
 
@@ -194,6 +390,9 @@ impl<'a> Problem<'a> {
             Self::Ambiguous { .. } => "ambiguous",
             Self::Weak { .. } => "weak",
             Self::Shared { .. } => "shared",
+            Self::PlaceholderGrid { .. } => "placeholder-grid",
+            Self::GridConflict { .. } => "grid-conflict",
+            Self::VariableTempo { .. } => "variable-tempo",
         }
     }
 
@@ -223,16 +422,32 @@ impl<'a> Problem<'a> {
                     ""
                 }
             ),
+            Self::PlaceholderGrid { .. } => "single TEMPO at 0.000, beat 1 (MDMA export \
+                                             placeholder); grid not imported"
+                .to_string(),
+            Self::GridConflict { copies, .. } => format!(
+                "{} rekordbox tracks of this library track have different grids; no grid \
+                 imported: {}",
+                copies.len(),
+                copies
+                    .iter()
+                    .map(|t| describe_grid_copy(t))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ),
+            Self::VariableTempo { track, deviation } => describe_variable_tempo(track, deviation),
         }
     }
 
     pub(crate) fn candidates(&self) -> &[Candidate] {
         match self {
-            Self::Unmatched { .. } => &[],
-            Self::Ambiguous { candidates, .. } => candidates,
-            Self::Weak { candidate, .. } | Self::Shared { candidate, .. } => {
-                std::slice::from_ref(candidate)
+            Self::Unmatched { .. } | Self::PlaceholderGrid { .. } | Self::VariableTempo { .. } => {
+                &[]
             }
+            Self::Ambiguous { candidates, .. } => candidates,
+            Self::Weak { candidate, .. }
+            | Self::Shared { candidate, .. }
+            | Self::GridConflict { candidate, .. } => std::slice::from_ref(candidate),
         }
     }
 }
@@ -266,9 +481,30 @@ pub(crate) fn problems<'a>(
 
     // Many to one: every rekordbox track of a library track that two or more share.
     let groups = matched_by_hash(results);
+    let grids = grid_choices(results);
     let mut described: HashMap<&ContentHash, Candidate> = HashMap::new();
     for &(track, ref result) in results {
         if let MatchResult::Definitive(hash, _) | MatchResult::Weak { hash, .. } = result {
+            if has_placeholder_grid(track) {
+                out.push(Problem::PlaceholderGrid { track });
+            }
+            if let Some(deviation) = variable_deviation(track) {
+                out.push(Problem::VariableTempo { track, deviation });
+            }
+            // One conflict row per library track, on its first copy with a real grid.
+            if let GridChoice::Conflict(copies) = &grids[hash] {
+                if std::ptr::eq(copies[0], track) {
+                    let candidate = described
+                        .entry(hash)
+                        .or_insert_with(|| describe(hash))
+                        .clone();
+                    out.push(Problem::GridConflict {
+                        track,
+                        copies: copies.clone(),
+                        candidate,
+                    });
+                }
+            }
             let sharing = &groups[hash];
             if sharing.len() >= 2 {
                 let candidate = described
@@ -644,6 +880,7 @@ pub(crate) fn render_tsv(report: &Report) -> String {
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+    use rekordbox_xml::xml::{TempoAnchor, TempoSet};
     use track_matcher::MatchConfidence;
 
     fn rb(id: u32, artist: &str, name: &str) -> RekordboxTrack {
@@ -655,6 +892,32 @@ mod tests {
             total_time: 300,
             location: "file://localhost/music/A%20B/track.flac".to_string(),
             ..RekordboxTrack::default()
+        }
+    }
+
+    /// The track with a single TEMPO (4/4, 128 BPM) at `inizio` on beat `battito`.
+    fn with_tempo(t: RekordboxTrack, inizio: f64, battito: u8) -> RekordboxTrack {
+        RekordboxTrack {
+            tempo: TempoSet::single(anchor_at(inizio, battito)),
+            ..t
+        }
+    }
+
+    fn anchor_at(inizio: f64, battito: u8) -> TempoAnchor {
+        TempoAnchor {
+            inizio_seconds: inizio,
+            bpm: Some(128.0),
+            metro_numerator: std::num::NonZeroU8::new(4),
+            battito: Some(battito),
+        }
+    }
+
+    /// 128 BPM, 4/4: a beat is 468.75 ms, a bar 1.875 s. The second anchor sits 32
+    /// bars (60 s) on, on the grid with bar position 1 when `drift_s` is 0.
+    fn with_two_anchors(t: RekordboxTrack, drift_s: f64) -> RekordboxTrack {
+        RekordboxTrack {
+            tempo: TempoSet::new(vec![anchor_at(0.0, 1), anchor_at(60.0 + drift_s, 1)]),
+            ..t
         }
     }
 
@@ -1086,6 +1349,149 @@ mod tests {
         );
     }
 
+    // ── grids ───────────────────────────────────────────────────────────────────
+
+    fn grid_at(ms: u32) -> MusicValue {
+        MusicValue::BeatGrid {
+            first_beat_ms: ms,
+            bpm: Bpm::from_f32(128.0).unwrap(),
+            beats_per_bar: 4,
+        }
+    }
+
+    #[test]
+    fn a_placeholder_grid_is_a_row_on_a_matched_track_and_nothing_more() {
+        let t = with_tempo(rb(7, "A", "T"), 0.0, 1);
+        let results = [(&t, definitive("sha256:one"))];
+        let ps = problems(&results, bare);
+        let tsv = render_tsv(&report(ps));
+        let r = rows(&tsv);
+        assert_eq!(r.len(), 2, "{tsv}");
+        assert_eq!(r[1][0], "placeholder-grid");
+        assert_eq!(
+            r[1][1],
+            "single TEMPO at 0.000, beat 1 (MDMA export placeholder); grid not imported"
+        );
+        assert_eq!(r[1][3], "7");
+        assert_eq!(choose_grid(&[&t]), GridChoice::Keep);
+    }
+
+    #[test]
+    fn a_real_grid_is_not_reported() {
+        let t = with_tempo(rb(7, "A", "T"), 0.018, 1);
+        let results = [(&t, definitive("sha256:one"))];
+        assert!(problems(&results, bare).is_empty());
+        assert_eq!(choose_grid(&[&t]), GridChoice::Write(grid_at(18)));
+    }
+
+    #[test]
+    fn a_placeholder_copy_yields_to_the_real_copy_whatever_the_order() {
+        let placeholder = with_tempo(rb(1, "a", "a"), 0.0, 1);
+        let real = with_tempo(rb(2, "a", "a"), 0.018, 1);
+        for copies in [[&placeholder, &real], [&real, &placeholder]] {
+            assert_eq!(choose_grid(&copies), GridChoice::Write(grid_at(18)));
+        }
+        // No TEMPO at all is no information either.
+        let none = rb(3, "a", "a");
+        assert_eq!(choose_grid(&[&none, &real]), GridChoice::Write(grid_at(18)));
+        assert_eq!(choose_grid(&[&none, &placeholder]), GridChoice::Keep);
+    }
+
+    #[test]
+    fn copies_with_the_same_real_grid_agree() {
+        let (a, b) = (
+            with_tempo(rb(1, "a", "a"), 0.018, 1),
+            with_tempo(rb(2, "a", "a"), 0.018, 1),
+        );
+        assert_eq!(choose_grid(&[&a, &b]), GridChoice::Write(grid_at(18)));
+    }
+
+    #[test]
+    fn different_real_grids_are_a_conflict_with_one_row_listing_the_candidates() {
+        let a = with_tempo(rb(1, "a", "a"), 0.018, 1);
+        let placeholder = with_tempo(rb(2, "a", "a"), 0.0, 1);
+        let b = with_tempo(rb(3, "a", "a"), 0.250, 1);
+        let results = [
+            (&a, definitive("sha256:one")),
+            (&placeholder, definitive("sha256:one")),
+            (&b, definitive("sha256:one")),
+        ];
+        let GridChoice::Conflict(copies) = choose_grid(&[&a, &placeholder, &b]) else {
+            panic!("conflict expected");
+        };
+        let ids: Vec<u32> = copies.iter().map(|t| t.track_id).collect();
+        assert_eq!(ids, [1, 3], "the placeholder is not a candidate");
+
+        let ps = problems(&results, bare);
+        let statuses: Vec<_> = ps
+            .iter()
+            .map(|p| (p.track().track_id, p.status()))
+            .collect();
+        assert_eq!(
+            statuses,
+            [
+                (1, "grid-conflict"),
+                (1, "shared"),
+                (2, "placeholder-grid"),
+                (2, "shared"),
+                (3, "shared")
+            ]
+        );
+        let reason = ps[0].reason();
+        assert!(
+            reason.contains("TrackID 1 /music/A B/track.flac (Inizio 0.018 Battito 1 Bpm 128.00)")
+        );
+        assert!(
+            reason.contains("TrackID 3 /music/A B/track.flac (Inizio 0.250 Battito 1 Bpm 128.00)")
+        );
+        assert_eq!(ps[0].candidates()[0].hash, hash("sha256:one"));
+        assert_eq!(summarize(&results).grid_conflicts, 1);
+    }
+
+    #[test]
+    fn a_multi_anchor_set_on_one_grid_imports_as_the_first_anchors_grid() {
+        let t = with_two_anchors(rb(1, "a", "a"), 0.0);
+        let results = [(&t, definitive("sha256:one"))];
+        assert!(problems(&results, bare).is_empty());
+        assert_eq!(choose_grid(&[&t]), GridChoice::Write(grid_at(0)));
+    }
+
+    #[test]
+    fn a_variable_tempo_writes_no_grid_and_has_a_row() {
+        let t = with_two_anchors(rb(5, "a", "a"), 0.1);
+        let results = [(&t, definitive("sha256:one"))];
+        let GridChoice::Variable(copies) = choose_grid(&[&t]) else {
+            panic!("variable expected");
+        };
+        assert_eq!(copies.len(), 1);
+        assert_eq!(copies[0].first_anchor_grid, Some(grid_at(0)));
+
+        let ps = problems(&results, bare);
+        assert_eq!(ps.len(), 1);
+        assert_eq!(ps[0].status(), "variable-tempo");
+        let reason = ps[0].reason();
+        assert!(reason.contains("2 TEMPO anchors"), "{reason}");
+        assert!(
+            reason.contains("anchor 2 is off the first anchor's beat grid"),
+            "{reason}"
+        );
+        assert!(reason.contains("worst offset 100.0 ms"), "{reason}");
+        let summary = summarize(&results);
+        assert_eq!(summary.variable_tempos, 1);
+        assert_eq!(summary.total(), 1, "an annotation, not a class");
+    }
+
+    #[test]
+    fn a_variable_copy_blocks_the_grid_of_the_other_copies() {
+        let variable = with_two_anchors(rb(1, "a", "a"), 0.1);
+        let real = with_tempo(rb(2, "a", "a"), 0.018, 1);
+        let choice = choose_grid(&[&real, &variable]);
+        assert!(
+            matches!(choice, GridChoice::Variable(ref v) if v.len() == 1),
+            "{choice:?}"
+        );
+    }
+
     #[test]
     fn no_problems_is_just_the_header() {
         assert_eq!(
@@ -1101,7 +1507,14 @@ mod tests {
     /// written or dropped for a counted cause.
     #[test]
     fn every_track_and_every_playlist_entry_is_accounted_for() {
-        let tracks: Vec<RekordboxTrack> = (1..=8).map(|i| rb(i, "a", "t")).collect();
+        let mut tracks: Vec<RekordboxTrack> = (1..=8).map(|i| rb(i, "a", "t")).collect();
+        // Placeholder grids are an annotation on top of the classes below. On a
+        // matched, a weak and a shared track they count; on an ambiguous one (never
+        // imported) they do not. The other shared track has a real grid: no conflict.
+        for i in [0, 1, 2, 4] {
+            tracks[i] = with_tempo(tracks[i].clone(), 0.0, 1);
+        }
+        tracks[3] = with_tempo(tracks[3].clone(), 0.018, 1);
         let results = [
             (&tracks[0], definitive("sha256:one")), // matched
             (
@@ -1137,10 +1550,22 @@ mod tests {
                 shared: 2,
                 ambiguous: 1,
                 unmatched: 2,
-                shared_groups: 1
+                shared_groups: 1,
+                placeholder_grids: 3,
+                grid_conflicts: 0,
+                variable_tempos: 0
             }
         );
-        assert_eq!(summary.total(), tracks.len());
+        assert_eq!(
+            summary.total(),
+            tracks.len(),
+            "annotations are not classes: the partition still adds up"
+        );
+        let placeholder_rows = problems(&results, bare)
+            .iter()
+            .filter(|p| p.status() == "placeholder-grid")
+            .count();
+        assert_eq!(placeholder_rows, summary.placeholder_grids);
         assert_eq!(
             matched(&results).len(),
             5,
