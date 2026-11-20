@@ -37,7 +37,7 @@ impl ContainerBytes {
         }
     }
 
-    fn get(self) -> usize {
+    pub fn get(self) -> usize {
         match self {
             ContainerBytes::One => 1,
             ContainerBytes::Two => 2,
@@ -98,6 +98,29 @@ impl RawPcmLayout {
     pub fn rate(&self) -> SampleRate {
         self.rate
     }
+
+    pub fn order(&self) -> Endian {
+        self.order
+    }
+
+    pub fn container_bytes(&self) -> usize {
+        self.container.get()
+    }
+
+    /// Byte range of the sample data in the file.
+    pub fn data(&self) -> &Range<u64> {
+        &self.data
+    }
+
+    /// Decode raw sample bytes into sign-extended values at the container's
+    /// full width (a 12-bit sample left-justified in 16 bits keeps its padding
+    /// bits, as the hash sees it).
+    pub fn decode_into(&self, raw: &[u8], out: &mut Vec<i32>) {
+        out.extend(
+            raw.chunks_exact(self.container.get())
+                .map(|b| decode_sample(b, self.order, self.eight_bit)),
+        );
+    }
 }
 
 /// Sign-extended, right-justified value of one stored sample.
@@ -137,11 +160,7 @@ pub(crate) fn hash<R: Read + Seek>(
         let len = n as usize * frame_bytes;
         r.read_exact(&mut raw[..len])?;
         samples.clear();
-        samples.extend(
-            raw[..len]
-                .chunks_exact(cb)
-                .map(|b| decode_sample(b, layout.order, layout.eight_bit)),
-        );
+        layout.decode_into(&raw[..len], &mut samples);
         hasher.write_interleaved(&samples);
         remaining -= n;
     }

@@ -12,6 +12,7 @@ license = "MIT"
 interface = "audio-decoder"
 
 [dependencies]
+audio-hash = { workspace = true }
 audio-types = { workspace = true }
 thiserror = "1.0"
 tracing = "0.1"

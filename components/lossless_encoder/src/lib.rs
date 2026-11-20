@@ -332,6 +332,7 @@ fn source_refusal(e: PcmHashError) -> Refusal {
             Unsupported::Mp3Lossy
             | Unsupported::Mp4
             | Unsupported::StreamInfoContainer
+            | Unsupported::NotAiff
             | Unsupported::WavUnknownSubFormat
             | Unsupported::WavNonPcmSubFormat
             | Unsupported::WavFloat

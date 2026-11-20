@@ -78,9 +78,13 @@ pub enum Unsupported {
     Mp3Lossy,
     #[error("mp4: not supported")]
     Mp4,
-    /// `pcm_info` reads AIFF and FLAC only.
+    /// `pcm_info` and `stream_info` read AIFF and FLAC only; this is any other
+    /// container asked for its stream properties.
     #[error("stream info: only AIFF and FLAC")]
     StreamInfoContainer,
+    /// A file that is not an AIFF was asked for an AIFF sample layout.
+    #[error("not an AIFF")]
+    NotAiff,
     #[error("wav: unknown SubFormat")]
     WavUnknownSubFormat,
     #[error("wav: non-PCM SubFormat")]
@@ -165,6 +169,41 @@ pub fn stream_info_reader<R: Read + Seek>(mut r: R) -> Result<PcmInfo, PcmHashEr
         Container::Flac => flac::info(&mut r, file_len),
         Container::Aiff => aiff::stream_info(&mut r, file_len),
         _ => Err(PcmHashError::Unsupported(Unsupported::StreamInfoContainer)),
+    }
+}
+
+pub use aiff::AiffPcmLayout;
+
+/// The sample layout of an AIFF / AIFF-C integer PCM stream (plain AIFF, or
+/// AIFF-C `NONE`/`twos`/`sowt`; mono or stereo), validated strictly like
+/// [`pcm_hash`]: SSND must hold exactly COMM's frame count.
+///
+/// A file that is not an AIFF is `Unsupported(NotAiff)` (or
+/// `AudioHashError::UnsupportedContainer` when not audio at all); an AIFF
+/// outside the integer-PCM scope (float, `ulaw`, more than two channels, ...)
+/// is another `Unsupported`; a malformed or truncated one is `Container`.
+pub fn aiff_pcm_layout<R: Read + Seek>(r: R) -> Result<AiffPcmLayout, PcmHashError> {
+    aiff_layout(r, aiff::Strictness::Strict)
+}
+
+/// [`aiff_pcm_layout`] for playback: the frames are bounded by
+/// `min(COMM's frame count, whole frames in SSND and in the file)`, so a
+/// truncated file plays what it has and bytes after the last frame are not
+/// played. Compare [`AiffPcmLayout::frames`] with
+/// [`AiffPcmLayout::declared_frames`] to see whether it differed. Only a file
+/// with no usable COMM or SSND, or an unsupported codec, is an error.
+pub fn aiff_pcm_layout_lenient<R: Read + Seek>(r: R) -> Result<AiffPcmLayout, PcmHashError> {
+    aiff_layout(r, aiff::Strictness::Lenient)
+}
+
+fn aiff_layout<R: Read + Seek>(
+    mut r: R,
+    strictness: aiff::Strictness,
+) -> Result<AiffPcmLayout, PcmHashError> {
+    let file_len = r.seek(SeekFrom::End(0))?;
+    match sniff::sniff(&mut r, file_len)? {
+        Container::Aiff => aiff::pcm_layout(&mut r, file_len, strictness),
+        _ => Err(PcmHashError::Unsupported(Unsupported::NotAiff)),
     }
 }
 

@@ -53,6 +53,75 @@ fn supported_aifc_variants_hash_like_plain_aiff() {
     }
 }
 
+#[test]
+fn public_layout_describes_the_sample_bytes_exactly() {
+    use super::{aiff_pcm_layout, ByteOrder};
+    let b = AiffBuilder::new()
+        .bits(20)
+        .frames(1000)
+        .aifc(Codec::Sowt)
+        .id3(id3::full_tag(id3::Id3Version::V24));
+    let bytes = b.build();
+    let l = aiff_pcm_layout(Cursor::new(&bytes)).unwrap();
+    assert_eq!(l.byte_order(), ByteOrder::Little);
+    assert_eq!(
+        (l.container_bytes(), l.significant_bits(), l.channels()),
+        (3, 20, 2)
+    );
+    assert_eq!((l.sample_rate(), l.frames()), (44_100, 1000));
+    // exactly the sample bytes, none of the trailing chunk
+    assert_eq!(
+        &bytes[l.data().start as usize..l.data().end as usize],
+        b.sample_bytes()
+    );
+    let mut ints = Vec::new();
+    l.decode_into(&b.sample_bytes(), &mut ints);
+    let want: Vec<i32> = b.samples().iter().map(|s| s << 4).collect();
+    assert_eq!(ints, want);
+}
+
+#[test]
+fn lenient_layout_bounds_frames_by_what_is_there_while_hashes_stay_strict() {
+    use super::{aiff_pcm_layout, aiff_pcm_layout_lenient};
+    use crate::audio_hash_reader;
+    let b = AiffBuilder::new().bits(24).frames(1000);
+    let bytes = b.build();
+    // 6 bytes per frame: cutting 100 bytes leaves 983 whole frames
+    let cut = &bytes[..bytes.len() - 100];
+    let l = aiff_pcm_layout_lenient(Cursor::new(cut)).unwrap();
+    assert_eq!(
+        (l.frames(), l.declared_frames(), l.is_exact()),
+        (983, 1000, false)
+    );
+    assert_eq!(l.data().end - l.data().start, 983 * 6);
+    assert!(l.data().end <= cut.len() as u64);
+    // strict layout, PcmHash and AudioHash all refuse the cut file
+    assert!(aiff_pcm_layout(Cursor::new(cut)).is_err());
+    assert!(pcm_hash_reader(Cursor::new(cut)).is_err());
+    assert!(audio_hash_reader(Cursor::new(cut)).is_err());
+    // a whole file reads the same either way
+    assert_eq!(
+        aiff_pcm_layout_lenient(Cursor::new(&bytes)).unwrap(),
+        aiff_pcm_layout(Cursor::new(&bytes)).unwrap()
+    );
+}
+
+#[test]
+fn public_layout_refuses_what_is_not_integer_pcm_aiff() {
+    use super::aiff_pcm_layout;
+    for codec in [Codec::Fl32, Codec::Ulaw] {
+        let bytes = AiffBuilder::new().aifc(codec).build();
+        assert!(matches!(
+            aiff_pcm_layout(Cursor::new(bytes)),
+            Err(PcmHashError::Unsupported(Unsupported::CompressedAiffC))
+        ));
+    }
+    assert!(matches!(
+        aiff_pcm_layout(Cursor::new(b"RIFF....WAVEfmt ".to_vec())),
+        Err(PcmHashError::Unsupported(_) | PcmHashError::Container(_))
+    ));
+}
+
 #[rstest]
 #[case(Codec::Fl32)]
 #[case(Codec::Ulaw)]

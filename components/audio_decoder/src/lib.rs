@@ -1,6 +1,8 @@
 pub use audio_types::{AudioSegment, DecodedSegment, SegmentIndex, SEGMENT_SIZE};
 
+use audio_hash::{AiffPcmLayout, AudioHashError, PcmHashError};
 use parking_lot::Mutex;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use symphonia::core::{
@@ -40,8 +42,8 @@ pub trait Source: Send + Sync {
 }
 
 pub struct AudioSource {
-    // Decoder state (format reader + decoder)
-    decoder_state: Mutex<DecoderState>,
+    // Where the samples come from (see `Backend`)
+    backend: Mutex<Backend>,
 
     // Current sample position in the stream
     current_position: AtomicUsize,
@@ -57,12 +59,203 @@ pub struct AudioSource {
     is_eof: AtomicBool,
 }
 
+/// Frames read per call by the raw PCM backend (about a symphonia AIFF packet).
+const PCM_CHUNK_FRAMES: usize = 4096;
+
+/// The two ways to get samples. Which one a file gets is decided in one place,
+/// [`Backend::open`]: integer-PCM AIFF / AIFF-C (plain AIFF, `NONE`, `twos`,
+/// `sowt`) is decoded by us from the layout `audio_hash` reads for PcmHash,
+/// everything else by symphonia.
+///
+/// symphonia 0.5.5 plays AIFF-C `twos`/`sowt` at 16 bits only and plain AIFF
+/// only at 8/16/24/32, takes the SSND chunk length (header included) as the
+/// sample byte count, so a chunk after SSND leaks about 4 garbage samples, and
+/// seeks to a packet boundary. The raw backend has none of these.
+enum Backend {
+    Symphonia(DecoderState),
+    Pcm(PcmStream),
+}
+
 struct DecoderState {
     format_reader: Box<dyn FormatReader>,
     decoder: Box<dyn symphonia::core::codecs::Decoder>,
 }
 
-type DecoderResult = Result<
+/// Integer PCM read straight from the file.
+struct PcmStream {
+    file: std::fs::File,
+    layout: AiffPcmLayout,
+    /// The next frame to read.
+    next_frame: u64,
+    /// The frame the file's read position is at, if known.
+    cursor_frame: Option<u64>,
+    /// Divisor that maps a full-width container integer to [-1, 1).
+    scale: f32,
+    raw: Vec<u8>,
+    ints: Vec<i32>,
+}
+
+impl PcmStream {
+    fn new(file: std::fs::File, layout: AiffPcmLayout) -> Result<Self, DecoderError> {
+        if file.metadata()?.len() < layout.data().end {
+            return Err(DecoderError::Decode("sample data is truncated".into()));
+        }
+        let scale = (1u64 << (8 * layout.container_bytes() - 1)) as f32;
+        Ok(Self {
+            file,
+            layout,
+            next_frame: 0,
+            cursor_frame: None,
+            scale,
+            raw: Vec::new(),
+            ints: Vec::new(),
+        })
+    }
+
+    fn channels(&self) -> usize {
+        usize::from(self.layout.channels())
+    }
+
+    /// The next chunk of interleaved samples, `None` after the last frame.
+    fn next_samples(&mut self) -> Result<Option<Vec<f32>>, DecoderError> {
+        let remaining = self.layout.frames() - self.next_frame;
+        if remaining == 0 {
+            return Ok(None);
+        }
+        let frames = remaining.min(PCM_CHUNK_FRAMES as u64) as usize;
+        let frame_bytes = self.layout.container_bytes() * self.channels();
+        self.raw.resize(frames * frame_bytes, 0);
+        // Sequential reads continue where the last one ended; only the first
+        // read and the first after a seek reposition the file.
+        if self.cursor_frame != Some(self.next_frame) {
+            self.file.seek(SeekFrom::Start(
+                self.layout.data().start + self.next_frame * frame_bytes as u64,
+            ))?;
+        }
+        // Unknown until the read completes: a failed partial read must not let
+        // a retry skip the seek.
+        self.cursor_frame = None;
+        self.file.read_exact(&mut self.raw)?;
+        self.ints.clear();
+        self.layout.decode_into(&self.raw, &mut self.ints);
+        self.next_frame += frames as u64;
+        self.cursor_frame = Some(self.next_frame);
+        Ok(Some(
+            self.ints.iter().map(|&s| s as f32 / self.scale).collect(),
+        ))
+    }
+
+    /// Seek to the frame containing interleaved sample `position`, clamped to
+    /// the end. Returns the interleaved position actually reached.
+    fn seek(&mut self, position: usize) -> usize {
+        let channels = self.channels();
+        self.next_frame = (position as u64 / channels as u64).min(self.layout.frames());
+        self.next_frame as usize * channels
+    }
+}
+
+impl Backend {
+    fn open(path: &Path) -> Result<(Self, u32, u16, Option<u64>), DecoderError> {
+        // Lenient: identity is strict, playback is not. A truncated or
+        // inconsistent AIFF (stored as a blob because the lossless encoder
+        // refused it) plays the frames it has.
+        match audio_hash::aiff_pcm_layout_lenient(std::fs::File::open(path)?) {
+            Ok(layout) => {
+                if !layout.is_exact() {
+                    tracing::warn!(
+                        "{}: AIFF declares {} frames but holds {}; playing those present",
+                        path.display(),
+                        layout.declared_frames(),
+                        layout.frames()
+                    );
+                }
+                let rate = layout.sample_rate();
+                let channels = u16::from(layout.channels());
+                // Exact: every frame is counted, nothing trails.
+                let duration_ms = Some(layout.frames() * 1000 / u64::from(rate));
+                let stream = PcmStream::new(std::fs::File::open(path)?, layout)?;
+                Ok((Backend::Pcm(stream), rate, channels, duration_ms))
+            }
+            // Not an AIFF, or an AIFF outside integer PCM (float, ulaw, more than
+            // two channels): symphonia's.
+            Err(
+                PcmHashError::Unsupported(_)
+                | PcmHashError::Container(AudioHashError::UnsupportedContainer),
+            ) => {
+                let (reader, decoder, rate, channels, duration_ms) = init_symphonia(path)?;
+                Ok((
+                    Backend::Symphonia(DecoderState {
+                        format_reader: reader,
+                        decoder,
+                    }),
+                    rate,
+                    channels,
+                    duration_ms,
+                ))
+            }
+            Err(PcmHashError::Container(AudioHashError::Io(e))) => Err(DecoderError::Io(e)),
+            // An AIFF we cannot play even leniently (no COMM or SSND, ...).
+            Err(e) => Err(DecoderError::Decode(e.to_string())),
+        }
+    }
+
+    /// The next chunk of interleaved samples, `None` at the end of the stream.
+    fn next_samples(&mut self) -> Result<Option<Vec<f32>>, DecoderError> {
+        match self {
+            Backend::Pcm(stream) => stream.next_samples(),
+            Backend::Symphonia(state) => {
+                let packet = match state.format_reader.next_packet() {
+                    Ok(packet) => packet,
+                    Err(symphonia::core::errors::Error::IoError(ref e))
+                        if e.kind() == std::io::ErrorKind::UnexpectedEof =>
+                    {
+                        return Ok(None)
+                    }
+                    Err(e) => return Err(DecoderError::Decode(e.to_string())),
+                };
+                let decoded = state
+                    .decoder
+                    .decode(&packet)
+                    .map_err(|e| DecoderError::Decode(e.to_string()))?;
+                let mut buffer =
+                    SampleBuffer::<f32>::new(decoded.capacity() as u64, *decoded.spec());
+                buffer.copy_interleaved_ref(decoded);
+                Ok(Some(buffer.samples().to_vec()))
+            }
+        }
+    }
+
+    /// Seek to interleaved sample `position`; returns the position reached.
+    fn seek(&mut self, position: usize, rate: u32, channels: u16) -> Result<usize, DecoderError> {
+        match self {
+            Backend::Pcm(stream) => Ok(stream.seek(position)),
+            Backend::Symphonia(state) => {
+                state
+                    .format_reader
+                    .seek(
+                        SeekMode::Accurate,
+                        SeekTo::Time {
+                            time: position_to_time(position, rate, channels),
+                            track_id: None,
+                        },
+                    )
+                    .map_err(|e| DecoderError::Decode(format!("Seek error: {}", e)))?;
+                Ok(position)
+            }
+        }
+    }
+}
+
+fn position_to_time(position: usize, sample_rate: u32, audio_channels: u16) -> Time {
+    let time_seconds = (position as f64) / (sample_rate as f64 * audio_channels as f64);
+
+    // Convert to Symphonia's Time format
+    let seconds = time_seconds.floor() as u64;
+    let frac = time_seconds - seconds as f64;
+    Time::new(seconds, frac)
+}
+
+type SymphoniaResult = Result<
     (
         Box<dyn FormatReader>,
         Box<dyn symphonia::core::codecs::Decoder>,
@@ -76,30 +269,22 @@ type DecoderResult = Result<
 impl AudioSource {
     pub fn new(path: impl AsRef<Path>) -> Result<Self, DecoderError> {
         tracing::debug!("Opening file: {:?}", path.as_ref());
-        // Initialize the decoder and format reader
-        let (format_reader, decoder, sample_rate, audio_channels, total_duration_ms) =
-            Self::init_decoder(path.as_ref())?;
+        let (backend, sample_rate, audio_channels, total_duration_ms) =
+            Backend::open(path.as_ref())?;
 
-        // Create the decoder state
-        let decoder_state = Mutex::new(DecoderState {
-            format_reader,
-            decoder,
-        });
-
-        // Create the source
-        let source = Self {
-            decoder_state,
+        Ok(Self {
+            backend: Mutex::new(backend),
             current_position: AtomicUsize::new(0),
             sample_rate,
             audio_channels,
             total_duration_ms,
             is_eof: AtomicBool::new(false),
-        };
-
-        Ok(source)
+        })
     }
+}
 
-    fn init_decoder(path: &Path) -> DecoderResult {
+fn init_symphonia(path: &Path) -> SymphoniaResult {
+    {
         let mut hint = Hint::new();
         if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
             hint.with_extension(ext);
@@ -153,34 +338,17 @@ impl AudioSource {
             total_duration_ms,
         ))
     }
+}
 
-    fn position_to_time(&self, position: usize) -> Time {
-        let sample_rate_f64 = self.sample_rate as f64;
-        let channels_f64 = self.audio_channels as f64;
-        let time_seconds = (position as f64) / (sample_rate_f64 * channels_f64);
-
-        // Convert to Symphonia's Time format
-        let seconds = time_seconds.floor() as u64;
-        let frac = time_seconds - seconds as f64;
-        Time::new(seconds, frac)
-    }
-
+impl AudioSource {
     pub fn is_eof(&self) -> bool {
         self.is_eof.load(Ordering::Relaxed)
     }
 
-    fn extract_segments(
-        &self,
-        decoded: symphonia::core::audio::AudioBufferRef<'_>,
-    ) -> Result<Vec<DecodedSegment>, DecoderError> {
+    /// Cut interleaved `samples` into segments at the current position and
+    /// advance it.
+    fn extract_segments(&self, samples: &[f32]) -> Vec<DecodedSegment> {
         tracing::debug!("extract segments called");
-        // Get decoded buffer specification
-        let spec = *decoded.spec();
-
-        // Create a sample buffer
-        let mut sample_buffer = SampleBuffer::<f32>::new(decoded.capacity() as u64, spec);
-        sample_buffer.copy_interleaved_ref(decoded);
-        let samples = sample_buffer.samples();
         let current_position = self.current_position.load(Ordering::Relaxed);
 
         // Break the samples into segments
@@ -225,7 +393,7 @@ impl AudioSource {
         self.current_position
             .store(current_position + samples.len(), Ordering::Relaxed);
 
-        Ok(segments)
+        segments
     }
 }
 
@@ -240,24 +408,12 @@ impl Source for AudioSource {
                 return Ok(Vec::new());
             }
 
-            let mut decoder_state = self.decoder_state.lock();
-            let packet = match decoder_state.format_reader.next_packet() {
-                Ok(packet) => packet,
-                Err(symphonia::core::errors::Error::IoError(ref e))
-                    if e.kind() == std::io::ErrorKind::UnexpectedEof =>
-                {
-                    self.is_eof.store(true, Ordering::Relaxed);
-                    return Ok(Vec::new());
-                }
-                Err(e) => return Err(DecoderError::Decode(e.to_string())),
+            let Some(samples) = self.backend.lock().next_samples()? else {
+                self.is_eof.store(true, Ordering::Relaxed);
+                return Ok(Vec::new());
             };
 
-            let decoded = match decoder_state.decoder.decode(&packet) {
-                Ok(decoded) => decoded,
-                Err(e) => return Err(DecoderError::Decode(e.to_string())),
-            };
-
-            let segments = self.extract_segments(decoded)?;
+            let segments = self.extract_segments(&samples);
             if !segments.is_empty() {
                 return Ok(segments);
             }
@@ -265,29 +421,18 @@ impl Source for AudioSource {
     }
 
     fn seek(&self, position: usize) -> Result<(), DecoderError> {
-        // Calculate the time to seek to
-        let seek_time = self.position_to_time(position);
-
         // Reset EOF flag since we're seeking
         self.is_eof.store(false, Ordering::Relaxed);
 
         // Update current position
         self.current_position.store(position, Ordering::Relaxed);
 
-        // Acquire lock on decoder state
-        let mut decoder_state = self.decoder_state.lock();
-
-        // Seek the format reader to the specified time
-        decoder_state
-            .format_reader
-            .seek(
-                SeekMode::Accurate,
-                SeekTo::Time {
-                    time: seek_time,
-                    track_id: None,
-                },
-            )
-            .map_err(|e| DecoderError::Decode(format!("Seek error: {}", e)))?;
+        // Seek the backend (it reports the position it reached)
+        let reached = self
+            .backend
+            .lock()
+            .seek(position, self.sample_rate, self.audio_channels)?;
+        self.current_position.store(reached, Ordering::Relaxed);
 
         Ok(())
     }
@@ -894,57 +1039,53 @@ mod tests {
                 .noise()
         }
 
+        /// Every form the raw-PCM path takes: plain AIFF and AIFF-C NONE/twos/sowt.
+        fn integer_forms(b: AiffBuilder) -> Vec<(&'static str, AiffBuilder)> {
+            vec![
+                ("aiff", b.clone()),
+                ("none", b.clone().aifc(Codec::None)),
+                ("twos", b.clone().aifc(Codec::Twos)),
+                ("sowt", b.aifc(Codec::Sowt)),
+            ]
+        }
+
         #[test]
-        fn integer_aiff_decodes_to_the_builders_samples() {
-            for bits in [8, 16, 24] {
+        fn every_integer_depth_decodes_bit_exact_in_every_form() {
+            // 12 and 20 bits, and 24-bit twos/sowt, are what symphonia 0.5.5 cannot play.
+            for bits in [8, 12, 16, 20, 24, 32] {
                 for channels in [1, 2] {
-                    let b = base(bits, channels);
-                    assert_pcm(&b, bits, "t.aiff");
-                    let (_, c, _, _) = decode(&b.build(), "t.aif");
-                    assert_eq!(c, channels, "{bits} bit");
+                    for (form, b) in integer_forms(base(bits, channels)) {
+                        let (_, c, _, _) = decode(&b.build(), "t.aif");
+                        assert_eq!(c, channels, "{form} {bits} bit");
+                        assert_pcm(&b, bits, "t.aif");
+                    }
                 }
             }
         }
 
         #[test]
-        fn aifc_none_twos_and_sowt_decode_to_the_builders_samples() {
-            // symphonia 0.5.5 takes `twos` and `sowt` at 16 bits only, `NONE` at 8..=32.
-            for bits in [8, 16, 24] {
-                assert_pcm(&base(bits, 2).aifc(Codec::None), bits, "t.aifc");
-            }
-            assert_pcm(&base(16, 2).aifc(Codec::Twos), 16, "t.aifc");
-            assert_pcm(&base(16, 2).aifc(Codec::Sowt), 16, "t.aifc");
+        fn little_endian_sowt_mono_and_stereo() {
             assert_pcm(&base(16, 1).aifc(Codec::Sowt), 16, "t.aifc");
+            assert_pcm(&base(24, 2).aifc(Codec::Sowt), 24, "t.aifc");
         }
 
         #[test]
-        fn thirty_two_bit_integer_decodes_within_f32_precision() {
-            for form in [None, Some(Codec::None)] {
-                let b = match form {
-                    Some(c) => base(32, 2).aifc(c),
-                    None => base(32, 2),
-                };
-                let (_, _, _, got) = decode(&b.build(), "t.aiff");
-                let want = b.samples();
-                assert_eq!(got.len(), want.len());
-                for (g, w) in got.iter().zip(&want) {
-                    assert!((g - *w as f32 / 2_147_483_648.0).abs() < 1e-6);
-                }
-            }
-        }
-
-        #[test]
-        fn unsupported_depths_are_errors_not_panics() {
-            // Limits of symphonia 0.5.5: these AIFF variants cannot be played.
-            let dir = tempfile::tempdir().unwrap();
-            for (name, bytes) in [
-                ("twos24.aifc", base(24, 2).aifc(Codec::Twos).build()),
-                ("sowt24.aifc", base(24, 2).aifc(Codec::Sowt).build()),
-                ("pcm20.aiff", base(20, 2).build()),
-            ] {
-                let path = dir.path().join(name);
-                std::fs::write(&path, bytes).unwrap();
-                assert!(AudioSource::new(&path).is_err(), "{name}");
+        fn block_aligned_ssnd_offset_and_block_size() {
+            use audio_fixtures::{aiff, be_chunk, be_samples, comm};
+            let b = base(16, 2);
+            let want = b.samples();
+            let mut payload = 6u32.to_be_bytes().to_vec(); // offset
+            payload.extend(2048u32.to_be_bytes()); // blockSize
+            payload.extend([0x55; 6]);
+            payload.extend(be_samples(&want, 2));
+            let bytes = aiff(
+                b"AIFF",
+                &[comm(2, 12_000, 16, 48_000), be_chunk(b"SSND", &payload)],
+            );
+            let got = decode(&bytes, "t.aiff").3;
+            assert_eq!(got.len(), want.len());
+            for (g, w) in got.iter().zip(&want) {
+                assert_eq!(*g, *w as f32 / 32_768.0);
             }
         }
 
@@ -953,21 +1094,110 @@ mod tests {
             use audio_fixtures::testkit::id3;
             let b = base(16, 2).id3(id3::full_tag(id3::Id3Version::V24));
             let want = base(16, 2).samples();
-            let plain = decode(&base(16, 2).build(), "no_extension").3.len();
-            assert_eq!(plain, want.len(), "no tag, no extension");
-            // Known symphonia 0.5.5 defect: it takes the SSND chunk length
-            // (which includes the 8-byte offset/blockSize header) as the sample
-            // byte count, so when another chunk follows SSND, 8 bytes of that
-            // chunk's header are decoded as audio (4 extra 16-bit samples, ~0.05 ms
-            // of noise at the very end). The real samples are intact.
+            // A chunk after SSND adds no samples: the length is exact.
             for name in ["no_extension", "t.aiff", "t.bin"] {
                 let got = decode(&b.build(), name).3;
-                assert_eq!(got.len(), want.len() + 4, "{name}");
-                let scale = 32_768.0;
+                assert_eq!(got.len(), want.len(), "{name}");
                 for (g, w) in got.iter().zip(&want) {
-                    assert_eq!(*g, *w as f32 / scale);
+                    assert_eq!(*g, *w as f32 / 32_768.0);
                 }
             }
+        }
+
+        #[test]
+        fn frame_count_and_duration_are_exact() {
+            // 12345 frames at 44.1 kHz is 279.9 ms: truncated like the symphonia path.
+            let b = AiffBuilder::new()
+                .bits(24)
+                .rate(44_100)
+                .frames(12_345)
+                .noise()
+                .aifc(Codec::Sowt)
+                .id3(audio_fixtures::testkit::id3::full_tag(
+                    audio_fixtures::testkit::id3::Id3Version::V23,
+                ));
+            let (rate, channels, duration, got) = decode(&b.build(), "t.aifc");
+            assert_eq!((rate, channels), (44_100, 2));
+            assert_eq!(duration, Some(279));
+            assert_eq!(got.len(), 2 * 12_345);
+        }
+
+        #[test]
+        fn a_truncated_file_plays_the_frames_it_has() {
+            let b = base(16, 2);
+            let bytes = b.build();
+            let want = b.samples();
+            for cut in [1usize, 2, 4, 5, 100, 10_000] {
+                let cut_bytes = &bytes[..bytes.len() - cut];
+                // identity stays strict: PcmHash refuses it
+                assert!(
+                    audio_hash::pcm_hash_reader(std::io::Cursor::new(cut_bytes)).is_err(),
+                    "strict {cut}"
+                );
+                let (_, _, duration, got) = decode(cut_bytes, "cut.aiff");
+                // whole frames only (a frame is 4 bytes)
+                let frames = (4 * 12_000 - cut) / 4;
+                assert_eq!(got.len(), 2 * frames, "cut {cut}");
+                assert_eq!(duration, Some(frames as u64 * 1000 / 48_000), "cut {cut}");
+                for (g, w) in got.iter().zip(&want) {
+                    assert_eq!(*g, *w as f32 / 32_768.0);
+                }
+            }
+        }
+
+        #[test]
+        fn extra_bytes_after_the_last_frame_are_not_played() {
+            use audio_fixtures::{aiff, be_chunk, be_samples, comm};
+            let b = base(16, 2);
+            let want = b.samples();
+            let mut payload = vec![0u8; 8]; // offset 0, blockSize 0
+            payload.extend(be_samples(&want, 2));
+            payload.extend([0x7f; 12]); // three stray frames after the declared 12000
+            let bytes = aiff(
+                b"AIFF",
+                &[comm(2, 12_000, 16, 48_000), be_chunk(b"SSND", &payload)],
+            );
+            assert!(audio_hash::pcm_hash_reader(std::io::Cursor::new(&bytes)).is_err());
+            let (_, _, duration, got) = decode(&bytes, "x.aiff");
+            assert_eq!(duration, Some(250));
+            assert_eq!(got.len(), want.len());
+            assert!(got.iter().all(|s| s.abs() <= 1.0));
+            for (g, w) in got.iter().zip(&want) {
+                assert_eq!(*g, *w as f32 / 32_768.0);
+            }
+        }
+
+        #[test]
+        fn a_failed_partial_read_is_retried_from_the_right_frame() {
+            let b = base(16, 2);
+            let bytes = b.build();
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("flaky.aiff");
+            std::fs::write(&path, &bytes).unwrap();
+            let layout =
+                audio_hash::aiff_pcm_layout_lenient(std::fs::File::open(&path).unwrap()).unwrap();
+            let mut stream = PcmStream::new(std::fs::File::open(&path).unwrap(), layout).unwrap();
+            let first = stream.next_samples().unwrap().unwrap();
+            assert_eq!(first.len(), 2 * PCM_CHUNK_FRAMES);
+            // the file shrinks mid-chunk: the second read fails after a partial read
+            std::fs::write(&path, &bytes[..bytes.len() - 20_000]).unwrap();
+            assert!(stream.next_samples().is_err());
+            // restored: the retry must reposition and return exactly the second chunk
+            std::fs::write(&path, &bytes).unwrap();
+            let second = stream.next_samples().unwrap().unwrap();
+            let want: Vec<f32> = b.samples()[2 * PCM_CHUNK_FRAMES..4 * PCM_CHUNK_FRAMES]
+                .iter()
+                .map(|s| *s as f32 / 32_768.0)
+                .collect();
+            assert_eq!(second, want);
+        }
+
+        #[test]
+        fn a_file_without_audio_chunks_is_an_error() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("none.aiff");
+            std::fs::write(&path, &base(16, 2).build()[..40]).unwrap();
+            assert!(AudioSource::new(&path).is_err());
         }
 
         #[test]
@@ -984,30 +1214,67 @@ mod tests {
         }
 
         #[test]
-        fn seeking_lands_on_the_right_frame() {
+        fn seeking_lands_on_exactly_the_target_frame() {
+            for (form, b) in integer_forms(base(24, 2)) {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("s.aiff");
+                std::fs::write(&path, b.build()).unwrap();
+                let source = AudioSource::new(&path).unwrap();
+                let all: Vec<f32> = b
+                    .samples()
+                    .iter()
+                    .map(|s| *s as f32 / 8_388_608.0)
+                    .collect();
+                for frame in [0usize, 1, 1023, 1024, 4095, 6_000, 11_999] {
+                    // interleaved sample position of a stereo file
+                    source.seek(2 * frame).unwrap();
+                    assert_eq!(source.current_position(), 2 * frame, "{form} {frame}");
+                    let mut got = Vec::new();
+                    loop {
+                        let segments = source.decode_next_frame().unwrap();
+                        if segments.is_empty() {
+                            break;
+                        }
+                        for s in segments {
+                            got.extend_from_slice(&s.segment.samples[..s.valid_samples]);
+                        }
+                    }
+                    // exactly the rest of the file, starting at the target frame
+                    assert_eq!(got, all[2 * frame..], "{form} frame {frame}");
+                    assert_eq!(source.current_position(), all.len(), "{form} {frame}");
+                }
+            }
+        }
+
+        #[test]
+        fn seeking_to_or_past_the_end_yields_nothing() {
             let b = base(16, 2);
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("s.aiff");
             std::fs::write(&path, b.build()).unwrap();
             let source = AudioSource::new(&path).unwrap();
-            let position = 2 * 6_000; // interleaved samples: frame 6000 of a stereo file
-            source.seek(position).unwrap();
+            for position in [2 * 12_000, 2 * 50_000] {
+                source.seek(position).unwrap();
+                assert!(source.decode_next_frame().unwrap().is_empty(), "{position}");
+                assert!(source.is_eof());
+            }
+            // and seeking back revives it
+            source.seek(2 * 11_999).unwrap();
             let segments = source.decode_next_frame().unwrap();
-            assert!(!segments.is_empty());
-            // The decoded audio is the file's own audio from a packet boundary at or
-            // before the target (an accurate seek lands on a packet start): find
-            // where the first samples sit in the builder's samples.
-            let all: Vec<f32> = b.samples().iter().map(|s| *s as f32 / 32_768.0).collect();
-            let got = &segments[0].segment.samples[..64];
-            let landed = all
-                .windows(64)
-                .position(|w| w == got)
-                .expect("the decoded samples are a slice of the file's audio");
-            assert!(landed <= position, "landed at {landed}, wanted {position}");
-            assert!(
-                position - landed < 2 * 4096,
-                "landed at {landed}, wanted {position}"
-            );
+            assert_eq!(segments[0].valid_samples, 2);
+        }
+
+        #[test]
+        fn segments_are_indexed_by_sample_position() {
+            let b = base(16, 2);
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("s.aiff");
+            std::fs::write(&path, b.build()).unwrap();
+            let source = AudioSource::new(&path).unwrap();
+            let first = source.decode_next_frame().unwrap();
+            assert_eq!(first[0].index, SegmentIndex::from_sample_position(0));
+            assert_eq!(first[0].index.next(), first[1].index);
+            assert_eq!(first[0].valid_samples, SEGMENT_SIZE);
         }
     }
 

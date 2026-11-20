@@ -13,8 +13,9 @@ use music_primitives::AudioHash;
 use sha2::{Digest, Sha256};
 
 pub use pcm::{
-    pcm_hash, pcm_hash_reader, pcm_info, pcm_info_reader, stream_info, stream_info_reader,
-    ByteOrder, PcmHashError, PcmInfo, SampleEncoding, Unsupported, FLAC_HASHABLE_BIT_DEPTHS,
+    aiff_pcm_layout, aiff_pcm_layout_lenient, pcm_hash, pcm_hash_reader, pcm_info, pcm_info_reader,
+    stream_info, stream_info_reader, AiffPcmLayout, ByteOrder, PcmHashError, PcmInfo,
+    SampleEncoding, Unsupported, FLAC_HASHABLE_BIT_DEPTHS,
 };
 
 mod aiff;

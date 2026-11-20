@@ -23,6 +23,16 @@ pub(crate) fn layout<R: Read + Seek>(
     r: &mut R,
     file_len: u64,
 ) -> Result<AiffLayout, AudioHashError> {
+    layout_with(r, file_len, false)
+}
+
+/// [`layout`]; with `clamp_truncated`, a chunk reaching past the end of the
+/// file ends at the end of the file (playback of a truncated download).
+pub(crate) fn layout_with<R: Read + Seek>(
+    r: &mut R,
+    file_len: u64,
+    clamp_truncated: bool,
+) -> Result<AiffLayout, AudioHashError> {
     if file_len < 12 {
         return Err(C.malformed("shorter than FORM header"));
     }
@@ -30,7 +40,16 @@ pub(crate) fn layout<R: Read + Seek>(
     if &head[0..4] != b"FORM" || !matches!(&head[8..12], b"AIFF" | b"AIFC") {
         return Err(C.malformed("not a FORM/AIFF file"));
     }
-    let [comm, ssnd] = iff::walk(r, file_len, C, Endian::Big, 12, [b"COMM", b"SSND"], None)?;
+    let [comm, ssnd] = iff::walk_with(
+        r,
+        file_len,
+        C,
+        Endian::Big,
+        12,
+        [b"COMM", b"SSND"],
+        None,
+        clamp_truncated,
+    )?;
     Ok(AiffLayout {
         is_aifc: &head[8..12] == b"AIFC",
         comm: comm.ok_or_else(|| C.malformed("missing COMM chunk"))?,
