@@ -1285,8 +1285,9 @@ pub struct ServiceStatus {
     #[serde(default)]
     pub unparseable_lines: usize,
     /// Inbox files the conversion worker holds (ADR-037): queued, being converted,
-    /// waiting to retry, or given up on. Absent on the wire from nodes that predate
-    /// it, which reads as none.
+    /// waiting to retry, or given up on, then the most recent it finished (`Done`,
+    /// newest first). Absent on the wire from nodes that predate it, which reads as
+    /// none.
     #[serde(default)]
     pub conversions: Vec<InboxConversion>,
 }
@@ -1311,11 +1312,28 @@ pub enum ConversionState {
     /// Retried to the limit. The file is still in the inbox; ingesting it again
     /// starts over.
     Failed { message: String },
+    /// Converted (or stored as it was, or found to be a duplicate): the file is gone
+    /// from the inbox and the track is `hash`. The service keeps the most recent of
+    /// these, so a client that asked for a conversion can learn how it ended.
+    Done {
+        hash: ContentHash,
+        #[serde(default)]
+        warnings: Vec<IngestWarning>,
+    },
+    /// A state a newer node reports that this client does not know.
+    #[serde(other)]
+    Unknown,
 }
 
 impl std::fmt::Display for ConversionState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Unknown => write!(f, "unknown state (upgrade the CLI)"),
+            Self::Done { warnings, .. } if warnings.is_empty() => write!(f, "done"),
+            Self::Done { warnings, .. } => {
+                let warnings: Vec<String> = warnings.iter().map(|w| w.to_string()).collect();
+                write!(f, "done, {}", warnings.join("; "))
+            }
             Self::Queued => write!(f, "queued for conversion"),
             Self::Converting => write!(f, "converting"),
             Self::Retrying {
@@ -3274,11 +3292,18 @@ mod tests {
                         message: "gave up".into(),
                     },
                 },
+                InboxConversion {
+                    path: InboxPath::new("e.aiff").unwrap(),
+                    state: ConversionState::Done {
+                        hash: ContentHash::new("sha256:abc"),
+                        warnings: vec![IngestWarning::StoredAsAiff { reason: "r".into() }],
+                    },
+                },
             ],
         };
         let json = serde_json::to_string(&status).unwrap();
         assert!(json.contains(
-            r#""conversions":[{"path":"a.aiff","state":{"state":"queued"}},{"path":"b.aiff","state":{"state":"converting"}},{"path":"c.aiff","state":{"state":"retrying","attempt":2,"last_error":"no flac"}},{"path":"d.aiff","state":{"state":"failed","message":"gave up"}}]"#
+            r#""conversions":[{"path":"a.aiff","state":{"state":"queued"}},{"path":"b.aiff","state":{"state":"converting"}},{"path":"c.aiff","state":{"state":"retrying","attempt":2,"last_error":"no flac"}},{"path":"d.aiff","state":{"state":"failed","message":"gave up"}},{"path":"e.aiff","state":{"state":"done","hash":"sha256:abc","warnings":[{"kind":"stored_as_aiff","reason":"r"}]}}]"#
         ), "{json}");
         let back: ServiceStatus = serde_json::from_str(&json).unwrap();
         assert_eq!(back.conversions, status.conversions);
@@ -3289,6 +3314,42 @@ mod tests {
         )
         .unwrap();
         assert!(old.conversions.is_empty());
+    }
+
+    #[test]
+    fn a_status_with_a_state_from_a_newer_node_still_decodes() {
+        let status: ServiceStatus = serde_json::from_str(
+            r#"{"version":"1","tracks_indexed":1,"facts_count":2,"inbox_queue_size":0,"uptime_seconds":3,
+                "conversions":[{"path":"a.aiff","state":{"state":"hashing","pct":4}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(status.conversions[0].state, ConversionState::Unknown);
+        assert_eq!(
+            ConversionState::Unknown.to_string(),
+            "unknown state (upgrade the CLI)"
+        );
+    }
+
+    #[test]
+    fn a_done_conversion_reads_without_warnings_and_shows_them() {
+        let done: ConversionState =
+            serde_json::from_str(r#"{"state":"done","hash":"sha256:abc"}"#).unwrap();
+        assert_eq!(
+            done,
+            ConversionState::Done {
+                hash: ContentHash::new("sha256:abc"),
+                warnings: Vec::new()
+            }
+        );
+        assert_eq!(done.to_string(), "done");
+        let warned = ConversionState::Done {
+            hash: ContentHash::new("sha256:abc"),
+            warnings: vec![IngestWarning::StoredAsAiff { reason: "r".into() }],
+        };
+        assert_eq!(
+            warned.to_string(),
+            "done, not converted to FLAC, stored as AIFF (r)"
+        );
     }
 
     #[test]

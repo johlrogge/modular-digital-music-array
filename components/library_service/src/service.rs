@@ -1363,18 +1363,25 @@ impl LibraryService {
         hash: &ContentHash,
         facts: &[(MusicValue, music_facts::FactSource)],
     ) -> Result<usize, acid_client::ClientError> {
-        let retracted = self.acid_client.retract_music_facts(hash, facts)?;
-        self.catch_up_after_write();
+        self.retract_and_project_with(&self.acid_client, hash, facts)
+    }
+
+    /// [`retract_and_project`](Self::retract_and_project) through an explicit ACID
+    /// client (see [`write_and_project_with`](Self::write_and_project_with)).
+    fn retract_and_project_with(
+        &self,
+        client: &AcidClient,
+        hash: &ContentHash,
+        facts: &[(MusicValue, music_facts::FactSource)],
+    ) -> Result<usize, acid_client::ClientError> {
+        let retracted = client.retract_music_facts(hash, facts)?;
+        self.catch_up_after_write_with(client);
         Ok(retracted)
     }
 
     /// `catch_up` for write paths: the ACID write already succeeded and is
     /// durable, so a failed read here only delays visibility until the
     /// subscriber's next catch-up. Log and carry on.
-    fn catch_up_after_write(&self) {
-        self.catch_up_after_write_with(&self.acid_client);
-    }
-
     fn catch_up_after_write_with(&self, client: &AcidClient) {
         if let Err(e) = self.catch_up_with(client) {
             tracing::warn!(error = %e, "catch_up after ACID write failed; subscriber will converge");
@@ -2014,12 +2021,12 @@ impl LibraryService {
     /// not reentrant. Production retires only through `merge_into`.
     fn retract_all_entity_facts_locked(
         &self,
+        client: &AcidClient,
         _gate: &RetireGuard<'_>,
         hash: &ContentHash,
     ) -> Result<usize, String> {
         // Read all fact lines for this entity from ACID
-        let lines = self
-            .acid_client
+        let lines = client
             .read_entity(hash.as_str())
             .map_err(|e| format!("Failed to read entity from ACID: {}", e))?;
 
@@ -2050,7 +2057,7 @@ impl LibraryService {
         // projection drops the entity, so resolve_hash returns TrackNotFound. This is
         // a hard delete: the old identity is gone, not hidden.
         let count = self
-            .retract_and_project(hash, &to_retract)
+            .retract_and_project_with(client, hash, &to_retract)
             .map_err(|e| format!("Failed to retract facts via ACID: {}", e))?;
 
         tracing::info!(
@@ -2095,7 +2102,7 @@ impl LibraryService {
             Err(message) => return LibraryResponse::Error(ProtocolError::Internal { message }),
         };
         let source = self.sources.user_default.clone();
-        match self.merge_into(&new_hash, &old_full, &source, carry) {
+        match self.merge_into(&self.acid_client, &new_hash, &old_full, &source, carry) {
             Ok(outcome) => LibraryResponse::TrackReplaced {
                 new_hash,
                 playlists_rewritten: outcome.playlists_rewritten,
@@ -2125,6 +2132,7 @@ impl LibraryService {
     /// of `Replaces(loser)`.
     fn merge_into(
         &self,
+        client: &AcidClient,
         winner: &ContentHash,
         loser: &ContentHash,
         source: &music_facts::FactSource,
@@ -2174,10 +2182,10 @@ impl LibraryService {
             let ancestors = self.ancestor_replaces(loser);
             let retired = self.retired_files(loser);
 
-            self.write_merge_facts(&gate, winner, loser, ancestors, source, carry)?;
+            self.write_merge_facts(client, &gate, winner, loser, ancestors, source, carry)?;
 
             // The crux: after this, resolve_hash(loser) -> TrackNotFound.
-            self.retract_all_entity_facts_locked(&gate, loser)
+            self.retract_all_entity_facts_locked(client, &gate, loser)
                 .map_err(|e| ProtocolError::Internal {
                     message: format!("Failed to retract old track facts: {}", e),
                 })?;
@@ -2186,7 +2194,7 @@ impl LibraryService {
 
         // Neither of these takes the gate (it is not reentrant), and neither needs it.
         let playlists_rewritten = self.rewrite_playlists_replace_hash(loser, winner);
-        self.refresh_lineage();
+        self.refresh_lineage_with(client);
 
         Ok(MergeOutcome {
             playlists_rewritten,
@@ -2200,8 +2208,10 @@ impl LibraryService {
     /// The winner never replaces itself (a revert A -> B -> A has A among B's
     /// ancestors), and a `Replaces` it already holds is not asserted again, so
     /// repeating a merge that crashed before its retire adds nothing twice.
+    #[allow(clippy::too_many_arguments)]
     fn write_merge_facts(
         &self,
+        client: &AcidClient,
         _gate: &RetireGuard<'_>,
         winner: &ContentHash,
         loser: &ContentHash,
@@ -2253,7 +2263,7 @@ impl LibraryService {
 
         // Read-your-writes (issue #44): the write is projected immediately, through
         // the same path the subscriber uses, so back-to-back replaces see each other.
-        self.write_and_project(winner, &facts)
+        self.write_and_project_with(client, winner, &facts)
             .map(|_| ())
             .map_err(|e| ProtocolError::Internal {
                 message: format!("Failed to assert Replaces facts: {}", e),
@@ -2275,7 +2285,15 @@ impl LibraryService {
             .map(|h| (h, source.clone()))
             .collect();
         let gate = self.retire_gate.lock().unwrap();
-        self.write_merge_facts(&gate, new_hash, old_full, ancestors, &source, Vec::new())
+        self.write_merge_facts(
+            &self.acid_client,
+            &gate,
+            new_hash,
+            old_full,
+            ancestors,
+            &source,
+            Vec::new(),
+        )
     }
 
     /// Whether `hash` is an indexed track (hidden ones included).
@@ -2690,6 +2708,12 @@ impl LibraryService {
     /// stream, so that what must not act on a stale lineage (the archiving of a cover)
     /// can tell; it must also have refreshed after the writes it depends on.
     fn refresh_lineage(&self) {
+        self.refresh_lineage_with(&self.acid_client);
+    }
+
+    /// [`refresh_lineage`](Self::refresh_lineage) reading through `client` (a thread
+    /// other than the request thread must use its own).
+    fn refresh_lineage_with(&self, client: &AcidClient) {
         const PAGE_SIZE: usize = 10_000;
 
         // Held for the whole refresh, like `cursor` in `catch_up_with`: concurrent
@@ -2702,10 +2726,7 @@ impl LibraryService {
         let mut caught_up = true;
 
         loop {
-            let chunk = match self
-                .acid_client
-                .read_stream(current_cursor.clone(), PAGE_SIZE)
-            {
+            let chunk = match client.read_stream(current_cursor.clone(), PAGE_SIZE) {
                 Ok(c) => c,
                 Err(e) => {
                     tracing::warn!(
@@ -10697,7 +10718,7 @@ mod tests {
     /// Hard-retire `h` the way production does: under `retire_gate`.
     pub(super) fn retire(s: &LibraryService, h: &ContentHash) -> Result<usize, String> {
         let gate = s.retire_gate.lock().unwrap();
-        s.retract_all_entity_facts_locked(&gate, h)
+        s.retract_all_entity_facts_locked(&s.acid_client, &gate, h)
     }
 
     /// Write a Title for `hash` to ACID and project it, creating the track.

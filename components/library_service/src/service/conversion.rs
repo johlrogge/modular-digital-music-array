@@ -33,6 +33,23 @@ const HEX_LEN: usize = 64;
 /// The sidecars of the queued jobs, under staging (the sweep leaves it alone: it
 /// removes files by name pattern only).
 const JOBS_DIR: &str = "jobs";
+/// How many finished jobs the status remembers, newest first. A count, not an age:
+/// the memory and the status stay bounded however fast files arrive, and nothing
+/// depends on a clock. 100 holds several large releases (an album is a few dozen
+/// files) for a client that polls while it waits.
+const RECENT_OUTCOMES: usize = 100;
+/// ... and none older than this: a status read a day later does not show the news of
+/// yesterday.
+const RECENT_OUTCOME_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// A job that ended stored: the file (gone from the inbox), the track, the warnings,
+/// and when.
+type Outcome = (
+    PathBuf,
+    ContentHash,
+    Vec<crate::ipc::IngestWarning>,
+    Instant,
+);
 
 /// What a queued job keeps across a restart: the request's own context.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -183,6 +200,8 @@ struct Queue {
     current: Option<PathBuf>,
     /// Given up on, with the last error.
     failed: Vec<(PathBuf, String)>,
+    /// The latest jobs that ended stored, newest first, at most `RECENT_OUTCOMES`.
+    done: VecDeque<Outcome>,
     /// Paths claimed by `try_reserve`, not queued yet.
     reserved: std::collections::HashSet<PathBuf>,
     shutdown: bool,
@@ -234,6 +253,8 @@ impl Conversions {
         let mut queue = self.lock();
         queue.reserved.remove(&job.path);
         queue.failed.retain(|(path, _)| *path != job.path);
+        // An earlier outcome of the same name is not this job's.
+        queue.done.retain(|(path, ..)| *path != job.path);
         let known = queue.current.as_ref() == Some(&job.path)
             || queue.pending.iter().any(|j| j.path == job.path);
         if !known {
@@ -274,6 +295,28 @@ impl Conversions {
 
     fn finish(&self) {
         self.lock().current = None;
+    }
+
+    /// The current job is in the library as `hash`: remember how it ended.
+    fn finish_done(
+        &self,
+        path: PathBuf,
+        hash: ContentHash,
+        warnings: Vec<crate::ipc::IngestWarning>,
+    ) {
+        let mut queue = self.lock();
+        queue.current = None;
+        queue
+            .done
+            .push_front((path, hash, warnings, Instant::now()));
+        queue.done.truncate(RECENT_OUTCOMES);
+    }
+
+    /// Forget the outcomes older than `RECENT_OUTCOME_AGE` at `now`.
+    fn expire_outcomes(&self, now: Instant) {
+        self.lock()
+            .done
+            .retain(|(.., at)| now.saturating_duration_since(*at) <= RECENT_OUTCOME_AGE);
     }
 
     /// The machine failed `job`: wait and try again, or give up at the limit.
@@ -333,8 +376,10 @@ impl Conversions {
     }
 
     /// Every file the worker holds, relative to the inbox: the one being converted,
-    /// then the others in order, then those given up on that are still there.
+    /// then the others in order, then those given up on that are still there, then
+    /// the recent ones that ended stored, newest first.
     pub(super) fn status(&self, inbox: &Path) -> Vec<InboxConversion> {
+        self.expire_outcomes(Instant::now());
         let queue = self.lock();
         let entry = |path: &Path, state: ConversionState| {
             let relative = path.strip_prefix(inbox).ok()?.to_str()?;
@@ -369,7 +414,18 @@ impl Conversions {
                     },
                 )
             });
-        current.chain(pending).chain(failed).collect()
+        // Done files are gone from the inbox, so unlike the failed they are not
+        // checked against it.
+        let done = queue.done.iter().filter_map(|(path, hash, warnings, _)| {
+            entry(
+                path,
+                ConversionState::Done {
+                    hash: hash.clone(),
+                    warnings: warnings.clone(),
+                },
+            )
+        });
+        current.chain(pending).chain(failed).chain(done).collect()
     }
 }
 
@@ -602,7 +658,8 @@ impl LibraryService {
             JobEnd::Stored { hash, warnings } => {
                 tracing::info!(file = path, hash = %hash.as_str(), ?warnings, "Conversion job done");
                 self.remove_job_context(&job.path);
-                self.conversions.finish();
+                self.conversions
+                    .finish_done(job.path, hash, wire_warnings(&warnings));
             }
             JobEnd::SourceGone => {
                 tracing::warn!(file = path, "Conversion job dropped: the file is gone");
@@ -639,12 +696,17 @@ impl LibraryService {
         if let Some(entity) = self.known_entity(&validated.content_hash) {
             let writer = job.writer.as_ref();
             let provenance = self.client_provenance(writer, &job.facts);
-            // No self-heal from the worker (phase 6b); the entity may have moved to
-            // a merge winner, which `ingest_duplicate` answers.
-            let (entity, _gained_item_id) =
+            let (entity, gained_item_id) =
                 self.ingest_duplicate(&client, validated, &entity, writer, provenance);
+            // As in `ingest_file_reporting`: a new ItemId may be the last piece the
+            // self-heal was waiting for. `ingest_duplicate` has let go of the gate.
+            let hash = if gained_item_id {
+                self.self_heal_after_ingest_with(&client, &entity)
+            } else {
+                entity
+            };
             return JobEnd::Stored {
-                hash: entity,
+                hash,
                 warnings: Vec::new(),
             };
         }
@@ -663,7 +725,10 @@ impl LibraryService {
                         warnings.push(IngestWarning::StoredAsAiff {
                             reason: refusal.to_string(),
                         });
-                        JobEnd::Stored { hash, warnings }
+                        JobEnd::Stored {
+                            hash: self.self_heal_after_ingest_with(&client, &hash),
+                            warnings,
+                        }
                     }
                     Err(e) => end_for_error(e),
                 }
@@ -744,8 +809,10 @@ impl LibraryService {
         };
 
         self.remove_converted_source(&job.path, &verified.source_content_hash);
+        // AudioHash and ItemId are durable together now: as in the IPC path, merge a
+        // re-download into its predecessor. It holds no lock of ours and never fails.
         JobEnd::Stored {
-            hash,
+            hash: self.self_heal_after_ingest_with(client, &hash),
             warnings: Vec::new(),
         }
     }
@@ -894,6 +961,55 @@ mod queue_tests {
         assert_eq!(c.status(inbox.path()).len(), 1);
         std::fs::remove_file(path).unwrap();
         assert_eq!(c.status(inbox.path()), vec![]);
+    }
+
+    #[test]
+    fn only_the_latest_outcomes_are_kept_newest_first() {
+        let inbox = tempfile::tempdir().unwrap();
+        let c = conversions(3);
+        for i in 0..RECENT_OUTCOMES + 5 {
+            c.finish_done(
+                inbox.path().join(format!("{i}.aiff")),
+                ContentHash::new(format!("sha256:{i}")),
+                Vec::new(),
+            );
+        }
+        let held = states(&c, inbox.path());
+        assert_eq!(held.len(), RECENT_OUTCOMES);
+        assert_eq!(held[0].0, format!("{}.aiff", RECENT_OUTCOMES + 4));
+        assert_eq!(held[RECENT_OUTCOMES - 1].0, "5.aiff");
+    }
+
+    #[test]
+    fn outcomes_older_than_a_day_are_forgotten() {
+        let inbox = tempfile::tempdir().unwrap();
+        let c = conversions(3);
+        c.finish_done(
+            inbox.path().join("a.aiff"),
+            ContentHash::new("sha256:1"),
+            Vec::new(),
+        );
+        let now = Instant::now();
+        c.expire_outcomes(now + RECENT_OUTCOME_AGE - Duration::from_secs(60));
+        assert_eq!(c.status(inbox.path()).len(), 1);
+        c.expire_outcomes(now + RECENT_OUTCOME_AGE + Duration::from_secs(60));
+        assert_eq!(c.status(inbox.path()), vec![]);
+    }
+
+    #[test]
+    fn ingesting_a_name_again_forgets_its_earlier_outcome() {
+        let inbox = tempfile::tempdir().unwrap();
+        let c = conversions(3);
+        c.finish_done(
+            inbox.path().join("a.aiff"),
+            ContentHash::new("sha256:1"),
+            Vec::new(),
+        );
+        c.enqueue(job(inbox.path(), "a.aiff"));
+        assert_eq!(
+            states(&c, inbox.path()),
+            [("a.aiff".to_string(), ConversionState::Queued)]
+        );
     }
 
     #[test]

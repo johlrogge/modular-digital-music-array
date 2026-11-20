@@ -634,6 +634,28 @@ mod tests {
     }
 
     #[test]
+    fn status_text_shows_how_the_recent_conversions_ended() {
+        use library_ipc_client::{
+            ContentHash, ConversionState, InboxConversion, InboxPath, IngestWarning,
+        };
+        let mut status = service_status(0);
+        status.conversions = vec![InboxConversion {
+            path: InboxPath::new("a.aiff").unwrap(),
+            state: ConversionState::Done {
+                hash: ContentHash::new("sha256:abc"),
+                warnings: vec![IngestWarning::StoredAsAiff { reason: "r".into() }],
+            },
+        }];
+        let text = format_status(&status);
+        assert!(
+            text.contains(
+                "Conversion:      a.aiff (done, not converted to FLAC, stored as AIFF (r))"
+            ),
+            "{text}"
+        );
+    }
+
+    #[test]
     fn status_text_omits_unparseable_lines_when_zero() {
         assert!(!format_status(&service_status(0)).contains("nparseable"));
     }

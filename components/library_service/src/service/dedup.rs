@@ -455,13 +455,24 @@ impl LibraryService {
     /// Returns the hash that is live afterwards: the winner if a merge happened,
     /// otherwise `new`.
     pub(super) fn self_heal_after_ingest(&self, new: &ContentHash) -> ContentHash {
+        self.self_heal_after_ingest_with(&self.acid_client, new)
+    }
+
+    /// [`self_heal_after_ingest`](Self::self_heal_after_ingest) through an explicit ACID
+    /// client: the conversion worker, which has its own, calls it. The caller must not
+    /// hold `retire_gate` (the merge takes it).
+    pub(super) fn self_heal_after_ingest_with(
+        &self,
+        client: &AcidClient,
+        new: &ContentHash,
+    ) -> ContentHash {
         let Some((winner, losers)) = self.self_heal_group(new) else {
             return new.clone();
         };
 
-        let mut report = self.merge_group(&winner, &losers);
+        let mut report = self.merge_group_with(client, &winner, &losers);
         if report.merged > 0 {
-            self.cleanup_merge_orphans(&mut report);
+            self.cleanup_merge_orphans(client, &mut report);
         }
         if report.errors.is_empty() {
             tracing::info!(
@@ -646,7 +657,7 @@ impl LibraryService {
             report.blobs_archived += merged.blobs_archived;
             report.errors.extend(merged.errors);
         }
-        self.cleanup_merge_orphans(&mut report);
+        self.cleanup_merge_orphans(&self.acid_client, &mut report);
 
         DedupScanReport {
             groups: self.scan_duplicate_groups(),
@@ -709,11 +720,22 @@ impl LibraryService {
         winner: &ContentHash,
         losers: &[ContentHash],
     ) -> DedupApplyReport {
+        self.merge_group_with(&self.acid_client, winner, losers)
+    }
+
+    /// [`merge_group`](Self::merge_group) through an explicit ACID client (see
+    /// `write_and_project_with`). The caller must not hold `retire_gate`.
+    pub(super) fn merge_group_with(
+        &self,
+        client: &AcidClient,
+        winner: &ContentHash,
+        losers: &[ContentHash],
+    ) -> DedupApplyReport {
         let mut report = DedupApplyReport::default();
 
         // Planned for the whole group up front and written with the first merge (see
         // `plan_carry`); later merges only add their `Replaces` links.
-        let mut carry = match self.plan_group_carry(winner, losers) {
+        let mut carry = match self.plan_group_carry_with(client, winner, losers) {
             Ok(c) => Some(c),
             Err(e) => {
                 report.errors.push(e);
@@ -723,7 +745,13 @@ impl LibraryService {
         let source = self.sources.dedup.clone();
 
         for loser in losers {
-            match self.merge_into(winner, loser, &source, carry.take().unwrap_or_default()) {
+            match self.merge_into(
+                client,
+                winner,
+                loser,
+                &source,
+                carry.take().unwrap_or_default(),
+            ) {
                 Ok(outcome) => {
                     report.merged += 1;
                     // The facts are retracted (and projected): now the files may be
@@ -745,8 +773,17 @@ impl LibraryService {
         winner: &ContentHash,
         losers: &[ContentHash],
     ) -> Result<Vec<(MusicValue, FactSource)>, String> {
+        self.plan_group_carry_with(&self.acid_client, winner, losers)
+    }
+
+    fn plan_group_carry_with(
+        &self,
+        client: &AcidClient,
+        winner: &ContentHash,
+        losers: &[ContentHash],
+    ) -> Result<Vec<(MusicValue, FactSource)>, String> {
         let read = |h: &ContentHash| {
-            self.acid_client
+            client
                 .read_entity(h.as_str())
                 .map(|lines| live_facts(&lines))
                 .map_err(|e| format!("Failed to read {h} from ACID: {e}"))
@@ -1112,9 +1149,9 @@ impl LibraryService {
     /// Archive the blob and cover art of every merge orphan. Idempotent, and it only
     /// ever touches hashes named by a live `Replaces` from `mdma-dedup`: other
     /// `NoLiveFacts` orphans (ADR-004 replace leftovers) are not its business.
-    pub(super) fn cleanup_merge_orphans(&self, report: &mut DedupApplyReport) {
+    pub(super) fn cleanup_merge_orphans(&self, client: &AcidClient, report: &mut DedupApplyReport) {
         // The covers an orphan's files may still be shown as are read from the lineage.
-        self.refresh_lineage();
+        self.refresh_lineage_with(client);
         for key in self.merge_orphan_candidates() {
             // Liveness is re-checked under the retire gate right before the files
             // move, so a track that came back since the candidate list was made
@@ -1125,8 +1162,8 @@ impl LibraryService {
     }
 
     /// Archive the files of `key` unless it came back to life. The gate serialises
-    /// against merges and the backfill. Ingest does not take it, so the check closes
-    /// all but a tiny window, which is recoverable: files are archived, not deleted.
+    /// against merges and the backfill. A new ingest (on the IPC thread or in the
+    /// conversion worker) does not take it, so the check closes all but a tiny window, which is recoverable: files are archived, not deleted.
     fn archive_orphan_files_if_still_gone(
         &self,
         gate: &super::RetireGuard<'_>,

@@ -1,5 +1,5 @@
 // Run with `deno test projects/mdma-console/tests-js/`. Kept out of static/, which is all served.
-import { barTarget, appendOps, editOutcome, insertedCount, addedAndSkipped, speakerRows, metaLine, bandcampSummary, restartPhase, RESTART_TIMEOUT_MS, uploadRows, ingestSummary, plural, packageRows, updatesSummary, consoleLast } from "../static/js/logic.js";
+import { barTarget, appendOps, editOutcome, insertedCount, addedAndSkipped, speakerRows, metaLine, bandcampSummary, restartPhase, RESTART_TIMEOUT_MS, uploadRows, ingestSummary, inboxFiles, isConverting, fileNote, doneRows, plural, packageRows, updatesSummary, consoleLast } from "../static/js/logic.js";
 
 function eq(actual, expected) {
   if (actual !== expected) throw new Error("expected " + expected + ", got " + actual);
@@ -113,6 +113,46 @@ Deno.test("ingest summary: counts ingested and failed, plural-aware", () => {
   eq(ingestSummary([{ success: true }]), "Ingested 1 file");
   eq(ingestSummary([]), "Nothing to ingest");
   eq(ingestSummary(null), "Nothing to ingest");
+});
+
+Deno.test("ingest summary: files still converting are counted apart from the ingested and the failed", () => {
+  const ok = { success: true, pending: false };
+  const converting = { success: true, pending: true };
+  eq(ingestSummary([ok, ok, converting, converting, converting, { success: false }]), "Ingested 2 files, converting 3, 1 failed");
+  eq(ingestSummary([converting]), "Ingested 0 files, converting 1");
+  eq(ingestSummary([ok, ok]), "Ingested 2 files");
+});
+
+Deno.test("inbox: the files are the answer's list, and anything else is none", () => {
+  eq(inboxFiles({ files: [{ path: "a.flac" }], done: [] }).length, 1);
+  eq(inboxFiles(null).length, 0);
+  eq(inboxFiles({}).length, 0);
+});
+
+Deno.test("inbox: the page polls only while a file is queued, converting or retrying", () => {
+  const files = (...states) => ({ files: states.map((state) => ({ path: "a", state })), done: [] });
+  for (const s of ["queued", "converting", "retrying"]) eq(isConverting(files("idle", s)), true);
+  eq(isConverting(files("idle", "failed")), false);
+  eq(isConverting(files()), false);
+  eq(isConverting(null), false);
+});
+
+Deno.test("inbox: a row says where the conversion of its file is, and nothing for a file the converter does not hold", () => {
+  eq(fileNote({ state: "queued" }), "Waiting to convert");
+  eq(fileNote({ state: "converting" }), "Converting to FLAC…");
+  eq(fileNote({ state: "retrying", attempt: 2, error: "no flac" }), "Retrying after attempt 2: no flac");
+  eq(fileNote({ state: "failed", error: "gave up" }), "Failed: gave up");
+  eq(fileNote({ state: "idle" }), "");
+});
+
+Deno.test("inbox: recent outcomes show their warnings, or that the file was added", () => {
+  const rows = doneRows({ files: [], done: [{ path: "a.aiff", warnings: ["not converted to FLAC, stored as AIFF (r)", "tags unreadable"] }, { path: "b.aiff", warnings: [] }] });
+  eq(JSON.stringify(rows), JSON.stringify([{ name: "a.aiff", text: "not converted to FLAC, stored as AIFF (r); tags unreadable" }, { name: "b.aiff", text: "Added to the library" }]));
+  // The row of a file stored as an AIFF says so, as the server words it.
+  const aiff = doneRows({ done: [{ path: "c.aiff", hash: "sha256:abc", warnings: ["not converted to FLAC, stored as AIFF (float or compressed)"] }] });
+  eq(aiff[0].text, "not converted to FLAC, stored as AIFF (float or compressed)");
+  eq(doneRows(null).length, 0);
+  eq(doneRows({ files: [] }).length, 0);
 });
 
 Deno.test("speakers: anything but a list is no devices", () => {

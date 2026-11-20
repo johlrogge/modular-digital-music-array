@@ -682,7 +682,15 @@ fn a_rerun_after_a_crash_before_the_retire_completes_without_duplicating_facts()
         .unwrap();
     let gate = service.retire_gate.lock().unwrap();
     service
-        .write_merge_facts(&gate, &new, &old, vec![], &test_sources().dedup, carry)
+        .write_merge_facts(
+            &service.acid_client,
+            &gate,
+            &new,
+            &old,
+            vec![],
+            &test_sources().dedup,
+            carry,
+        )
         .unwrap();
     drop(gate);
     // The loser is retired now: no group any more, but an unfinished merge to find.

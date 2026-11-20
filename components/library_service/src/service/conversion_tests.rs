@@ -136,6 +136,16 @@ fn tagged_aiff() -> Vec<u8> {
         .build()
 }
 
+/// The track a finished job for `name` ended in, once the status says it is done.
+fn done_hash(rig: &Rig, name: &str) -> Option<ContentHash> {
+    rig.conversions()
+        .into_iter()
+        .find_map(|(path, state)| match state {
+            ConversionState::Done { hash, .. } if path == name => Some(hash),
+            _ => None,
+        })
+}
+
 fn only_track(service: &LibraryService) -> IndexedTrackInfo {
     let tracks = service.tracks.lock().unwrap();
     assert_eq!(tracks.len(), 1);
@@ -217,9 +227,19 @@ fn a_verified_conversion_stores_the_flac_with_the_facts_of_the_aiff_and_removes_
         rig.service.known_entity(&hash_of(&bytes)),
         Some(track.content_hash.clone())
     );
-    // Nothing is left in staging, and nothing waits in the worker.
+    // Nothing is left in staging, and nothing waits in the worker: it only
+    // remembers how the job ended.
     assert_eq!(staged(&rig), Vec::<String>::new());
-    assert_eq!(rig.conversions(), vec![]);
+    assert_eq!(
+        rig.conversions(),
+        vec![(
+            "Whatever Name.aiff".to_string(),
+            ConversionState::Done {
+                hash: track.content_hash.clone(),
+                warnings: Vec::new()
+            }
+        )]
+    );
 }
 
 fn id3_title() -> String {
@@ -299,7 +319,8 @@ fn reingesting_a_converted_aiff_is_a_duplicate_through_the_encoded_from_index() 
         other => panic!("expected a duplicate, got {other:?}"),
     }
     assert!(!again.exists());
-    assert_eq!(rig.conversions(), vec![]);
+    // Only the first file's outcome: the duplicate was never queued.
+    assert_eq!(rig.conversions().len(), 1);
     assert_eq!(rig.service.tracks_count(), 1);
     assert_eq!(staged(&rig), Vec::<String>::new());
 }
@@ -363,7 +384,11 @@ fn an_aiff_in_the_inbox_at_startup_is_deduped_before_any_encode() {
     let again = rig.put("a.aiff", &bytes);
     let restarted = service_over(rig.music.path(), &rig.addrs, broken_flac());
     wait_for("the duplicate to be removed", || !again.exists());
-    assert_eq!(restarted.conversion_status(), vec![]);
+    // Nothing is held; at most the outcome of the clean-up itself is remembered.
+    assert!(restarted
+        .conversion_status()
+        .iter()
+        .all(|c| matches!(c.state, ConversionState::Done { .. })));
 }
 
 // --- refusal and environment -------------------------------------------------
@@ -416,6 +441,124 @@ fn a_refusal_ends_the_job_with_a_warning_naming_the_reason() {
         }
         other => panic!("{other:?}"),
     }
+}
+
+#[test]
+fn a_stored_as_aiff_outcome_is_remembered_with_its_warning() {
+    let rig = Rig::new(config());
+    let bytes = AiffBuilder::new().frames(3_002).aifc(Codec::Fl32).build();
+    rig.put("o.aiff", &bytes);
+    rig.ingest("o.aiff");
+    wait_for("the outcome", || done_hash(&rig, "o.aiff").is_some());
+    match rig.conversions().as_slice() {
+        [(path, ConversionState::Done { hash, warnings })] => {
+            assert_eq!(path, "o.aiff");
+            assert_eq!(*hash, hash_of(&bytes));
+            assert!(
+                matches!(warnings.as_slice(), [IngestWarning::StoredAsAiff { .. }]),
+                "{warnings:?}"
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+// --- self-heal ---------------------------------------------------------------------
+
+/// The same audio under another tag: another file, the same AudioHash.
+fn retagged_aiff(version: Id3Version) -> Vec<u8> {
+    AiffBuilder::new()
+        .frames(20_000)
+        .id3(id3::full_tag(version))
+        .build()
+}
+
+/// Bandcamp downloads a purchase again: the second copy of the same ItemId and audio
+/// merges into the first after its conversion, as a FLAC re-download does on ingest.
+#[test]
+fn a_redownloaded_aiff_with_the_same_item_id_merges_after_its_conversion() {
+    let rig = Rig::new(config());
+    let item = || vec![MusicValue::ItemId("p1".into())];
+
+    rig.put("a.aiff", &retagged_aiff(Id3Version::V23));
+    rig.ingest_with("a.aiff", item());
+    wait_for("the first conversion", || {
+        done_hash(&rig, "a.aiff").is_some()
+    });
+    let first = done_hash(&rig, "a.aiff").unwrap();
+
+    rig.put("b.aiff", &retagged_aiff(Id3Version::V24));
+    assert!(matches!(
+        rig.ingest_with("b.aiff", item()),
+        IngestResult::Pending { .. }
+    ));
+    wait_for("the second conversion", || {
+        done_hash(&rig, "b.aiff").is_some()
+    });
+    let second = done_hash(&rig, "b.aiff").unwrap();
+
+    // One live track: the newest copy, which holds the ItemId; the first is gone.
+    assert_ne!(first, second);
+    let track = only_track(&rig.service);
+    assert_eq!(track.content_hash, second);
+    assert_eq!(track.item_ids().collect::<Vec<_>>(), vec!["p1"]);
+    assert!(is_gone(&rig.service, &first));
+}
+
+/// The same, when the ItemId only arrives with a duplicate of the file's bytes: the
+/// worker's duplicate answer gained it, and that is the last piece the merge waited for.
+#[test]
+fn an_item_id_gained_by_a_duplicate_job_completes_the_merge() {
+    let rig = Rig::new(config());
+    let bytes_a = retagged_aiff(Id3Version::V23);
+    let bytes_b = retagged_aiff(Id3Version::V24);
+
+    // Two copies of the audio, the first with an ItemId already; the second (no
+    // ItemId, so no automatic merge) lands as another track.
+    rig.put("a.aiff", &bytes_a);
+    rig.ingest_with("a.aiff", vec![MusicValue::ItemId("p1".into())]);
+    wait_for("the first conversion", || {
+        done_hash(&rig, "a.aiff").is_some()
+    });
+    rig.put("b.aiff", &bytes_b);
+    rig.ingest("b.aiff");
+    wait_for("the second conversion", || {
+        done_hash(&rig, "b.aiff").is_some()
+    });
+    assert_eq!(rig.service.tracks_count(), 2);
+    let second = done_hash(&rig, "b.aiff").unwrap();
+
+    // The second file comes again, now with the ItemId: a duplicate (an `EncodedFrom`
+    // alias), the ItemId lands on its track, and the group merges.
+    rig.put("c.aiff", &bytes_b);
+    let again = rig.service.convert_job(&Job::new(
+        rig.inbox().join("c.aiff"),
+        Some(client()),
+        vec![MusicValue::ItemId("p1".into())],
+    ));
+    match again {
+        JobEnd::Stored { hash, .. } => assert_eq!(hash, second),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(rig.service.tracks_count(), 1);
+    assert_eq!(only_track(&rig.service).content_hash, second);
+}
+
+#[test]
+fn an_item_id_less_second_copy_is_not_merged() {
+    let rig = Rig::new(config());
+    rig.put("a.aiff", &retagged_aiff(Id3Version::V23));
+    rig.ingest("a.aiff");
+    wait_for("the first conversion", || {
+        done_hash(&rig, "a.aiff").is_some()
+    });
+    rig.put("b.aiff", &retagged_aiff(Id3Version::V24));
+    rig.ingest("b.aiff");
+    wait_for("the second conversion", || {
+        done_hash(&rig, "b.aiff").is_some()
+    });
+    // Without an ItemId the group needs a person's confirmation (as for FLAC).
+    assert_eq!(rig.service.tracks_count(), 2);
 }
 
 #[test]
@@ -513,7 +656,7 @@ fn a_source_changed_after_verification_is_kept() {
     let source = rig.put("k.aiff", &bytes);
     rig.ingest("k.aiff");
     wait_for("the conversion to be stored", || {
-        rig.service.tracks_count() == 1 && rig.conversions().is_empty()
+        rig.service.tracks_count() == 1 && done_hash(&rig, "k.aiff").is_some()
     });
 
     assert!(source.exists(), "the changed file is not removed");

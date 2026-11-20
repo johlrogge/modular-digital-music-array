@@ -2,10 +2,12 @@
 import { api, h, icon, plural, toast } from "./core.js";
 import { SETTINGS_LINK, pageHead } from "./collections.js";
 import { emptyNote, failReason, failedNote } from "./lists.js";
-import { ingestSummary, uploadRows } from "./logic.js";
+import { doneRows, fileNote, inboxFiles, ingestSummary, isConverting, uploadRows } from "./logic.js";
 
 const ACCEPT = ".flac,.mp3,.wav,.m4a,.zip";
 const MAX_ROWS = 200; // the inbox list shows this many; the rest is a count
+const POLL_MS = 2000; // how often the list is read again while a conversion runs
+const MAX_FAILS = 3; // failed polls in a row before the page says so and stops
 
 export function viewAddMusic(root) {
   pageHead(root, SETTINGS_LINK, "Add music");
@@ -20,34 +22,61 @@ export function viewAddMusic(root) {
   ]);
   const heading = (count) => head.replaceChildren(h("h2", {}, ["Inbox", count == null ? null : " ", count == null ? null : h("span", { class: "kicker", text: String(count).padStart(2, "0") })]));
   heading(null);
-  root.appendChild(h("div", { class: "settings-wrap" }, [uploadBox, h("div", { class: "section" }, [head, inbox])]));
+  // The button stays outside the list a poll redraws, so it keeps its focus.
+  root.appendChild(h("div", { class: "settings-wrap" }, [uploadBox, h("div", { class: "section" }, [head, inbox, h("div", { class: "btn-row", style: "margin-top:var(--s-4)" }, [ingest])])]));
   let gone = false;
   let loads = 0; // the newest loadInbox wins when an upload and an ingest overlap
+  let timer = null;
+  let polling = false; // a conversion is running, so the list is read again
+  let fails = 0; // quiet polls that failed in a row
 
-  async function loadInbox() {
+  // A poll waits while the tab is hidden; `visibilitychange` takes it up again.
+  const schedule = () => {
+    if (polling && !document.hidden) timer = setTimeout(() => loadInbox(true), POLL_MS);
+  };
+  const onVisible = () => {
+    if (polling && !document.hidden && !gone) loadInbox(true);
+  };
+  document.addEventListener("visibilitychange", onVisible);
+
+  // `quiet` is a poll: the list is redrawn in place, and a failed read is tried again, up to MAX_FAILS in a row.
+  async function loadInbox(quiet) {
     const mine = ++loads;
-    inbox.replaceChildren(h("div", { class: "empty", text: "Loading…" }));
-    ingest.disabled = true;
-    let paths;
+    clearTimeout(timer);
+    if (!quiet) {
+      fails = 0;
+      inbox.replaceChildren(h("div", { class: "empty", text: "Loading…" }));
+      ingest.disabled = true;
+    }
+    let data;
     try {
-      paths = await api("/api/inbox");
+      data = await api("/api/inbox");
     } catch (e) {
-      if (!gone && mine === loads) {
+      if (gone || mine !== loads) return;
+      if (quiet && ++fails < MAX_FAILS) schedule();
+      else {
+        polling = false;
         heading(null);
-        inbox.replaceChildren(...failedNote("Couldn't load the inbox", e, loadInbox));
+        inbox.replaceChildren(...failedNote("Couldn't load the inbox", e, () => loadInbox()));
       }
       return;
     }
     if (gone || mine !== loads) return;
-    heading(paths.length);
-    if (!paths.length) return inbox.replaceChildren(emptyNote("The inbox is empty", "Uploaded files wait here until they are ingested."));
-    ingest.disabled = false;
-    const row = (text) => h("div", { role: "listitem" }, [h("span", { class: "ico" }, [icon("upload")]), h("span", { class: "ttl", text })]);
+    fails = 0;
+    const files = inboxFiles(data);
+    const done = doneRows(data);
+    heading(files.length);
+    ingest.disabled = !files.length || ingest.hasAttribute("aria-busy"); // a poll must not undo the in-flight guard
+    const row = (icn, name, note) => h("div", { role: "listitem" }, [h("span", { class: "ico" }, [icon(icn)]), h("span", { class: "ttl" }, [name, note ? h("small", { text: note }) : null])]);
+    const list = (label, rows) => h("div", { class: "list", role: "list", "aria-label": label }, rows);
     inbox.replaceChildren(
-      h("div", { class: "list", role: "list", "aria-label": "Inbox" }, paths.slice(0, MAX_ROWS).map(row)),
-      paths.length > MAX_ROWS ? h("div", { class: "sub", text: "and " + (paths.length - MAX_ROWS) + " more" }) : null,
-      h("div", { class: "btn-row", style: "margin-top:var(--s-4)" }, [ingest]),
+      files.length ? list("Inbox", files.slice(0, MAX_ROWS).map((f) => row(f.state === "failed" ? "close" : "upload", f.path, fileNote(f)))) : emptyNote("The inbox is empty", "Uploaded files wait here until they are ingested."),
+      files.length > MAX_ROWS ? h("div", { class: "sub", text: "and " + (files.length - MAX_ROWS) + " more" }) : null,
+      done.length ? h("div", { class: "sub", text: "Recently ingested" }) : null,
+      done.length ? list("Recently ingested", done.map((d) => row("check", d.name, d.text))) : null,
     );
+    polling = isConverting(data);
+    schedule();
   }
 
   async function send() {
@@ -98,5 +127,7 @@ export function viewAddMusic(root) {
   loadInbox();
   return () => {
     gone = true;
+    clearTimeout(timer);
+    document.removeEventListener("visibilitychange", onVisible);
   };
 }

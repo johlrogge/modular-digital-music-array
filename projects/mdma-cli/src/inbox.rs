@@ -3,7 +3,7 @@ use crate::output::{library_error, success_unless};
 use color_eyre::eyre::eyre;
 use color_eyre::Result;
 use hicli::{Arg, Success};
-use library_ipc_client::{InboxConversion, InboxPath, InboxPathError};
+use library_ipc_client::{ConversionState, InboxConversion, InboxPath, InboxPathError};
 use std::str::FromStr;
 use track_formatter::short_hash;
 
@@ -25,30 +25,100 @@ impl FromStr for InboxFileArg {
 pub(crate) fn list(ctx: &Ctx) -> Result<()> {
     let library = ctx.node().library()?;
     let files = library.inbox_queue().map_err(library_error)?;
-    if files.is_empty() {
-        println!("Inbox is empty");
-        return Ok(());
-    }
 
     // What the conversion worker says of the files it holds (AIFF, ADR-037). A node
     // that cannot say is not an error: the list is still the list.
     let conversions = library.status().map(|s| s.conversions).unwrap_or_default();
+    // Finished files are gone from the inbox: they are listed apart.
+    let finished: Vec<&InboxConversion> = conversions.iter().filter(|c| is_done(c)).collect();
 
-    println!("Inbox queue ({} files):", files.len());
-    println!("{}", "=".repeat(65));
+    if files.is_empty() && finished.is_empty() {
+        println!("Inbox is empty");
+        return Ok(());
+    }
 
-    for file in files {
-        println!("{}", list_line(&file, &conversions));
+    if files.is_empty() {
+        println!("Inbox is empty");
+    } else {
+        println!("Inbox queue ({} files):", files.len());
+        println!("{}", "=".repeat(65));
+        for file in files {
+            println!("{}", list_line(&file, &conversions));
+        }
+    }
+    if !finished.is_empty() {
+        println!("Recently converted:");
+        for c in finished {
+            println!("  {}  [{}]", c.path.as_str(), c.state);
+        }
     }
     Ok(())
 }
 
+fn is_done(conversion: &InboxConversion) -> bool {
+    matches!(conversion.state, ConversionState::Done { .. })
+}
+
 /// One line of the inbox list: the file, and its conversion state if the worker
-/// holds it.
+/// holds it. (A finished one is not in the inbox: a file of its name there now is a
+/// different one.)
 fn list_line(file: &InboxPath, conversions: &[InboxConversion]) -> String {
-    match conversions.iter().find(|c| c.path == *file) {
+    match conversions.iter().find(|c| c.path == *file && !is_done(c)) {
         Some(c) => format!("  {}  [{}]", file.as_str(), c.state),
         None => format!("  {}", file.as_str()),
+    }
+}
+
+/// How often `ingest --wait` asks the worker.
+const POLL: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Where a file's conversion is, from the worker's status.
+#[derive(Debug, PartialEq, Eq)]
+enum Progress<'a> {
+    /// Queued, converting or waiting to retry (or in a state this client does not know).
+    Working,
+    /// Stored (`Done`) or given up on (`Failed`).
+    Ended(&'a ConversionState),
+    /// The worker does not hold it (a restart, or an outcome pushed out by newer ones).
+    Unknown,
+}
+
+fn progress<'a>(conversions: &'a [InboxConversion], file: &InboxPath) -> Progress<'a> {
+    match conversions.iter().find(|c| c.path == *file) {
+        Some(InboxConversion {
+            state: state @ (ConversionState::Done { .. } | ConversionState::Failed { .. }),
+            ..
+        }) => Progress::Ended(state),
+        Some(_) => Progress::Working,
+        None => Progress::Unknown,
+    }
+}
+
+/// Poll `conversions` (the worker's status) until the worker is done with `file`,
+/// and print how it ended.
+fn wait_for_conversion(
+    conversions: impl Fn() -> Result<Vec<InboxConversion>>,
+    file: &InboxPath,
+) -> Result<()> {
+    loop {
+        let conversions = conversions()?;
+        match progress(&conversions, file) {
+            Progress::Working => std::thread::sleep(POLL),
+            Progress::Ended(ConversionState::Done { hash, warnings }) => {
+                println!("Success: {}", hash.as_str());
+                for warning in warnings {
+                    println!("Warning: {}", warning);
+                }
+                return Ok(());
+            }
+            Progress::Ended(state) => return Err(eyre!("{}", state)),
+            Progress::Unknown => {
+                return Err(eyre!(
+                    "The library no longer reports {}; see `mdma inbox list`",
+                    file.as_str()
+                ))
+            }
+        }
     }
 }
 
@@ -73,9 +143,14 @@ fn ingest_failed(message: &str) -> color_eyre::Report {
     eyre!("Failed: {}", message)
 }
 
+/// Wait for a conversion in the background (an AIFF) to end, and show how it ended
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Arg)]
+#[arg(long = "wait")]
+pub(crate) struct Wait(pub bool);
+
 /// Ingest a specific file from inbox
 #[hicli::command]
-pub(crate) fn ingest(file: InboxFileArg, ctx: &Ctx) -> Result<()> {
+pub(crate) fn ingest(wait: Wait, file: InboxFileArg, ctx: &Ctx) -> Result<()> {
     let library = ctx.node().library()?;
     let InboxFileArg(path) = file;
 
@@ -97,7 +172,15 @@ pub(crate) fn ingest(file: InboxFileArg, ctx: &Ctx) -> Result<()> {
                 println!("Warning: {}", warning);
             }
         }
-        IngestResult::Pending { message } => println!("Pending: {}", message),
+        IngestResult::Pending { message } => {
+            println!("Pending: {}", message);
+            if wait.0 {
+                wait_for_conversion(
+                    || Ok(library.status().map_err(library_error)?.conversions),
+                    &path,
+                )?;
+            }
+        }
         IngestResult::Failure { message } => return Err(ingest_failed(&message)),
     }
     Ok(())
@@ -199,6 +282,68 @@ mod tests {
             list_line(&InboxPath::new("b.mp3").unwrap(), &[held]),
             "  b.mp3"
         );
+    }
+
+    #[test]
+    fn a_finished_conversion_is_not_the_state_of_a_file_in_the_inbox() {
+        use super::list_line;
+        use library_ipc_client::{ConversionState, InboxConversion};
+        let done = InboxConversion {
+            path: InboxPath::new("a.aiff").unwrap(),
+            state: ConversionState::Done {
+                hash: library_ipc_client::ContentHash::new("sha256:abc"),
+                warnings: Vec::new(),
+            },
+        };
+        assert_eq!(
+            list_line(&InboxPath::new("a.aiff").unwrap(), &[done]),
+            "  a.aiff"
+        );
+    }
+
+    #[test]
+    fn wait_follows_the_workers_status_to_an_end() {
+        use super::{progress, Progress};
+        use library_ipc_client::{ContentHash, ConversionState, InboxConversion};
+        let file = InboxPath::new("a.aiff").unwrap();
+        let held = |state| {
+            vec![InboxConversion {
+                path: file.clone(),
+                state,
+            }]
+        };
+        for working in [
+            ConversionState::Queued,
+            ConversionState::Converting,
+            ConversionState::Retrying {
+                attempt: 1,
+                last_error: "no flac".into(),
+            },
+            // Decoded from a newer node's status: keep polling.
+            serde_json::from_str(r#"{"state":"hashing"}"#).unwrap(),
+        ] {
+            assert_eq!(progress(&held(working), &file), Progress::Working);
+        }
+        let done = ConversionState::Done {
+            hash: ContentHash::new("sha256:abc"),
+            warnings: Vec::new(),
+        };
+        let failed = ConversionState::Failed {
+            message: "gave up".into(),
+        };
+        assert_eq!(progress(&held(done.clone()), &file), Progress::Ended(&done));
+        assert_eq!(
+            progress(&held(failed.clone()), &file),
+            Progress::Ended(&failed)
+        );
+        assert_eq!(progress(&[], &file), Progress::Unknown);
+    }
+
+    #[test]
+    fn ingest_takes_a_wait_switch() {
+        assert!(parse(&["inbox", "ingest", "--wait", "a.aiff"]).is_ok());
+        assert!(parse(&["inbox", "ingest", "a.aiff", "--wait"]).is_ok());
+        assert!(parse(&["inbox", "ingest", "a.aiff"]).is_ok());
     }
 
     #[test]
