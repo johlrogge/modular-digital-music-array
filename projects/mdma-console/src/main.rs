@@ -1450,18 +1450,13 @@ async fn export_track(
     // This is blocking CPU/IO work so we run it in spawn_blocking.
     let transcode_format = req_format.to_transcoder_format();
 
-    // Read the source sample rate so the transcoder can downsample to
-    // ≤ 48 kHz when exporting AIFF/WAV for CDJ playback.
-    let source_sample_rate = audio_metadata::extract_metadata(&blob_path)
-        .ok()
-        .and_then(|m| m.sample_rate);
-
     let metadata = audio_transcoder::ExportMetadata {
         title: track.title.clone(),
         artist: track.artist.clone(),
         album: track.album.clone(),
         bpm: track.bpm.map(|b| b.as_f32() as f64),
-        key: track.key.map(|k| k.to_traditional_sharp()),
+        // Short form (`Abm`, `C`): fits the ID3v2 TKEY frame's three characters.
+        key: track.key.map(|k| k.to_short_flat()),
     };
 
     let transcode_result = tokio::task::spawn_blocking(move || {
@@ -1470,12 +1465,22 @@ async fn export_track(
             .suffix(ext_suffix)
             .tempfile()
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
+        // Describe the source so the transcoder can downsample for CDJs, keep
+        // 16-bit sources 16-bit and trim AAC padding. Unreadable metadata means
+        // an unknown source: exported as-is.
+        let source_meta = audio_metadata::extract_metadata(&blob_path).ok();
+        let source = audio_transcoder::SourceAudio {
+            ext: source_ext,
+            sample_rate: source_meta.as_ref().and_then(|m| m.sample_rate),
+            bit_depth: source_meta.as_ref().and_then(|m| m.bit_depth),
+            duration: source_meta.as_ref().and_then(|m| m.duration),
+        };
         audio_transcoder::transcode(
             &blob_path,
             tmp.path(),
             &transcode_format,
             &metadata,
-            source_sample_rate,
+            &source,
         )
         .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
         std::fs::read(tmp.path())

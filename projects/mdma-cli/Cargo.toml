@@ -25,6 +25,7 @@ node-discovery = { workspace = true }
 serde = { workspace = true }
 serde_json = "1.0"
 private-file = { workspace = true }
+audio-metadata = { path = "../../components/audio_metadata" }
 audio-transcoder = { path = "../../components/audio_transcoder" }
 library-ipc-client = { path = "../../components/library_ipc_client" }
 library-search = { path = "../../components/library_search" }
