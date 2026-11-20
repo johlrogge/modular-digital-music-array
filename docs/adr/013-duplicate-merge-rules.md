@@ -115,6 +115,10 @@ Archiving is product behaviour. It is unrelated to operator rules about `/music`
 
 ADR-003 (entity key, soft delete) · ADR-004 (hard replace, `Replaces`, redeploy-together) · ADR-010 (AudioHash v1; release context) · ADR-011 (read-your-writes after each merge write) · ADR-012 (PcmHash v1) · issue #55 (tiered track identity)
 
+## Amendment 2026-11-20: `EncodedFrom` is united on merge
+
+`EncodedFrom` (ADR-037, the ContentHash of the source file a blob losslessly rebuilds) joins the multi-valued attributes that a merge unites, with StyleDescriptor, cue points, Bookmarked and ItemId. The winner then still recognises every source file converted into any member as a duplicate at ingest (`library_projection::track_encoded_from`). It is not file-derived: it names the sources, not the winner's file.
+
 ## Amendment 2026-11-17 (Joakim decided): the cover follows the `Replaces` chain
 
 If there was a cover and the recent file has none, aggregation follows the replacement chain.

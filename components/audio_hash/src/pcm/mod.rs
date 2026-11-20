@@ -138,6 +138,16 @@ pub struct PcmInfo {
     pub encoding: SampleEncoding,
 }
 
+impl PcmInfo {
+    /// `frames / sample_rate`, truncated to a nanosecond. Zero when the container
+    /// does not state the frame count (FLAC without total samples). A zero rate
+    /// counts as 1 Hz, so this never divides by zero.
+    pub fn duration(&self) -> std::time::Duration {
+        let nanos = u128::from(self.frames) * 1_000_000_000 / u128::from(self.sample_rate.max(1));
+        std::time::Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX))
+    }
+}
+
 /// The stream properties of the AIFF or FLAC file at `path`.
 pub fn pcm_info(path: &Path) -> Result<PcmInfo, PcmHashError> {
     pcm_info_reader(File::open(path)?)
@@ -438,6 +448,31 @@ impl PcmHasher {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn info(frames: u64, sample_rate: u32) -> PcmInfo {
+        PcmInfo {
+            container: Container::Aiff,
+            channels: 2,
+            sample_rate,
+            frames,
+            bits_per_sample: 16,
+            encoding: SampleEncoding::Pcm {
+                order: ByteOrder::Big,
+            },
+        }
+    }
+
+    #[test]
+    fn duration_is_frames_over_rate() {
+        use std::time::Duration;
+        assert_eq!(info(44_100, 44_100).duration(), Duration::from_secs(1));
+        assert_eq!(info(22_050, 44_100).duration(), Duration::from_millis(500));
+        // 1 frame at 44.1 kHz is 22675.736... ns, truncated
+        assert_eq!(info(1, 44_100).duration(), Duration::from_nanos(22_675));
+        assert_eq!(info(0, 44_100).duration(), Duration::ZERO);
+        assert_eq!(info(5, 0).duration(), Duration::from_secs(5));
+    }
+
     use crate::fixtures::*;
     use pretty_assertions::assert_eq;
     use std::io::Cursor;

@@ -732,8 +732,14 @@ dependencies = [
 name = "audio-transcoder"
 version = "0.10.1"
 dependencies = [
+ "audio-fixtures",
+ "audio-hash",
+ "audio-metadata",
+ "lossless-encoder",
+ "music-primitives",
  "pretty_assertions",
  "rstest",
+ "tempfile",
  "thiserror 1.0.69",
  "tracing",
 ]

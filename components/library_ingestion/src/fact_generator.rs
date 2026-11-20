@@ -113,9 +113,9 @@ pub fn generate_facts_tolerant(
 }
 
 /// What `COMM` states, in the shape the file facts are made from. The duration is
-/// `frames / rate`, truncated to a millisecond like lofty's.
+/// `frames / rate` (`PcmInfo::duration`); the duration facts truncate it to a
+/// millisecond like lofty's.
 fn metadata_from_stream_info(path: &Path, info: &audio_hash::PcmInfo) -> TrackMetadata {
-    let millis = u128::from(info.frames) * 1000 / u128::from(info.sample_rate.max(1));
     TrackMetadata {
         artist: None,
         album: None,
@@ -123,7 +123,7 @@ fn metadata_from_stream_info(path: &Path, info: &audio_hash::PcmInfo) -> TrackMe
         album_artist: None,
         track_number: None,
         disc_number: None,
-        duration: Some(std::time::Duration::from_millis(millis as u64)),
+        duration: Some(info.duration()),
         sample_rate: Some(info.sample_rate),
         channels: Some(u16::from(info.channels)),
         bit_depth: Some(info.bits_per_sample),

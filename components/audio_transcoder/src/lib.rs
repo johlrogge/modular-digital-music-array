@@ -1,4 +1,10 @@
 mod ffmpeg;
+mod source;
+
+pub use source::{canonical_ext, describe_source, ExportSource};
+
+#[cfg(test)]
+mod export_roundtrip_tests;
 
 use std::path::Path;
 

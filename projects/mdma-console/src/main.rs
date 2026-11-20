@@ -1354,60 +1354,7 @@ struct ExportPlan {
     serve_directly: bool,
 }
 
-/// The canonical file extension of a format: `aif` is `aiff`.
-fn canonical_ext(ext: &str) -> &str {
-    if ext == "aif" {
-        "aiff"
-    } else {
-        ext
-    }
-}
-
-/// What the export of a blob to a converted format needs to know about it. Built
-/// only for converted formats: `original` reads nothing from the file.
-#[derive(Debug, Default)]
-struct ExportSource {
-    /// Extension (lowercase), rate and depth as the transcoder sees them.
-    audio: audio_transcoder::SourceAudio,
-    /// The samples are plain PCM (a plain AIFF, a WAV), not AIFF-C or a codec.
-    plain_pcm: bool,
-}
-
-/// Describe the blob at `path` (blocking file reads). Unreadable properties are
-/// unknown, which the transcoder and the export decision treat conservatively.
-///
-/// An AIFF blob is read once with `audio_hash::stream_info` (rate, depth and
-/// encoding from COMM, validated; its tags may be unreadable); everything else
-/// from its tags.
-fn describe_source(path: &std::path::Path, ext: &str) -> ExportSource {
-    if canonical_ext(ext) == "aiff" {
-        if let Ok(info) = audio_hash::stream_info(path) {
-            let micros = u128::from(info.frames) * 1_000_000 / u128::from(info.sample_rate.max(1));
-            return ExportSource {
-                audio: audio_transcoder::SourceAudio {
-                    ext: ext.to_string(),
-                    sample_rate: Some(info.sample_rate),
-                    bit_depth: Some(info.bits_per_sample),
-                    duration: Some(std::time::Duration::from_micros(micros as u64)),
-                },
-                plain_pcm: matches!(info.encoding, audio_hash::SampleEncoding::Pcm { .. }),
-            };
-        }
-    }
-    let meta = audio_metadata::extract_metadata(path).ok();
-    ExportSource {
-        audio: audio_transcoder::SourceAudio {
-            ext: ext.to_string(),
-            sample_rate: meta.as_ref().and_then(|m| m.sample_rate),
-            bit_depth: meta.as_ref().and_then(|m| m.bit_depth),
-            duration: meta.as_ref().and_then(|m| m.duration),
-        },
-        // A WAV is PCM unless it is float, which lofty reports as 32 bits and the
-        // export-ready rule then refuses. An AIFF whose COMM could not be read is
-        // not known to be plain.
-        plain_pcm: canonical_ext(ext) == "wav",
-    }
-}
+use audio_transcoder::{canonical_ext, describe_source, ExportSource};
 
 /// Decide the export of a blob with extension `source_ext` as `req_format`.
 /// `source` is `None` for `original` (nothing was read from the file) and

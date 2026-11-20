@@ -362,6 +362,12 @@ music_value_enum! {
     /// (hard delete) so the old identity is gone from search/list/get_track.
     Replaces(crate::primitives::ContentHash),
 
+    /// This track's blob losslessly rebuilds the file with this ContentHash (the
+    /// source AIFF of a FLAC conversion, ADR-037). Multi-valued: a track holds one
+    /// per source after merges (united, ADR-013). Lets ingest recognise the source
+    /// again as a duplicate without decoding it.
+    EncodedFrom(crate::primitives::ContentHash),
+
     /// Track soft-deleted: hidden from default views, file/blob retained, recoverable.
     Deleted { timestamp: DateTime<Utc> },
 }
@@ -451,6 +457,7 @@ impl MusicValue {
         "AddedAt",
         "Bookmarked",
         "Replaces",
+        "EncodedFrom",
         "Deleted",
         "Role",
         "Energy",
@@ -504,6 +511,7 @@ impl MusicValue {
             MusicValue::AddedAt(_) => "AddedAt",
             MusicValue::Bookmarked { .. } => "Bookmarked",
             MusicValue::Replaces(_) => "Replaces",
+            MusicValue::EncodedFrom(_) => "EncodedFrom",
             MusicValue::Deleted { .. } => "Deleted",
             MusicValue::Role(_) => "Role",
             MusicValue::Energy(_) => "Energy",
@@ -612,6 +620,7 @@ impl fmt::Display for MusicValue {
                 None => write!(f, "Bookmarked at {timestamp}"),
             },
             MusicValue::Replaces(old_hash) => write!(f, "Replaces({})", old_hash.as_str()),
+            MusicValue::EncodedFrom(source) => write!(f, "{}", source.as_str()),
             MusicValue::Deleted { timestamp } => write!(f, "Deleted at {}", timestamp),
             MusicValue::Role(r) => write!(f, "{}", r),
             MusicValue::Energy(e) => write!(f, "{}", e),
@@ -700,6 +709,7 @@ mod tests {
             | MusicValue::AddedAt(_)
             | MusicValue::Bookmarked { .. }
             | MusicValue::Replaces(_)
+            | MusicValue::EncodedFrom(_)
             | MusicValue::Deleted { .. } => {}
         }
     }
@@ -767,6 +777,7 @@ mod tests {
                 timestamp: now,
             },
             MusicValue::Replaces(crate::primitives::ContentHash::new("sha256:a")),
+            MusicValue::EncodedFrom(crate::primitives::ContentHash::new("sha256:b")),
             MusicValue::Deleted { timestamp: now },
         ]
     }
@@ -1263,6 +1274,24 @@ mod tests {
         let val = MusicValue::PcmHash(h.clone());
         assert_eq!(val.display_name(), "PcmHash");
         assert_eq!(val.to_string(), h.as_str());
+    }
+
+    #[test]
+    fn encoded_from_golden_wire_format() {
+        use crate::primitives::ContentHash;
+        let val = MusicValue::EncodedFrom(ContentHash::new("sha256:abcdef"));
+        let json = r#"{"t":"EncodedFrom","v":"sha256:abcdef"}"#;
+        assert_eq!(serde_json::to_string(&val).unwrap(), json);
+        assert_eq!(serde_json::from_str::<MusicValue>(json).unwrap(), val);
+        assert_fact_value_format!(val);
+    }
+
+    #[test]
+    fn encoded_from_display_and_name() {
+        use crate::primitives::ContentHash;
+        let val = MusicValue::EncodedFrom(ContentHash::new("sha256:abc123"));
+        assert_eq!(val.display_name(), "EncodedFrom");
+        assert_eq!(val.to_string(), "sha256:abc123");
     }
 
     #[test]

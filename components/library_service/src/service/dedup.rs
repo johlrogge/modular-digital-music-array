@@ -103,9 +103,13 @@ fn carry_rule(v: &MusicValue) -> CarryRule {
         V::AddedAt(_) => CarryRule::AddedAt,
         // Every purchase the group stands for stays known to the source: a source's
         // `has_facts("ItemId")` must not report a retired copy's purchase as new.
-        V::StyleDescriptor(_) | V::MemoryCue { .. } | V::Bookmarked { .. } | V::ItemId(_) => {
-            CarryRule::Union
-        }
+        // `EncodedFrom` is united for the same reason (ADR-037): the winner must still
+        // recognise every source file that was converted into any member as a duplicate.
+        V::StyleDescriptor(_)
+        | V::MemoryCue { .. }
+        | V::Bookmarked { .. }
+        | V::ItemId(_)
+        | V::EncodedFrom(_) => CarryRule::Union,
         V::Title(_)
         | V::Artist(_)
         | V::Album(_)

@@ -12,9 +12,15 @@ license = "MIT"
 interface = "audio-transcoder"
 
 [dependencies]
+audio-hash = { workspace = true }
+audio-metadata = { workspace = true }
 thiserror = "1.0"
 tracing = "0.1"
 
 [dev-dependencies]
+audio-fixtures = { workspace = true }
+lossless-encoder = { workspace = true }
+music-primitives = { workspace = true }
+tempfile = { workspace = true }
 pretty_assertions = "1"
 rstest = "0.26"
