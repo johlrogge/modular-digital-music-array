@@ -2695,10 +2695,10 @@ impl LibraryService {
     ) -> IngestResult {
         let path = self.resolve_inbox_path(inbox_path);
 
-        match self.ingest_file_internal(&path, writer, facts) {
-            Ok(hash) => IngestResult::Success {
+        match self.ingest_file_reporting(&path, writer, facts) {
+            Ok((hash, warnings)) => IngestResult::Success {
                 hash: Some(hash),
-                message: "File ingested successfully".to_string(),
+                message: ingest_success_message(&warnings),
             },
             Err(e) => IngestResult::Failure {
                 message: e.to_string(),
@@ -2752,6 +2752,18 @@ impl LibraryService {
         writer: Option<&music_facts::FactSource>,
         facts: &[MusicValue],
     ) -> Result<ContentHash, ServiceError> {
+        self.ingest_file_reporting(path, writer, facts)
+            .map(|(hash, _warnings)| hash)
+    }
+
+    /// [`Self::ingest_file_internal`], with the warnings for the ingest result: what
+    /// the ingest went on without (the tags of an AIFF blob that could not be read).
+    fn ingest_file_reporting(
+        &self,
+        path: &PathBuf,
+        writer: Option<&music_facts::FactSource>,
+        facts: &[MusicValue],
+    ) -> Result<(ContentHash, Vec<library_ingestion::IngestWarning>), ServiceError> {
         if !path.exists() {
             return Err(ServiceError::Io(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
@@ -2857,17 +2869,18 @@ impl LibraryService {
                     );
                     // A new ItemId may be the last piece the self-heal was waiting for.
                     if gained_item_id {
-                        return Ok(self.self_heal_after_ingest(&content_hash));
+                        return Ok((self.self_heal_after_ingest(&content_hash), Vec::new()));
                     }
                 }
             }
 
-            return Ok(content_hash);
+            return Ok((content_hash, Vec::new()));
         }
 
         // Stage 3: Extract metadata
         let extracted = validated.extract_metadata(&scan_source, &content_source)?;
         let mut facts = extracted.facts.clone();
+        let warnings = extracted.warnings.clone();
 
         // Stage 4: Import to blob storage
         let indexed = extracted.import(&self.music_dir)?;
@@ -2902,7 +2915,18 @@ impl LibraryService {
         self.write_and_project(&content_hash, &facts)?;
 
         // AudioHash and ItemId are durable together now. Never fails the ingest.
-        Ok(self.self_heal_after_ingest(&content_hash))
+        Ok((self.self_heal_after_ingest(&content_hash), warnings))
+    }
+}
+
+/// The message of a successful ingest, with the warnings the ingest went on
+/// with. A `Success` message is free text, so no protocol change (ADR-004).
+fn ingest_success_message(warnings: &[library_ingestion::IngestWarning]) -> String {
+    if warnings.is_empty() {
+        "File ingested successfully".to_string()
+    } else {
+        let texts: Vec<String> = warnings.iter().map(ToString::to_string).collect();
+        format!("File ingested with warnings: {}", texts.join("; "))
     }
 }
 
@@ -5381,6 +5405,25 @@ mod tests {
             source: None,
         });
         assert!(matches!(resp, LibraryResponse::FactRetracted), "{resp:?}");
+    }
+
+    #[test]
+    fn ingest_message_carries_the_warnings() {
+        use library_ingestion::IngestWarning;
+        assert_eq!(ingest_success_message(&[]), "File ingested successfully");
+        let warnings = [
+            IngestWarning::TagsUnreadable {
+                detail: "no SSND".into(),
+            },
+            IngestWarning::TagsUnreadable {
+                detail: "other".into(),
+            },
+        ];
+        assert_eq!(
+            ingest_success_message(&warnings),
+            "File ingested with warnings: tags unreadable, stored without them (no SSND); \
+             tags unreadable, stored without them (other)"
+        );
     }
 
     /// Facts without a writer have no source to state them: the ingest is refused.

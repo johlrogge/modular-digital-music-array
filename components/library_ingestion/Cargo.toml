@@ -20,6 +20,8 @@ chrono = "0.4"
 music-facts = { workspace = true }
 music-primitives = { workspace = true }
 audio-metadata = { workspace = true }
+# Stream properties of an AIFF whose tags lofty cannot read (ADR-037).
+audio-hash = { workspace = true }
 
 # Hashing
 sha2 = { workspace = true }

@@ -146,7 +146,7 @@ Estimates only; P1 adds an ignored timing test and P5 measures on a Pi.
 - The beatgrid editor gets data: native resolution is one request of about 360 KB per track, and the overview needs one small request.
 - Waveforms are comparable by eye because the scale is absolute; quiet tracks look quiet.
 - A retag never triggers a recompute. Changed audio leaves orphans until the next explicit run's GC.
-- **Tracks without a waveform:** tracks whose AudioHash failed (for example some M4A/MP4 layouts `audio_hash` rejects with `UnsupportedContainer`), and tracks whose rate is unknown (§7). AIFF is not ingestible as of this ADR; ADR-037 converts AIFF to FLAC on ingest, so converted tracks get waveforms. Any AIFF stored as AIFF under ADR-037 needs AudioHash AIFF support to get one.
+- **Tracks without a waveform:** tracks whose AudioHash failed (for example some M4A/MP4 layouts `audio_hash` rejects with `UnsupportedContainer`), and tracks whose rate is unknown (§7). AIFF is not ingestible as of this ADR; ADR-037 converts AIFF to FLAC on ingest, so converted tracks get waveforms. An AIFF stored as AIFF under ADR-037 gets an AudioHash too, since AudioHash v1 supports AIFF and AIFF-C (ADR-010, amended 2026-11-20), and so a waveform, provided the decoder can play it (symphonia 0.5.5 takes AIFF-C `twos` and `sowt` at 16 bits only; see ADR-037).
 - About 270 KB per 6 minutes on `/music`, rebuildable by a backfill.
 - Gateway, library and console deploy together (ADR-004). The CLI is upgraded with the node, as usual.
 

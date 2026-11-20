@@ -23,7 +23,7 @@ Accepted, 2026-11-20 (Joakim decided). Not yet implemented.
 - **Today's identity support:**
   - PcmHash covers AIFF and AIFF-C `NONE`/`twos`/`sowt`, integer PCM, 1 or 2 channels (`audio_hash/src/pcm/aiff.rs`).
   - PcmHash on FLAC uses claxon. It refuses 32-bit and the depths that need FLAC bps code 000.
-  - AudioHash v1 does not support AIFF (`audio_hash/src/lib.rs`).
+  - AudioHash v1 did not support AIFF. Phase 4 added it (ADR-010, amended 2026-11-20).
 
 ## Decision
 
@@ -110,10 +110,18 @@ Accepted, 2026-11-20 (Joakim decided). Not yet implemented.
 1. **Generated fixtures:** the in-memory `AiffBuilder` of the `audio-fixtures` component (`components/audio_fixtures`), no files and no regen script.
 2. **Refactor:** split `generate_facts` into `tag_facts` / `file_facts` / `name_facts`, with no behaviour change.
 3. **The verified encoder:** `encode_aiff_to_flac(src, staging) -> Result<Verified, Refusal>`. Its acceptance also compares the FLAC's picture count and types with the AIFF's APIC frames.
-4. **AIFF blob support:**
-   - AudioHash v1 AIFF rules;
-   - symphonia AIFF playback;
-   - export pass-through.
+4. **AIFF blob support** (done 2026-11-20):
+   - AudioHash v1 AIFF rules (ADR-010 amendment);
+   - symphonia AIFF playback (the `aiff` feature was already on in `audio-decoder`; now tested);
+   - export pass-through (`export_plan` in the console, tested);
+   - ingest tolerates unreadable tags: `generate_facts_tolerant` gives file facts (stream properties from `COMM` via `audio_hash::stream_info`, any compression) and name facts plus a typed `IngestWarning`, shown as text in the `IngestResult::Success` message (no protocol change; a typed field comes with phase 6). `HasAlbumArt` is left out, as unknown. Only AIFF is tolerated (widening it to other formats would change their behaviour and is a separate decision); if `COMM` is unreadable too the ingest still fails;
+   - export: `format=original` always passes through; `format=aiff` serves an AIFF blob directly only when it is plain AIFF (not AIFF-C) within the export limits (rate ≤ 48 kHz, depth ≤ 24, the transcoder's rule), otherwise it transcodes.
+
+   **Known limits of symphonia 0.5.5** (found in phase 4; no fix here, a symphonia upgrade or patch is a separate change):
+   - AIFF-C `twos` and `sowt` play at 16 bits only (`NONE` at 8, 16, 24, 32), and plain AIFF only at 8, 16, 24, 32 bits (not 12 or 20), so an AIFF blob outside these returns a decode error at playback. Block-aligned `SSND` (non-zero `offset` or `blockSize`) is unsupported too.
+   - It takes the `SSND` chunk length, which includes the 8-byte header, as the sample byte count. When another chunk follows `SSND` (typically `ID3 `), the first 8 bytes of that chunk are decoded as audio: 4 extra 16-bit samples (about 0.1 ms of noise) at the very end of the track, and the reported length is that much too long. The real samples are intact. The audio-decoder test pins this.
+
+4b. **AIFF integer-PCM playback through `audio_hash`'s PCM layout** (fixes symphonia 0.5.5's 16-bit-only `twos`/`sowt` and its SSND-length tail). Our own decode path for integer AIFF and AIFF-C `NONE`/`twos`/`sowt`, using the layout PcmHash already reads. **Phase 8 is gated on 4b**: AIFF is not made ingestible until blobs play correctly.
 5. **`MusicValue::EncodedFrom`,** with a golden wire test.
 6. **The library service:** the conversion worker, staging, crash order, `EncodedFrom` in the dedup set, PcmHash at ingest, and the pending state in the protocol.
 7. **An export round-trip test.**

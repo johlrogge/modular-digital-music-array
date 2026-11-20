@@ -13,8 +13,8 @@ use music_primitives::AudioHash;
 use sha2::{Digest, Sha256};
 
 pub use pcm::{
-    pcm_hash, pcm_hash_reader, pcm_info, pcm_info_reader, PcmHashError, PcmInfo, Unsupported,
-    FLAC_HASHABLE_BIT_DEPTHS,
+    pcm_hash, pcm_hash_reader, pcm_info, pcm_info_reader, stream_info, stream_info_reader,
+    ByteOrder, PcmHashError, PcmInfo, SampleEncoding, Unsupported, FLAC_HASHABLE_BIT_DEPTHS,
 };
 
 mod aiff;
@@ -39,7 +39,7 @@ pub enum Container {
     Mp3,
     Wav,
     Mp4,
-    /// Recognised by sniffing only; AudioHash v1 does not support it.
+    /// AIFF and AIFF-C (ADR-010 note, 2026-11-20).
     Aiff,
 }
 
@@ -94,7 +94,7 @@ pub fn audio_hash_reader<R: Read + Seek>(mut r: R) -> Result<AudioHash, AudioHas
             vec![l.fmt, l.data]
         }
         Container::Mp4 => mp4::layout(&mut r, file_len)?,
-        Container::Aiff => return Err(AudioHashError::UnsupportedContainer),
+        Container::Aiff => aiff::hash_ranges(&mut r, file_len)?,
     };
     hash_ranges(&mut r, container, &ranges)
 }
@@ -210,12 +210,12 @@ mod tests {
     }
 
     #[test]
-    fn aiff_is_unsupported_through_public_api() {
+    fn aiff_without_chunks_is_malformed_through_public_api() {
         let mut aiff = b"FORM\0\0\0\x04AIFF".to_vec();
         aiff.extend([0u8; 64]);
         assert!(matches!(
             audio_hash_reader(Cursor::new(aiff)),
-            Err(AudioHashError::UnsupportedContainer)
+            Err(AudioHashError::Malformed { .. })
         ));
     }
 
@@ -241,6 +241,9 @@ mod tests {
         "audio-sha256-v1:59168282d97863fe19a2798e1b34feb99f88f6e93b63edfcdb85311dc2b9a70f";
     const GOLDEN_MP4: &str =
         "audio-sha256-v1:74c2aa21653be59c02bd6f2b3a88e2d8e6a64d9af6af28b12d8c5bfbf7d5e20a";
+
+    const GOLDEN_AIFF: &str =
+        "audio-sha256-v1:605f17d3e74497a329c3529fb8c2d04a7f7a3578139b1c9ec701ecd3d300a73d";
 
     // Golden inputs are spelled out byte by byte on purpose: they must not
     // depend on `fixtures`, whose builders may change.
@@ -279,6 +282,26 @@ mod tests {
         v
     }
 
+    fn golden_aiff() -> Vec<u8> {
+        let mut v = b"FORM".to_vec();
+        v.extend(70u32.to_be_bytes()); // "AIFF" + COMM (26) + ANNO (16) + SSND (24)
+        v.extend(b"AIFF");
+        v.extend(b"COMM");
+        v.extend(18u32.to_be_bytes());
+        v.extend(1u16.to_be_bytes()); // channels
+        v.extend(4u32.to_be_bytes()); // frames
+        v.extend(16u16.to_be_bytes()); // sample size
+        v.extend([0x40, 0x0E, 0xAC, 0x44, 0, 0, 0, 0, 0, 0]); // 44100 Hz, 80-bit extended
+        v.extend(b"ANNO");
+        v.extend(7u32.to_be_bytes());
+        v.extend(b"ignored\0"); // odd length, with its pad byte
+        v.extend(b"SSND");
+        v.extend(16u32.to_be_bytes());
+        v.extend([0u8; 8]); // offset, blockSize
+        v.extend([0, 1, 0, 2, 0, 3, 0, 4]);
+        v
+    }
+
     fn golden_mp4() -> Vec<u8> {
         let mut v = 24u32.to_be_bytes().to_vec();
         v.extend(b"ftypM4A \0\0\0\0M4A isom");
@@ -297,6 +320,7 @@ mod tests {
         assert_eq!(hash_of(&golden_mp3()).as_str(), GOLDEN_MP3);
         assert_eq!(hash_of(&golden_wav()).as_str(), GOLDEN_WAV);
         assert_eq!(hash_of(&golden_mp4()).as_str(), GOLDEN_MP4);
+        assert_eq!(hash_of(&golden_aiff()).as_str(), GOLDEN_AIFF);
     }
 
     // Hand-built ADR-010 preimage:
@@ -326,6 +350,18 @@ mod tests {
         let want = spec_hash(b"mp4\0", &[b"mdat-payload-one", b"two"]);
         assert_eq!(hash_of(&golden_mp4()).as_str(), want);
         assert_eq!(want, GOLDEN_MP4);
+    }
+
+    #[test]
+    fn preimage_matches_adr_for_aiff() {
+        let b = golden_aiff();
+        // the COMM payload, then the SSND samples (not the offset/blockSize header)
+        let comm_payload = &b[20..38];
+        let samples = &b[b.len() - 8..];
+        assert_eq!(comm_payload.len(), 18);
+        let want = spec_hash(b"aif\0", &[comm_payload, samples]);
+        assert_eq!(hash_of(&b).as_str(), want);
+        assert_eq!(want, GOLDEN_AIFF);
     }
 
     #[test]

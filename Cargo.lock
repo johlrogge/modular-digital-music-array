@@ -655,12 +655,14 @@ name = "audio-decoder"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "audio-fixtures",
  "audio-types",
  "criterion",
  "hound",
  "parking_lot",
  "pretty_assertions",
  "symphonia",
+ "tempfile",
  "thiserror 1.0.69",
  "tracing",
 ]
@@ -5651,6 +5653,7 @@ name = "library-ingestion"
 version = "0.1.0"
 dependencies = [
  "audio-fixtures",
+ "audio-hash",
  "audio-metadata",
  "chrono",
  "hex",
@@ -6231,6 +6234,7 @@ dependencies = [
  "admin-ipc-protocol",
  "askama",
  "async-stream",
+ "audio-hash",
  "audio-metadata",
  "audio-transcoder",
  "axum",

@@ -52,6 +52,20 @@ pub(crate) fn padded_source_end(source_ext: &str, duration: Option<Duration>) ->
 }
 
 impl SourceAudio {
+    /// Whether a PCM source already is what an AIFF/WAV export would produce, so
+    /// that the file can be served as it is: the rate and depth are known, the rate
+    /// is within the CDJ limit (no downsample, [`cdj_target_rate`]) and the depth is
+    /// one the export keeps (exactly 16 or 24 bits: [`pcm_bit_depth`] widens or
+    /// narrows every other). Unknown properties count as not ready.
+    pub fn is_pcm_export_ready(&self) -> bool {
+        let rate_ok = self
+            .sample_rate
+            .is_some_and(|hz| cdj_target_rate(hz).is_none());
+        // the export keeps exactly 16 and 24 bits and changes every other depth
+        let depth_ok = self.bit_depth.is_some_and(|d| pcm_bit_depth(Some(d)) == d);
+        rate_ok && depth_ok
+    }
+
     /// The rate AIFF/WAV exports are downsampled to, when the source exceeds the
     /// CDJ limit. FLAC is never resampled.
     pub(crate) fn cdj_downsample_rate(&self, format: &ExportFormat) -> Option<u32> {
@@ -346,6 +360,28 @@ mod tests {
     #[case(Some(32), 24)]
     fn pcm_bit_depth_rule(#[case] source: Option<u8>, #[case] expected: u8) {
         assert_eq!(pcm_bit_depth(source), expected);
+    }
+
+    #[rstest]
+    #[case(Some(44_100), Some(16), true)]
+    #[case(Some(48_000), Some(24), true)]
+    #[case(Some(96_000), Some(24), false)]
+    #[case(Some(44_100), Some(32), false)]
+    #[case(Some(44_100), Some(8), false)]
+    #[case(Some(44_100), Some(20), false)]
+    #[case(None, Some(16), false)]
+    #[case(Some(44_100), None, false)]
+    fn pcm_export_ready_rule(
+        #[case] rate: Option<u32>,
+        #[case] depth: Option<u8>,
+        #[case] expected: bool,
+    ) {
+        let source = SourceAudio {
+            sample_rate: rate,
+            bit_depth: depth,
+            ..Default::default()
+        };
+        assert_eq!(source.is_pcm_export_ready(), expected);
     }
 
     #[rstest]

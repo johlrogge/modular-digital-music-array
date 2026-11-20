@@ -36,6 +36,24 @@ pub enum IngestError {
     Io(#[from] std::io::Error),
 }
 
+/// Something an ingest went on without (ADR-037). Shown in the ingest result; the
+/// protocol carries it as message text until it has a typed field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IngestWarning {
+    /// The file's tags could not be read; it is stored without tag facts.
+    TagsUnreadable { detail: String },
+}
+
+impl std::fmt::Display for IngestWarning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TagsUnreadable { detail } => {
+                write!(f, "tags unreadable, stored without them ({detail})")
+            }
+        }
+    }
+}
+
 /// Supported audio formats
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AudioFormat {
@@ -149,14 +167,19 @@ impl ValidatedAudio {
         content: &FactSource,
     ) -> Result<ExtractedTrack, IngestError> {
         // Only read metadata, not audio data
-        let facts =
-            crate::fact_generator::generate_facts(&self.path, self.format, library, content)?;
+        let generated = crate::fact_generator::generate_facts_tolerant(
+            &self.path,
+            self.format,
+            library,
+            content,
+        )?;
 
         Ok(ExtractedTrack {
             path: self.path,
             format: self.format,
             content_hash: self.content_hash,
-            facts,
+            facts: generated.facts,
+            warnings: generated.warnings,
         })
     }
 }
@@ -171,6 +194,9 @@ pub struct ExtractedTrack {
     pub format: AudioFormat,
     pub content_hash: ContentHash,
     pub facts: Vec<(MusicValue, FactSource)>,
+    /// What the ingest went on without (unreadable tags of an AIFF blob); shown in
+    /// the ingest result.
+    pub warnings: Vec<IngestWarning>,
 }
 
 impl ExtractedTrack {
@@ -335,6 +361,44 @@ mod tests {
     #[case("ogg", None)]
     fn audio_format_from_extension(#[case] ext: &str, #[case] expected: Option<AudioFormat>) {
         assert_eq!(AudioFormat::from_extension(ext), expected);
+    }
+
+    /// An AIFF the encoder refuses is stored as an AIFF blob even when its tags
+    /// cannot be read (ADR-037). AIFF is not ingestible yet, so the stages are built
+    /// by hand instead of through `InboxFile::validate`.
+    #[test]
+    fn aiff_with_unreadable_tags_extracts_and_imports_with_a_warning() {
+        use audio_fixtures::testkit::{comt_payload, id3, AiffBuilder};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("01 - Yagya - Empty Streets.aiff");
+        let bytes = AiffBuilder::new()
+            .frames(4_410)
+            .chunk(b"COMT", comt_payload())
+            .id3(id3::full_tag(id3::Id3Version::V24))
+            .build();
+        std::fs::write(&path, &bytes).unwrap();
+        let validated = ValidatedAudio {
+            content_hash: compute_hash(&path).unwrap(),
+            path: path.clone(),
+            format: AudioFormat::Aiff,
+        };
+        let library = FactSource::new("mdma-library", "test", "FilesystemScan");
+        let content = FactSource::new("a-client", "test", "Client");
+
+        let extracted = validated.extract_metadata(&library, &content).unwrap();
+        assert!(matches!(
+            extracted.warnings.as_slice(),
+            [IngestWarning::TagsUnreadable { .. }]
+        ));
+        assert!(extracted
+            .facts
+            .iter()
+            .any(|(v, _)| matches!(v, MusicValue::Title(t) if t.as_str() == "Empty Streets")));
+
+        let music = dir.path().join("music");
+        let indexed = extracted.import(&music).unwrap();
+        assert_eq!(std::fs::read(&indexed.blob_path).unwrap(), bytes);
+        assert_eq!(indexed.blob_path.extension().unwrap(), "aiff");
     }
 
     #[test]

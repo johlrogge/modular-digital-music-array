@@ -95,6 +95,9 @@ fn aiff_info_reports_comm(#[case] bits: u16, #[case] channels: u16) {
             sample_rate: 48_000,
             frames: 1234,
             bits_per_sample: bits as u8,
+            encoding: super::SampleEncoding::Pcm {
+                order: super::ByteOrder::Big
+            },
         }
     );
 }

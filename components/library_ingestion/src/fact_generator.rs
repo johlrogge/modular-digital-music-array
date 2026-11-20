@@ -10,7 +10,7 @@ use music_primitives::{Bpm, Key};
 use std::collections::HashMap;
 use std::path::Path;
 
-use crate::pipeline::{AudioFormat, IngestError};
+use crate::pipeline::{AudioFormat, IngestError, IngestWarning};
 
 impl From<AudioFormat> for MusicFormat {
     fn from(fmt: AudioFormat) -> Self {
@@ -36,10 +36,107 @@ pub fn generate_facts(
     content: &FactSource,
 ) -> Result<Vec<(MusicValue, FactSource)>, IngestError> {
     let (metadata, all_fields) = read_metadata(path)?;
+    Ok(compose(&metadata, &all_fields, format, library, content))
+}
+
+fn compose(
+    metadata: &TrackMetadata,
+    all_fields: &HashMap<String, String>,
+    format: AudioFormat,
+    library: &FactSource,
+    content: &FactSource,
+) -> Vec<(MusicValue, FactSource)> {
+    let mut facts = file_facts_from_metadata(metadata, format, library);
+    facts.extend(tag_facts_from_metadata(metadata, all_fields, content));
+    facts.extend(name_facts_from_metadata(metadata, content));
+    facts
+}
+
+/// The facts of a file and the warnings raised while reading it.
+#[derive(Debug)]
+pub struct GeneratedFacts {
+    pub facts: Vec<(MusicValue, FactSource)>,
+    /// Things the ingest went on without, for the ingest result (ADR-037).
+    pub warnings: Vec<IngestWarning>,
+}
+
+/// [`generate_facts`], except that an AIFF whose *tags* cannot be read is not a
+/// failure (ADR-037): such a file is stored as an AIFF blob, and no AIFF is left
+/// behind in the inbox.
+///
+/// Only the tag read may fail, and only for AIFF. The tolerance is deliberately
+/// not for other formats: widening it (to FLAC, say) would change what an
+/// unreadable FLAC does today (fail the ingest), which is a product decision, not
+/// part of the AIFF blob fallback.
+///
+/// lofty reads tags and stream properties in one pass, so when it fails the stream
+/// properties come from the file's own `COMM` chunk instead
+/// ([`audio_hash::stream_info`]: what COMM declares, under any compression, float
+/// included). If even that cannot be read (a corrupt file) the original error
+/// stands: the audio properties are never guessed. The result then has the file
+/// facts and the name facts (from the file name, as no tag states a title or an
+/// artist), no tag facts, no `HasAlbumArt` (unknown, as the tags cannot be read),
+/// and a warning.
+pub fn generate_facts_tolerant(
+    path: &Path,
+    format: AudioFormat,
+    library: &FactSource,
+    content: &FactSource,
+) -> Result<GeneratedFacts, IngestError> {
+    let tag_error = match read_metadata(path) {
+        Ok((metadata, all_fields)) => {
+            return Ok(GeneratedFacts {
+                facts: compose(&metadata, &all_fields, format, library, content),
+                warnings: Vec::new(),
+            })
+        }
+        Err(e) if format == AudioFormat::Aiff => e,
+        Err(e) => return Err(e),
+    };
+    let detail = match &tag_error {
+        IngestError::MetadataError(m) => m.clone(),
+        other => other.to_string(),
+    };
+    let info =
+        audio_hash::stream_info(path).map_err(|_| IngestError::MetadataError(detail.clone()))?;
+    let metadata = metadata_from_stream_info(path, &info);
     let mut facts = file_facts_from_metadata(&metadata, format, library);
-    facts.extend(tag_facts_from_metadata(&metadata, &all_fields, content));
+    // The tags could not be read, so whether there is album art is unknown, not "no".
+    facts.retain(|(v, _)| !matches!(v, MusicValue::HasAlbumArt(_)));
     facts.extend(name_facts_from_metadata(&metadata, content));
-    Ok(facts)
+    let warning = IngestWarning::TagsUnreadable { detail };
+    tracing::warn!(path = %path.display(), %warning, "ingesting without tags");
+    Ok(GeneratedFacts {
+        facts,
+        warnings: vec![warning],
+    })
+}
+
+/// What `COMM` states, in the shape the file facts are made from. The duration is
+/// `frames / rate`, truncated to a millisecond like lofty's.
+fn metadata_from_stream_info(path: &Path, info: &audio_hash::PcmInfo) -> TrackMetadata {
+    let millis = u128::from(info.frames) * 1000 / u128::from(info.sample_rate.max(1));
+    TrackMetadata {
+        artist: None,
+        album: None,
+        title: None,
+        album_artist: None,
+        track_number: None,
+        disc_number: None,
+        duration: Some(std::time::Duration::from_millis(millis as u64)),
+        sample_rate: Some(info.sample_rate),
+        channels: Some(u16::from(info.channels)),
+        bit_depth: Some(info.bits_per_sample),
+        bitrate: None,
+        bpm: None,
+        key: None,
+        genre: None,
+        year: None,
+        comment: None,
+        file_path: path.to_path_buf(),
+        file_size_bytes: std::fs::metadata(path).ok().map(|m| m.len()),
+        has_picture: false,
+    }
 }
 
 /// The facts the file's tags state (title, artist, genre, BPM, key, ...), all
@@ -725,6 +822,170 @@ mod tests {
             debug_sorted(&without_import_time(facts)),
             debug_sorted(&expected)
         );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Unreadable tags of an AIFF blob (ADR-037 phase 4)
+    // ---------------------------------------------------------------------------
+
+    /// An AIFF whose odd-length `COMT` chunk makes lofty 0.18 lose its place.
+    fn odd_comt_aiff(
+        dir: &tempfile::TempDir,
+        name: &str,
+        builder: AiffBuilder,
+    ) -> std::path::PathBuf {
+        let path = dir.path().join(name);
+        let bytes = builder
+            .chunk(b"COMT", audio_fixtures::testkit::comt_payload())
+            .id3(id3::full_tag(Id3Version::V24))
+            .build();
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    #[test]
+    fn an_aiff_with_unreadable_tags_gets_file_and_name_facts_and_a_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = odd_comt_aiff(
+            &dir,
+            "01 - Yagya - Empty Streets.aiff",
+            AiffBuilder::new().frames(44_100),
+        );
+        let (library, content) = sources();
+        // the strict path still fails: this is what lofty cannot read
+        assert!(matches!(
+            generate_facts(&path, AudioFormat::Aiff, &library, &content),
+            Err(IngestError::MetadataError(_))
+        ));
+
+        let got = generate_facts_tolerant(&path, AudioFormat::Aiff, &library, &content).unwrap();
+        assert!(matches!(
+            got.warnings.as_slice(),
+            [IngestWarning::TagsUnreadable { .. }]
+        ));
+        // the album art is unknown, not absent
+        assert!(!got
+            .facts
+            .iter()
+            .any(|(v, _)| matches!(v, MusicValue::HasAlbumArt(_))));
+
+        let facts = without_import_time(got.facts);
+        let values: Vec<&MusicValue> = facts.iter().map(|(v, _)| v).collect();
+        // the file facts, from COMM, in the library source
+        for want in [
+            MusicValue::FilePath(path.clone()),
+            MusicValue::Format(MusicFormat::Aiff),
+            MusicValue::BitDepth(BitDepth::new(16)),
+            MusicValue::Channels(Channels::new(2)),
+            MusicValue::SampleRate(SampleRate::new(44_100)),
+            MusicValue::DurationSeconds(DurationSeconds::new(1)),
+            MusicValue::DurationMs(DurationMs::new(1000)),
+            MusicValue::FileSizeBytes(FileSizeBytes::new(std::fs::metadata(&path).unwrap().len())),
+        ] {
+            let (_, source) = facts
+                .iter()
+                .find(|(v, _)| *v == want)
+                .unwrap_or_else(|| panic!("{want:?} missing in {values:?}"));
+            assert_eq!(source, &library, "{want:?}");
+        }
+        // the name facts, from the original file name, in the content source
+        assert!(has_title(&facts, "Empty Streets"));
+        assert!(has_artist(&facts, "Yagya"));
+        assert!(has_track_number(&facts, 1));
+        for (v, source) in &facts {
+            if matches!(
+                v,
+                MusicValue::Title(_) | MusicValue::Artist(_) | MusicValue::TrackNumber(_)
+            ) {
+                assert_eq!(source, &content, "{v:?}");
+            }
+        }
+        // and nothing the tags would have stated
+        assert!(!values.iter().any(|v| matches!(
+            v,
+            MusicValue::Album(_) | MusicValue::Bpm(_) | MusicValue::Key(_)
+        )));
+    }
+
+    #[test]
+    fn readable_tags_give_no_warning_and_the_strict_facts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = tagged_aiff(&dir, Id3Version::V24);
+        let (library, content) = sources();
+        let got = generate_facts_tolerant(&path, AudioFormat::Aiff, &library, &content).unwrap();
+        assert!(got.warnings.is_empty());
+        let strict = generate_facts(&path, AudioFormat::Aiff, &library, &content).unwrap();
+        assert_eq!(
+            debug_sorted(&without_import_time(got.facts)),
+            debug_sorted(&without_import_time(strict))
+        );
+    }
+
+    #[test]
+    fn float_and_ulaw_aiff_c_with_unreadable_tags_still_get_their_properties() {
+        use audio_fixtures::testkit::Codec;
+        let dir = tempfile::tempdir().unwrap();
+        let (library, content) = sources();
+        for (name, codec, bits) in [("f.aifc", Codec::Fl32, 32), ("u.aifc", Codec::Ulaw, 16)] {
+            let path = odd_comt_aiff(&dir, name, AiffBuilder::new().frames(44_100).aifc(codec));
+            let got =
+                generate_facts_tolerant(&path, AudioFormat::Aiff, &library, &content).unwrap();
+            let values: Vec<&MusicValue> = got.facts.iter().map(|(v, _)| v).collect();
+            assert!(values.contains(&&MusicValue::BitDepth(BitDepth::new(bits))));
+            assert!(values.contains(&&MusicValue::SampleRate(SampleRate::new(44_100))));
+            assert!(values.contains(&&MusicValue::DurationMs(DurationMs::new(1000))));
+        }
+    }
+
+    /// The fallback must state what lofty states for a file lofty can read.
+    #[rstest]
+    #[case(44_100, 16, 2, 44_100)]
+    #[case(44_100, 16, 2, 1_001)] // 22.69 ms: the truncation
+    #[case(48_000, 24, 1, 12_345)] // 257.18 ms
+    #[case(96_000, 24, 2, 1_234)] // 12.85 ms
+    #[case(44_100, 8, 1, 99_999)] // 2267.76 ms
+    fn the_fallback_properties_equal_lofty_s(
+        #[case] rate: u32,
+        #[case] bits: u16,
+        #[case] channels: u16,
+        #[case] frames: u32,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("p.aiff");
+        let builder = AiffBuilder::new()
+            .rate(rate)
+            .bits(bits)
+            .channels(channels)
+            .frames(frames);
+        std::fs::write(&path, builder.build()).unwrap();
+        let lofty = extract_metadata(&path).unwrap();
+        let info = audio_hash::stream_info(&path).unwrap();
+        let fallback = metadata_from_stream_info(&path, &info);
+        assert_eq!(fallback.sample_rate, lofty.sample_rate);
+        assert_eq!(fallback.bit_depth, lofty.bit_depth);
+        assert_eq!(fallback.channels, lofty.channels);
+        let ms = |m: &TrackMetadata| DurationMs::from_duration(m.duration.unwrap());
+        assert_eq!(ms(&fallback), ms(&lofty), "{frames} frames at {rate} Hz");
+    }
+
+    #[test]
+    fn unreadable_tags_are_only_tolerated_when_the_properties_are_readable() {
+        let dir = tempfile::tempdir().unwrap();
+        let (library, content) = sources();
+        // not an AIFF at all
+        let junk = dir.path().join("junk.aiff");
+        std::fs::write(&junk, b"definitely not audio").unwrap();
+        assert!(matches!(
+            generate_facts_tolerant(&junk, AudioFormat::Aiff, &library, &content),
+            Err(IngestError::MetadataError(_))
+        ));
+        // other formats keep failing on unreadable tags
+        let mp3 = dir.path().join("x.mp3");
+        std::fs::write(&mp3, b"definitely not audio").unwrap();
+        assert!(matches!(
+            generate_facts_tolerant(&mp3, AudioFormat::Mp3, &library, &content),
+            Err(IngestError::MetadataError(_))
+        ));
     }
 
     #[test]

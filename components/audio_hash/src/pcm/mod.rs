@@ -102,6 +102,25 @@ pub enum Unsupported {
 /// any other depth needs the STREAMINFO fallback, which claxon does not do.
 pub const FLAC_HASHABLE_BIT_DEPTHS: [u8; 5] = [8, 12, 16, 20, 24];
 
+/// Byte order of PCM samples.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ByteOrder {
+    Big,
+    Little,
+}
+
+/// How a stream's samples are stored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SampleEncoding {
+    /// Plain integer PCM as the container defines it (a plain AIFF's big-endian
+    /// samples).
+    Pcm { order: ByteOrder },
+    /// Anything else, named by a four-character code: `flac` for FLAC, and for an
+    /// AIFF-C its compression type (`NONE`, `twos`, `sowt`, `fl32`, `ulaw`, ...),
+    /// whether or not the samples are integer PCM, as AIFF-C is not a plain AIFF.
+    Other([u8; 4]),
+}
+
 /// The stream properties a container declares, read without decoding samples.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PcmInfo {
@@ -112,6 +131,7 @@ pub struct PcmInfo {
     /// Sample frames. FLAC: STREAMINFO's total samples, 0 when it does not say.
     pub frames: u64,
     pub bits_per_sample: u8,
+    pub encoding: SampleEncoding,
 }
 
 /// The stream properties of the AIFF or FLAC file at `path`.
@@ -126,6 +146,24 @@ pub fn pcm_info_reader<R: Read + Seek>(mut r: R) -> Result<PcmInfo, PcmHashError
     match sniff::sniff(&mut r, file_len)? {
         Container::Flac => flac::info(&mut r, file_len),
         Container::Aiff => aiff::info(&mut r, file_len),
+        _ => Err(PcmHashError::Unsupported(Unsupported::StreamInfoContainer)),
+    }
+}
+
+/// What an AIFF or FLAC file declares about its stream (`COMM`, STREAMINFO),
+/// without PcmHash's support check: an AIFF-C of any compression type (float,
+/// `ulaw`) and the sample data are not looked at. [`pcm_info`] is this plus the
+/// PcmHash validation.
+pub fn stream_info(path: &Path) -> Result<PcmInfo, PcmHashError> {
+    stream_info_reader(File::open(path)?)
+}
+
+/// [`stream_info`] of a seekable byte source.
+pub fn stream_info_reader<R: Read + Seek>(mut r: R) -> Result<PcmInfo, PcmHashError> {
+    let file_len = r.seek(SeekFrom::End(0))?;
+    match sniff::sniff(&mut r, file_len)? {
+        Container::Flac => flac::info(&mut r, file_len),
+        Container::Aiff => aiff::stream_info(&mut r, file_len),
         _ => Err(PcmHashError::Unsupported(Unsupported::StreamInfoContainer)),
     }
 }

@@ -8,7 +8,8 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use music_primitives::PcmHash;
 
 use super::{
-    AudioHashError, Channels, PcmHashError, PcmHasher, PcmInfo, SampleRate, StoredBits, Unsupported,
+    AudioHashError, Channels, PcmHashError, PcmHasher, PcmInfo, SampleEncoding, SampleRate,
+    StoredBits, Unsupported,
 };
 use crate::tags::be_u32;
 use crate::{flac, Container};
@@ -133,6 +134,7 @@ pub(crate) fn info<R: Read + Seek>(r: &mut R, file_len: u64) -> Result<PcmInfo, 
         sample_rate: si.rate.get(),
         frames: si.total_samples,
         bits_per_sample: si.bits.get(),
+        encoding: SampleEncoding::Other(*b"flac"),
     })
 }
 

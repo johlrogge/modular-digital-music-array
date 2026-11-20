@@ -5,7 +5,7 @@ use std::io::{Read, Seek};
 use std::ops::Range;
 
 use super::raw::{ContainerBytes, EightBit, RawPcmLayout};
-use super::{Channels, PcmHashError, PcmInfo, SampleRate, Unsupported};
+use super::{ByteOrder, Channels, PcmHashError, PcmInfo, SampleEncoding, SampleRate, Unsupported};
 use crate::iff::Endian;
 use crate::tags::{be_u16, be_u32, read_at};
 use crate::{aiff, Container};
@@ -114,6 +114,8 @@ pub(crate) fn layout<R: Read + Seek>(
 /// hash (SSND length against the frame count included).
 pub(crate) fn info<R: Read + Seek>(r: &mut R, file_len: u64) -> Result<PcmInfo, PcmHashError> {
     let (layout, sample_size) = parse(r, file_len)?;
+    let l = aiff::layout(r, file_len)?;
+    let encoding = encoding(r, &l)?;
     Ok(PcmInfo {
         container: C,
         channels: layout.channels().count() as u8,
@@ -121,7 +123,60 @@ pub(crate) fn info<R: Read + Seek>(r: &mut R, file_len: u64) -> Result<PcmInfo, 
         frames: layout.frames(),
         // At most 32: the container is at most 4 bytes.
         bits_per_sample: sample_size as u8,
+        encoding,
     })
+}
+
+/// What `COMM` declares, under any compression type (float, `ulaw`, ... included):
+/// no support check and no look at the sample data. `sampleSize` is the width of
+/// the decoded samples as the file states it.
+pub(crate) fn stream_info<R: Read + Seek>(
+    r: &mut R,
+    file_len: u64,
+) -> Result<PcmInfo, PcmHashError> {
+    let l = aiff::layout(r, file_len)?;
+    let encoding = encoding(r, &l)?;
+    if l.comm.end - l.comm.start < 18 {
+        return Err(PcmHashError::malformed(C, "COMM chunk too short"));
+    }
+    let b: [u8; 18] = read_at(r, l.comm.start)?;
+    let channels = u8::try_from(be_u16(&b, 0))
+        .ok()
+        .filter(|c| *c != 0)
+        .ok_or_else(|| PcmHashError::malformed(C, "COMM channel count out of range"))?;
+    let bits_per_sample = u8::try_from(be_u16(&b, 6))
+        .ok()
+        .filter(|s| *s != 0)
+        .ok_or_else(|| PcmHashError::malformed(C, "COMM sample size out of range"))?;
+    let mut ext = [0u8; 10];
+    ext.copy_from_slice(&b[8..18]);
+    let sample_rate =
+        extended_to_u32(&ext).ok_or(PcmHashError::Unsupported(Unsupported::NonIntegerRate))?;
+    Ok(PcmInfo {
+        container: C,
+        channels,
+        sample_rate,
+        frames: u64::from(be_u32(&b, 2)),
+        bits_per_sample,
+        encoding,
+    })
+}
+
+/// A plain AIFF is big-endian PCM; an AIFF-C is named by its compression type.
+fn encoding<R: Read + Seek>(
+    r: &mut R,
+    l: &aiff::AiffLayout,
+) -> Result<SampleEncoding, PcmHashError> {
+    if !l.is_aifc {
+        return Ok(SampleEncoding::Pcm {
+            order: ByteOrder::Big,
+        });
+    }
+    if l.comm.end - l.comm.start < 22 {
+        return Err(PcmHashError::malformed(C, "COMM chunk too short"));
+    }
+    let b: [u8; 22] = read_at(r, l.comm.start)?;
+    Ok(SampleEncoding::Other([b[18], b[19], b[20], b[21]]))
 }
 
 /// The layout and COMM's `sampleSize` (bits per sample, as declared).

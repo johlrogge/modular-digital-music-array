@@ -839,6 +839,178 @@ mod tests {
         }
     }
 
+    /// AIFF / AIFF-C blobs (ADR-037): the files the lossless encoder refuses are
+    /// stored as AIFF and must play, so decoding must handle them.
+    mod aiff {
+        use super::*;
+        use audio_fixtures::testkit::{AiffBuilder, Codec};
+        use pretty_assertions::assert_eq;
+
+        /// Decode a whole file and return (rate, channels, duration_ms, interleaved samples).
+        fn decode(bytes: &[u8], name: &str) -> (u32, u16, Option<u64>, Vec<f32>) {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(name);
+            std::fs::write(&path, bytes).unwrap();
+            let source = AudioSource::new(&path).expect("symphonia opens the AIFF");
+            let mut samples = Vec::new();
+            loop {
+                let segments = source.decode_next_frame().expect("decodes");
+                if segments.is_empty() {
+                    break;
+                }
+                for s in segments {
+                    samples.extend_from_slice(&s.segment.samples[..s.valid_samples]);
+                }
+            }
+            (
+                source.sample_rate(),
+                source.audio_channels(),
+                source.duration_ms(),
+                samples,
+            )
+        }
+
+        /// Integer PCM comes out as `sample / 2^(bits-1)`, exactly.
+        fn assert_pcm(b: &AiffBuilder, bits: u16, name: &str) {
+            let (rate, channels, duration, got) = decode(&b.build(), name);
+            let want = b.samples();
+            assert_eq!(rate, 48_000);
+            assert_eq!(got.len(), want.len(), "sample count");
+            assert_eq!(duration, Some(250));
+            let scale = (1i64 << (bits - 1)) as f32;
+            for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+                assert_eq!(*g, *w as f32 / scale, "sample {i}");
+            }
+            assert!(want.iter().any(|s| *s != 0));
+            assert!(channels == 1 || channels == 2);
+        }
+
+        fn base(bits: u16, channels: u16) -> AiffBuilder {
+            AiffBuilder::new()
+                .bits(bits)
+                .channels(channels)
+                .rate(48_000)
+                .frames(12_000)
+                .noise()
+        }
+
+        #[test]
+        fn integer_aiff_decodes_to_the_builders_samples() {
+            for bits in [8, 16, 24] {
+                for channels in [1, 2] {
+                    let b = base(bits, channels);
+                    assert_pcm(&b, bits, "t.aiff");
+                    let (_, c, _, _) = decode(&b.build(), "t.aif");
+                    assert_eq!(c, channels, "{bits} bit");
+                }
+            }
+        }
+
+        #[test]
+        fn aifc_none_twos_and_sowt_decode_to_the_builders_samples() {
+            // symphonia 0.5.5 takes `twos` and `sowt` at 16 bits only, `NONE` at 8..=32.
+            for bits in [8, 16, 24] {
+                assert_pcm(&base(bits, 2).aifc(Codec::None), bits, "t.aifc");
+            }
+            assert_pcm(&base(16, 2).aifc(Codec::Twos), 16, "t.aifc");
+            assert_pcm(&base(16, 2).aifc(Codec::Sowt), 16, "t.aifc");
+            assert_pcm(&base(16, 1).aifc(Codec::Sowt), 16, "t.aifc");
+        }
+
+        #[test]
+        fn thirty_two_bit_integer_decodes_within_f32_precision() {
+            for form in [None, Some(Codec::None)] {
+                let b = match form {
+                    Some(c) => base(32, 2).aifc(c),
+                    None => base(32, 2),
+                };
+                let (_, _, _, got) = decode(&b.build(), "t.aiff");
+                let want = b.samples();
+                assert_eq!(got.len(), want.len());
+                for (g, w) in got.iter().zip(&want) {
+                    assert!((g - *w as f32 / 2_147_483_648.0).abs() < 1e-6);
+                }
+            }
+        }
+
+        #[test]
+        fn unsupported_depths_are_errors_not_panics() {
+            // Limits of symphonia 0.5.5: these AIFF variants cannot be played.
+            let dir = tempfile::tempdir().unwrap();
+            for (name, bytes) in [
+                ("twos24.aifc", base(24, 2).aifc(Codec::Twos).build()),
+                ("sowt24.aifc", base(24, 2).aifc(Codec::Sowt).build()),
+                ("pcm20.aiff", base(20, 2).build()),
+            ] {
+                let path = dir.path().join(name);
+                std::fs::write(&path, bytes).unwrap();
+                assert!(AudioSource::new(&path).is_err(), "{name}");
+            }
+        }
+
+        #[test]
+        fn extension_and_tags_do_not_matter() {
+            use audio_fixtures::testkit::id3;
+            let b = base(16, 2).id3(id3::full_tag(id3::Id3Version::V24));
+            let want = base(16, 2).samples();
+            let plain = decode(&base(16, 2).build(), "no_extension").3.len();
+            assert_eq!(plain, want.len(), "no tag, no extension");
+            // Known symphonia 0.5.5 defect: it takes the SSND chunk length
+            // (which includes the 8-byte offset/blockSize header) as the sample
+            // byte count, so when another chunk follows SSND, 8 bytes of that
+            // chunk's header are decoded as audio (4 extra 16-bit samples, ~0.05 ms
+            // of noise at the very end). The real samples are intact.
+            for name in ["no_extension", "t.aiff", "t.bin"] {
+                let got = decode(&b.build(), name).3;
+                assert_eq!(got.len(), want.len() + 4, "{name}");
+                let scale = 32_768.0;
+                for (g, w) in got.iter().zip(&want) {
+                    assert_eq!(*g, *w as f32 / scale);
+                }
+            }
+        }
+
+        #[test]
+        fn float_and_ulaw_aifc_are_playable() {
+            // Encoder-refused variants that end up as AIFF blobs.
+            let b = base(16, 2).aifc(Codec::Fl32);
+            let (rate, channels, _, got) = decode(&b.build(), "f.aifc");
+            assert_eq!((rate, channels), (48_000, 2));
+            assert_eq!(got.len(), 24_000);
+            assert!(got.iter().any(|s| s.abs() > 0.1));
+            let b = base(16, 2).aifc(Codec::Ulaw);
+            let (_, _, _, got) = decode(&b.build(), "u.aifc");
+            assert_eq!(got.len(), 24_000);
+        }
+
+        #[test]
+        fn seeking_lands_on_the_right_frame() {
+            let b = base(16, 2);
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("s.aiff");
+            std::fs::write(&path, b.build()).unwrap();
+            let source = AudioSource::new(&path).unwrap();
+            let position = 2 * 6_000; // interleaved samples: frame 6000 of a stereo file
+            source.seek(position).unwrap();
+            let segments = source.decode_next_frame().unwrap();
+            assert!(!segments.is_empty());
+            // The decoded audio is the file's own audio from a packet boundary at or
+            // before the target (an accurate seek lands on a packet start): find
+            // where the first samples sit in the builder's samples.
+            let all: Vec<f32> = b.samples().iter().map(|s| *s as f32 / 32_768.0).collect();
+            let got = &segments[0].segment.samples[..64];
+            let landed = all
+                .windows(64)
+                .position(|w| w == got)
+                .expect("the decoded samples are a slice of the file's audio");
+            assert!(landed <= position, "landed at {landed}, wanted {position}");
+            assert!(
+                position - landed < 2 * 4096,
+                "landed at {landed}, wanted {position}"
+            );
+        }
+    }
+
     mod audio_source_position {
         use super::*;
         use pretty_assertions::assert_eq;
