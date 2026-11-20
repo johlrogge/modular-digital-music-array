@@ -9,7 +9,7 @@ pub struct CandidateTrack {
     pub duration_secs: Option<u32>,
 }
 
-/// How confident we are in the match
+/// How confident we are in a definitive match
 #[derive(Debug, Clone, PartialEq)]
 pub enum MatchConfidence {
     Isrc,
@@ -17,12 +17,72 @@ pub enum MatchConfidence {
     ArtistTitleOnly,
 }
 
-/// The match outcome, carrying the confidence level when a match was found
+/// Why nothing matched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoMatchReason {
+    /// Nothing to look up: no artist or no title (and no ISRC hit).
+    NoArtistOrTitle,
+    /// The library has no track with this artist and title.
+    NoTrackWithArtistTitle,
+}
+
+impl std::fmt::Display for NoMatchReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoArtistOrTitle => write!(f, "no artist or title to match on"),
+            Self::NoTrackWithArtistTitle => write!(f, "no track with this artist+title"),
+        }
+    }
+}
+
+/// Why several tracks matched and none could be chosen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AmbiguityReason {
+    /// Several tracks share the ISRC.
+    Isrc,
+    /// Several tracks with this artist+title are within [`DURATION_TOLERANCE_SECS`].
+    WithinTolerance,
+    /// Several tracks with this artist+title and the source gave no duration.
+    NoDurationToCompare,
+    /// Several tracks with this artist+title, none within tolerance; the closest
+    /// is off by `closest_offset_secs`.
+    DurationOff { closest_offset_secs: u32 },
+}
+
+impl AmbiguityReason {
+    /// A sentence for `count` candidates.
+    pub fn describe(&self, count: usize) -> String {
+        match self {
+            Self::Isrc => format!("{count} candidates with this ISRC"),
+            Self::WithinTolerance => {
+                format!("{count} candidates within {DURATION_TOLERANCE_SECS} s duration tolerance")
+            }
+            Self::NoDurationToCompare => {
+                format!("{count} candidates with this artist+title, no duration to tell them apart")
+            }
+            Self::DurationOff {
+                closest_offset_secs,
+            } => format!(
+                "{count} candidates with this artist+title, none within \
+                 {DURATION_TOLERANCE_SECS} s duration (closest off by {closest_offset_secs} s)"
+            ),
+        }
+    }
+}
+
+/// The match outcome
 #[derive(Debug, Clone, PartialEq)]
 pub enum MatchResult {
     Definitive(ContentHash, MatchConfidence),
-    Ambiguous(Vec<ContentHash>, MatchConfidence),
-    NoMatch,
+    /// Exactly one track has this artist+title and both durations are known, but
+    /// the library's is outside [`DURATION_TOLERANCE_SECS`]: probably another
+    /// version (a radio edit, say).
+    Weak {
+        hash: ContentHash,
+        library_secs: u32,
+    },
+    Ambiguous(Vec<ContentHash>, AmbiguityReason),
+    NoMatch(NoMatchReason),
 }
 
 /// Caller-provided lookup — keeps this component free of IPC/network deps
@@ -68,7 +128,7 @@ pub fn match_track(candidate: &CandidateTrack, lookup: &impl TrackLookup) -> Mat
                 );
             }
             _ => {
-                return MatchResult::Ambiguous(results, MatchConfidence::Isrc);
+                return MatchResult::Ambiguous(results, AmbiguityReason::Isrc);
             }
         }
     }
@@ -90,7 +150,7 @@ pub fn match_track(candidate: &CandidateTrack, lookup: &impl TrackLookup) -> Mat
 
             match duration_filtered.len() {
                 0 => {
-                    // Duration filter produced nothing — fall through to artist+title only
+                    // Duration filter produced nothing — fall through
                 }
                 1 => {
                     return MatchResult::Definitive(
@@ -101,30 +161,46 @@ pub fn match_track(candidate: &CandidateTrack, lookup: &impl TrackLookup) -> Mat
                 _ => {
                     return MatchResult::Ambiguous(
                         duration_filtered,
-                        MatchConfidence::ArtistTitleDuration,
+                        AmbiguityReason::WithinTolerance,
                     );
                 }
             }
         }
 
-        // Artist+title only (no duration supplied or duration filter produced nothing)
-        let unfiltered: Vec<ContentHash> = raw_results.into_iter().map(|(h, _)| h).collect();
-        match unfiltered.len() {
-            0 => { /* fall through */ }
+        // Artist+title only (no duration supplied, or the duration filter removed
+        // every candidate, so every library duration is known and off).
+        let closest_offset = candidate.duration_secs.and_then(|wanted| {
+            raw_results
+                .iter()
+                .filter_map(|(_, d)| d.map(|d| d.abs_diff(wanted)))
+                .min()
+        });
+        match raw_results.len() {
+            0 => return MatchResult::NoMatch(NoMatchReason::NoTrackWithArtistTitle),
             1 => {
-                return MatchResult::Definitive(
-                    unfiltered.into_iter().next().unwrap(),
-                    MatchConfidence::ArtistTitleOnly,
-                );
+                let (hash, library_secs) = raw_results.into_iter().next().unwrap();
+                return match (candidate.duration_secs, library_secs) {
+                    (Some(_), Some(library_secs)) => MatchResult::Weak { hash, library_secs },
+                    _ => MatchResult::Definitive(hash, MatchConfidence::ArtistTitleOnly),
+                };
             }
             _ => {
-                return MatchResult::Ambiguous(unfiltered, MatchConfidence::ArtistTitleOnly);
+                let reason = match closest_offset {
+                    Some(closest_offset_secs) => AmbiguityReason::DurationOff {
+                        closest_offset_secs,
+                    },
+                    None => AmbiguityReason::NoDurationToCompare,
+                };
+                return MatchResult::Ambiguous(
+                    raw_results.into_iter().map(|(h, _)| h).collect(),
+                    reason,
+                );
             }
         }
     }
 
-    // Phase 3: No match
-    MatchResult::NoMatch
+    // Phase 3: Nothing to search for
+    MatchResult::NoMatch(NoMatchReason::NoArtistOrTitle)
 }
 
 #[cfg(test)]
@@ -204,6 +280,23 @@ mod tests {
         }
     }
 
+    fn cand(artist: Option<&str>, title: Option<&str>, secs: Option<u32>) -> CandidateTrack {
+        CandidateTrack {
+            isrc: None,
+            artist: artist.map(str::to_string),
+            title: title.map(str::to_string),
+            duration_secs: secs,
+        }
+    }
+
+    fn at(secs: Option<u32>) -> CandidateTrack {
+        cand(Some("artist"), Some("title"), secs)
+    }
+
+    fn h(s: &str) -> ContentHash {
+        ContentHash::new(s)
+    }
+
     // ---------------------------------------------------------------------------
     // Normalization tests
     // ---------------------------------------------------------------------------
@@ -235,51 +328,36 @@ mod tests {
     #[test]
     fn isrc_exact_match_returns_definitive() {
         let lookup = MockLookup::new().with_isrc("USRC12345678", "hash1");
-        let candidate = CandidateTrack {
-            isrc: Some("USRC12345678".to_string()),
-            artist: None,
-            title: None,
-            duration_secs: None,
-        };
-        let result = match_track(&candidate, &lookup);
-        assert!(matches!(
-            result,
-            MatchResult::Definitive(_, MatchConfidence::Isrc)
-        ));
-        if let MatchResult::Definitive(h, _) = result {
-            assert_eq!(h.as_str(), "hash1");
-        }
+        let mut c = cand(None, None, None);
+        c.isrc = Some("USRC12345678".to_string());
+        assert_eq!(
+            match_track(&c, &lookup),
+            MatchResult::Definitive(h("hash1"), MatchConfidence::Isrc)
+        );
     }
 
     #[test]
     fn isrc_no_match_falls_through_to_no_match() {
         let lookup = MockLookup::new().with_isrc("USRC99999999", "hash1");
-        let candidate = CandidateTrack {
-            isrc: Some("USRC12345678".to_string()),
-            artist: None,
-            title: None,
-            duration_secs: None,
-        };
-        let result = match_track(&candidate, &lookup);
-        assert!(matches!(result, MatchResult::NoMatch));
+        let mut c = cand(None, None, None);
+        c.isrc = Some("USRC12345678".to_string());
+        assert_eq!(
+            match_track(&c, &lookup),
+            MatchResult::NoMatch(NoMatchReason::NoArtistOrTitle)
+        );
     }
 
     #[test]
     fn isrc_ambiguous_returns_ambiguous() {
         let lookup = MockLookup::new()
-            .with_isrc("USRC12345678", "hash1")
-            .with_isrc("USRC12345678", "hash2");
-        let candidate = CandidateTrack {
-            isrc: Some("USRC12345678".to_string()),
-            artist: None,
-            title: None,
-            duration_secs: None,
-        };
-        let result = match_track(&candidate, &lookup);
-        assert!(matches!(
-            result,
-            MatchResult::Ambiguous(_, MatchConfidence::Isrc)
-        ));
+            .with_isrc("X", "hash1")
+            .with_isrc("X", "hash2");
+        let mut c = cand(None, None, None);
+        c.isrc = Some("X".to_string());
+        assert_eq!(
+            match_track(&c, &lookup),
+            MatchResult::Ambiguous(vec![h("hash1"), h("hash2")], AmbiguityReason::Isrc)
+        );
     }
 
     #[test]
@@ -287,21 +365,10 @@ mod tests {
         let lookup = MockLookup::new()
             .with_isrc("USRC12345678", "isrc_hash")
             .with_artist_title("artist", "title", "meta_hash");
-        let candidate = CandidateTrack {
-            isrc: None,
-            artist: Some("artist".to_string()),
-            title: Some("title".to_string()),
-            duration_secs: None,
-        };
-        let result = match_track(&candidate, &lookup);
-        // Should match via artist/title, not ISRC
-        assert!(matches!(
-            result,
-            MatchResult::Definitive(_, MatchConfidence::ArtistTitleOnly)
-        ));
-        if let MatchResult::Definitive(h, _) = result {
-            assert_eq!(h.as_str(), "meta_hash");
-        }
+        assert_eq!(
+            match_track(&at(None), &lookup),
+            MatchResult::Definitive(h("meta_hash"), MatchConfidence::ArtistTitleOnly)
+        );
     }
 
     // ---------------------------------------------------------------------------
@@ -311,50 +378,31 @@ mod tests {
     #[test]
     fn artist_title_duration_exact_match() {
         let lookup = MockLookup::new().with_artist_title_duration("artist", "title", "hash1", 300);
-        let candidate = CandidateTrack {
-            isrc: None,
-            artist: Some("artist".to_string()),
-            title: Some("title".to_string()),
-            duration_secs: Some(300),
-        };
-        let result = match_track(&candidate, &lookup);
-        assert!(matches!(
-            result,
-            MatchResult::Definitive(_, MatchConfidence::ArtistTitleDuration)
-        ));
+        assert_eq!(
+            match_track(&at(Some(300)), &lookup),
+            MatchResult::Definitive(h("hash1"), MatchConfidence::ArtistTitleDuration)
+        );
     }
 
     #[test]
     fn artist_title_duration_within_tolerance() {
         let lookup = MockLookup::new().with_artist_title_duration("artist", "title", "hash1", 300);
-        let candidate = CandidateTrack {
-            isrc: None,
-            artist: Some("artist".to_string()),
-            title: Some("title".to_string()),
-            duration_secs: Some(302), // 2 seconds off — within tolerance
-        };
-        let result = match_track(&candidate, &lookup);
-        assert!(matches!(
-            result,
-            MatchResult::Definitive(_, MatchConfidence::ArtistTitleDuration)
-        ));
+        assert_eq!(
+            match_track(&at(Some(302)), &lookup),
+            MatchResult::Definitive(h("hash1"), MatchConfidence::ArtistTitleDuration)
+        );
     }
 
     #[test]
-    fn artist_title_duration_outside_tolerance_falls_to_title_only() {
+    fn single_candidate_outside_tolerance_is_weak() {
         let lookup = MockLookup::new().with_artist_title_duration("artist", "title", "hash1", 300);
-        let candidate = CandidateTrack {
-            isrc: None,
-            artist: Some("artist".to_string()),
-            title: Some("title".to_string()),
-            duration_secs: Some(305), // 5 seconds off — outside tolerance
-        };
-        let result = match_track(&candidate, &lookup);
-        // Duration filter produced nothing → falls to artist+title only
-        assert!(matches!(
-            result,
-            MatchResult::Definitive(_, MatchConfidence::ArtistTitleOnly)
-        ));
+        assert_eq!(
+            match_track(&at(Some(305)), &lookup),
+            MatchResult::Weak {
+                hash: h("hash1"),
+                library_secs: 300
+            }
+        );
     }
 
     #[test]
@@ -362,34 +410,33 @@ mod tests {
         let lookup = MockLookup::new()
             .with_artist_title_duration("artist", "title", "hash1", 300)
             .with_artist_title_duration("artist", "title", "hash2", 301);
-        let candidate = CandidateTrack {
-            isrc: None,
-            artist: Some("artist".to_string()),
-            title: Some("title".to_string()),
-            duration_secs: Some(300),
-        };
-        let result = match_track(&candidate, &lookup);
-        assert!(matches!(
-            result,
-            MatchResult::Ambiguous(_, MatchConfidence::ArtistTitleDuration)
-        ));
+        assert_eq!(
+            match_track(&at(Some(300)), &lookup),
+            MatchResult::Ambiguous(
+                vec![h("hash1"), h("hash2")],
+                AmbiguityReason::WithinTolerance
+            )
+        );
     }
 
     #[test]
-    fn artist_title_duration_includes_entries_with_no_duration() {
-        let lookup = MockLookup::new().with_artist_title("artist", "title", "hash_no_dur"); // no duration
-        let candidate = CandidateTrack {
-            isrc: None,
-            artist: Some("artist".to_string()),
-            title: Some("title".to_string()),
-            duration_secs: Some(300),
-        };
-        let result = match_track(&candidate, &lookup);
-        // Entry with no duration is included in duration-filtered set
-        assert!(matches!(
-            result,
-            MatchResult::Definitive(_, MatchConfidence::ArtistTitleDuration)
-        ));
+    fn library_track_with_no_duration_passes_the_duration_filter() {
+        let lookup = MockLookup::new().with_artist_title("artist", "title", "hash_no_dur");
+        assert_eq!(
+            match_track(&at(Some(300)), &lookup),
+            MatchResult::Definitive(h("hash_no_dur"), MatchConfidence::ArtistTitleDuration)
+        );
+    }
+
+    #[test]
+    fn duration_filter_keeps_unknown_and_drops_far_away() {
+        let lookup = MockLookup::new()
+            .with_artist_title_duration("artist", "title", "far_away", 400)
+            .with_artist_title("artist", "title", "no_duration_hash");
+        assert_eq!(
+            match_track(&at(Some(300)), &lookup),
+            MatchResult::Definitive(h("no_duration_hash"), MatchConfidence::ArtistTitleDuration)
+        );
     }
 
     // ---------------------------------------------------------------------------
@@ -399,35 +446,51 @@ mod tests {
     #[test]
     fn artist_title_only_single_match_definitive() {
         let lookup = MockLookup::new().with_artist_title("artist", "title", "hash1");
-        let candidate = CandidateTrack {
-            isrc: None,
-            artist: Some("artist".to_string()),
-            title: Some("title".to_string()),
-            duration_secs: None,
-        };
-        let result = match_track(&candidate, &lookup);
-        assert!(matches!(
-            result,
-            MatchResult::Definitive(_, MatchConfidence::ArtistTitleOnly)
-        ));
+        assert_eq!(
+            match_track(&at(None), &lookup),
+            MatchResult::Definitive(h("hash1"), MatchConfidence::ArtistTitleOnly)
+        );
     }
 
     #[test]
-    fn artist_title_only_multiple_matches_ambiguous() {
+    fn artist_title_only_with_a_library_duration_is_still_definitive() {
+        // The source gave no duration, so there is nothing to disagree with.
+        let lookup = MockLookup::new().with_artist_title_duration("artist", "title", "hash1", 300);
+        assert_eq!(
+            match_track(&at(None), &lookup),
+            MatchResult::Definitive(h("hash1"), MatchConfidence::ArtistTitleOnly)
+        );
+    }
+
+    #[test]
+    fn no_duration_to_compare_is_ambiguous_with_every_candidate() {
         let lookup = MockLookup::new()
             .with_artist_title("artist", "title", "hash1")
-            .with_artist_title("artist", "title", "hash2");
-        let candidate = CandidateTrack {
-            isrc: None,
-            artist: Some("artist".to_string()),
-            title: Some("title".to_string()),
-            duration_secs: None,
-        };
-        let result = match_track(&candidate, &lookup);
-        assert!(matches!(
-            result,
-            MatchResult::Ambiguous(_, MatchConfidence::ArtistTitleOnly)
-        ));
+            .with_artist_title("artist", "title", "hash2")
+            .with_artist_title("artist", "title", "hash3");
+        assert_eq!(
+            match_track(&at(None), &lookup),
+            MatchResult::Ambiguous(
+                vec![h("hash1"), h("hash2"), h("hash3")],
+                AmbiguityReason::NoDurationToCompare
+            )
+        );
+    }
+
+    #[test]
+    fn all_candidates_off_in_duration_report_the_closest() {
+        let lookup = MockLookup::new()
+            .with_artist_title_duration("artist", "title", "h1", 310)
+            .with_artist_title_duration("artist", "title", "h2", 296);
+        assert_eq!(
+            match_track(&at(Some(300)), &lookup),
+            MatchResult::Ambiguous(
+                vec![h("h1"), h("h2")],
+                AmbiguityReason::DurationOff {
+                    closest_offset_secs: 4
+                }
+            )
+        );
     }
 
     // ---------------------------------------------------------------------------
@@ -435,98 +498,86 @@ mod tests {
     // ---------------------------------------------------------------------------
 
     #[test]
-    fn no_match_when_no_artist_or_title_or_isrc() {
+    fn no_artist_or_title_is_no_match() {
         let lookup = MockLookup::new();
-        let candidate = CandidateTrack {
-            isrc: None,
-            artist: None,
-            title: None,
-            duration_secs: None,
-        };
-        let result = match_track(&candidate, &lookup);
-        assert!(matches!(result, MatchResult::NoMatch));
+        for c in [
+            cand(None, Some("t"), Some(100)),
+            cand(Some("a"), None, None),
+            cand(None, None, None),
+        ] {
+            assert_eq!(
+                match_track(&c, &lookup),
+                MatchResult::NoMatch(NoMatchReason::NoArtistOrTitle)
+            );
+        }
     }
 
     #[test]
-    fn no_match_when_lookup_has_no_results() {
-        let lookup = MockLookup::new();
-        let candidate = CandidateTrack {
-            isrc: Some("USRC12345678".to_string()),
-            artist: Some("artist".to_string()),
-            title: Some("title".to_string()),
-            duration_secs: None,
-        };
-        let result = match_track(&candidate, &lookup);
-        assert!(matches!(result, MatchResult::NoMatch));
+    fn no_track_with_artist_title_is_no_match() {
+        let lookup = MockLookup::new().with_artist_title("other", "t", "h1");
+        assert_eq!(
+            match_track(&cand(Some("a"), Some("t"), Some(100)), &lookup),
+            MatchResult::NoMatch(NoMatchReason::NoTrackWithArtistTitle)
+        );
     }
 
-    // ---------------------------------------------------------------------------
-    // Fallthrough tests
-    // ---------------------------------------------------------------------------
+    #[test]
+    fn isrc_miss_with_empty_lookup_is_no_match() {
+        let lookup = MockLookup::new();
+        let mut c = at(None);
+        c.isrc = Some("USRC12345678".to_string());
+        assert_eq!(
+            match_track(&c, &lookup),
+            MatchResult::NoMatch(NoMatchReason::NoTrackWithArtistTitle)
+        );
+    }
 
     #[test]
     fn isrc_miss_falls_through_to_metadata_match() {
         let lookup = MockLookup::new()
-            .with_isrc("USRC99999999", "wrong_hash") // different ISRC
+            .with_isrc("USRC99999999", "wrong_hash")
             .with_artist_title("artist", "title", "correct_hash");
-        let candidate = CandidateTrack {
-            isrc: Some("USRC12345678".to_string()), // won't match lookup
-            artist: Some("artist".to_string()),
-            title: Some("title".to_string()),
-            duration_secs: None,
-        };
-        let result = match_track(&candidate, &lookup);
-        assert!(matches!(
-            result,
-            MatchResult::Definitive(_, MatchConfidence::ArtistTitleOnly)
-        ));
-        if let MatchResult::Definitive(h, _) = result {
-            assert_eq!(h.as_str(), "correct_hash");
-        }
+        let mut c = at(None);
+        c.isrc = Some("USRC12345678".to_string());
+        assert_eq!(
+            match_track(&c, &lookup),
+            MatchResult::Definitive(h("correct_hash"), MatchConfidence::ArtistTitleOnly)
+        );
     }
 
-    #[test]
-    fn duration_filter_miss_falls_through_to_title_only_match() {
-        // Two entries: one has duration outside tolerance, one has no duration
-        let lookup = MockLookup::new()
-            .with_artist_title_duration("artist", "title", "far_away", 400) // outside tolerance
-            .with_artist_title("artist", "title", "no_duration_hash"); // no duration
-        let candidate = CandidateTrack {
-            isrc: None,
-            artist: Some("artist".to_string()),
-            title: Some("title".to_string()),
-            duration_secs: Some(300),
-        };
-        let result = match_track(&candidate, &lookup);
-        // Duration filter keeps no_duration_hash (unknown duration) and drops far_away.
-        // So we get a single Definitive result from the duration-filtered set.
-        assert!(matches!(
-            result,
-            MatchResult::Definitive(_, MatchConfidence::ArtistTitleDuration)
-        ));
-        if let MatchResult::Definitive(h, _) = result {
-            assert_eq!(h.as_str(), "no_duration_hash");
-        }
-    }
+    // ---------------------------------------------------------------------------
+    // Reasons read as sentences
+    // ---------------------------------------------------------------------------
 
     #[test]
-    fn all_duration_filtered_falls_through_to_title_only() {
-        let lookup = MockLookup::new().with_artist_title_duration("artist", "title", "hash1", 400); // outside tolerance
-        let candidate = CandidateTrack {
-            isrc: None,
-            artist: Some("artist".to_string()),
-            title: Some("title".to_string()),
-            duration_secs: Some(300),
-        };
-        let result = match_track(&candidate, &lookup);
-        // Duration filter returns nothing → falls to title-only using unfiltered results
-        assert!(matches!(
-            result,
-            MatchResult::Definitive(_, MatchConfidence::ArtistTitleOnly)
-        ));
-        if let MatchResult::Definitive(h, _) = result {
-            assert_eq!(h.as_str(), "hash1");
-        }
+    fn reasons_read_as_sentences() {
+        assert_eq!(
+            NoMatchReason::NoArtistOrTitle.to_string(),
+            "no artist or title to match on"
+        );
+        assert_eq!(
+            NoMatchReason::NoTrackWithArtistTitle.to_string(),
+            "no track with this artist+title"
+        );
+        assert_eq!(
+            AmbiguityReason::WithinTolerance.describe(2),
+            "2 candidates within 2 s duration tolerance"
+        );
+        assert_eq!(
+            AmbiguityReason::NoDurationToCompare.describe(3),
+            "3 candidates with this artist+title, no duration to tell them apart"
+        );
+        assert_eq!(
+            AmbiguityReason::DurationOff {
+                closest_offset_secs: 4
+            }
+            .describe(2),
+            "2 candidates with this artist+title, none within 2 s duration (closest off by 4 s)"
+        );
+        assert_eq!(
+            AmbiguityReason::Isrc.describe(2),
+            "2 candidates with this ISRC"
+        );
     }
 
     // ---------------------------------------------------------------------------
@@ -535,15 +586,11 @@ mod tests {
 
     #[test]
     fn artist_title_normalized_before_lookup() {
-        // Lookup stores normalized keys
         let lookup = MockLookup::new().with_artist_title("daft punk", "get lucky", "hash1");
-        let candidate = CandidateTrack {
-            isrc: None,
-            artist: Some("  Daft   Punk  ".to_string()),
-            title: Some("GET LUCKY".to_string()),
-            duration_secs: None,
-        };
-        let result = match_track(&candidate, &lookup);
-        assert!(matches!(result, MatchResult::Definitive(_, _)));
+        let c = cand(Some("  Daft   Punk  "), Some("GET LUCKY"), None);
+        assert!(matches!(
+            match_track(&c, &lookup),
+            MatchResult::Definitive(_, _)
+        ));
     }
 }

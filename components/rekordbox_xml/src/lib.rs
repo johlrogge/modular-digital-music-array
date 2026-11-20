@@ -848,21 +848,29 @@ pub mod parse {
     }
 
     fn percent_decode(s: &str) -> String {
-        let mut out = String::with_capacity(s.len());
+        // Decode to bytes first: `%C3%B6` is one UTF-8 character, not two.
+        let mut out: Vec<u8> = Vec::with_capacity(s.len());
         let bytes = s.as_bytes();
         let mut i = 0;
         while i < bytes.len() {
             if bytes[i] == b'%' && i + 2 < bytes.len() {
                 if let (Some(h), Some(l)) = (char_to_hex(bytes[i + 1]), char_to_hex(bytes[i + 2])) {
-                    out.push((h * 16 + l) as char);
+                    out.push(h * 16 + l);
                     i += 3;
                     continue;
                 }
             }
-            out.push(bytes[i] as char);
+            out.push(bytes[i]);
             i += 1;
         }
-        out
+        // Bytes that are not valid UTF-8 (a Latin-1 filename) become one char per
+        // byte, so nothing is lost the way U+FFFD would lose it.
+        let mut decoded = String::with_capacity(out.len());
+        for chunk in out.utf8_chunks() {
+            decoded.push_str(chunk.valid());
+            decoded.extend(chunk.invalid().iter().map(|&b| b as char));
+        }
+        decoded
     }
 
     fn char_to_hex(b: u8) -> Option<u8> {
@@ -1249,6 +1257,23 @@ pub mod parse {
             assert_eq!(
                 parse_location("file://localhost/music/Simon%20%26%20Garfunkel/track.mp3"),
                 Some("/music/Simon & Garfunkel/track.mp3".to_string())
+            );
+        }
+
+        #[test]
+        fn parse_location_decodes_utf8_sequences() {
+            assert_eq!(
+                parse_location("file://localhost/music/Bj%C3%B6rk/Cr%C3%A8me.flac"),
+                Some("/music/Björk/Crème.flac".to_string())
+            );
+        }
+
+        #[test]
+        fn parse_location_decodes_invalid_utf8_as_latin1() {
+            // `%E9` alone is not UTF-8: it is Latin-1 `é`. Valid sequences around it stay.
+            assert_eq!(
+                parse_location("file://localhost/music/Caf%E9/Bj%C3%B6rk%E9.flac"),
+                Some("/music/Café/Björké.flac".to_string())
             );
         }
 

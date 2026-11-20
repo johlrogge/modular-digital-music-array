@@ -4,6 +4,7 @@ use crate::args::{
 use crate::ctx::Ctx;
 use crate::output::library_error;
 use crate::rekordbox_exchange;
+use crate::rekordbox_report::{self, Candidate, Problem};
 use crate::stdin::{require_stdin_hashes_or_usage, resolve_tracks_or_abort};
 use crate::transfer::{
     build_http_client, download_tracks, existing_location_set, export_dest_path_checked,
@@ -85,6 +86,13 @@ pub(crate) struct AllPlaylists(pub bool);
 #[arg(long = "enrich")]
 pub(crate) struct Enrich(pub bool);
 
+/// Write a TSV report of the tracks that did not match (unmatched and ambiguous, with
+/// the reason and the candidates) and of the playlist entries dropped for them.
+/// Also written with --dry-run.
+#[derive(Debug, Clone, PartialEq, Eq, Arg)]
+#[arg(long = "report", metavar = "FILE", complete = files)]
+pub(crate) struct ReportFile(pub Option<std::path::PathBuf>);
+
 // Values of `rekordbox import`; the file must exist and the playlist name is
 // sanitised, both at parse time. The file is a positional, so it comes last.
 #[derive(Debug, Clone, PartialEq, Eq, Arg)]
@@ -92,6 +100,7 @@ pub(crate) struct RekordboxImportArgs {
     pub(crate) playlist: ImportPlaylist,
     pub(crate) all_playlists: AllPlaylists,
     pub(crate) enrich: Enrich,
+    pub(crate) report: ReportFile,
     pub(crate) dry_run: DryRun,
     pub(crate) path: ExistingFileArg,
 }
@@ -728,12 +737,12 @@ fn print_write_outcome(name: &str, track_count: usize, created: bool) {
 #[hicli::command]
 pub(crate) fn import(args: RekordboxImportArgs, ctx: &Ctx) -> Result<()> {
     use library_ipc_client::Bpm;
-    use std::collections::HashMap;
 
     let RekordboxImportArgs {
         playlist: ImportPlaylist(playlist),
         all_playlists: AllPlaylists(all_playlists),
         enrich: Enrich(enrich),
+        report: ReportFile(report),
         dry_run: DryRun(dry_run),
         path,
     } = args;
@@ -757,9 +766,9 @@ pub(crate) fn import(args: RekordboxImportArgs, ctx: &Ctx) -> Result<()> {
     let facts = Facts::Node(ctx.node());
     let lookup = LibraryTrackLookup::new(|q| facts.search(q));
 
-    let mut matched: Vec<(&RekordboxTrack, ContentHash)> = Vec::new();
-    let mut ambiguous: Vec<(&RekordboxTrack, Vec<ContentHash>)> = Vec::new();
-    let mut unmatched: Vec<&RekordboxTrack> = Vec::new();
+    // The one matching pass: everything below (summary, playlists, enrichment, report)
+    // is derived from these results.
+    let mut results: Vec<(&RekordboxTrack, MatchResult)> = Vec::new();
 
     for track in &parsed.tracks {
         let candidate = CandidateTrack {
@@ -781,17 +790,7 @@ pub(crate) fn import(args: RekordboxImportArgs, ctx: &Ctx) -> Result<()> {
             },
         };
 
-        match track_matcher::match_track(&candidate, &lookup) {
-            MatchResult::Definitive(hash, _) => {
-                matched.push((track, hash));
-            }
-            MatchResult::Ambiguous(hashes, _) => {
-                ambiguous.push((track, hashes));
-            }
-            MatchResult::NoMatch => {
-                unmatched.push(track);
-            }
-        }
+        results.push((track, track_matcher::match_track(&candidate, &lookup)));
     }
 
     // A failed library search must not look like "not in library"
@@ -813,51 +812,159 @@ pub(crate) fn import(args: RekordboxImportArgs, ctx: &Ctx) -> Result<()> {
     };
 
     // 3. Print summary
+    let summary = rekordbox_report::summarize(&results);
+    debug_assert_eq!(summary.total(), parsed.tracks.len());
+    // Definitive and weak matches both go into playlists and get enriched.
+    let matched = rekordbox_report::matched(&results);
     println!("Matched:   {:3} tracks", matched.len());
     println!(
         "Ambiguous: {:3} tracks (need manual resolution)",
-        ambiguous.len()
+        summary.ambiguous
     );
-    println!("Unmatched: {:3} tracks", unmatched.len());
+    println!("Unmatched: {:3} tracks", summary.unmatched);
 
-    // 4. Print unmatched tracks to stderr
-    if !unmatched.is_empty() {
-        eprintln!();
-        eprintln!("Unmatched tracks:");
-        for t in &unmatched {
-            let filename = rekordbox_xml::parse_location(&t.location)
-                .map(|p| {
-                    std::path::Path::new(&p)
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or(&p)
-                        .to_string()
-                })
-                .unwrap_or_else(|| t.location.clone());
-            eprintln!("  {} - {} ({})", t.artist, t.name, filename);
+    // 4. The report rows, from the same match results. The candidates' details are
+    // only fetched for a report: they are not needed otherwise.
+    let problems = rekordbox_report::problems(&results, |hash| {
+        if report.is_none() {
+            return Candidate::bare(hash.clone());
         }
-    }
+        match library.get_track(hash) {
+            Ok(info) => Candidate::from_track(&info),
+            Err(e) => Candidate::failed(hash.clone(), e.to_string()),
+        }
+    });
+    let lookup_failures = problems
+        .iter()
+        .flat_map(|p| p.candidates())
+        .filter(|c| c.lookup_failed())
+        .count();
+    // What `--all-playlists` would do with the playlists: written below, and the
+    // source of the name problems in the report.
+    let mut plan = rekordbox_report::plan_playlists(
+        &parsed.playlists,
+        &results,
+        playlist.as_ref().map(|p| p.name()),
+    );
+    let covers_playlists = all_playlists || report.is_some();
+    let report_data = rekordbox_report::Report {
+        problems,
+        // What each playlist loses; the report covers every playlist of the XML.
+        playlists: if covers_playlists {
+            rekordbox_report::tally_playlists(&parsed.playlists, &results)
+        } else {
+            vec![]
+        },
+        // The playlists an `--all-playlists` import would write.
+        issues: if covers_playlists {
+            std::mem::take(&mut plan.issues)
+        } else {
+            rekordbox_report::NameIssues::default()
+        },
+    };
 
-    // 5. Print ambiguous tracks to stderr
-    if !ambiguous.is_empty() {
-        eprintln!();
-        eprintln!("Ambiguous tracks (multiple candidates):");
-        for (t, hashes) in &ambiguous {
-            eprintln!("  {} - {}", t.artist, t.name);
-            for h in hashes.iter().take(3) {
-                eprintln!(
-                    "    candidate: {}",
-                    h.as_str().get(..16).unwrap_or(h.as_str())
-                );
+    if let Some(report_path) = &report {
+        // Written with --dry-run too: it is a report, not a change to the library.
+        std::fs::write(report_path, rekordbox_report::render_tsv(&report_data))
+            .map_err(|e| eyre!("Failed to write report {}: {}", report_path.display(), e))?;
+        println!(
+            "{} unmatched, {} ambiguous, {} weak, {} shared \u{2192} report written to {}",
+            summary.unmatched,
+            summary.ambiguous,
+            summary.weak,
+            summary.shared,
+            report_path.display()
+        );
+        if lookup_failures > 0 {
+            eprintln!(
+                "{lookup_failures} candidate lookup(s) failed; marked `<lookup failed: ..>` in the report"
+            );
+        }
+    } else {
+        // 4a. Print unmatched tracks to stderr
+        let unmatched: Vec<&RekordboxTrack> = report_data
+            .problems
+            .iter()
+            .filter_map(|p| match p {
+                Problem::Unmatched { track, .. } => Some(*track),
+                _ => None,
+            })
+            .collect();
+        if !unmatched.is_empty() {
+            eprintln!();
+            eprintln!("Unmatched tracks:");
+            for t in &unmatched {
+                let location = rekordbox_report::location_path(t);
+                let filename = std::path::Path::new(&location)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(&location);
+                eprintln!("  {} - {} ({})", t.artist, t.name, filename);
             }
         }
+
+        // 4b. Print ambiguous tracks to stderr
+        let ambiguous: Vec<(&RekordboxTrack, &[Candidate])> = report_data
+            .problems
+            .iter()
+            .filter_map(|p| match p {
+                Problem::Ambiguous {
+                    track, candidates, ..
+                } => Some((*track, candidates.as_slice())),
+                _ => None,
+            })
+            .collect();
+        if !ambiguous.is_empty() {
+            eprintln!();
+            eprintln!("Ambiguous tracks (multiple candidates):");
+            for (t, candidates) in &ambiguous {
+                eprintln!("  {} - {}", t.artist, t.name);
+                for c in candidates.iter().take(3) {
+                    let h = c.hash.as_str();
+                    eprintln!("    candidate: {}", h.get(..16).unwrap_or(h));
+                }
+            }
+        }
+        if summary.weak + summary.shared > 0 {
+            eprintln!();
+            eprintln!(
+                "{} weak (duration differs) and {} shared (several tracks, one library track) \
+                 matches are not listed; use --report to see them",
+                summary.weak, summary.shared
+            );
+        }
     }
 
-    // Build track_id → ContentHash map for playlist resolution
-    let track_id_to_hash: HashMap<u32, ContentHash> = matched
+    let losing: Vec<_> = report_data
+        .playlists
         .iter()
-        .map(|(rb_track, hash)| (rb_track.track_id, hash.clone()))
+        .filter(|d| d.dropped() > 0)
         .collect();
+    if !losing.is_empty() {
+        eprintln!();
+        eprintln!(
+            "Playlist entries dropped (track unmatched, ambiguous or not in the collection):"
+        );
+        for d in losing {
+            eprintln!("  {}: {}", d.playlist, d.describe());
+        }
+    }
+    for c in report_data
+        .issues
+        .collisions
+        .iter()
+        .filter(|_| all_playlists)
+    {
+        eprintln!(
+            "Playlists {} all become '{}'; each replaces the one before",
+            c.playlists
+                .iter()
+                .map(|p| format!("'{p}'"))
+                .collect::<Vec<_>>()
+                .join(", "),
+            c.name
+        );
+    }
 
     // 6. Create --playlist if requested
     if let Some(arg) = playlist {
@@ -883,28 +990,22 @@ pub(crate) fn import(args: RekordboxImportArgs, ctx: &Ctx) -> Result<()> {
 
     // 7. Create --all-playlists
     if all_playlists {
-        for rb_playlist in &parsed.playlists {
-            let resolved: Vec<ContentHash> = rb_playlist
-                .track_ids
-                .iter()
-                .filter_map(|id| track_id_to_hash.get(id).cloned())
-                .collect();
-
-            if resolved.is_empty() {
-                eprintln!(
-                    "Skipping playlist '{}': no matched tracks",
-                    rb_playlist.name
-                );
-                continue;
-            }
-
-            let target = match SanitizedPlaylistName::new(&rb_playlist.name) {
-                Ok(t) => t,
-                Err(reason) => {
-                    eprintln!("Skipping playlist '{}': {}", rb_playlist.name, reason);
-                    continue;
-                }
-            };
+        for rb_playlist in &plan.nothing_matched {
+            eprintln!(
+                "Skipping playlist '{}': no matched tracks",
+                rb_playlist.name
+            );
+        }
+        for skipped in &report_data.issues.skipped {
+            eprintln!(
+                "Skipping playlist '{}': {}",
+                skipped.playlist, skipped.reason
+            );
+        }
+        for planned in &plan.writes {
+            let rb_playlist = planned.source;
+            let target = &planned.target;
+            let resolved = &planned.hashes;
             let sanitized = target.name().as_str();
 
             if dry_run {
@@ -915,7 +1016,7 @@ pub(crate) fn import(args: RekordboxImportArgs, ctx: &Ctx) -> Result<()> {
                     resolved.len()
                 );
             } else {
-                match write_playlist(&library, target.name(), &resolved) {
+                match write_playlist(&library, target.name(), resolved) {
                     Ok(created) => print_write_outcome(sanitized, resolved.len(), created),
                     Err(e) => {
                         eprintln!("Failed to write playlist '{}': {}", sanitized, e)
@@ -1209,7 +1310,23 @@ mod tests {
         assert!(args.all_playlists.0 && args.enrich.0 && args.dry_run.0);
         assert_eq!(args.path.0, file.path());
 
+        assert_eq!(args.report.0, None);
+
+        let reported = run_arg::<super::RekordboxImportArgs>(&[
+            "--report",
+            "/tmp/missing.tsv",
+            "--dry-run",
+            path,
+        ])
+        .unwrap();
+        assert_eq!(
+            reported.report.0,
+            Some(std::path::PathBuf::from("/tmp/missing.tsv"))
+        );
+        assert!(reported.dry_run.0);
+
         let plain = run_arg::<super::RekordboxImportArgs>(&[path]).unwrap();
+        assert_eq!(plain.report.0, None);
         assert_eq!(plain.playlist.0, None);
         assert!(!plain.all_playlists.0 && !plain.enrich.0 && !plain.dry_run.0);
     }
