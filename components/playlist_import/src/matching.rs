@@ -1,7 +1,7 @@
 //! Classify source playlist tracks against the library.
 
 use library_ipc_client::ContentHash;
-use track_matcher::{CandidateTrack, MatchConfidence, MatchResult, TrackLookup};
+use track_matcher::{CandidateTrack, MatchResult, TrackLookup};
 
 /// The library tracks an ambiguous item matched: at least two, in the order
 /// the matcher returned them.
@@ -55,17 +55,18 @@ pub fn match_source_playlist(
                 },
             };
             match track_matcher::match_track(&candidate, lookup) {
-                MatchResult::Definitive(hash, MatchConfidence::ArtistTitleOnly) => {
-                    match candidate.duration_secs {
-                        Some(source_secs) => {
-                            definitive_with_duration(&candidate, hash, source_secs, lookup)
-                        }
-                        None => TrackOutcome::Matched(hash),
-                    }
-                }
                 MatchResult::Definitive(hash, _) => TrackOutcome::Matched(hash),
+                // The matcher only says Weak when the source has a duration.
+                MatchResult::Weak { hash, library_secs } => match candidate.duration_secs {
+                    Some(source_secs) => TrackOutcome::DurationMismatch {
+                        hash,
+                        library_secs,
+                        source_secs,
+                    },
+                    None => TrackOutcome::Matched(hash),
+                },
                 MatchResult::Ambiguous(hashes, _) => from_candidates(hashes),
-                MatchResult::NoMatch => TrackOutcome::Missing,
+                MatchResult::NoMatch(_) => TrackOutcome::Missing,
             }
         })
         .collect()
@@ -80,38 +81,6 @@ fn from_candidates(mut hashes: Vec<ContentHash>) -> TrackOutcome {
     match Candidates::new(hashes) {
         Some(candidates) => TrackOutcome::Ambiguous(candidates),
         None => TrackOutcome::Missing,
-    }
-}
-
-/// The matcher fell back to artist+title although the source has a duration,
-/// so the duration filter removed every candidate: the library version
-/// differs. Look up the library duration to report it.
-fn definitive_with_duration(
-    candidate: &CandidateTrack,
-    hash: ContentHash,
-    source_secs: u32,
-    lookup: &impl TrackLookup,
-) -> TrackOutcome {
-    let (Some(artist), Some(title)) = (&candidate.artist, &candidate.title) else {
-        return TrackOutcome::Matched(hash);
-    };
-    let library_secs = lookup
-        .find_by_artist_title(
-            &track_matcher::normalize(artist),
-            &track_matcher::normalize(title),
-        )
-        .into_iter()
-        .find(|(h, _)| *h == hash)
-        .and_then(|(_, d)| d);
-    match library_secs {
-        Some(library_secs) => TrackOutcome::DurationMismatch {
-            hash,
-            library_secs,
-            source_secs,
-        },
-        // The matcher treats an unknown library duration as passing its
-        // duration filter, so such a track is a match.
-        None => TrackOutcome::Matched(hash),
     }
 }
 
@@ -167,18 +136,13 @@ mod tests {
 
     #[test]
     fn a_library_track_without_a_duration_is_matched_and_written() {
-        let candidate = CandidateTrack {
-            isrc: None,
-            artist: Some("A".into()),
-            title: Some("One".into()),
-            duration_secs: Some(545),
-        };
         let lookup = FakePlaylistLookup {
             entries: vec![("a", "one", vec![(hash("5555555555555555"), None)])],
         };
-        let outcome = definitive_with_duration(&candidate, hash("5555555555555555"), 545, &lookup);
-        assert_eq!(outcome, TrackOutcome::Matched(hash("5555555555555555")));
-        assert_eq!(matched_hashes(&[outcome]), [hash("5555555555555555")]);
+        let tracks = [pl_track(1, "A", "One", 545.088)];
+        let outcomes = match_source_playlist(&tracks, &lookup);
+        assert_eq!(outcomes, [TrackOutcome::Matched(hash("5555555555555555"))]);
+        assert_eq!(matched_hashes(&outcomes), [hash("5555555555555555")]);
     }
 
     #[test]

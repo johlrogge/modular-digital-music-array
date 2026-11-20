@@ -205,13 +205,6 @@ pub mod path_uri {
 
 pub mod xml {
     /// Beat-grid anchor from a Rekordbox `<TEMPO>` element.
-    ///
-    /// When `None` on a track, the written TEMPO element defaults to
-    /// `Inizio="0.000"` to preserve backward-compatibility with the
-    /// existing export format.
-    ///
-    /// Only the first `<TEMPO>` of a track is kept; further anchors (variable
-    /// tempo) are ignored.
     #[derive(Clone, Debug, Default, PartialEq)]
     pub struct TempoAnchor {
         /// Position of the anchor in seconds (`Inizio`).
@@ -223,6 +216,173 @@ pub mod xml {
         /// `Battito`: the 1-based beat within the bar that the anchor sits on.
         /// `None` when missing or unparsable (treated as 1).
         pub battito: Option<u8>,
+    }
+
+    impl TempoAnchor {
+        /// Beats per bar: the numerator of `Metro`, 4 when missing, unparsable or 0.
+        pub fn beats_per_bar(&self) -> u8 {
+            self.metro_numerator.map_or(4, std::num::NonZeroU8::get)
+        }
+
+        /// The 1-based beat within the bar the anchor sits on (`Battito`); a missing,
+        /// unparsable or 0 value counts as 1, the downbeat.
+        pub fn beat_in_bar(&self) -> u8 {
+            self.battito.filter(|&b| b >= 1).unwrap_or(1)
+        }
+    }
+
+    /// How far a later anchor may sit from a beat of the first anchor's grid and
+    /// still count as on it, in milliseconds.
+    pub const GRID_TOLERANCE_MS: f64 = 5.0;
+
+    /// Why a set of anchors is not one constant grid.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum DeviationCause {
+        /// The anchor's `Bpm` differs from the first one's (to 2 decimals).
+        Bpm,
+        /// The anchor's `Metro` differs from the first one's.
+        Meter,
+        /// The anchor is more than [`GRID_TOLERANCE_MS`] from a beat of the first
+        /// anchor's grid.
+        OffGrid,
+        /// The anchor's `Battito` is not the bar position extrapolated from the
+        /// first anchor.
+        BarPosition,
+    }
+
+    /// The first anchor that breaks the first anchor's grid, and how far the
+    /// later anchors drift at worst.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    pub struct Deviation {
+        /// Index into the anchors of the first anchor that breaks the rule (>= 1).
+        pub anchor: usize,
+        pub cause: DeviationCause,
+        /// The largest distance of any later anchor from a beat of the first
+        /// anchor's grid, in milliseconds.
+        pub worst_offset_ms: f64,
+    }
+
+    /// What a track's TEMPO set says about its grid.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    pub enum TempoKind {
+        /// No TEMPO.
+        Absent,
+        /// Exactly the placeholder older MDMA exports wrote: carries no grid.
+        Placeholder,
+        /// One anchor, or several that the first anchor's grid reproduces: the set
+        /// collapses to a single grid within 5 ms of every anchor.
+        Constant,
+        /// Several anchors the first anchor's grid does not reproduce: no single
+        /// grid describes the track.
+        Variable(Deviation),
+    }
+
+    /// All `<TEMPO>` anchors of a track, in file order. Empty means no TEMPO (on
+    /// export: rekordbox analyses the track itself).
+    #[derive(Clone, Debug, Default, PartialEq)]
+    pub struct TempoSet(Vec<TempoAnchor>);
+
+    impl TempoSet {
+        pub fn new(anchors: Vec<TempoAnchor>) -> Self {
+            Self(anchors)
+        }
+
+        pub fn single(anchor: TempoAnchor) -> Self {
+            Self(vec![anchor])
+        }
+
+        pub fn push(&mut self, anchor: TempoAnchor) {
+            self.0.push(anchor);
+        }
+
+        pub fn anchors(&self) -> &[TempoAnchor] {
+            &self.0
+        }
+
+        pub fn first(&self) -> Option<&TempoAnchor> {
+            self.0.first()
+        }
+
+        pub fn is_empty(&self) -> bool {
+            self.0.is_empty()
+        }
+
+        pub fn is_single(&self) -> bool {
+            self.0.len() == 1
+        }
+
+        /// Exactly one anchor, at `Inizio` 0.000, on beat 1 of a 4/4 bar: the
+        /// placeholder that older MDMA exports wrote for every track with a BPM.
+        /// It carries no grid information. A real grid whose first beat is at 0 ms
+        /// in 4/4 is indistinguishable from it.
+        pub fn is_placeholder(&self) -> bool {
+            match self.0.as_slice() {
+                [a] => {
+                    a.inizio_seconds.abs() < 0.0005
+                        && a.beat_in_bar() == 1
+                        && a.beats_per_bar() == 4
+                }
+                _ => false,
+            }
+        }
+
+        /// Classify the set. A multi-anchor set is [`TempoKind::Constant`] when every
+        /// later anchor has the first anchor's `Bpm` (to 2 decimals; a missing `Bpm`
+        /// reads as `average_bpm`) and `Metro`, sits within [`GRID_TOLERANCE_MS`] of
+        /// a beat of the first anchor's grid, and has the `Battito` that the bar
+        /// position extrapolated from the first anchor gives.
+        pub fn classify(&self, average_bpm: Option<f32>) -> TempoKind {
+            let Some(first) = self.first() else {
+                return TempoKind::Absent;
+            };
+            if self.is_placeholder() {
+                return TempoKind::Placeholder;
+            }
+            let hundredths = |a: &TempoAnchor| {
+                a.bpm
+                    .or(average_bpm)
+                    .map(|b| (f64::from(b) * 100.0).round() as i64)
+            };
+            // Without a tempo there is no grid to compare against (nor to import).
+            let Some(first_hundredths) = hundredths(first) else {
+                return TempoKind::Constant;
+            };
+            let beat_seconds = 6_000.0 / first_hundredths as f64;
+            let bar = i64::from(first.beats_per_bar());
+            let first_position = i64::from(first.beat_in_bar()) - 1;
+
+            let mut worst_offset_ms = 0.0_f64;
+            let mut first_break: Option<(usize, DeviationCause)> = None;
+            for (index, anchor) in self.0.iter().enumerate().skip(1) {
+                let beats = (anchor.inizio_seconds - first.inizio_seconds) / beat_seconds;
+                let nearest = beats.round();
+                let offset_ms = (beats - nearest).abs() * beat_seconds * 1000.0;
+                worst_offset_ms = worst_offset_ms.max(offset_ms);
+                let expected_beat = (first_position + nearest as i64).rem_euclid(bar) + 1;
+                let cause = if hundredths(anchor) != Some(first_hundredths) {
+                    Some(DeviationCause::Bpm)
+                } else if anchor.beats_per_bar() != first.beats_per_bar() {
+                    Some(DeviationCause::Meter)
+                } else if offset_ms > GRID_TOLERANCE_MS + 1e-6 {
+                    Some(DeviationCause::OffGrid)
+                } else if i64::from(anchor.beat_in_bar()) != expected_beat {
+                    Some(DeviationCause::BarPosition)
+                } else {
+                    None
+                };
+                if first_break.is_none() {
+                    first_break = cause.map(|c| (index, c));
+                }
+            }
+            match first_break {
+                None => TempoKind::Constant,
+                Some((anchor, cause)) => TempoKind::Variable(Deviation {
+                    anchor,
+                    cause,
+                    worst_offset_ms,
+                }),
+            }
+        }
     }
 
     /// A cue point or loop marker from a Rekordbox `<POSITION_MARK>` element.
@@ -244,7 +404,7 @@ pub mod xml {
     }
 
     /// A single track entry for the Rekordbox XML collection.
-    #[derive(Clone, Default)]
+    #[derive(Clone, Debug, Default, PartialEq)]
     pub struct RekordboxTrack {
         pub track_id: u32,
         pub name: String,
@@ -267,8 +427,8 @@ pub mod xml {
         pub location: String, // file://localhost/ URI
         /// The `Rating` attribute: 0, 51, 102, 153, 204 or 255 (0 to 5 stars). 0 when absent.
         pub rating: u32,
-        /// Beat-grid anchor. `None` produces `Inizio="0.000"` (backward-compat).
-        pub tempo_anchor: Option<TempoAnchor>,
+        /// The `<TEMPO>` anchors. Empty writes no `<TEMPO>`.
+        pub tempo: TempoSet,
         /// Cue points and loops. Empty vec produces no `<POSITION_MARK>` output.
         pub position_marks: Vec<PositionMark>,
     }
@@ -415,25 +575,25 @@ pub mod xml {
 
         out.push_str(&format!(" Location=\"{}\"", xml_escape(&track.location)));
 
-        let has_children = track.average_bpm.is_some() || !track.position_marks.is_empty();
+        // Every anchor is written, so a set is never collapsed. An anchor's Bpm,
+        // else the track's AverageBpm, is its tempo; with neither it is skipped.
+        // An empty set writes no TEMPO: this writer never invents a placeholder.
+        let tempo: Vec<(&TempoAnchor, f32)> = track
+            .tempo
+            .anchors()
+            .iter()
+            .filter_map(|a| Some((a, a.bpm.or(track.average_bpm)?)))
+            .collect();
+        let has_children = !tempo.is_empty() || !track.position_marks.is_empty();
         if has_children {
             out.push_str(">\n");
-            if let Some(average_bpm) = track.average_bpm {
-                // When tempo_anchor is None, default to Inizio="0.000", 4/4 and
-                // Battito="1" for backward-compatibility with the existing export
-                // format. An anchor keeps its own Bpm, Metro and Battito.
-                let (inizio, bpm, metro, battito) = match &track.tempo_anchor {
-                    Some(a) => (
-                        a.inizio_seconds,
-                        a.bpm.unwrap_or(average_bpm),
-                        a.metro_numerator.map_or(4, |n| n.get()),
-                        a.battito.unwrap_or(1),
-                    ),
-                    None => (0.0, average_bpm, 4, 1),
-                };
+            for (a, bpm) in tempo {
                 out.push_str(&format!(
                     "      <TEMPO Inizio=\"{:.3}\" Bpm=\"{:.2}\" Metro=\"{}/4\" Battito=\"{}\"/>\n",
-                    inizio, bpm, metro, battito
+                    a.inizio_seconds,
+                    bpm,
+                    a.beats_per_bar(),
+                    a.beat_in_bar()
                 ));
             }
             for mark in &track.position_marks {
@@ -483,7 +643,7 @@ pub mod xml {
                     bitrate: Some(1411),
                     sample_rate: Some(44100),
                     location: "file://localhost/music/Test%20Track.aiff".to_string(),
-                    tempo_anchor: None,
+                    tempo: TempoSet::default(),
                     rating: 0,
                     position_marks: vec![],
                 }],
@@ -533,12 +693,170 @@ pub mod xml {
         }
 
         #[test]
-        fn xml_tempo_element_present_when_bpm_set() {
-            let xml = make_test_library().to_xml();
+        fn xml_tempo_element_present_when_anchor_set() {
+            let mut lib = make_test_library();
+            lib.tracks[0].tempo = TempoSet::single(TempoAnchor {
+                inizio_seconds: 0.018,
+                bpm: Some(127.5),
+                metro_numerator: std::num::NonZeroU8::new(3),
+                battito: Some(1),
+            });
+            let xml = lib.to_xml();
             assert!(
-                xml.contains("<TEMPO Inizio=\"0.000\" Bpm=\"128.00\""),
-                "TEMPO element missing"
+                xml.contains(
+                    "<TEMPO Inizio=\"0.018\" Bpm=\"127.50\" Metro=\"3/4\" Battito=\"1\"/>"
+                ),
+                "TEMPO element missing: {xml}"
             );
+        }
+
+        // ── TempoSet: placeholder and classification ─────────────────────────────
+
+        fn at(inizio: f64, bpm: f32, metro: u8, battito: u8) -> TempoAnchor {
+            TempoAnchor {
+                inizio_seconds: inizio,
+                bpm: Some(bpm),
+                metro_numerator: std::num::NonZeroU8::new(metro),
+                battito: Some(battito),
+            }
+        }
+
+        /// 120 BPM in 4/4: a beat is 500 ms, a bar 2 s.
+        fn two(second: TempoAnchor) -> TempoSet {
+            TempoSet::new(vec![at(0.0, 120.0, 4, 1), second])
+        }
+
+        #[test]
+        fn the_export_placeholder_is_a_placeholder() {
+            let set = TempoSet::single(at(0.0, 128.0, 4, 1));
+            assert!(set.is_placeholder());
+            assert_eq!(set.classify(None), TempoKind::Placeholder);
+            // Missing Metro and Battito, and Battito 0, read as 4/4 and beat 1.
+            assert!(TempoSet::single(TempoAnchor::default()).is_placeholder());
+            assert!(TempoSet::single(at(0.0, 128.0, 4, 0)).is_placeholder());
+        }
+
+        #[test]
+        fn a_real_single_anchor_is_not_a_placeholder() {
+            let set = TempoSet::single(at(0.018, 128.0, 4, 1));
+            assert!(!set.is_placeholder());
+            assert!(set.is_single());
+            assert_eq!(set.classify(None), TempoKind::Constant);
+        }
+
+        #[test]
+        fn an_anchor_on_another_beat_or_meter_is_not_a_placeholder() {
+            assert!(!TempoSet::single(at(0.0, 128.0, 4, 2)).is_placeholder());
+            assert!(!TempoSet::single(at(0.0, 128.0, 3, 1)).is_placeholder());
+        }
+
+        #[test]
+        fn several_anchors_starting_at_zero_are_not_a_placeholder() {
+            let set = two(at(30.0, 120.0, 4, 1));
+            assert!(!set.is_placeholder());
+            assert_eq!(set.classify(None), TempoKind::Constant);
+        }
+
+        #[test]
+        fn no_anchors_is_absent() {
+            assert_eq!(TempoSet::default().classify(Some(128.0)), TempoKind::Absent);
+        }
+
+        #[test]
+        fn later_anchors_on_the_first_anchors_grid_are_constant() {
+            // 60 beats on: bar position 1. 62 beats on: bar position 3.
+            assert_eq!(
+                two(at(30.0, 120.0, 4, 1)).classify(None),
+                TempoKind::Constant
+            );
+            assert_eq!(
+                two(at(31.0, 120.0, 4, 3)).classify(None),
+                TempoKind::Constant
+            );
+            // A missing Bpm reads as AverageBpm.
+            let mut no_bpm = at(30.0, 120.0, 4, 1);
+            no_bpm.bpm = None;
+            assert_eq!(two(no_bpm).classify(Some(120.0)), TempoKind::Constant);
+        }
+
+        fn deviation(set: &TempoSet) -> Deviation {
+            match set.classify(None) {
+                TempoKind::Variable(d) => d,
+                other => panic!("variable expected, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn an_anchor_off_the_grid_is_variable() {
+            let d = deviation(&two(at(30.1, 120.0, 4, 1)));
+            assert_eq!(d.anchor, 1);
+            assert_eq!(d.cause, DeviationCause::OffGrid);
+            assert!((d.worst_offset_ms - 100.0).abs() < 1e-6, "{d:?}");
+        }
+
+        #[test]
+        fn a_bpm_change_is_variable() {
+            let d = deviation(&two(at(30.0, 121.0, 4, 1)));
+            assert_eq!((d.anchor, d.cause), (1, DeviationCause::Bpm));
+        }
+
+        #[test]
+        fn a_bpm_equal_to_two_decimals_is_the_same_bpm() {
+            assert_eq!(
+                two(at(30.0, 120.004, 4, 1)).classify(None),
+                TempoKind::Constant
+            );
+        }
+
+        #[test]
+        fn a_meter_change_is_variable() {
+            let d = deviation(&two(at(30.0, 120.0, 3, 1)));
+            assert_eq!(d.cause, DeviationCause::Meter);
+        }
+
+        #[test]
+        fn a_battito_that_breaks_the_bar_position_is_variable() {
+            // On the grid (62 beats on) but the bar position is 3, not 1.
+            let d = deviation(&two(at(31.0, 120.0, 4, 1)));
+            assert_eq!((d.anchor, d.cause), (1, DeviationCause::BarPosition));
+            assert!(d.worst_offset_ms < 1e-6);
+        }
+
+        #[test]
+        fn five_ms_off_the_grid_is_on_it_and_more_is_not() {
+            assert_eq!(
+                two(at(30.005, 120.0, 4, 1)).classify(None),
+                TempoKind::Constant,
+                "exactly 5 ms"
+            );
+            assert_eq!(
+                two(at(29.995, 120.0, 4, 1)).classify(None),
+                TempoKind::Constant,
+                "5 ms early"
+            );
+            let d = deviation(&two(at(30.0051, 120.0, 4, 1)));
+            assert_eq!(d.cause, DeviationCause::OffGrid);
+        }
+
+        #[test]
+        fn the_first_breaking_anchor_is_named_and_the_worst_offset_is_the_largest() {
+            let set = TempoSet::new(vec![
+                at(0.0, 120.0, 4, 1),
+                at(30.0, 120.0, 4, 1),  // fine
+                at(60.02, 120.0, 4, 1), // 20 ms off: first to break
+                at(90.2, 120.0, 4, 1),  // 200 ms off: worst
+            ]);
+            let d = deviation(&set);
+            assert_eq!((d.anchor, d.cause), (2, DeviationCause::OffGrid));
+            assert!((d.worst_offset_ms - 200.0).abs() < 1e-6, "{d:?}");
+        }
+
+        #[test]
+        fn xml_never_writes_a_placeholder_tempo_when_there_is_no_anchor() {
+            // The track has a BPM but no grid: no TEMPO, so rekordbox analyses it.
+            let xml = make_test_library().to_xml();
+            assert!(!xml.contains("<TEMPO"), "no placeholder TEMPO: {xml}");
+            assert!(xml.contains("AverageBpm=\"128.00\""));
         }
 
         #[test]
@@ -564,7 +882,7 @@ pub mod xml {
                     bitrate: None,
                     sample_rate: None,
                     location: "file://localhost/music/nobpm.mp3".to_string(),
-                    tempo_anchor: None,
+                    tempo: TempoSet::default(),
                     rating: 0,
                     position_marks: vec![],
                 }],
@@ -631,7 +949,7 @@ pub mod xml {
                     bitrate: None,
                     sample_rate: None,
                     location: "file://localhost/music/track.mp3".to_string(),
-                    tempo_anchor: None,
+                    tempo: TempoSet::default(),
                     rating: 0,
                     position_marks: vec![],
                 }],
@@ -681,7 +999,7 @@ pub mod xml {
                     bitrate: None,
                     sample_rate: None,
                     location: "file://localhost/music/t.aiff".to_string(),
-                    tempo_anchor: Some(TempoAnchor {
+                    tempo: TempoSet::single(TempoAnchor {
                         inizio_seconds: 1.5,
                         ..Default::default()
                     }),
@@ -720,7 +1038,7 @@ pub mod xml {
                     bitrate: None,
                     sample_rate: None,
                     location: "file://localhost/music/t.aiff".to_string(),
-                    tempo_anchor: None,
+                    tempo: TempoSet::default(),
                     rating: 0,
                     position_marks: vec![PositionMark {
                         name: "Loop".to_string(),
@@ -767,7 +1085,7 @@ pub mod xml {
                     bitrate: None,
                     sample_rate: None,
                     location: "file://localhost/music/t.aiff".to_string(),
-                    tempo_anchor: None,
+                    tempo: TempoSet::default(),
                     rating: 0,
                     position_marks: vec![PositionMark {
                         name: "Intro".to_string(),
@@ -802,17 +1120,6 @@ pub mod xml {
             assert!(xml.contains(" Rating=\"204\""), "{xml}");
             assert!(!xml.contains(" Rating=\"0\""), "no hardcoded rating: {xml}");
         }
-
-        #[test]
-        fn xml_backward_compat_no_anchor_produces_inizio_zero() {
-            // A track with tempo_anchor=None must produce Inizio="0.000" to stay
-            // byte-identical to what was exported before TempoAnchor was added.
-            let xml = make_test_library().to_xml();
-            assert!(
-                xml.contains("Inizio=\"0.000\""),
-                "None anchor must produce Inizio=\"0.000\""
-            );
-        }
     }
 }
 
@@ -822,7 +1129,7 @@ pub mod xml {
 
 pub mod parse {
     use super::xml::{
-        PositionMark, RekordboxLibrary, RekordboxPlaylist, RekordboxTrack, TempoAnchor,
+        PositionMark, RekordboxLibrary, RekordboxPlaylist, RekordboxTrack, TempoAnchor, TempoSet,
     };
     use quick_xml::events::Event;
     use quick_xml::reader::Reader;
@@ -848,21 +1155,29 @@ pub mod parse {
     }
 
     fn percent_decode(s: &str) -> String {
-        let mut out = String::with_capacity(s.len());
+        // Decode to bytes first: `%C3%B6` is one UTF-8 character, not two.
+        let mut out: Vec<u8> = Vec::with_capacity(s.len());
         let bytes = s.as_bytes();
         let mut i = 0;
         while i < bytes.len() {
             if bytes[i] == b'%' && i + 2 < bytes.len() {
                 if let (Some(h), Some(l)) = (char_to_hex(bytes[i + 1]), char_to_hex(bytes[i + 2])) {
-                    out.push((h * 16 + l) as char);
+                    out.push(h * 16 + l);
                     i += 3;
                     continue;
                 }
             }
-            out.push(bytes[i] as char);
+            out.push(bytes[i]);
             i += 1;
         }
-        out
+        // Bytes that are not valid UTF-8 (a Latin-1 filename) become one char per
+        // byte, so nothing is lost the way U+FFFD would lose it.
+        let mut decoded = String::with_capacity(out.len());
+        for chunk in out.utf8_chunks() {
+            decoded.push_str(chunk.valid());
+            decoded.extend(chunk.invalid().iter().map(|&b| b as char));
+        }
+        decoded
     }
 
     fn char_to_hex(b: u8) -> Option<u8> {
@@ -963,14 +1278,13 @@ pub mod parse {
                         // into the PLAYLISTS section.
                         "TEMPO" if section == Section::Collection && in_collection_track => {
                             if let Some(track) = tracks.last_mut() {
-                                // First TEMPO wins — later anchors (variable tempo) are
-                                // ignored: the grid is one anchor and one BPM.
-                                if track.tempo_anchor.is_none() {
+                                // Every anchor is kept, in file order.
+                                {
                                     let attrs = e.attributes();
                                     if let Some(inizio) = attr_str(&attrs, b"Inizio")
                                         .and_then(|s| s.parse::<f64>().ok())
                                     {
-                                        track.tempo_anchor = Some(TempoAnchor {
+                                        track.tempo.push(TempoAnchor {
                                             inizio_seconds: inizio,
                                             bpm: attr_str(&attrs, b"Bpm")
                                                 .and_then(|s| s.parse::<f32>().ok()),
@@ -1133,7 +1447,7 @@ pub mod parse {
             bitrate,
             sample_rate,
             location,
-            tempo_anchor: None,
+            tempo: TempoSet::default(),
             rating,
             position_marks: vec![],
         });
@@ -1253,6 +1567,23 @@ pub mod parse {
         }
 
         #[test]
+        fn parse_location_decodes_utf8_sequences() {
+            assert_eq!(
+                parse_location("file://localhost/music/Bj%C3%B6rk/Cr%C3%A8me.flac"),
+                Some("/music/Björk/Crème.flac".to_string())
+            );
+        }
+
+        #[test]
+        fn parse_location_decodes_invalid_utf8_as_latin1() {
+            // `%E9` alone is not UTF-8: it is Latin-1 `é`. Valid sequences around it stay.
+            assert_eq!(
+                parse_location("file://localhost/music/Caf%E9/Bj%C3%B6rk%E9.flac"),
+                Some("/music/Café/Björké.flac".to_string())
+            );
+        }
+
+        #[test]
         fn parse_location_rejects_non_file_uri() {
             assert_eq!(parse_location("http://example.com/track.mp3"), None);
         }
@@ -1282,7 +1613,7 @@ pub mod parse {
                     bitrate: Some(1411),
                     sample_rate: Some(44100),
                     location: "file://localhost/music/Round%20Trip.flac".to_string(),
-                    tempo_anchor: None,
+                    tempo: TempoSet::default(),
                     rating: 0,
                     position_marks: vec![],
                 }],
@@ -1355,10 +1686,7 @@ pub mod parse {
             let lib = parse_xml(xml).unwrap();
             assert_eq!(lib.tracks.len(), 1);
             let t = &lib.tracks[0];
-            let anchor = t
-                .tempo_anchor
-                .as_ref()
-                .expect("tempo_anchor should be Some");
+            let anchor = t.tempo.first().expect("tempo should have an anchor");
             assert!(
                 (anchor.inizio_seconds - 1.5).abs() < 1e-9,
                 "inizio should be 1.5, got {}",
@@ -1381,11 +1709,14 @@ pub mod parse {
   <PLAYLISTS><NODE Type="0" Name="ROOT" Count="0"/></PLAYLISTS>
 </DJ_PLAYLISTS>"#;
             let lib = parse_xml(xml).unwrap();
-            let anchor = lib.tracks[0].tempo_anchor.as_ref().unwrap();
+            let tempo = &lib.tracks[0].tempo;
+            assert_eq!(tempo.anchors().len(), 2, "every anchor is kept");
+            let anchor = tempo.first().unwrap();
             assert_eq!(anchor.bpm, Some(127.5));
             assert_eq!(anchor.metro_numerator, std::num::NonZeroU8::new(3));
             assert_eq!(anchor.battito, Some(3));
             assert!((anchor.inizio_seconds - 0.25).abs() < 1e-9);
+            assert_eq!(tempo.anchors()[1].bpm, Some(130.0));
         }
 
         #[test]
@@ -1401,7 +1732,7 @@ pub mod parse {
   <PLAYLISTS><NODE Type="0" Name="ROOT" Count="0"/></PLAYLISTS>
 </DJ_PLAYLISTS>"#;
             let lib = parse_xml(xml).unwrap();
-            let anchor = lib.tracks[0].tempo_anchor.as_ref().unwrap();
+            let anchor = lib.tracks[0].tempo.first().unwrap();
             assert_eq!(anchor.bpm, None);
             assert_eq!(anchor.metro_numerator, None);
             assert_eq!(anchor.battito, None);
@@ -1443,7 +1774,9 @@ pub mod parse {
 
         #[test]
         fn roundtrip_with_tempo_anchor_and_position_marks() {
-            use super::super::xml::{PositionMark, RekordboxLibrary, RekordboxTrack, TempoAnchor};
+            use super::super::xml::{
+                PositionMark, RekordboxLibrary, RekordboxTrack, TempoAnchor, TempoSet,
+            };
 
             let original = RekordboxLibrary {
                 tracks: vec![RekordboxTrack {
@@ -1466,12 +1799,20 @@ pub mod parse {
                     bitrate: Some(1411),
                     sample_rate: Some(44100),
                     location: "file://localhost/music/anchored.aiff".to_string(),
-                    tempo_anchor: Some(TempoAnchor {
-                        inizio_seconds: 0.25,
-                        bpm: Some(131.5),
-                        metro_numerator: std::num::NonZeroU8::new(3),
-                        battito: Some(2),
-                    }),
+                    tempo: TempoSet::new(vec![
+                        TempoAnchor {
+                            inizio_seconds: 0.25,
+                            bpm: Some(131.5),
+                            metro_numerator: std::num::NonZeroU8::new(3),
+                            battito: Some(2),
+                        },
+                        TempoAnchor {
+                            inizio_seconds: 30.0,
+                            bpm: Some(131.5),
+                            metro_numerator: std::num::NonZeroU8::new(3),
+                            battito: Some(1),
+                        },
+                    ]),
                     rating: 153,
                     position_marks: vec![
                         // memory cue: Num=-1
@@ -1509,10 +1850,13 @@ pub mod parse {
             assert_eq!(parsed.tracks.len(), 1);
             let t = &parsed.tracks[0];
 
-            let anchor = t
-                .tempo_anchor
-                .as_ref()
-                .expect("tempo_anchor should survive round-trip");
+            assert_eq!(
+                t.tempo.anchors().len(),
+                2,
+                "a multi-anchor set is written whole"
+            );
+            assert_eq!(t.tempo, original.tracks[0].tempo);
+            let anchor = t.tempo.first().expect("tempo should survive round-trip");
             assert!(
                 (anchor.inizio_seconds - 0.25).abs() < 1e-9,
                 "inizio round-trips: {}",
@@ -1579,8 +1923,7 @@ pub mod parse {
         }
 
         #[test]
-        fn parser_multiple_tempo_first_wins() {
-            // When a TRACK has multiple TEMPO children (defensive), first Inizio wins.
+        fn parser_keeps_every_tempo_in_file_order() {
             let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
 <DJ_PLAYLISTS Version="1.0.0">
   <PRODUCT Name="rekordbox" Version="6.0.0" Company="AlphaTheta"/>
@@ -1595,15 +1938,13 @@ pub mod parse {
   <PLAYLISTS><NODE Type="0" Name="ROOT" Count="0"/></PLAYLISTS>
 </DJ_PLAYLISTS>"#;
             let lib = parse_xml(xml).unwrap();
-            let anchor = lib.tracks[0]
-                .tempo_anchor
-                .as_ref()
-                .expect("tempo_anchor should be Some");
-            assert!(
-                (anchor.inizio_seconds - 1.0).abs() < 1e-9,
-                "first TEMPO wins, got {}",
-                anchor.inizio_seconds
-            );
+            let inizios: Vec<f64> = lib.tracks[0]
+                .tempo
+                .anchors()
+                .iter()
+                .map(|a| a.inizio_seconds)
+                .collect();
+            assert_eq!(inizios, [1.0, 2.0]);
         }
 
         #[test]
@@ -1637,7 +1978,7 @@ pub mod parse {
             let lib = parse_xml(SAMPLE_XML).unwrap();
             let t2 = &lib.tracks[1]; // the self-closing track in SAMPLE_XML
             assert!(t2.position_marks.is_empty());
-            assert!(t2.tempo_anchor.is_none());
+            assert!(t2.tempo.is_empty());
         }
 
         #[test]
@@ -1648,7 +1989,7 @@ pub mod parse {
             //
             // This XML has a playlist TRACK (Key="1") followed by a stray TEMPO element.
             // Without the section guard, the stray TEMPO would modify the last collection
-            // track's tempo_anchor via the leaked in_collection_track flag.
+            // track's tempo via the leaked in_collection_track flag.
             let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
 <DJ_PLAYLISTS Version="1.0.0">
   <PRODUCT Name="rekordbox" Version="6.0.0" Company="AlphaTheta"/>
@@ -1671,9 +2012,10 @@ pub mod parse {
             let lib = parse_xml(xml).unwrap();
             assert_eq!(lib.tracks.len(), 1);
             // The stray TEMPO in PLAYLISTS must NOT have overwritten the collection track's anchor.
+            assert_eq!(lib.tracks[0].tempo.anchors().len(), 1);
             let anchor = lib.tracks[0]
-                .tempo_anchor
-                .as_ref()
+                .tempo
+                .first()
                 .expect("anchor from COLLECTION should survive");
             assert!(
                 (anchor.inizio_seconds - 1.0).abs() < 1e-9,
@@ -1693,7 +2035,7 @@ pub mod merge {
     use std::path::{Path, PathBuf};
 
     use super::path_uri::path_to_file_uri;
-    use super::xml::{PositionMark, RekordboxLibrary, RekordboxPlaylist, RekordboxTrack};
+    use super::xml::{PositionMark, RekordboxLibrary, RekordboxPlaylist, RekordboxTrack, TempoSet};
 
     /// A playlist to create or replace in the export.
     ///
@@ -1761,6 +2103,9 @@ pub mod merge {
         pub bitrate: Option<u32>,
         pub sample_rate: Option<u32>,
         pub location: String,
+        /// MDMA's stored beat grid as TEMPO; empty when MDMA has none (the existing
+        /// TEMPO of the track is then kept, unless it is a placeholder).
+        pub tempo: TempoSet,
         /// The `Rating` to write: 0, 51, 102, 153, 204 or 255.
         pub rating: u32,
         pub position_marks: Vec<PositionMark>,
@@ -1895,9 +2240,17 @@ pub mod merge {
             .map(|t| (t.track_id, t.location.clone()))
             .collect();
 
+        // The existing XML is usually MDMA's own previous export, where older versions
+        // wrote a placeholder TEMPO for every track with a BPM. It carries no grid, so
+        // it is dropped here: neither the fallback below nor a pass-through copies it.
         let mut existing_tracks_by_location: HashMap<String, RekordboxTrack> = existing_tracks
             .into_iter()
-            .map(|t| (t.location.clone(), t))
+            .map(|mut t| {
+                if t.tempo.is_placeholder() {
+                    t.tempo = TempoSet::default();
+                }
+                (t.location.clone(), t)
+            })
             .collect();
 
         // Ordered locations: existing first, then new from refreshed.
@@ -1919,6 +2272,17 @@ pub mod merge {
             // by lowercased location.
             let track: RekordboxTrack =
                 if let Some(r) = refreshed_by_location.remove(&loc.to_lowercase()) {
+                    // MDMA owns the grid: its own wins; with none, the (non-placeholder)
+                    // TEMPO that rekordbox has for this track stays.
+                    let existing_tempo = existing_tracks_by_location
+                        .remove(loc)
+                        .map(|t| t.tempo)
+                        .unwrap_or_default();
+                    let tempo = if r.tempo.is_empty() {
+                        existing_tempo
+                    } else {
+                        r.tempo
+                    };
                     RekordboxTrack {
                         track_id,
                         name: r.name,
@@ -1939,7 +2303,7 @@ pub mod merge {
                         bitrate: r.bitrate,
                         sample_rate: r.sample_rate,
                         location: r.location,
-                        tempo_anchor: None,
+                        tempo,
                         rating: r.rating,
                         position_marks: r.position_marks,
                     }
@@ -2017,7 +2381,9 @@ pub mod merge {
 
     #[cfg(test)]
     mod tests {
-        use super::super::xml::{RekordboxLibrary, RekordboxPlaylist, RekordboxTrack};
+        use super::super::xml::{
+            RekordboxLibrary, RekordboxPlaylist, RekordboxTrack, TempoAnchor, TempoSet,
+        };
         use super::*;
 
         fn make_track(id: u32, location: &str) -> RekordboxTrack {
@@ -2041,7 +2407,7 @@ pub mod merge {
                 bitrate: None,
                 sample_rate: None,
                 location: location.to_string(),
-                tempo_anchor: None,
+                tempo: TempoSet::default(),
                 rating: 0,
                 position_marks: vec![],
             }
@@ -2067,6 +2433,7 @@ pub mod merge {
                 bitrate: None,
                 sample_rate: None,
                 location: location.to_string(),
+                tempo: TempoSet::default(),
                 rating: 0,
                 position_marks: vec![],
             }
@@ -2228,6 +2595,115 @@ pub mod merge {
             refreshed.rating = 102;
             let lib = merge_export(None, vec![refreshed], &[]);
             assert_eq!(lib.tracks[0].rating, 102);
+        }
+
+        fn anchor(inizio_seconds: f64) -> TempoAnchor {
+            TempoAnchor {
+                inizio_seconds,
+                bpm: Some(128.0),
+                ..Default::default()
+            }
+        }
+
+        fn set(inizio_seconds: f64) -> TempoSet {
+            TempoSet::single(anchor(inizio_seconds))
+        }
+
+        /// What older MDMA exports wrote for every track with a BPM.
+        fn placeholder() -> TempoSet {
+            TempoSet::single(TempoAnchor {
+                inizio_seconds: 0.0,
+                bpm: Some(128.0),
+                metro_numerator: std::num::NonZeroU8::new(4),
+                battito: Some(1),
+            })
+        }
+
+        #[test]
+        fn merge_export_writes_the_grid_of_the_refreshed_track_over_the_existing_one() {
+            let mut existing_track = make_track(1, LOC_A);
+            existing_track.tempo = set(0.5);
+            let mut refreshed = make_refreshed("Track A", LOC_A);
+            refreshed.tempo = set(0.018);
+            let lib = merge_export(
+                Some(make_library(vec![existing_track], vec![])),
+                vec![refreshed],
+                &[],
+            );
+            assert_eq!(lib.tracks[0].tempo, set(0.018));
+        }
+
+        #[test]
+        fn merge_export_keeps_the_existing_grid_when_mdma_has_none() {
+            let mut existing_track = make_track(1, LOC_A);
+            existing_track.tempo = set(0.5);
+            let refreshed = make_refreshed("Track A", LOC_A);
+            assert!(refreshed.tempo.is_empty());
+            let lib = merge_export(
+                Some(make_library(vec![existing_track], vec![])),
+                vec![refreshed],
+                &[],
+            );
+            assert_eq!(lib.tracks[0].tempo, set(0.5));
+        }
+
+        #[test]
+        fn merge_export_of_a_new_track_without_a_grid_has_no_grid() {
+            let lib = merge_export(None, vec![make_refreshed("Track A", LOC_A)], &[]);
+            assert!(lib.tracks[0].tempo.is_empty());
+        }
+
+        #[test]
+        fn merge_export_does_not_carry_an_existing_placeholder_forward() {
+            let mut existing_track = make_track(1, LOC_A);
+            existing_track.tempo = placeholder();
+            let refreshed = make_refreshed("Track A", LOC_A);
+            let lib = merge_export(
+                Some(make_library(vec![existing_track], vec![])),
+                vec![refreshed],
+                &[],
+            );
+            assert!(lib.tracks[0].tempo.is_empty());
+            assert!(!lib.to_xml().contains("<TEMPO"));
+        }
+
+        #[test]
+        fn merge_export_drops_a_placeholder_on_pass_through_too() {
+            // LOC_A is not refreshed: the track passes through, but not its placeholder.
+            let mut untouched = make_track(1, LOC_A);
+            untouched.tempo = placeholder();
+            let mut real = make_track(2, LOC_B);
+            real.tempo = set(0.018);
+            let lib = merge_export(
+                Some(make_library(vec![untouched, real], vec![])),
+                vec![],
+                &[],
+            );
+            assert!(lib.tracks[0].tempo.is_empty());
+            assert_eq!(
+                lib.tracks[1].tempo,
+                set(0.018),
+                "a real grid passes through"
+            );
+        }
+
+        #[test]
+        fn merge_export_passes_a_multi_anchor_set_through_whole() {
+            let sets = TempoSet::new(vec![anchor(0.018), anchor(30.0)]);
+            let mut existing_track = make_track(1, LOC_A);
+            existing_track.tempo = sets.clone();
+            let kept = merge_export(
+                Some(make_library(vec![existing_track.clone()], vec![])),
+                vec![make_refreshed("Track A", LOC_A)],
+                &[],
+            );
+            assert_eq!(kept.tracks[0].tempo, sets, "kept when MDMA has no grid");
+            let passed = merge_export(
+                Some(make_library(vec![existing_track], vec![])),
+                vec![],
+                &[],
+            );
+            assert_eq!(passed.tracks[0].tempo, sets);
         }
 
         #[test]

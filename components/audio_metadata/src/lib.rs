@@ -184,14 +184,21 @@ pub fn extract_metadata(path: impl AsRef<Path>) -> Result<TrackMetadata, Metadat
 
         // DJ-specific metadata - try multiple possible tag keys
         // BPM can be stored in different fields
+        // lofty maps the standard fields to named keys: ID3v2 `TBPM` is
+        // `IntegerBpm`, Vorbis `BPM` is `Bpm`, `TKEY`/`INITIALKEY`/`KEY` are
+        // `InitialKey`. The `Unknown` lookups stay for taggers that write custom
+        // fields.
         metadata.bpm = tag
-            .get_string(&ItemKey::Unknown("BPM".to_string()))
+            .get_string(&ItemKey::Bpm)
+            .or_else(|| tag.get_string(&ItemKey::IntegerBpm))
+            .or_else(|| tag.get_string(&ItemKey::Unknown("BPM".to_string())))
             .or_else(|| tag.get_string(&ItemKey::Unknown("TBPM".to_string())))
             .and_then(|s| s.parse::<f32>().ok());
 
         // Key can be stored in different fields depending on the tagger
         metadata.key = tag
-            .get_string(&ItemKey::Unknown("INITIALKEY".to_string()))
+            .get_string(&ItemKey::InitialKey)
+            .or_else(|| tag.get_string(&ItemKey::Unknown("INITIALKEY".to_string())))
             .or_else(|| tag.get_string(&ItemKey::Unknown("KEY".to_string())))
             .or_else(|| tag.get_string(&ItemKey::Unknown("TKEY".to_string())))
             .map(|s| s.to_string());
@@ -412,6 +419,43 @@ mod tests {
         tag.save_to_path(path).expect("save tag");
 
         tmp
+    }
+
+    /// A one-frame 16-bit mono 44.1 kHz AIFF with no tags.
+    fn tiny_aiff() -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(b"FORM");
+        b.extend_from_slice(&48u32.to_be_bytes());
+        b.extend_from_slice(b"AIFF");
+        b.extend_from_slice(b"COMM");
+        b.extend_from_slice(&18u32.to_be_bytes());
+        b.extend_from_slice(&1u16.to_be_bytes()); // channels
+        b.extend_from_slice(&1u32.to_be_bytes()); // frames
+        b.extend_from_slice(&16u16.to_be_bytes()); // bits
+        b.extend_from_slice(&[0x40, 0x0E, 0xAC, 0x44, 0, 0, 0, 0, 0, 0]); // 44100 Hz
+        b.extend_from_slice(b"SSND");
+        b.extend_from_slice(&10u32.to_be_bytes());
+        b.extend_from_slice(&[0; 8]); // offset, block size
+        b.extend_from_slice(&[0; 2]); // one sample
+        b
+    }
+
+    /// A MDMA AIFF export carries BPM and key as the ID3v2 `TBPM` / `TKEY` frames;
+    /// re-reading it must find them.
+    #[test]
+    fn extract_metadata_reads_id3v2_tbpm_and_tkey_from_aiff() {
+        let mut tmp = NamedTempFile::with_suffix(".aiff").expect("tmpfile");
+        tmp.write_all(&tiny_aiff()).expect("write aiff");
+        tmp.flush().expect("flush");
+
+        let mut tag = Tag::new(TagType::Id3v2);
+        tag.insert_text(ItemKey::IntegerBpm, "128".to_string());
+        tag.insert_text(ItemKey::InitialKey, "Abm".to_string());
+        tag.save_to_path(tmp.path()).expect("save tag");
+
+        let meta = extract_metadata(tmp.path()).expect("extract");
+        assert_eq!(meta.bpm, Some(128.0));
+        assert_eq!(meta.key.as_deref(), Some("Abm"));
     }
 
     #[test]

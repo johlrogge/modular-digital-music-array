@@ -1,7 +1,7 @@
 //! Library wire types for the new web UI.
 //!
 //! `ApiTrack` is the one track shape the browser sees. Its field names are exactly the ones
-//! `static/js/logic.js` reads; the old UI keeps using `TrackInfoJson` and is not affected.
+//! `static/js/logic.js` reads.
 
 use super::{fail, gw, json_or_failure, lib, library, unexpected_library_response};
 use crate::AppState;
@@ -18,8 +18,7 @@ use library_ipc_client::{
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-/// The text and range filters shared by the old `/library/search` and the new
-/// `/api/tracks/match`.
+/// The text and range filters of `/api/tracks/match`.
 #[derive(Debug, Default, Deserialize)]
 pub struct SearchParams {
     pub q: Option<String>,
@@ -1261,15 +1260,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn root_is_the_new_shell_and_classic_the_old_ui() {
+    async fn root_is_the_shell_and_classic_redirects_to_it() {
         let res = send_get(test_app(), "/", None).await;
         assert_eq!(res.status(), StatusCode::OK);
         let body = crate::test_support::body_text(res).await;
         assert!(body.contains("<title>MDMA Player</title>"));
 
         let res = send_get(test_app(), "/classic", None).await;
-        assert_eq!(res.status(), StatusCode::OK);
-        let body = crate::test_support::body_text(res).await;
-        assert!(body.contains("<title>MDMA Console</title>"));
+        assert_eq!(res.status(), StatusCode::PERMANENT_REDIRECT);
+        assert_eq!(res.headers().get("location").unwrap(), "/");
     }
 }

@@ -26,7 +26,7 @@
 // Non-2xx rejects with ApiError (status 0 means the network failed, 409 means busy or stale).
 // Every /api/queue/* mutation returns the resulting { queue: [hash] }; pass it to applyQueue().
 
-import { LIKED, markLabel, trackTitle } from "./logic.js";
+import { LIKED, markLabel, plural, trackTitle } from "./logic.js";
 
 /* ============================================================ store + events */
 
@@ -161,7 +161,7 @@ export function setKeyNotation(n) {
 /** A track's key ({ musical, camelot, open_key } or null) in the chosen notation; "" when it has none. */
 export const keyText = (k) => (k && k[keyNotation]) || "";
 
-export const plural = (n, w) => n + " " + w + (n === 1 ? "" : "s");
+export { plural }; // defined in logic.js; the other modules keep importing it via core.js
 export const enc = (s) => encodeURIComponent(s);
 /** The address of playlist `name`'s page, or of its sub page (`sub`: "edit"). */
 export const playlistHref = (name, sub) => "#/playlist/" + enc(name) + (sub ? "/" + sub : "");
@@ -382,7 +382,9 @@ export class ApiError extends Error {
  */
 export async function api(path, opts = {}) {
   const init = { method: opts.method || (opts.body !== undefined ? "POST" : "GET"), headers: {} };
-  if (opts.body !== undefined) {
+  if (opts.body instanceof FormData) {
+    init.body = opts.body; // multipart: the browser sets the content type and boundary
+  } else if (opts.body !== undefined) {
     init.headers["content-type"] = "application/json";
     init.body = JSON.stringify(opts.body);
   }
@@ -679,10 +681,8 @@ export function startRouter() {
 
 // The ONLY ways a click may change what is heard. Each one calls the API, applies the returned
 // { queue } with applyQueue(), and shows a toast (with Undo where a queue change can be undone).
-// Nothing here may call the raw /player/play-queue: playNow and start go through the server's
-// idle guard. Each action resolves true when the server did what was asked, false otherwise.
-
-const count = (n) => (n === 1 ? "1 track" : n + " tracks");
+// playNow and start go through the server's idle guard (/api/start, /api/queue); there is no
+// unguarded play route. Each action resolves true when the server did what was asked, false otherwise.
 
 // What a queue action acts on is a "set": a function from the action ("next", "last", "replace",
 // "now") to the request that does it. The server holds every rule about which tracks can play.
@@ -745,7 +745,7 @@ function settle(body, done) {
 function said(body, subject, done) {
   const skipped = (body.skipped || []).map((s) => s.position + 1);
   const note = skipped.length ? " (unavailable skipped: " + skipped.join(", ") + ")" : "";
-  return (body.queued ? done(subject || count(body.queued), body.queued) : "Nothing to queue") + note;
+  return (body.queued ? done(subject || plural(body.queued, "track"), body.queued) : "Nothing to queue") + note;
 }
 
 /** Toast with an Undo that puts back `before`, the queue the server replaced, but only if it is still as the server returned it (`after`). */

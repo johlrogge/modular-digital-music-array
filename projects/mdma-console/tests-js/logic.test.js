@@ -1,9 +1,33 @@
 // Run with `deno test projects/mdma-console/tests-js/`. Kept out of static/, which is all served.
-import { barTarget, appendOps, editOutcome, insertedCount, addedAndSkipped, speakerRows, metaLine } from "../static/js/logic.js";
+import { barTarget, appendOps, editOutcome, insertedCount, addedAndSkipped, speakerRows, metaLine, bandcampSummary, restartPhase, RESTART_TIMEOUT_MS, uploadRows, ingestSummary, plural, packageRows, updatesSummary, consoleLast } from "../static/js/logic.js";
 
 function eq(actual, expected) {
   if (actual !== expected) throw new Error("expected " + expected + ", got " + actual);
 }
+
+Deno.test("package rows: a null update stays null, only the console is self, and it comes last", () => {
+  const rows = packageRows([{ name: "mdma-console", version: "1", update_version: "2" }, { name: "mdma-library", version: "1", update_version: null }]);
+  eq(JSON.stringify(rows), JSON.stringify([{ name: "mdma-library", version: "1", update: null, self: false }, { name: "mdma-console", version: "1", update: "2", self: true }]));
+});
+
+Deno.test("console last: only a console update next to other updates asks for the hint", () => {
+  const row = (name, update_version) => ({ name, version: "1", update_version });
+  eq(consoleLast(packageRows([row("mdma-console", "2"), row("mdma-library", "2")])), true);
+  eq(consoleLast(packageRows([row("mdma-console", "2"), row("mdma-library", null)])), false);
+  eq(consoleLast(packageRows([row("mdma-console", null), row("mdma-library", "2")])), false);
+});
+
+Deno.test("package rows: anything but a list is no packages", () => {
+  eq(packageRows(null).length, 0);
+  eq(packageRows({}).length, 0);
+});
+
+Deno.test("updates summary: counts the updates, plural-aware, or says no updates were found", () => {
+  eq(updatesSummary(packageRows([{ name: "a", version: "1", update_version: null }])), "No updates found. Check for newer versions.");
+  eq(updatesSummary(packageRows([{ name: "a", version: "1", update_version: "2" }])), "1 update available");
+  eq(updatesSummary(packageRows([{ name: "a", version: "1", update_version: "2" }, { name: "b", version: "1", update_version: "3" }])), "2 updates available");
+  eq(updatesSummary([]), "No updates found. Check for newer versions.");
+});
 
 Deno.test("speakers: the current device is marked, labels fall back to the name", () => {
   const rows = speakerRows([{ name: "a", description: "Desk" }, { name: "b", description: null }], { device_name: "b" });
@@ -16,6 +40,47 @@ Deno.test("speakers: no current device (auto) marks nothing", () => {
   eq(speakerRows([{ name: "a" }], null)[0].current, false);
 });
 
+Deno.test("bandcamp: a connected, signed in, running source", () => {
+  const s = bandcampSummary({ connected: true, authenticated: true, downloads_active: 2, downloads_queued: 1, downloads_completed: 5, downloads_failed: 0, paused: false });
+  eq(s.auth, "Signed in");
+  eq(s.counts, "2 active · 1 queued · 5 completed · 0 failed");
+  eq(s.paused, false);
+  eq(s.pauseLabel, "Pause downloads");
+});
+
+Deno.test("bandcamp: paused offers resume; not signed in says so", () => {
+  const s = bandcampSummary({ connected: true, authenticated: false, paused: true });
+  eq(s.auth, "Not signed in");
+  eq(s.paused, true);
+  eq(s.pauseLabel, "Resume downloads");
+  eq(s.counts, "0 active · 0 queued · 0 completed · 0 failed");
+});
+
+Deno.test("bandcamp: a source that is not connected has no counts", () => {
+  for (const s of [null, { connected: false }]) {
+    const r = bandcampSummary(s);
+    eq(r.auth, "Bandcamp is not running");
+    eq(r.counts, "");
+    eq(r.connected, false);
+  }
+});
+
+Deno.test("bandcamp: invalid cookies are reported, connected or not", () => {
+  eq(bandcampSummary({ connected: true, authenticated: false, cookies_valid: false }).cookies, "Cookie file expired or invalid");
+  eq(bandcampSummary({ connected: false, cookies_valid: false }).cookies, "Cookie file expired or invalid");
+  eq(bandcampSummary({ connected: true, authenticated: true, cookies_valid: true }).cookies, "");
+  eq(bandcampSummary({ connected: true, authenticated: true }).cookies, "");
+  eq(bandcampSummary(null).cookies, "");
+});
+
+Deno.test("restart: waits, comes back, or gives up after the timeout", () => {
+  eq(restartPhase(1000, 1000, false), "waiting");
+  eq(restartPhase(1000, 1000 + RESTART_TIMEOUT_MS - 1, false), "waiting");
+  eq(restartPhase(1000, 1000 + RESTART_TIMEOUT_MS, false), "gave-up");
+  eq(restartPhase(1000, 1000, true), "back");
+  eq(restartPhase(1000, 1000 + RESTART_TIMEOUT_MS * 2, true), "back");
+});
+
 Deno.test("meta line: album, BPM, key and duration joined", () => {
   eq(metaLine({ album: "Alb", bpm: 127.6 }, "8A", "4:05"), "Alb · 128 BPM · 8A · 4:05");
 });
@@ -25,6 +90,29 @@ Deno.test("meta line: missing fields leave no gaps or separators", () => {
   eq(metaLine({ album: "Alb", bpm: 0 }, "", ""), "Alb · 0 BPM");
   eq(metaLine({}, "", ""), "");
   eq(metaLine(null, "", "1:00"), "");
+});
+
+Deno.test("upload rows: a file is ok unless it carries an error", () => {
+  const rows = uploadRows({ files: [{ file: "a.flac", success: true }, { file: "b.txt", error: "Not a supported audio file or ZIP" }] });
+  eq(JSON.stringify(rows), JSON.stringify([{ name: "a.flac", ok: true, text: "Added to the inbox" }, { name: "b.txt", ok: false, text: "Not a supported audio file or ZIP" }]));
+});
+
+Deno.test("upload rows: anything but a files list is no rows", () => {
+  eq(uploadRows(null).length, 0);
+  eq(uploadRows({}).length, 0);
+});
+
+Deno.test("plural: adds an s unless the count is one", () => {
+  eq(plural(1, "song"), "1 song");
+  eq(plural(0, "song"), "0 songs");
+  eq(plural(2, "song"), "2 songs");
+});
+
+Deno.test("ingest summary: counts ingested and failed, plural-aware", () => {
+  eq(ingestSummary([{ success: true }, { success: true }, { success: false }]), "Ingested 2 files, 1 failed");
+  eq(ingestSummary([{ success: true }]), "Ingested 1 file");
+  eq(ingestSummary([]), "Nothing to ingest");
+  eq(ingestSummary(null), "Nothing to ingest");
 });
 
 Deno.test("speakers: anything but a list is no devices", () => {

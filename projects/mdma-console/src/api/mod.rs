@@ -21,6 +21,7 @@ pub mod library;
 pub mod marks;
 pub mod player;
 pub mod playlists;
+pub mod system;
 pub mod timeline;
 
 /// All `/api/...` routes.
@@ -58,6 +59,8 @@ pub fn routes() -> Router<Arc<AppState>> {
             post(playlists::link).delete(playlists::unlink),
         )
         .route("/api/playlists/:name/sync", post(playlists::sync))
+        .route("/api/inbox", get(system::inbox))
+        .route("/api/packages", get(system::packages))
         .route("/api/bin", get(bin::list).delete(bin::empty))
         .route("/api/bin/:id", delete(bin::purge))
         .route("/api/bin/:id/restore", post(bin::restore))

@@ -1,8 +1,12 @@
 // Settings: an index of sections and the pages behind it (#/settings/<page>).
-import { ApiError, KEY_NOTATIONS, api, getKeyNotation, h, icon, route, setKeyNotation, toast } from "./core.js";
-import { backLink } from "./collections.js";
-import { emptyNote, topbar } from "./lists.js";
+import { KEY_NOTATIONS, api, getKeyNotation, h, icon, route, setKeyNotation, toast } from "./core.js";
+import { SETTINGS_LINK, pageHead } from "./collections.js";
+import { emptyNote, failedNote, topbar } from "./lists.js";
 import { speakerRows } from "./logic.js";
+import { viewAbout } from "./about.js";
+import { viewAddMusic } from "./addmusic.js";
+import { viewBandcamp } from "./bandcamp.js";
+import { viewUpdates } from "./updates.js";
 
 /* ------------------------------------------------------------ theme */
 
@@ -34,9 +38,6 @@ function setTheme(t) {
 
 /* ------------------------------------------------------------ pages */
 
-/** A sub page's head: the back link to the index, then the title. */
-const subHead = (root, title) => root.append(h("div", { class: "coll-bar" }, [backLink("#/settings", "Settings")]), topbar(title));
-
 function seg(label, items, current, pick) {
   const box = h(
     "div",
@@ -58,16 +59,10 @@ function seg(label, items, current, pick) {
 const inUse = (on) => (on ? [h("span", { text: "In use" }), icon("check", "sm")] : []);
 
 function viewSpeakers(root) {
-  subHead(root, "Speakers");
+  pageHead(root, SETTINGS_LINK, "Speakers");
   const body = h("div", { class: "section" });
   root.appendChild(h("div", { class: "settings-wrap" }, [body]));
   let gone = false;
-
-  const failed = (e) =>
-    body.replaceChildren(
-      emptyNote("Couldn't load speakers", e instanceof ApiError && e.status === 0 ? "The node did not answer." : e.message),
-      h("button", { class: "link", text: "Try again", onclick: load }),
-    );
 
   async function load() {
     body.replaceChildren(h("div", { class: "empty", text: "Loading…" }));
@@ -76,7 +71,7 @@ function viewSpeakers(root) {
       const [outputs, config] = await Promise.all([api("/player/audio-outputs"), api("/player/audio-output")]);
       rows = speakerRows(outputs, config);
     } catch (e) {
-      if (!gone) failed(e);
+      if (!gone) body.replaceChildren(...failedNote("Couldn't load speakers", e, load));
       return;
     }
     if (gone) return;
@@ -125,19 +120,32 @@ function viewSpeakers(root) {
 }
 
 function viewKeyNotation(root) {
-  subHead(root, "Key notation");
+  pageHead(root, SETTINGS_LINK, "Key notation");
   root.appendChild(h("div", { class: "section" }, [seg("Key notation", KEY_NOTATIONS, getKeyNotation(), setKeyNotation)]));
 }
 
 function viewTheme(root) {
-  subHead(root, "Theme");
+  pageHead(root, SETTINGS_LINK, "Theme");
   root.appendChild(h("div", { class: "section" }, [seg("Theme", THEMES, getTheme(), setTheme)]));
+}
+
+// Service mode and reboot live on a page of their own (/admin), which comes back here.
+function viewAdvanced(root) {
+  pageHead(root, SETTINGS_LINK, "Advanced");
+  root.appendChild(
+    h("div", { class: "settings-wrap" }, [
+      h("div", { class: "section" }, [
+        h("p", { class: "sub", text: "Service mode and rebooting the node. Music stops while the node restarts." }),
+        h("a", { class: "btn", href: "/admin" }, ["Open the admin page", icon("right", "sm")]),
+      ]),
+    ]),
+  );
 }
 
 /* ------------------------------------------------------------ index */
 
-// Every entry the settings will have. One without a `view` is not built yet: the index hides it and the
-// route ignores it until its phase lands and gives it a view.
+// Every entry the settings have. One without a `view` is not built yet: the index hides it and the
+// route ignores it until it gets a view.
 const SECTIONS = [
   [
     "Playback",
@@ -150,16 +158,16 @@ const SECTIONS = [
   [
     "Library",
     [
-      { id: "add", icon: "upload", title: "Add music", sub: "Upload tracks", view: null },
-      { id: "bandcamp", icon: "cloud", title: "Bandcamp", sub: "Your collection and playlists", view: null },
+      { id: "add", icon: "upload", title: "Add music", sub: "Upload tracks", view: viewAddMusic },
+      { id: "bandcamp", icon: "cloud", title: "Bandcamp", sub: "Your collection and playlists", view: viewBandcamp },
     ],
   ],
   [
     "System",
     [
-      { id: "updates", icon: "download", title: "Updates", sub: "Software on this node", view: null },
-      { id: "about", icon: "info", title: "About", sub: "Versions and status", view: null },
-      { id: "advanced", icon: "wrench", title: "Advanced", sub: "For tinkering", view: null },
+      { id: "updates", icon: "download", title: "Updates", sub: "Software on this node", view: viewUpdates },
+      { id: "about", icon: "info", title: "About", sub: "Versions and status", view: viewAbout },
+      { id: "advanced", icon: "wrench", title: "Advanced", sub: "For tinkering", view: viewAdvanced },
     ],
   ],
 ];
@@ -187,11 +195,6 @@ function viewIndex(root) {
         ),
       ]),
     );
-  }
-  const pending = ENTRIES.filter((e) => !e.view).map((e) => e.title);
-  if (pending.length) {
-    const last = pending.length > 1 ? " and " + pending.pop() : "";
-    root.appendChild(h("div", { class: "section" }, [h("a", { class: "link", href: "/classic", text: pending.join(", ") + last + " are still in the classic console →" })]));
   }
 }
 

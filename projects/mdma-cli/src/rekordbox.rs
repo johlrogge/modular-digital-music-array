@@ -4,6 +4,7 @@ use crate::args::{
 use crate::ctx::Ctx;
 use crate::output::library_error;
 use crate::rekordbox_exchange;
+use crate::rekordbox_report::{self, Candidate, Problem};
 use crate::stdin::{require_stdin_hashes_or_usage, resolve_tracks_or_abort};
 use crate::transfer::{
     build_http_client, download_tracks, existing_location_set, export_dest_path_checked,
@@ -15,10 +16,11 @@ use color_eyre::eyre::{bail, eyre};
 use color_eyre::Result;
 use hicli::Arg;
 use library_ipc_client::{track_hashes, unresolved_entries};
-use library_ipc_client::{ContentHash, PlaylistEntry, TrackInfo};
+use library_ipc_client::{ContentHash, Key, PlaylistEntry, TrackInfo};
 use music_facts::MusicValue;
 use playlist_import::{format_write_outcome, write_playlist, LibraryTrackLookup};
 use rekordbox_roundtrip::Stars;
+use rekordbox_xml::xml::TempoSet;
 use rekordbox_xml::{parse_xml, RekordboxTrack};
 use track_matcher::{CandidateTrack, MatchResult};
 
@@ -85,6 +87,13 @@ pub(crate) struct AllPlaylists(pub bool);
 #[arg(long = "enrich")]
 pub(crate) struct Enrich(pub bool);
 
+/// Write a TSV report of the tracks that did not match (unmatched and ambiguous, with
+/// the reason and the candidates) and of the playlist entries dropped for them.
+/// Also written with --dry-run.
+#[derive(Debug, Clone, PartialEq, Eq, Arg)]
+#[arg(long = "report", metavar = "FILE", complete = files)]
+pub(crate) struct ReportFile(pub Option<std::path::PathBuf>);
+
 // Values of `rekordbox import`; the file must exist and the playlist name is
 // sanitised, both at parse time. The file is a positional, so it comes last.
 #[derive(Debug, Clone, PartialEq, Eq, Arg)]
@@ -92,8 +101,82 @@ pub(crate) struct RekordboxImportArgs {
     pub(crate) playlist: ImportPlaylist,
     pub(crate) all_playlists: AllPlaylists,
     pub(crate) enrich: Enrich,
+    pub(crate) report: ReportFile,
     pub(crate) dry_run: DryRun,
     pub(crate) path: ExistingFileArg,
+}
+
+/// The key of a rekordbox `Tonality`. rekordbox writes Camelot (`8A`) as well as
+/// traditional notation (`Abm`, `C`, `F#m`, `Bb`); `Key`'s parser takes both.
+fn parse_tonality(tonality: &str) -> Option<Key> {
+    tonality.parse::<Key>().ok()
+}
+
+/// The `BitRate` (kbps) and `SampleRate` (Hz) the export XML states for a track.
+///
+/// They must describe the exported file: after an AIFF/WAV transcode the source's
+/// facts (FLAC's compressed kbps, a 96 kHz rate that was downsampled) are wrong.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ExportedAudio {
+    bitrate: Option<u32>,
+    sample_rate: Option<u32>,
+}
+
+impl ExportedAudio {
+    /// The values of the source file, right for an untouched (`Original`) export.
+    fn of_source(track: &TrackInfo) -> Self {
+        Self {
+            bitrate: track.audio.bitrate.map(|b| b.value()),
+            sample_rate: track.audio.sample_rate.map(|s| s.value()),
+        }
+    }
+
+    /// Uncompressed PCM of the given format; the bit rate is computed the way
+    /// rekordbox does (see [`audio_transcoder::pcm_bitrate_kbps`]).
+    fn of_pcm(sample_rate: u32, bit_depth: u8, channels: u16) -> Self {
+        Self {
+            bitrate: Some(audio_transcoder::pcm_bitrate_kbps(
+                sample_rate,
+                bit_depth,
+                channels,
+            )),
+            sample_rate: Some(sample_rate),
+        }
+    }
+
+    /// Read the real format back from an exported AIFF/WAV file. When it cannot be
+    /// read, the values are omitted: the source's would be wrong.
+    fn of_exported_pcm_file(path: &std::path::Path) -> Self {
+        match audio_metadata::extract_metadata(path) {
+            Ok(audio_metadata::TrackMetadata {
+                sample_rate: Some(rate),
+                bit_depth: Some(depth),
+                channels: Some(channels),
+                ..
+            }) => Self::of_pcm(rate, depth, channels),
+            _ => {
+                eprintln!(
+                    "warning: cannot read the audio format of {}; BitRate and SampleRate are omitted from the XML",
+                    path.display()
+                );
+                Self {
+                    bitrate: None,
+                    sample_rate: None,
+                }
+            }
+        }
+    }
+
+    /// The values for a track exported under `format`: read back from the file
+    /// when the destination is a PCM container (AIFF/WAV, whether transcoded or an
+    /// already-PCM source served unchanged), the source's otherwise.
+    fn of_export(format: &ExportFormat, path: &std::path::Path, track: &TrackInfo) -> Self {
+        if format.static_extension().is_some() {
+            Self::of_exported_pcm_file(path)
+        } else {
+            Self::of_source(track)
+        }
+    }
 }
 
 /// Build a single `RekordboxTrack` from MDMA metadata and file facts.
@@ -110,6 +193,7 @@ fn build_rekordbox_track(
     ext: &str,
     size: u64,
     facts: &[(String, String)],
+    audio: &ExportedAudio,
 ) -> rekordbox_xml::RefreshedTrack {
     let find_fact = |name: &str| -> Option<String> {
         facts
@@ -118,8 +202,10 @@ fn build_rekordbox_track(
             .map(|(_, v)| v.clone())
     };
 
-    let bitrate = track.audio.bitrate.map(|b| b.value());
-    let sample_rate = track.audio.sample_rate.map(|s| s.value());
+    let ExportedAudio {
+        bitrate,
+        sample_rate,
+    } = *audio;
     let year = find_fact("Year").or_else(|| find_fact("RecordingYear"));
     let label = find_fact("Label");
     let comment = find_fact("Comment");
@@ -151,6 +237,18 @@ fn build_rekordbox_track(
         .collect();
     let position_marks = rekordbox_roundtrip::position_marks_from_cues(&cues_as_music_values);
 
+    // MDMA owns the grid: its stored grid is the TEMPO; without one, none is written.
+    let tempo = track
+        .beat_grid
+        .as_ref()
+        .map_or_else(TempoSet::default, |g| {
+            TempoSet::single(rekordbox_roundtrip::tempo_from_grid(
+                g.first_beat_ms,
+                g.bpm,
+                g.beats_per_bar,
+            ))
+        });
+
     rekordbox_xml::RefreshedTrack {
         name: track.title.clone().unwrap_or_else(|| "Unknown".to_string()),
         artist: track.artist.clone().unwrap_or_default(),
@@ -170,6 +268,7 @@ fn build_rekordbox_track(
         bitrate,
         sample_rate,
         location,
+        tempo,
         rating: Stars::from_energy(track.energy).to_rating(),
         position_marks,
     }
@@ -484,12 +583,14 @@ pub(crate) fn export(args: RekordboxExportArgs, ctx: &Ctx) -> Result<()> {
                 .map(|(_hash, facts)| facts)
                 .unwrap_or_default();
             exported.push((track.content_hash.clone(), Stars::from_energy(track.energy)));
+            let audio = ExportedAudio::of_export(&format_owned, &actual_dest, track);
             refreshed.push(build_rekordbox_track(
                 track,
                 &actual_dest,
                 &actual_ext,
                 size,
                 &facts,
+                &audio,
             ));
         }
     }
@@ -588,6 +689,50 @@ pub(crate) fn export(args: RekordboxExportArgs, ctx: &Ctx) -> Result<()> {
     Ok(())
 }
 
+/// What enrich does about the beat grid at one matched rekordbox track.
+#[derive(Debug, PartialEq)]
+enum GridAction {
+    /// Nothing: no usable grid, or the library track was already decided at an
+    /// earlier copy.
+    Nothing,
+    /// Assert this grid (through [`plan_grid_update`]).
+    Write(MusicValue),
+    /// The copies disagree: no grid is written.
+    Conflict { copies: usize },
+    /// Variable tempo: no grid is written, and the library's grid is the first
+    /// anchor alone, a truncation, so it is retracted.
+    RetractTruncation(MusicValue),
+}
+
+/// The grid decision for one library track, taken the first time one of its
+/// rekordbox copies is visited (`decided` remembers which have been), so the grid is
+/// written, retracted or reported once however many copies there are.
+fn plan_grid_action<'a>(
+    decided: &mut std::collections::HashSet<&'a ContentHash>,
+    hash: &'a ContentHash,
+    choice: &rekordbox_report::GridChoice<'_>,
+    current: Option<&library_ipc_client::BeatGridInfo>,
+) -> GridAction {
+    use rekordbox_report::GridChoice;
+    if !decided.insert(hash) {
+        return GridAction::Nothing;
+    }
+    match choice {
+        GridChoice::Keep => GridAction::Nothing,
+        GridChoice::Write(grid) => GridAction::Write(grid.clone()),
+        GridChoice::Conflict(copies) => GridAction::Conflict {
+            copies: copies.len(),
+        },
+        GridChoice::Variable(copies) => copies
+            .iter()
+            .filter_map(|c| c.first_anchor_grid.as_ref())
+            .find(|g| plan_grid_update(g, current) == GridUpdate::Current)
+            .map_or(GridAction::Nothing, |g| {
+                GridAction::RetractTruncation(g.clone())
+            }),
+    }
+}
+
 /// What enrich does with a track's beat grid.
 #[derive(Debug, PartialEq)]
 enum GridUpdate {
@@ -649,13 +794,13 @@ fn print_write_outcome(name: &str, track_count: usize, created: bool) {
 /// ```
 #[hicli::command]
 pub(crate) fn import(args: RekordboxImportArgs, ctx: &Ctx) -> Result<()> {
-    use library_ipc_client::{Bpm, Key};
-    use std::collections::HashMap;
+    use library_ipc_client::Bpm;
 
     let RekordboxImportArgs {
         playlist: ImportPlaylist(playlist),
         all_playlists: AllPlaylists(all_playlists),
         enrich: Enrich(enrich),
+        report: ReportFile(report),
         dry_run: DryRun(dry_run),
         path,
     } = args;
@@ -679,9 +824,9 @@ pub(crate) fn import(args: RekordboxImportArgs, ctx: &Ctx) -> Result<()> {
     let facts = Facts::Node(ctx.node());
     let lookup = LibraryTrackLookup::new(|q| facts.search(q));
 
-    let mut matched: Vec<(&RekordboxTrack, ContentHash)> = Vec::new();
-    let mut ambiguous: Vec<(&RekordboxTrack, Vec<ContentHash>)> = Vec::new();
-    let mut unmatched: Vec<&RekordboxTrack> = Vec::new();
+    // The one matching pass: everything below (summary, playlists, enrichment, report)
+    // is derived from these results.
+    let mut results: Vec<(&RekordboxTrack, MatchResult)> = Vec::new();
 
     for track in &parsed.tracks {
         let candidate = CandidateTrack {
@@ -703,17 +848,7 @@ pub(crate) fn import(args: RekordboxImportArgs, ctx: &Ctx) -> Result<()> {
             },
         };
 
-        match track_matcher::match_track(&candidate, &lookup) {
-            MatchResult::Definitive(hash, _) => {
-                matched.push((track, hash));
-            }
-            MatchResult::Ambiguous(hashes, _) => {
-                ambiguous.push((track, hashes));
-            }
-            MatchResult::NoMatch => {
-                unmatched.push(track);
-            }
-        }
+        results.push((track, track_matcher::match_track(&candidate, &lookup)));
     }
 
     // A failed library search must not look like "not in library"
@@ -735,51 +870,183 @@ pub(crate) fn import(args: RekordboxImportArgs, ctx: &Ctx) -> Result<()> {
     };
 
     // 3. Print summary
+    let summary = rekordbox_report::summarize(&results);
+    debug_assert_eq!(summary.total(), parsed.tracks.len());
+    // Definitive and weak matches both go into playlists and get enriched.
+    let matched = rekordbox_report::matched(&results);
     println!("Matched:   {:3} tracks", matched.len());
     println!(
         "Ambiguous: {:3} tracks (need manual resolution)",
-        ambiguous.len()
+        summary.ambiguous
     );
-    println!("Unmatched: {:3} tracks", unmatched.len());
+    println!("Unmatched: {:3} tracks", summary.unmatched);
+    println!(
+        "{} placeholder grids skipped, {} variable tempos, {} grid conflicts (no grid imported for those)",
+        summary.placeholder_grids, summary.variable_tempos, summary.grid_conflicts
+    );
+    // The grid per library track: decided once, from all its rekordbox copies.
+    let grid_choices = rekordbox_report::grid_choices(&results);
 
-    // 4. Print unmatched tracks to stderr
-    if !unmatched.is_empty() {
-        eprintln!();
-        eprintln!("Unmatched tracks:");
-        for t in &unmatched {
-            let filename = rekordbox_xml::parse_location(&t.location)
-                .map(|p| {
-                    std::path::Path::new(&p)
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or(&p)
-                        .to_string()
-                })
-                .unwrap_or_else(|| t.location.clone());
-            eprintln!("  {} - {} ({})", t.artist, t.name, filename);
+    // 4. The report rows, from the same match results. The candidates' details are
+    // only fetched for a report: they are not needed otherwise.
+    let problems = rekordbox_report::problems(&results, |hash| {
+        if report.is_none() {
+            return Candidate::bare(hash.clone());
         }
-    }
+        match library.get_track(hash) {
+            Ok(info) => Candidate::from_track(&info),
+            Err(e) => Candidate::failed(hash.clone(), e.to_string()),
+        }
+    });
+    let lookup_failures = problems
+        .iter()
+        .flat_map(|p| p.candidates())
+        .filter(|c| c.lookup_failed())
+        .count();
+    // What `--all-playlists` would do with the playlists: written below, and the
+    // source of the name problems in the report.
+    let mut plan = rekordbox_report::plan_playlists(
+        &parsed.playlists,
+        &results,
+        playlist.as_ref().map(|p| p.name()),
+    );
+    let covers_playlists = all_playlists || report.is_some();
+    let report_data = rekordbox_report::Report {
+        problems,
+        // What each playlist loses; the report covers every playlist of the XML.
+        playlists: if covers_playlists {
+            rekordbox_report::tally_playlists(&parsed.playlists, &results)
+        } else {
+            vec![]
+        },
+        // The playlists an `--all-playlists` import would write.
+        issues: if covers_playlists {
+            std::mem::take(&mut plan.issues)
+        } else {
+            rekordbox_report::NameIssues::default()
+        },
+    };
 
-    // 5. Print ambiguous tracks to stderr
-    if !ambiguous.is_empty() {
-        eprintln!();
-        eprintln!("Ambiguous tracks (multiple candidates):");
-        for (t, hashes) in &ambiguous {
-            eprintln!("  {} - {}", t.artist, t.name);
-            for h in hashes.iter().take(3) {
-                eprintln!(
-                    "    candidate: {}",
-                    h.as_str().get(..16).unwrap_or(h.as_str())
-                );
+    if let Some(report_path) = &report {
+        // Written with --dry-run too: it is a report, not a change to the library.
+        std::fs::write(report_path, rekordbox_report::render_tsv(&report_data))
+            .map_err(|e| eyre!("Failed to write report {}: {}", report_path.display(), e))?;
+        println!(
+            "{} unmatched, {} ambiguous, {} weak, {} shared, {} placeholder grids, \
+             {} variable tempos, {} grid conflicts \u{2192} report written to {}",
+            summary.unmatched,
+            summary.ambiguous,
+            summary.weak,
+            summary.shared,
+            summary.placeholder_grids,
+            summary.variable_tempos,
+            summary.grid_conflicts,
+            report_path.display()
+        );
+        if lookup_failures > 0 {
+            eprintln!(
+                "{lookup_failures} candidate lookup(s) failed; marked `<lookup failed: ..>` in the report"
+            );
+        }
+    } else {
+        // 4a. Print unmatched tracks to stderr
+        let unmatched: Vec<&RekordboxTrack> = report_data
+            .problems
+            .iter()
+            .filter_map(|p| match p {
+                Problem::Unmatched { track, .. } => Some(*track),
+                _ => None,
+            })
+            .collect();
+        if !unmatched.is_empty() {
+            eprintln!();
+            eprintln!("Unmatched tracks:");
+            for t in &unmatched {
+                let location = rekordbox_report::location_path(t);
+                let filename = std::path::Path::new(&location)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(&location);
+                eprintln!("  {} - {} ({})", t.artist, t.name, filename);
+            }
+        }
+
+        // 4b. Print ambiguous tracks to stderr
+        let ambiguous: Vec<(&RekordboxTrack, &[Candidate])> = report_data
+            .problems
+            .iter()
+            .filter_map(|p| match p {
+                Problem::Ambiguous {
+                    track, candidates, ..
+                } => Some((*track, candidates.as_slice())),
+                _ => None,
+            })
+            .collect();
+        if !ambiguous.is_empty() {
+            eprintln!();
+            eprintln!("Ambiguous tracks (multiple candidates):");
+            for (t, candidates) in &ambiguous {
+                eprintln!("  {} - {}", t.artist, t.name);
+                for c in candidates.iter().take(3) {
+                    let h = c.hash.as_str();
+                    eprintln!("    candidate: {}", h.get(..16).unwrap_or(h));
+                }
+            }
+        }
+        if summary.weak + summary.shared > 0 {
+            eprintln!();
+            eprintln!(
+                "{} weak (duration differs) and {} shared (several tracks, one library track) \
+                 matches are not listed; use --report to see them",
+                summary.weak, summary.shared
+            );
+        }
+        // Grid conflicts change what the import writes, so they are listed.
+        let conflicts: Vec<&Problem> = report_data
+            .problems
+            .iter()
+            .filter(|p| matches!(p, Problem::GridConflict { .. }))
+            .collect();
+        if !conflicts.is_empty() {
+            eprintln!();
+            eprintln!("Grid conflicts (copies disagree; no grid imported):");
+            for p in conflicts {
+                let t = p.track();
+                eprintln!("  {} - {}", t.artist, t.name);
             }
         }
     }
 
-    // Build track_id → ContentHash map for playlist resolution
-    let track_id_to_hash: HashMap<u32, ContentHash> = matched
+    let losing: Vec<_> = report_data
+        .playlists
         .iter()
-        .map(|(rb_track, hash)| (rb_track.track_id, hash.clone()))
+        .filter(|d| d.dropped() > 0)
         .collect();
+    if !losing.is_empty() {
+        eprintln!();
+        eprintln!(
+            "Playlist entries dropped (track unmatched, ambiguous or not in the collection):"
+        );
+        for d in losing {
+            eprintln!("  {}: {}", d.playlist, d.describe());
+        }
+    }
+    for c in report_data
+        .issues
+        .collisions
+        .iter()
+        .filter(|_| all_playlists)
+    {
+        eprintln!(
+            "Playlists {} all become '{}'; each replaces the one before",
+            c.playlists
+                .iter()
+                .map(|p| format!("'{p}'"))
+                .collect::<Vec<_>>()
+                .join(", "),
+            c.name
+        );
+    }
 
     // 6. Create --playlist if requested
     if let Some(arg) = playlist {
@@ -805,28 +1072,22 @@ pub(crate) fn import(args: RekordboxImportArgs, ctx: &Ctx) -> Result<()> {
 
     // 7. Create --all-playlists
     if all_playlists {
-        for rb_playlist in &parsed.playlists {
-            let resolved: Vec<ContentHash> = rb_playlist
-                .track_ids
-                .iter()
-                .filter_map(|id| track_id_to_hash.get(id).cloned())
-                .collect();
-
-            if resolved.is_empty() {
-                eprintln!(
-                    "Skipping playlist '{}': no matched tracks",
-                    rb_playlist.name
-                );
-                continue;
-            }
-
-            let target = match SanitizedPlaylistName::new(&rb_playlist.name) {
-                Ok(t) => t,
-                Err(reason) => {
-                    eprintln!("Skipping playlist '{}': {}", rb_playlist.name, reason);
-                    continue;
-                }
-            };
+        for rb_playlist in &plan.nothing_matched {
+            eprintln!(
+                "Skipping playlist '{}': no matched tracks",
+                rb_playlist.name
+            );
+        }
+        for skipped in &report_data.issues.skipped {
+            eprintln!(
+                "Skipping playlist '{}': {}",
+                skipped.playlist, skipped.reason
+            );
+        }
+        for planned in &plan.writes {
+            let rb_playlist = planned.source;
+            let target = &planned.target;
+            let resolved = &planned.hashes;
             let sanitized = target.name().as_str();
 
             if dry_run {
@@ -837,7 +1098,7 @@ pub(crate) fn import(args: RekordboxImportArgs, ctx: &Ctx) -> Result<()> {
                     resolved.len()
                 );
             } else {
-                match write_playlist(&library, target.name(), &resolved) {
+                match write_playlist(&library, target.name(), resolved) {
                     Ok(created) => print_write_outcome(sanitized, resolved.len(), created),
                     Err(e) => {
                         eprintln!("Failed to write playlist '{}': {}", sanitized, e)
@@ -854,6 +1115,8 @@ pub(crate) fn import(args: RekordboxImportArgs, ctx: &Ctx) -> Result<()> {
         let mut errors = 0usize;
 
         let source = library_ipc_client::rekordbox_source(env!("CARGO_PKG_VERSION"));
+        let mut grid_decided: std::collections::HashSet<&ContentHash> =
+            std::collections::HashSet::new();
 
         for (rb_track, hash) in &matched {
             // Fetch current track facts; on failure fall back to writing (safe default).
@@ -892,8 +1155,21 @@ pub(crate) fn import(args: RekordboxImportArgs, ctx: &Ctx) -> Result<()> {
             }
 
             // Write Key (Tonality) if available
-            if let Some(ref tonality) = rb_track.tonality {
-                if let Ok(key) = Key::from_camelot(tonality) {
+            if let Some(tonality) = rb_track
+                .tonality
+                .as_deref()
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+            {
+                let key = parse_tonality(tonality);
+                if key.is_none() {
+                    eprintln!(
+                        "warning: unrecognised Tonality '{}' for {} - {}; no Key written",
+                        tonality, rb_track.artist, rb_track.name
+                    );
+                    errors += 1;
+                }
+                if let Some(key) = key {
                     let already_current = existing
                         .as_ref()
                         .and_then(|t| t.key)
@@ -922,14 +1198,42 @@ pub(crate) fn import(args: RekordboxImportArgs, ctx: &Ctx) -> Result<()> {
                 }
             }
 
-            // Write BeatGrid from tempo anchor (Rekordbox is beat-grid master;
-            // MDMA never writes <TEMPO> data back on export).
-            let average_bpm = rb_track.average_bpm.and_then(|b| Bpm::from_f32(b).ok());
-            let projected_grid = rb_track
-                .tempo_anchor
-                .as_ref()
-                .and_then(|anchor| rekordbox_roundtrip::grid_from_tempo(anchor, average_bpm));
-            if let Some(new_grid) = projected_grid {
+            // The BeatGrid is decided once per library track, from the choice over all
+            // its rekordbox copies (see `plan_grid_action`).
+            let grid_action = plan_grid_action(
+                &mut grid_decided,
+                hash,
+                &grid_choices[hash],
+                existing.as_ref().and_then(|t| t.beat_grid.as_ref()),
+            );
+            match &grid_action {
+                GridAction::Conflict { copies } if dry_run => println!(
+                    "[dry-run] Would write no BeatGrid for {} - {}: {} rekordbox tracks \
+                     have different grids",
+                    rb_track.artist, rb_track.name, copies
+                ),
+                GridAction::RetractTruncation(old) if dry_run => println!(
+                    "[dry-run] Would retract {:?} for {} - {}: variable tempo, the grid is \
+                     only the first anchor",
+                    old, rb_track.artist, rb_track.name
+                ),
+                GridAction::RetractTruncation(old) => {
+                    match library.retract_fact_as(hash, old.clone(), &source) {
+                        Ok(true) => enriched += 1,
+                        // Nothing to retract: the grid came from another source.
+                        Ok(false) => skipped += 1,
+                        Err(e) => {
+                            eprintln!(
+                                "Failed to retract BeatGrid for {} - {}: {}",
+                                rb_track.artist, rb_track.name, e
+                            );
+                            errors += 1;
+                        }
+                    }
+                }
+                GridAction::Conflict { .. } | GridAction::Write(_) | GridAction::Nothing => {}
+            }
+            if let GridAction::Write(new_grid) = grid_action {
                 // Guard: skip if the projected beat_grid is already identical.
                 let plan = plan_grid_update(
                     &new_grid,
@@ -1118,7 +1422,23 @@ mod tests {
         assert!(args.all_playlists.0 && args.enrich.0 && args.dry_run.0);
         assert_eq!(args.path.0, file.path());
 
+        assert_eq!(args.report.0, None);
+
+        let reported = run_arg::<super::RekordboxImportArgs>(&[
+            "--report",
+            "/tmp/missing.tsv",
+            "--dry-run",
+            path,
+        ])
+        .unwrap();
+        assert_eq!(
+            reported.report.0,
+            Some(std::path::PathBuf::from("/tmp/missing.tsv"))
+        );
+        assert!(reported.dry_run.0);
+
         let plain = run_arg::<super::RekordboxImportArgs>(&[path]).unwrap();
+        assert_eq!(plain.report.0, None);
         assert_eq!(plain.playlist.0, None);
         assert!(!plain.all_playlists.0 && !plain.enrich.0 && !plain.dry_run.0);
     }
@@ -1259,9 +1579,57 @@ mod tests {
                 "aiff",
                 1,
                 &[],
+                &super::ExportedAudio::of_source(&track),
             );
             assert_eq!(built.rating, rating, "energy {energy:?}");
         }
+    }
+
+    // ── beat grid export ─────────────────────────────────────────────────────────
+
+    fn exported_xml(track: &library_ipc_client::TrackInfo) -> String {
+        let built = super::build_rekordbox_track(
+            track,
+            std::path::Path::new("/x/a.aiff"),
+            "aiff",
+            1,
+            &[],
+            &super::ExportedAudio::of_source(track),
+        );
+        rekordbox_xml::merge_export(None, vec![built], &[]).to_xml()
+    }
+
+    /// ADR-005 (amended 2026-11-20): MDMA owns the grid on export.
+    #[test]
+    fn export_writes_the_stored_grid_as_the_tempo() {
+        let hash = format!("sha256:{}", "a".repeat(64));
+        let track = library_ipc_client::TrackInfo {
+            bpm: library_ipc_client::Bpm::from_u32(128).ok(),
+            beat_grid: Some(library_ipc_client::BeatGridInfo {
+                first_beat_ms: 18,
+                bpm: library_ipc_client::Bpm::from_u32(128).unwrap(),
+                beats_per_bar: 4,
+            }),
+            ..crate::test_support::track(&hash)
+        };
+        let xml = exported_xml(&track);
+        assert!(
+            xml.contains("<TEMPO Inizio=\"0.018\" Bpm=\"128.00\" Metro=\"4/4\" Battito=\"1\"/>"),
+            "{xml}"
+        );
+    }
+
+    #[test]
+    fn export_of_a_track_without_a_grid_writes_no_tempo_even_with_a_bpm() {
+        let hash = format!("sha256:{}", "a".repeat(64));
+        let track = library_ipc_client::TrackInfo {
+            bpm: library_ipc_client::Bpm::from_u32(128).ok(),
+            beat_grid: None,
+            ..crate::test_support::track(&hash)
+        };
+        let xml = exported_xml(&track);
+        assert!(xml.contains("AverageBpm=\"128.00\""), "{xml}");
+        assert!(!xml.contains("<TEMPO"), "no placeholder: {xml}");
     }
 
     // ── beat grid re-import ──────────────────────────────────────────────────────
@@ -1280,6 +1648,105 @@ mod tests {
             bpm: library_ipc_client::Bpm::from_u32(120).unwrap(),
             beats_per_bar: 4,
         }
+    }
+
+    // ── the grid decision per library track ──────────────────────────────────────
+
+    use crate::rekordbox_report::{GridChoice, VariableCopy};
+    use rekordbox_xml::xml::{Deviation, DeviationCause, TempoSet};
+    use rekordbox_xml::RekordboxTrack;
+
+    fn hash_of(c: char) -> ContentHash {
+        ContentHash::new(format!("sha256:{}", c.to_string().repeat(64)))
+    }
+
+    #[test]
+    fn the_grid_is_decided_once_per_library_track_however_many_copies() {
+        let (one, two) = (hash_of('a'), hash_of('b'));
+        let mut decided = std::collections::HashSet::new();
+        let choice = GridChoice::Write(grid_value(1_000));
+
+        // Two rekordbox copies of library track `one`: only the first acts.
+        assert_eq!(
+            super::plan_grid_action(&mut decided, &one, &choice, None),
+            super::GridAction::Write(grid_value(1_000))
+        );
+        assert_eq!(
+            super::plan_grid_action(&mut decided, &one, &choice, None),
+            super::GridAction::Nothing,
+            "the second copy of the same library track does nothing"
+        );
+        // Another library track is decided on its own.
+        assert_eq!(
+            super::plan_grid_action(&mut decided, &two, &choice, None),
+            super::GridAction::Write(grid_value(1_000))
+        );
+    }
+
+    #[test]
+    fn a_conflict_is_reported_once_and_writes_nothing() {
+        let one = hash_of('a');
+        let (a, b) = (RekordboxTrack::default(), RekordboxTrack::default());
+        let choice = GridChoice::Conflict(vec![&a, &b]);
+        let mut decided = std::collections::HashSet::new();
+        assert_eq!(
+            super::plan_grid_action(&mut decided, &one, &choice, None),
+            super::GridAction::Conflict { copies: 2 }
+        );
+        assert_eq!(
+            super::plan_grid_action(&mut decided, &one, &choice, None),
+            super::GridAction::Nothing
+        );
+    }
+
+    #[test]
+    fn keeping_the_library_grid_does_nothing() {
+        let one = hash_of('a');
+        let mut decided = std::collections::HashSet::new();
+        assert_eq!(
+            super::plan_grid_action(
+                &mut decided,
+                &one,
+                &GridChoice::Keep,
+                Some(&grid_info(1_000))
+            ),
+            super::GridAction::Nothing
+        );
+    }
+
+    #[test]
+    fn a_variable_tempo_retracts_the_library_grid_only_if_it_is_the_first_anchor() {
+        let track = RekordboxTrack::default();
+        let copy = VariableCopy {
+            track: &track,
+            deviation: Deviation {
+                anchor: 1,
+                cause: DeviationCause::OffGrid,
+                worst_offset_ms: 20.0,
+            },
+            first_anchor_grid: Some(grid_value(1_000)),
+        };
+        let choice = GridChoice::Variable(vec![copy]);
+        let one = hash_of('a');
+
+        // The library has the truncated grid an earlier import wrote: it goes.
+        let mut decided = std::collections::HashSet::new();
+        assert_eq!(
+            super::plan_grid_action(&mut decided, &one, &choice, Some(&grid_info(1_000))),
+            super::GridAction::RetractTruncation(grid_value(1_000))
+        );
+        // A different library grid (corrected by hand, or another source) stays.
+        let mut decided = std::collections::HashSet::new();
+        assert_eq!(
+            super::plan_grid_action(&mut decided, &one, &choice, Some(&grid_info(2_500))),
+            super::GridAction::Nothing
+        );
+        // No library grid: nothing to retract.
+        let mut decided = std::collections::HashSet::new();
+        assert_eq!(
+            super::plan_grid_action(&mut decided, &one, &choice, None),
+            super::GridAction::Nothing
+        );
     }
 
     #[test]
@@ -1334,10 +1801,125 @@ mod tests {
             "aiff",
             1,
             &facts,
+            &super::ExportedAudio::of_source(&track),
         );
         let xml = rekordbox_xml::merge_export(None, vec![built], &[]).to_xml();
         assert!(xml.contains("BitRate=\"1411\""), "{xml}");
         assert!(xml.contains("SampleRate=\"44100\""), "{xml}");
+    }
+
+    /// A 96 kHz FLAC exported as 16-bit/48 kHz AIFF states the exported file's
+    /// rates, not the source's.
+    #[test]
+    fn export_writes_the_format_of_the_exported_file_not_the_source() {
+        use library_ipc_client::{AudioProperties, Bitrate, SampleRate};
+        let hash = format!("sha256:{}", "a".repeat(64));
+        let track = library_ipc_client::TrackInfo {
+            audio: AudioProperties {
+                bitrate: Some(Bitrate::new(3000)),
+                sample_rate: Some(SampleRate::new(96000)),
+                ..AudioProperties::default()
+            },
+            ..crate::test_support::track(&hash)
+        };
+        let built = super::build_rekordbox_track(
+            &track,
+            std::path::Path::new("/x/a.aiff"),
+            "aiff",
+            1,
+            &[],
+            &super::ExportedAudio::of_pcm(48000, 16, 2),
+        );
+        let xml = rekordbox_xml::merge_export(None, vec![built], &[]).to_xml();
+        assert!(xml.contains("BitRate=\"1536\""), "{xml}");
+        assert!(xml.contains("SampleRate=\"48000\""), "{xml}");
+    }
+
+    #[test]
+    fn pcm_audio_is_computed_from_rate_depth_and_channels() {
+        for (rate, depth, channels, kbps) in [
+            (44_100, 16, 2, 1411),
+            (44_100, 24, 2, 2116),
+            (48_000, 16, 2, 1536),
+            (48_000, 24, 2, 2304),
+        ] {
+            assert_eq!(
+                super::ExportedAudio::of_pcm(rate, depth, channels),
+                super::ExportedAudio {
+                    bitrate: Some(kbps),
+                    sample_rate: Some(rate)
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn an_original_export_keeps_the_source_values() {
+        use library_ipc_client::{AudioProperties, Bitrate, SampleRate};
+        let hash = format!("sha256:{}", "a".repeat(64));
+        let track = library_ipc_client::TrackInfo {
+            audio: AudioProperties {
+                bitrate: Some(Bitrate::new(320)),
+                sample_rate: Some(SampleRate::new(44100)),
+                ..AudioProperties::default()
+            },
+            ..crate::test_support::track(&hash)
+        };
+        // The path does not exist: an Original export must not read it.
+        let audio = super::ExportedAudio::of_export(
+            &crate::transfer::ExportFormat::Original,
+            std::path::Path::new("/nonexistent/a.aiff"),
+            &track,
+        );
+        assert_eq!(audio, super::ExportedAudio::of_source(&track));
+        assert_eq!(audio.bitrate, Some(320));
+    }
+
+    /// A PCM export whose format cannot be read back states no rates rather than
+    /// the source's, which describe a different file.
+    #[test]
+    fn an_unreadable_pcm_export_omits_the_rates() {
+        let hash = format!("sha256:{}", "a".repeat(64));
+        let track = crate::test_support::track(&hash);
+        let audio = super::ExportedAudio::of_export(
+            &crate::transfer::ExportFormat::Aiff,
+            std::path::Path::new("/nonexistent/a.aiff"),
+            &track,
+        );
+        assert_eq!(
+            audio,
+            super::ExportedAudio {
+                bitrate: None,
+                sample_rate: None
+            }
+        );
+    }
+
+    #[test]
+    fn tonality_in_any_notation_is_a_key() {
+        use library_ipc_client::Key;
+        for (tonality, expected) in [
+            ("Abm", "G#m"),
+            ("C", "C"),
+            ("F#m", "F#m"),
+            ("Bb", "A#"),
+            ("8A", "Am"),
+            ("11B", "A"),
+        ] {
+            let key = super::parse_tonality(tonality)
+                .unwrap_or_else(|| panic!("{tonality} should parse"));
+            assert_eq!(
+                key,
+                expected.parse::<Key>().unwrap(),
+                "{tonality} vs {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn unparseable_tonality_is_not_a_key() {
+        assert_eq!(super::parse_tonality("H#"), None);
+        assert_eq!(super::parse_tonality("nonsense"), None);
     }
 
     #[test]
@@ -1458,7 +2040,7 @@ mod tests {
                 bitrate: None,
                 sample_rate: None,
                 location: loc_mixed.clone(),
-                tempo_anchor: None,
+                tempo: TempoSet::default(),
                 rating: 0,
                 position_marks: vec![],
             }],
@@ -1485,6 +2067,7 @@ mod tests {
             bitrate: None,
             sample_rate: None,
             location: loc_lower.clone(),
+            tempo: TempoSet::default(),
             rating: 0,
             position_marks: vec![],
         };

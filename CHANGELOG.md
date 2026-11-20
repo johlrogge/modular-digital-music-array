@@ -4,6 +4,41 @@ All notable changes to MDMA are documented here.
 
 ---
 
+## [0.42.0] — 2026-11-20
+
+### Upgrade note
+
+**Units provisioned before 0.26.1 must run `migrate-bootfs` before `xbps-install -Su`** (#65, #128). Skipping it bricked prod on 2026-11-19.
+
+### Added
+
+- **Console Settings pages.** Speakers, Theme, Add music, Bandcamp, Updates, About and Advanced are all in the new console.
+- **rekordbox import `--report FILE`.** Writes a TSV of unmatched, ambiguous, weak, shared, placeholder-grid, variable-tempo and grid-conflict tracks, plus playlist drops, skips and name collisions. Works with `--dry-run`.
+- **Tag keys in any notation**, and the standard ID3 `TBPM`/`TKEY` frames, become BPM/key facts on ingest.
+- `mdma fact` accepts every key notation.
+- devenv: picocom for the Pi serial console.
+
+### Changed
+
+- **The classic console page is removed.** `/classic` redirects to `/`. The console no longer makes Google Fonts requests.
+- **rekordbox export**
+  - 16-bit sources stay 16-bit in AIFF/WAV.
+  - XML `BitRate` and `SampleRate` are read back from the exported file.
+  - AAC/M4A trailing encoder padding is trimmed.
+  - AIFF writes ID3 `TBPM` (integer) and `TKEY` (short form, e.g. Abm) and drops duplicate source BPM/key tags.
+  - The stored MDMA beat grid is exported as `TEMPO`, and no `TEMPO` is written without a grid. ADR-005 is amended: MDMA owns grids on export.
+- **rekordbox import**
+  - Tonality is accepted in every notation (Camelot, Open Key, Abm, C…).
+  - Multi-anchor grids that drift become no grid instead of a truncated one.
+  - One grid choice per library track when rekordbox holds duplicates.
+
+### Fixed
+
+- The old placeholder `TEMPO` is never written on export, and placeholder grids from old MDMA exports are skipped on import.
+- Accented file names in `Location` decode correctly on rekordbox import.
+
+---
+
 ## [0.41.0] — 2026-11-19
 
 ### Added

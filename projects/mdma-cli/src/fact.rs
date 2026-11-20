@@ -123,12 +123,9 @@ fn parse_field_value(field: FactField, raw: &str) -> Result<MusicValue, String> 
             let bpm = Bpm::from_f32(b).map_err(|_| format!("`{name}` is out of range"))?;
             Ok(MusicValue::Bpm(bpm))
         }
-        FactField::Key => Key::from_camelot(raw)
-            .or_else(|_| Key::from_traditional(raw))
-            .map(MusicValue::Key)
-            .map_err(|_| {
-                format!("`{name}` must be Camelot notation (1A-12B) or traditional (e.g. `C Major`, `A Minor`)")
-            }),
+        FactField::Key => raw.parse::<Key>().map(MusicValue::Key).map_err(|_| {
+            format!("`{name}` must be Camelot notation (1A-12B), Open Key (1m-12d) or traditional (e.g. `Am`, `F#m`, `Bb`, `C Major`)")
+        }),
         FactField::MainGenre => Ok(MusicValue::MainGenre(raw.to_string())),
         FactField::StyleDescriptor => Ok(MusicValue::StyleDescriptor(raw.to_string())),
         FactField::FullGenre => Ok(MusicValue::FullGenre(raw.to_string())),
@@ -488,6 +485,17 @@ mod tests {
             "expected MusicValue::Key, got {:?}",
             result
         );
+    }
+
+    #[test]
+    fn parse_field_value_key_accepts_traditional_notation() {
+        for raw in ["Abm", "C", "F#m", "Bb", "A minor"] {
+            let result = parse_field_value(FactField::Key, raw);
+            assert!(
+                matches!(result, Ok(MusicValue::Key(_))),
+                "{raw}: expected MusicValue::Key, got {result:?}"
+            );
+        }
     }
 
     #[test]

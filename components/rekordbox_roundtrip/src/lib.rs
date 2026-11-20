@@ -6,6 +6,8 @@
 //! - [`build_hash_to_location`] — map content hashes to export location URIs (three hash forms)
 //! - [`location_to_hash`] — reverse map: location URI → full content hash
 //! - [`grid_from_tempo`] — convert a Rekordbox [`TempoAnchor`] + BPM to a [`MusicValue::BeatGrid`]
+//! - [`tempo_from_grid`] — the inverse, used by the export (the placeholder and
+//!   variable-tempo checks live on `rekordbox_xml::xml::TempoSet`)
 //! - [`cues_from_position_marks`] — convert Rekordbox [`PositionMark`]s to [`MusicValue::MemoryCue`] facts
 //! - [`position_marks_from_cues`] — exact inverse of `cues_from_position_marks`
 //! - [`Stars`] and [`decide`] — Rekordbox `Rating` ↔ energy, and the three-way merge of
@@ -115,15 +117,15 @@ pub fn location_to_hash(entries: &[HashLocation]) -> HashMap<String, String> {
 ///   f64 seconds and **rounded** to ms once. A `Battito` outside `1..=bpb`
 ///   still wraps into the bar (it never panics); a missing or 0 `Battito` counts as 1.
 ///
-/// Rekordbox is the beat-grid master; MDMA never writes `<TEMPO>` grid data
-/// back on export.
+/// On import rekordbox's grid is read with this; on export MDMA's stored grid is
+/// written back with [`tempo_from_grid`] (ADR-005, amended 2026-11-20).
 pub fn grid_from_tempo(anchor: &TempoAnchor, average_bpm: Option<Bpm>) -> Option<MusicValue> {
     let bpm = anchor
         .bpm
         .and_then(|b| Bpm::from_f32(b).ok())
         .or(average_bpm)?;
-    let beats_per_bar = anchor.metro_numerator.map_or(4, NonZeroU8::get);
-    let battito = anchor.battito.filter(|&b| b >= 1).unwrap_or(1);
+    let beats_per_bar = anchor.beats_per_bar();
+    let battito = anchor.beat_in_bar();
     // Beats from the anchor up to the next downbeat (0 when the anchor is one).
     let beats_to_downbeat =
         (i32::from(beats_per_bar) + 1 - i32::from(battito)).rem_euclid(i32::from(beats_per_bar));
@@ -137,6 +139,21 @@ pub fn grid_from_tempo(anchor: &TempoAnchor, average_bpm: Option<Bpm>) -> Option
         bpm,
         beats_per_bar,
     })
+}
+
+/// The `<TEMPO>` anchor an MDMA `BeatGrid` is written as on export: the exact
+/// inverse of [`grid_from_tempo`] for a single-anchor grid.
+///
+/// `first_beat_ms` is a downbeat, so `Battito` is 1; `Inizio` is its position in
+/// seconds; `Bpm` is the grid's; `Metro` is `beats_per_bar/4` (0 beats per bar
+/// leaves `Metro` unset, which is written as 4/4).
+pub fn tempo_from_grid(first_beat_ms: u32, bpm: Bpm, beats_per_bar: u8) -> TempoAnchor {
+    TempoAnchor {
+        inizio_seconds: f64::from(first_beat_ms) / 1000.0,
+        bpm: Some(bpm.as_f32()),
+        metro_numerator: NonZeroU8::new(beats_per_bar),
+        battito: Some(1),
+    }
 }
 
 // =============================================================================
@@ -568,6 +585,57 @@ mod tests {
             metro_numerator: metro.and_then(NonZeroU8::new),
             battito,
         }
+    }
+
+    // ── tempo_from_grid ───────────────────────────────────────────────────────
+
+    #[test]
+    fn tempo_to_grid_to_tempo_is_the_identity_for_a_single_anchor_downbeat() {
+        for (inizio, bpm, metro) in [
+            (0.018, 128.0, 4),
+            (1.234, 127.57, 4),
+            (0.0, 174.0, 3),
+            (12.5, 99.99, 6),
+        ] {
+            let anchor = tempo(inizio, Some(bpm), Some(metro), Some(1));
+            let Some(MusicValue::BeatGrid {
+                first_beat_ms,
+                bpm: grid_bpm,
+                beats_per_bar,
+            }) = grid_from_tempo(&anchor, None)
+            else {
+                panic!("no grid for {anchor:?}");
+            };
+            assert_eq!(
+                tempo_from_grid(first_beat_ms, grid_bpm, beats_per_bar),
+                anchor
+            );
+        }
+    }
+
+    #[test]
+    fn grid_to_tempo_to_grid_is_the_identity() {
+        let bpm = Bpm::from_f32(128.57).unwrap();
+        let anchor = tempo_from_grid(18, bpm, 4);
+        assert_eq!(
+            grid_from_tempo(&anchor, None),
+            Some(MusicValue::BeatGrid {
+                first_beat_ms: 18,
+                bpm,
+                beats_per_bar: 4
+            })
+        );
+        let set = rekordbox_xml::xml::TempoSet::single(tempo_from_grid(18, bpm, 4));
+        assert!(!set.is_placeholder());
+    }
+
+    #[test]
+    fn a_grid_at_zero_ms_looks_like_a_placeholder() {
+        // The known limit of the placeholder rule: a real grid whose first beat is
+        // at 0 ms, in 4/4, is skipped by the import. Joakim accepted this.
+        let bpm = Bpm::from_f32(128.0).unwrap();
+        let set = rekordbox_xml::xml::TempoSet::single(tempo_from_grid(0, bpm, 4));
+        assert!(set.is_placeholder());
     }
 
     #[test]

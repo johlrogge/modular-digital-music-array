@@ -1,6 +1,7 @@
 use std::path::Path;
+use std::time::Duration;
 
-use crate::{ExportFormat, ExportMetadata, TranscoderError};
+use crate::{ExportFormat, ExportMetadata, SourceAudio, TranscoderError};
 
 /// Compute the CDJ-safe target sample rate for a source rate.
 ///
@@ -18,27 +19,71 @@ pub(crate) fn cdj_target_rate(source_hz: u32) -> Option<u32> {
     Some(rate)
 }
 
+/// The PCM bit depth (16 or 24) an AIFF/WAV export of a source gets.
+///
+/// Sources of 16 bits or less stay 16-bit (no point inflating CD-quality
+/// files); anything deeper, or of unknown depth, is exported as 24-bit.
+pub(crate) fn pcm_bit_depth(source_bit_depth: Option<u8>) -> u8 {
+    match source_bit_depth {
+        Some(depth) if (1..=16).contains(&depth) => 16,
+        _ => 24,
+    }
+}
+
+/// Where to cut the decode of a source whose decoder emits trailing encoder
+/// padding, as a time from the start (so the sample rate, which HE-AAC can
+/// report as its core rate, is not involved).
+///
+/// AAC (`m4a`/`aac`): priming is trimmed on decode but the trailing padding is
+/// not (a 1.000 s M4A decodes to 21.7 ms too much). The bound is lofty's
+/// container duration, which it rounds to the nearest millisecond; the end is
+/// rounded up to a whole millisecond plus one, so real audio is never cut (at
+/// most ~1 ms of padding remains). Lossless sources decode to their exact
+/// length and need no trim, so they yield `None`, as does MP3 (its duration is
+/// only an estimate, not safe to cut at), and a zero or unknown duration (lofty
+/// reports zero when it cannot tell, which would cut everything).
+pub(crate) fn padded_source_end(source_ext: &str, duration: Option<Duration>) -> Option<Duration> {
+    if !matches!(source_ext.to_ascii_lowercase().as_str(), "m4a" | "aac") {
+        return None;
+    }
+    let duration = duration.filter(|d| !d.is_zero())?;
+    let millis = duration.as_nanos().div_ceil(1_000_000) as u64;
+    Some(Duration::from_millis(millis + 1))
+}
+
+impl SourceAudio {
+    /// The rate AIFF/WAV exports are downsampled to, when the source exceeds the
+    /// CDJ limit. FLAC is never resampled.
+    pub(crate) fn cdj_downsample_rate(&self, format: &ExportFormat) -> Option<u32> {
+        match format {
+            ExportFormat::Aiff | ExportFormat::Wav => self.sample_rate.and_then(cdj_target_rate),
+            ExportFormat::Flac => None,
+        }
+    }
+}
+
 /// Build the ffmpeg argument list for a transcode operation.
 ///
-/// `source_sample_rate` — when supplied and the format is AIFF or WAV, a
-/// downsample to ≤ 48 kHz is added when the source exceeds that limit
-/// (Pioneer CDJ "illegal format" prevention).  Pass `None` when the rate is
-/// unknown; the file will be exported as-is.
+/// The `source` description decides, for AIFF/WAV, the downsample to ≤ 48 kHz
+/// (Pioneer CDJ "illegal format" prevention) and the PCM width
+/// ([`pcm_bit_depth`]); for lossy sources it bounds the decode to the source
+/// duration ([`padded_source_end`]), before any resample.
 ///
 /// Extracted into a pure function so the argument construction can be tested
 /// without actually running ffmpeg.
 pub(crate) fn build_ffmpeg_args(
-    source: &Path,
+    input: &Path,
     output: &Path,
     format: &ExportFormat,
     meta: &ExportMetadata,
-    source_sample_rate: Option<u32>,
+    source: &SourceAudio,
 ) -> Vec<String> {
+    let pcm_depth = pcm_bit_depth(source.bit_depth);
     let mut args: Vec<String> = Vec::new();
 
     // Input
     args.push("-i".to_string());
-    args.push(source.to_string_lossy().into_owned());
+    args.push(input.to_string_lossy().into_owned());
 
     // Codec flags per format
     match format {
@@ -48,11 +93,11 @@ pub(crate) fn build_ffmpeg_args(
             args.push("-id3v2_version".to_string());
             args.push("3".to_string());
             args.push("-c:a".to_string());
-            args.push("pcm_s24be".to_string());
+            args.push(format!("pcm_s{pcm_depth}be"));
         }
         ExportFormat::Wav => {
             args.push("-c:a".to_string());
-            args.push("pcm_s24le".to_string());
+            args.push(format!("pcm_s{pcm_depth}le"));
         }
         ExportFormat::Flac => {
             args.push("-c:a".to_string());
@@ -60,19 +105,25 @@ pub(crate) fn build_ffmpeg_args(
         }
     }
 
+    // Audio filter chain (one `-af`; the trim runs first).
+    let mut filters: Vec<String> = Vec::new();
+    if let Some(end) = padded_source_end(&source.ext, source.duration) {
+        filters.push(format!("atrim=end={:.6}", end.as_secs_f64()));
+    }
+
     // CDJ sample-rate guard: AIFF and WAV must not exceed 48 kHz.
-    // When the source rate is known and above the limit, add a soxr
-    // aresample filter and set the output rate.
-    let needs_resample = matches!(format, ExportFormat::Aiff | ExportFormat::Wav);
-    if needs_resample {
-        if let Some(src_hz) = source_sample_rate {
-            if let Some(target_hz) = cdj_target_rate(src_hz) {
-                args.push("-af".to_string());
-                args.push("aresample=resampler=soxr".to_string());
-                args.push("-ar".to_string());
-                args.push(target_hz.to_string());
-            }
-        }
+    let target_rate = source.cdj_downsample_rate(format);
+    if target_rate.is_some() {
+        filters.push("aresample=resampler=soxr".to_string());
+    }
+
+    if !filters.is_empty() {
+        args.push("-af".to_string());
+        args.push(filters.join(","));
+    }
+    if let Some(target_hz) = target_rate {
+        args.push("-ar".to_string());
+        args.push(target_hz.to_string());
     }
 
     // Always pass through all metadata from the source (includes cover art)
@@ -85,25 +136,43 @@ pub(crate) fn build_ffmpeg_args(
     args.push("error".to_string());
 
     // Metadata tags
-    if let Some(title) = &meta.title {
+    let mut tag = |key: &str, value: &str| {
         args.push("-metadata".to_string());
-        args.push(format!("title={}", title));
+        args.push(format!("{key}={value}"));
+    };
+    if let Some(title) = &meta.title {
+        tag("title", title);
     }
     if let Some(artist) = &meta.artist {
-        args.push("-metadata".to_string());
-        args.push(format!("artist={}", artist));
+        tag("artist", artist);
     }
     if let Some(album) = &meta.album {
-        args.push("-metadata".to_string());
-        args.push(format!("album={}", album));
+        tag("album", album);
     }
-    if let Some(bpm) = meta.bpm {
-        args.push("-metadata".to_string());
-        args.push(format!("BPM={:.2}", bpm));
-    }
-    if let Some(key) = &meta.key {
-        args.push("-metadata".to_string());
-        args.push(format!("INITIALKEY={}", key));
+    match format {
+        // ID3v2 has standard frames for BPM (an integer string in v2.3) and key;
+        // the generic keys would be written as TXXX user frames. The source's own
+        // generic tags, copied by `-map_metadata`, are cleared (an empty value
+        // removes a key) so they cannot sit next to ours and disagree.
+        ExportFormat::Aiff => {
+            if let Some(bpm) = meta.bpm {
+                tag("TBPM", &format!("{}", bpm.round()));
+                tag("BPM", "");
+            }
+            if let Some(key) = &meta.key {
+                tag("TKEY", key);
+                tag("INITIALKEY", "");
+                tag("KEY", "");
+            }
+        }
+        ExportFormat::Wav | ExportFormat::Flac => {
+            if let Some(bpm) = meta.bpm {
+                tag("BPM", &format!("{bpm:.2}"));
+            }
+            if let Some(key) = &meta.key {
+                tag("INITIALKEY", key);
+            }
+        }
     }
 
     // Output path
@@ -112,22 +181,21 @@ pub(crate) fn build_ffmpeg_args(
     args
 }
 
-/// Run ffmpeg to transcode `source` to `output` in the given `format`,
+/// Run ffmpeg to transcode `input` to `output` in the given `format`,
 /// embedding the supplied `meta` tags.
 ///
-/// `source_sample_rate` is forwarded to `build_ffmpeg_args` — see its docs for
-/// the CDJ downsampling behaviour.
+/// `source` describes the input; see `build_ffmpeg_args` for what it decides.
 ///
 /// Captures ffmpeg's stderr; on a non-zero exit code the stderr content is
 /// returned as `TranscoderError::FfmpegFailed`.
 pub(crate) fn run_ffmpeg(
-    source: &Path,
+    input: &Path,
     output: &Path,
     format: &ExportFormat,
     meta: &ExportMetadata,
-    source_sample_rate: Option<u32>,
+    source: &SourceAudio,
 ) -> Result<(), TranscoderError> {
-    let args = build_ffmpeg_args(source, output, format, meta, source_sample_rate);
+    let args = build_ffmpeg_args(input, output, format, meta, source);
 
     let result = std::process::Command::new("ffmpeg")
         .args(&args)
@@ -159,24 +227,8 @@ mod tests {
         PathBuf::from("/input/track.flac")
     }
 
-    fn output_aiff() -> PathBuf {
-        PathBuf::from("/output/track.aiff")
-    }
-
-    fn output_wav() -> PathBuf {
-        PathBuf::from("/output/track.wav")
-    }
-
-    fn output_flac() -> PathBuf {
-        PathBuf::from("/output/track.flac")
-    }
-
     fn output_for(format: &ExportFormat) -> PathBuf {
-        match format {
-            ExportFormat::Aiff => output_aiff(),
-            ExportFormat::Wav => output_wav(),
-            ExportFormat::Flac => output_flac(),
-        }
+        PathBuf::from(format!("/output/track{}", format.suffix()))
     }
 
     fn full_meta() -> ExportMetadata {
@@ -190,146 +242,119 @@ mod tests {
     }
 
     fn empty_meta() -> ExportMetadata {
-        ExportMetadata {
-            title: None,
-            artist: None,
-            album: None,
-            bpm: None,
-            key: None,
+        ExportMetadata::default()
+    }
+
+    /// A FLAC source of unknown format.
+    fn unknown() -> SourceAudio {
+        SourceAudio::default()
+    }
+
+    fn rate(hz: u32) -> SourceAudio {
+        SourceAudio {
+            sample_rate: Some(hz),
+            ..SourceAudio::default()
         }
+    }
+
+    fn depth(bits: Option<u8>) -> SourceAudio {
+        SourceAudio {
+            bit_depth: bits,
+            ..SourceAudio::default()
+        }
+    }
+
+    fn aac(secs: f64, hz: u32) -> SourceAudio {
+        SourceAudio {
+            ext: "m4a".to_string(),
+            sample_rate: Some(hz),
+            duration: Some(Duration::from_secs_f64(secs)),
+            ..SourceAudio::default()
+        }
+    }
+
+    fn build(format: &ExportFormat, meta: &ExportMetadata, src: &SourceAudio) -> Vec<String> {
+        build_ffmpeg_args(&source(), &output_for(format), format, meta, src)
+    }
+
+    fn has_tag(args: &[String], tag: &str) -> bool {
+        args.windows(2).any(|w| w[0] == "-metadata" && w[1] == tag)
+    }
+
+    fn value_after<'a>(args: &'a [String], flag: &str) -> Option<&'a String> {
+        args.iter().position(|a| a == flag).map(|p| &args[p + 1])
     }
 
     // ── AIFF tests ────────────────────────────────────────────────────────────
 
     #[test]
     fn aiff_args_start_with_input() {
-        let args = build_ffmpeg_args(
-            &source(),
-            &output_aiff(),
-            &ExportFormat::Aiff,
-            &empty_meta(),
-            None,
-        );
+        let args = build(&ExportFormat::Aiff, &empty_meta(), &unknown());
         assert_eq!(args[0], "-i");
         assert_eq!(args[1], "/input/track.flac");
     }
 
     #[test]
     fn aiff_args_include_write_id3v2() {
-        let args = build_ffmpeg_args(
-            &source(),
-            &output_aiff(),
-            &ExportFormat::Aiff,
-            &empty_meta(),
-            None,
-        );
-        let pos = args
-            .iter()
-            .position(|a| a == "-write_id3v2")
-            .expect("-write_id3v2 must be present for AIFF");
-        assert_eq!(args[pos + 1], "1");
+        let args = build(&ExportFormat::Aiff, &empty_meta(), &unknown());
+        assert_eq!(value_after(&args, "-write_id3v2").unwrap(), "1");
     }
 
     #[test]
     fn aiff_args_include_id3v2_version_3() {
-        let args = build_ffmpeg_args(
-            &source(),
-            &output_aiff(),
-            &ExportFormat::Aiff,
-            &empty_meta(),
-            None,
-        );
-        let pos = args
-            .iter()
-            .position(|a| a == "-id3v2_version")
-            .expect("-id3v2_version must be present for AIFF");
-        assert_eq!(args[pos + 1], "3");
+        let args = build(&ExportFormat::Aiff, &empty_meta(), &unknown());
+        assert_eq!(value_after(&args, "-id3v2_version").unwrap(), "3");
+    }
+
+    fn codec_of(format: &ExportFormat, bit_depth: Option<u8>) -> String {
+        let args = build(format, &empty_meta(), &depth(bit_depth));
+        value_after(&args, "-c:a")
+            .expect("-c:a must be present")
+            .clone()
+    }
+
+    #[rstest]
+    #[case(None, "pcm_s24be")]
+    #[case(Some(24), "pcm_s24be")]
+    #[case(Some(32), "pcm_s24be")]
+    #[case(Some(16), "pcm_s16be")]
+    #[case(Some(8), "pcm_s16be")]
+    fn aiff_args_codec_follows_source_bit_depth(#[case] depth: Option<u8>, #[case] expected: &str) {
+        assert_eq!(codec_of(&ExportFormat::Aiff, depth), expected);
+    }
+
+    #[rstest]
+    #[case(None, "pcm_s24le")]
+    #[case(Some(24), "pcm_s24le")]
+    #[case(Some(16), "pcm_s16le")]
+    fn wav_args_codec_follows_source_bit_depth(#[case] depth: Option<u8>, #[case] expected: &str) {
+        assert_eq!(codec_of(&ExportFormat::Wav, depth), expected);
     }
 
     #[test]
-    fn aiff_args_codec_is_pcm_s24be() {
-        let args = build_ffmpeg_args(
-            &source(),
-            &output_aiff(),
-            &ExportFormat::Aiff,
-            &empty_meta(),
-            None,
-        );
-        let pos = args
-            .iter()
-            .position(|a| a == "-c:a")
-            .expect("-c:a must be present for AIFF");
-        assert_eq!(args[pos + 1], "pcm_s24be");
+    fn flac_codec_ignores_source_bit_depth() {
+        assert_eq!(codec_of(&ExportFormat::Flac, Some(16)), "flac");
     }
 
-    // ── WAV tests ─────────────────────────────────────────────────────────────
-
-    #[test]
-    fn wav_args_codec_is_pcm_s24le() {
-        let args = build_ffmpeg_args(
-            &source(),
-            &output_wav(),
-            &ExportFormat::Wav,
-            &empty_meta(),
-            None,
-        );
-        let pos = args
-            .iter()
-            .position(|a| a == "-c:a")
-            .expect("-c:a must be present for WAV");
-        assert_eq!(args[pos + 1], "pcm_s24le");
+    #[rstest]
+    #[case(None, 24)]
+    #[case(Some(0), 24)]
+    #[case(Some(8), 16)]
+    #[case(Some(16), 16)]
+    #[case(Some(20), 24)]
+    #[case(Some(24), 24)]
+    #[case(Some(32), 24)]
+    fn pcm_bit_depth_rule(#[case] source: Option<u8>, #[case] expected: u8) {
+        assert_eq!(pcm_bit_depth(source), expected);
     }
 
-    #[test]
-    fn wav_args_do_not_include_id3v2_flags() {
-        let args = build_ffmpeg_args(
-            &source(),
-            &output_wav(),
-            &ExportFormat::Wav,
-            &empty_meta(),
-            None,
-        );
-        assert!(
-            !args.iter().any(|a| a == "-write_id3v2"),
-            "WAV args must not contain -write_id3v2"
-        );
-        assert!(
-            !args.iter().any(|a| a == "-id3v2_version"),
-            "WAV args must not contain -id3v2_version"
-        );
-    }
-
-    // ── FLAC tests ────────────────────────────────────────────────────────────
-
-    #[test]
-    fn flac_args_codec_is_flac() {
-        let args = build_ffmpeg_args(
-            &source(),
-            &output_flac(),
-            &ExportFormat::Flac,
-            &empty_meta(),
-            None,
-        );
-        let pos = args
-            .iter()
-            .position(|a| a == "-c:a")
-            .expect("-c:a must be present for FLAC");
-        assert_eq!(args[pos + 1], "flac");
-    }
-
-    #[test]
-    fn flac_args_do_not_include_id3v2_flags() {
-        let args = build_ffmpeg_args(
-            &source(),
-            &output_flac(),
-            &ExportFormat::Flac,
-            &empty_meta(),
-            None,
-        );
-        assert!(
-            !args.iter().any(|a| a == "-write_id3v2"),
-            "FLAC args must not contain -write_id3v2"
-        );
+    #[rstest]
+    #[case(ExportFormat::Wav)]
+    #[case(ExportFormat::Flac)]
+    fn only_aiff_gets_id3v2_flags(#[case] format: ExportFormat) {
+        let args = build(&format, &empty_meta(), &unknown());
+        assert!(!args.iter().any(|a| a == "-write_id3v2"));
+        assert!(!args.iter().any(|a| a == "-id3v2_version"));
     }
 
     // ── common flags ──────────────────────────────────────────────────────────
@@ -338,54 +363,14 @@ mod tests {
     #[case(ExportFormat::Aiff)]
     #[case(ExportFormat::Wav)]
     #[case(ExportFormat::Flac)]
-    fn all_formats_include_map_metadata(#[case] format: ExportFormat) {
-        let output = output_for(&format);
-        let args = build_ffmpeg_args(&source(), &output, &format, &empty_meta(), None);
-        let pos = args
-            .iter()
-            .position(|a| a == "-map_metadata")
-            .unwrap_or_else(|| panic!("-map_metadata must be present for {:?}", format));
-        assert_eq!(args[pos + 1], "0");
-    }
-
-    #[rstest]
-    #[case(ExportFormat::Aiff)]
-    #[case(ExportFormat::Wav)]
-    #[case(ExportFormat::Flac)]
-    fn all_formats_include_loglevel_error(#[case] format: ExportFormat) {
-        let output = output_for(&format);
-        let args = build_ffmpeg_args(&source(), &output, &format, &empty_meta(), None);
-        let pos = args
-            .iter()
-            .position(|a| a == "-loglevel")
-            .unwrap_or_else(|| panic!("-loglevel must be present for {:?}", format));
-        assert_eq!(args[pos + 1], "error");
-    }
-
-    #[rstest]
-    #[case(ExportFormat::Aiff)]
-    #[case(ExportFormat::Wav)]
-    #[case(ExportFormat::Flac)]
-    fn all_formats_include_overwrite_flag(#[case] format: ExportFormat) {
-        let output = output_for(&format);
-        let args = build_ffmpeg_args(&source(), &output, &format, &empty_meta(), None);
-        assert!(
-            args.iter().any(|a| a == "-y"),
-            "-y must be present for {:?}",
-            format
-        );
-    }
-
-    #[rstest]
-    #[case(ExportFormat::Aiff)]
-    #[case(ExportFormat::Wav)]
-    #[case(ExportFormat::Flac)]
-    fn all_formats_end_with_output_path(#[case] format: ExportFormat) {
-        let output = output_for(&format);
-        let args = build_ffmpeg_args(&source(), &output, &format, &empty_meta(), None);
+    fn all_formats_include_common_flags(#[case] format: ExportFormat) {
+        let args = build(&format, &empty_meta(), &unknown());
+        assert_eq!(value_after(&args, "-map_metadata").unwrap(), "0");
+        assert_eq!(value_after(&args, "-loglevel").unwrap(), "error");
+        assert!(args.iter().any(|a| a == "-y"));
         assert_eq!(
             args.last().expect("args must not be empty"),
-            output.to_str().unwrap(),
+            output_for(&format).to_str().unwrap(),
             "last arg must be output path for {:?}",
             format
         );
@@ -394,139 +379,86 @@ mod tests {
     // ── metadata injection ────────────────────────────────────────────────────
 
     #[test]
-    fn full_metadata_produces_title_metadata_arg() {
-        let args = build_ffmpeg_args(
-            &source(),
-            &output_aiff(),
-            &ExportFormat::Aiff,
-            &full_meta(),
-            None,
-        );
-        let pos = args
-            .windows(2)
-            .position(|w| w[0] == "-metadata" && w[1].starts_with("title="))
-            .expect("-metadata title= must be present");
-        assert_eq!(args[pos + 1], "title=Test Track");
+    fn full_metadata_produces_text_tags() {
+        let args = build(&ExportFormat::Aiff, &full_meta(), &unknown());
+        assert!(has_tag(&args, "title=Test Track"));
+        assert!(has_tag(&args, "artist=Test Artist"));
+        assert!(has_tag(&args, "album=Test Album"));
     }
 
     #[test]
-    fn full_metadata_produces_artist_metadata_arg() {
-        let args = build_ffmpeg_args(
-            &source(),
-            &output_aiff(),
-            &ExportFormat::Aiff,
-            &full_meta(),
-            None,
-        );
-        assert!(
-            args.windows(2)
-                .any(|w| w[0] == "-metadata" && w[1] == "artist=Test Artist"),
-            "artist metadata must be present"
-        );
+    fn aiff_bpm_and_key_are_the_standard_id3v2_frames() {
+        let args = build(&ExportFormat::Aiff, &full_meta(), &unknown());
+        assert!(has_tag(&args, "TBPM=128"), "TBPM is an integer string");
+        assert!(has_tag(&args, "TKEY=Am"));
     }
 
     #[test]
-    fn full_metadata_produces_album_metadata_arg() {
-        let args = build_ffmpeg_args(
-            &source(),
-            &output_aiff(),
-            &ExportFormat::Aiff,
-            &full_meta(),
-            None,
-        );
-        assert!(
-            args.windows(2)
-                .any(|w| w[0] == "-metadata" && w[1] == "album=Test Album"),
-            "album metadata must be present"
-        );
+    fn aiff_clears_the_generic_bpm_and_key_tags_copied_from_the_source() {
+        let args = build(&ExportFormat::Aiff, &full_meta(), &unknown());
+        for cleared in ["BPM=", "INITIALKEY=", "KEY="] {
+            assert!(has_tag(&args, cleared), "{cleared} must be cleared");
+        }
+        assert!(!args.iter().any(|a| a.starts_with("BPM=") && a != "BPM="));
     }
 
     #[test]
-    fn full_metadata_produces_bpm_metadata_arg() {
-        let args = build_ffmpeg_args(
-            &source(),
-            &output_aiff(),
-            &ExportFormat::Aiff,
-            &full_meta(),
-            None,
-        );
-        assert!(
-            args.windows(2)
-                .any(|w| w[0] == "-metadata" && w[1] == "BPM=128.00"),
-            "BPM metadata must be present with two decimal places"
-        );
+    fn aiff_leaves_the_generic_tags_alone_when_it_sets_neither() {
+        let args = build(&ExportFormat::Aiff, &empty_meta(), &unknown());
+        assert!(!args.iter().any(|a| a == "-metadata"));
     }
 
     #[test]
-    fn full_metadata_produces_key_metadata_arg() {
-        let args = build_ffmpeg_args(
-            &source(),
-            &output_aiff(),
-            &ExportFormat::Aiff,
-            &full_meta(),
-            None,
-        );
-        assert!(
-            args.windows(2)
-                .any(|w| w[0] == "-metadata" && w[1] == "INITIALKEY=Am"),
-            "INITIALKEY metadata must be present"
-        );
+    fn aiff_bpm_is_rounded_to_an_integer() {
+        let meta = ExportMetadata {
+            bpm: Some(140.5),
+            ..ExportMetadata::default()
+        };
+        let args = build(&ExportFormat::Aiff, &meta, &unknown());
+        assert!(has_tag(&args, "TBPM=141"));
+    }
+
+    #[rstest]
+    #[case(ExportFormat::Wav)]
+    #[case(ExportFormat::Flac)]
+    fn wav_and_flac_keep_the_generic_bpm_and_key_tags(#[case] format: ExportFormat) {
+        let meta = ExportMetadata {
+            bpm: Some(140.5),
+            key: Some("Am".to_string()),
+            ..ExportMetadata::default()
+        };
+        let args = build(&format, &meta, &unknown());
+        assert!(has_tag(&args, "BPM=140.50"));
+        assert!(has_tag(&args, "INITIALKEY=Am"));
+        assert!(!args.iter().any(|a| a.starts_with("TBPM=")));
     }
 
     #[test]
     fn empty_metadata_produces_no_metadata_args() {
-        let args = build_ffmpeg_args(
-            &source(),
-            &output_aiff(),
-            &ExportFormat::Aiff,
-            &empty_meta(),
-            None,
-        );
-        let metadata_count = args.iter().filter(|a| *a == "-metadata").count();
-        assert_eq!(
-            metadata_count, 0,
-            "empty metadata must not produce any -metadata args"
-        );
+        let args = build(&ExportFormat::Aiff, &empty_meta(), &unknown());
+        assert_eq!(args.iter().filter(|a| *a == "-metadata").count(), 0);
     }
 
     #[test]
     fn partial_metadata_only_includes_present_fields() {
         let meta = ExportMetadata {
             title: Some("Only Title".to_string()),
-            artist: None,
-            album: None,
-            bpm: None,
-            key: None,
+            ..ExportMetadata::default()
         };
-        let args = build_ffmpeg_args(&source(), &output_aiff(), &ExportFormat::Aiff, &meta, None);
-        assert!(
-            args.windows(2)
-                .any(|w| w[0] == "-metadata" && w[1] == "title=Only Title"),
-            "title must be present"
-        );
-        let metadata_count = args.iter().filter(|a| *a == "-metadata").count();
-        assert_eq!(
-            metadata_count, 1,
-            "only one -metadata arg for title-only metadata"
-        );
+        let args = build(&ExportFormat::Aiff, &meta, &unknown());
+        assert!(has_tag(&args, "title=Only Title"));
+        assert_eq!(args.iter().filter(|a| *a == "-metadata").count(), 1);
     }
 
     #[test]
     fn run_ffmpeg_returns_ffmpeg_not_found_when_binary_missing() {
-        // Run against a binary name that will never exist on PATH.
-        // We need to call run_ffmpeg, but it always uses "ffmpeg".
-        // Instead, test the error mapping logic directly by calling Command
-        // and verifying our map_err produces FfmpegNotFound.
         let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "file not found");
         let mapped: TranscoderError = if io_err.kind() == std::io::ErrorKind::NotFound {
             TranscoderError::FfmpegNotFound
         } else {
             TranscoderError::Io(io_err)
         };
-        assert!(
-            matches!(mapped, TranscoderError::FfmpegNotFound),
-            "NotFound IO error must map to FfmpegNotFound"
-        );
+        assert!(matches!(mapped, TranscoderError::FfmpegNotFound));
     }
 
     #[test]
@@ -537,165 +469,110 @@ mod tests {
         } else {
             TranscoderError::Io(io_err)
         };
-        assert!(
-            matches!(mapped, TranscoderError::Io(_)),
-            "PermissionDenied IO error must map to Io variant"
-        );
-    }
-
-    #[test]
-    fn bpm_is_formatted_with_two_decimal_places() {
-        let meta = ExportMetadata {
-            title: None,
-            artist: None,
-            album: None,
-            bpm: Some(140.5),
-            key: None,
-        };
-        let args = build_ffmpeg_args(&source(), &output_aiff(), &ExportFormat::Aiff, &meta, None);
-        assert!(
-            args.windows(2)
-                .any(|w| w[0] == "-metadata" && w[1] == "BPM=140.50"),
-            "BPM must be formatted with two decimal places"
-        );
+        assert!(matches!(mapped, TranscoderError::Io(_)));
     }
 
     // ── CDJ sample-rate downsampling ──────────────────────────────────────────
 
-    #[test]
-    fn aiff_96khz_source_produces_ar_48000_and_soxr() {
-        let args = build_ffmpeg_args(
-            &source(),
-            &output_aiff(),
-            &ExportFormat::Aiff,
-            &empty_meta(),
-            Some(96_000),
-        );
-        assert!(
-            args.iter().any(|a| a == "-ar"),
-            "96kHz AIFF must include -ar arg"
-        );
-        let ar_pos = args.iter().position(|a| a == "-ar").unwrap();
-        assert_eq!(args[ar_pos + 1], "48000", "96kHz must halve to 48000");
-        assert!(
-            args.windows(2)
-                .any(|w| w[0] == "-af" && w[1].contains("soxr")),
-            "96kHz AIFF must include soxr aresample filter"
-        );
-    }
-
-    #[test]
-    fn aiff_88200hz_source_produces_ar_44100_and_soxr() {
-        let args = build_ffmpeg_args(
-            &source(),
-            &output_aiff(),
-            &ExportFormat::Aiff,
-            &empty_meta(),
-            Some(88_200),
-        );
-        let ar_pos = args
-            .iter()
-            .position(|a| a == "-ar")
-            .expect("88.2kHz AIFF must include -ar");
-        assert_eq!(args[ar_pos + 1], "44100", "88.2kHz must halve to 44100");
-        assert!(
-            args.windows(2)
-                .any(|w| w[0] == "-af" && w[1].contains("soxr")),
-            "88.2kHz AIFF must include soxr filter"
-        );
-    }
-
-    #[test]
-    fn aiff_192khz_source_produces_ar_48000() {
-        let args = build_ffmpeg_args(
-            &source(),
-            &output_aiff(),
-            &ExportFormat::Aiff,
-            &empty_meta(),
-            Some(192_000),
-        );
-        let ar_pos = args
-            .iter()
-            .position(|a| a == "-ar")
-            .expect("192kHz AIFF must include -ar");
-        assert_eq!(
-            args[ar_pos + 1],
-            "48000",
-            "192kHz must halve twice to 48000"
-        );
+    #[rstest]
+    #[case(ExportFormat::Aiff, 96_000, "48000")]
+    #[case(ExportFormat::Wav, 96_000, "48000")]
+    #[case(ExportFormat::Aiff, 88_200, "44100")]
+    #[case(ExportFormat::Aiff, 192_000, "48000")]
+    fn high_rate_sources_are_downsampled_with_soxr(
+        #[case] format: ExportFormat,
+        #[case] hz: u32,
+        #[case] target: &str,
+    ) {
+        let args = build(&format, &empty_meta(), &rate(hz));
+        assert_eq!(value_after(&args, "-ar").unwrap(), target);
+        assert!(value_after(&args, "-af").unwrap().contains("soxr"));
     }
 
     #[rstest]
-    #[case(48_000u32)]
-    #[case(44_100u32)]
-    fn aiff_cdj_rates_produce_no_ar_arg(#[case] rate: u32) {
-        let args = build_ffmpeg_args(
-            &source(),
-            &output_aiff(),
-            &ExportFormat::Aiff,
-            &empty_meta(),
-            Some(rate),
-        );
-        assert!(
-            !args.iter().any(|a| a == "-ar"),
-            "{}Hz AIFF must not contain -ar (already CDJ-safe)",
-            rate
-        );
-        assert!(
-            !args.iter().any(|a| a == "-af"),
-            "{}Hz AIFF must not contain -af (no resample needed)",
-            rate
-        );
-    }
-
-    #[test]
-    fn aiff_no_source_rate_produces_no_ar_arg() {
-        let args = build_ffmpeg_args(
-            &source(),
-            &output_aiff(),
-            &ExportFormat::Aiff,
-            &empty_meta(),
-            None,
-        );
-        assert!(
-            !args.iter().any(|a| a == "-ar"),
-            "unknown source rate must not produce -ar"
-        );
-    }
-
-    #[test]
-    fn wav_96khz_source_produces_ar_48000_and_soxr() {
-        let args = build_ffmpeg_args(
-            &source(),
-            &output_wav(),
-            &ExportFormat::Wav,
-            &empty_meta(),
-            Some(96_000),
-        );
-        let ar_pos = args
-            .iter()
-            .position(|a| a == "-ar")
-            .expect("96kHz WAV must include -ar");
-        assert_eq!(args[ar_pos + 1], "48000");
-        assert!(
-            args.windows(2)
-                .any(|w| w[0] == "-af" && w[1].contains("soxr")),
-            "96kHz WAV must include soxr filter"
-        );
+    #[case(Some(48_000))]
+    #[case(Some(44_100))]
+    #[case(None)]
+    fn cdj_safe_or_unknown_rates_produce_no_resample(#[case] hz: Option<u32>) {
+        let src = SourceAudio {
+            sample_rate: hz,
+            ..SourceAudio::default()
+        };
+        let args = build(&ExportFormat::Aiff, &empty_meta(), &src);
+        assert!(!args.iter().any(|a| a == "-ar"));
+        assert!(!args.iter().any(|a| a == "-af"));
     }
 
     #[test]
     fn flac_96khz_source_produces_no_ar_arg() {
-        let args = build_ffmpeg_args(
-            &source(),
-            &output_flac(),
-            &ExportFormat::Flac,
-            &empty_meta(),
-            Some(96_000),
+        let args = build(&ExportFormat::Flac, &empty_meta(), &rate(96_000));
+        assert!(!args.iter().any(|a| a == "-ar"));
+    }
+
+    // ── trimming encoder padding of lossy sources ─────────────────────────────
+
+    #[test]
+    fn aac_source_is_trimmed_by_time() {
+        let args = build(&ExportFormat::Aiff, &empty_meta(), &aac(1.0, 44_100));
+        assert_eq!(value_after(&args, "-af").unwrap(), "atrim=end=1.001000");
+        assert!(!args.iter().any(|a| a == "-ar"), "no resample at 44.1 kHz");
+    }
+
+    #[test]
+    fn trim_does_not_depend_on_the_reported_sample_rate() {
+        // HE-AAC may report its core rate (22.05 kHz) while decoding at 44.1 kHz.
+        let core = build(&ExportFormat::Aiff, &empty_meta(), &aac(2.0, 22_050));
+        let full = build(&ExportFormat::Aiff, &empty_meta(), &aac(2.0, 44_100));
+        assert_eq!(value_after(&core, "-af"), value_after(&full, "-af"));
+    }
+
+    #[test]
+    fn trim_comes_before_the_resample_in_one_filter_chain() {
+        let args = build(&ExportFormat::Aiff, &empty_meta(), &aac(1.0, 96_000));
+        assert_eq!(args.iter().filter(|a| *a == "-af").count(), 1);
+        assert_eq!(
+            value_after(&args, "-af").unwrap(),
+            "atrim=end=1.001000,aresample=resampler=soxr"
         );
-        assert!(
-            !args.iter().any(|a| a == "-ar"),
-            "FLAC must not resample regardless of source rate"
+        assert_eq!(value_after(&args, "-ar").unwrap(), "48000");
+    }
+
+    #[test]
+    fn zero_duration_is_unknown_and_not_trimmed() {
+        let src = SourceAudio {
+            ext: "m4a".to_string(),
+            duration: Some(Duration::ZERO),
+            ..SourceAudio::default()
+        };
+        let args = build(&ExportFormat::Aiff, &empty_meta(), &src);
+        assert!(!args.iter().any(|a| a == "-af"));
+    }
+
+    #[rstest]
+    #[case("m4a", Some(1.0), Some(1_001))]
+    #[case("M4A", Some(0.5), Some(501))]
+    #[case("aac", Some(2.0), Some(2_001))]
+    #[case("flac", Some(1.0), None)]
+    #[case("aiff", Some(1.0), None)]
+    #[case("wav", Some(1.0), None)]
+    #[case("mp3", Some(1.0), None)]
+    #[case("m4a", Some(0.0), None)]
+    #[case("m4a", None, None)]
+    fn padded_source_end_rule(
+        #[case] ext: &str,
+        #[case] secs: Option<f64>,
+        #[case] expected_ms: Option<u64>,
+    ) {
+        let duration = secs.map(Duration::from_secs_f64);
+        assert_eq!(
+            padded_source_end(ext, duration),
+            expected_ms.map(Duration::from_millis)
         );
+    }
+
+    #[test]
+    fn padded_source_end_rounds_up_to_the_next_millisecond() {
+        let end = padded_source_end("m4a", Some(Duration::from_micros(1_000_400)));
+        assert_eq!(end, Some(Duration::from_millis(1_002)));
     }
 }

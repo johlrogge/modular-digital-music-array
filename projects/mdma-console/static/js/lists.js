@@ -3,7 +3,7 @@
 // playback route. A plain tap on a row or card opens a menu or a page and NEVER plays; the one
 // exception is a preview row (opts.preview, the playlist workbench), which can always go Back.
 // Play now is offered only when logic.isIdle(store.player) (paused counts as playing).
-import { $$, typing, h, icon, store, actions, setOf, enc, fmt, fmtTotal, plural, openMenu, on, onView, playlistHref, marksOf, macroForKey, keyText, api, toast, loadPlaylists, editPlaylist, revertPlaylist } from "./core.js";
+import { $$, typing, h, icon, store, actions, setOf, enc, fmt, fmtTotal, plural, openMenu, on, onView, playlistHref, marksOf, macroForKey, keyText, api, toast, loadPlaylists, editPlaylist, revertPlaylist, ApiError } from "./core.js";
 import { art } from "./art.js";
 import { isIdle, groupAlbums, trackTitle, sortTracks, placeholderTrack, albumCovers, coverOf, LIKED, markLabel, appendOps, editOutcome, addedAndSkipped } from "./logic.js";
 import { narrowedView, matchSet, setSort, SEARCH_FAILED_NOTE, FILTERS_EMPTY_NOTE } from "./narrow.js";
@@ -582,6 +582,12 @@ export function topbar(title, sub, link) {
 export function emptyNote(title, text, link) {
   return h("div", { class: "empty" }, [h("b", { text: title }), text, link ? h("a", { class: "link", href: link.href, text: link.text }) : null]);
 }
+
+/** Why a request failed, in words for the user. */
+export const failReason = (e) => (e instanceof ApiError && e.status === 0 ? "The node did not answer." : e.message);
+
+/** The nodes of a failed load: the note and a "Try again" that calls `retry`. */
+export const failedNote = (title, e, retry) => [emptyNote(title, failReason(e)), h("button", { class: "link", text: "Try again", onclick: retry })];
 
 /* ============================================================ keyboard row navigation */
 
