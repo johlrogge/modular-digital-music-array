@@ -14,7 +14,7 @@
 //! and [`AiffBuilder::id3`] chunks in the order they were added. Odd-length
 //! payloads get their pad byte.
 
-use crate::{aiff, be_chunk, be_samples, comm, comm_c, le_samples, ssnd};
+use crate::{aiff, be_chunk, be_samples, comm, comm_with, ext80, le_samples, ssnd};
 
 pub mod id3;
 
@@ -71,6 +71,7 @@ pub struct AiffBuilder {
     frames: Option<u32>,
     signal: Signal,
     form: Form,
+    compression_name: String,
     before_ssnd: Vec<Vec<u8>>,
     after_ssnd: Vec<Vec<u8>>,
 }
@@ -91,6 +92,7 @@ impl AiffBuilder {
             frames: None,
             signal: Signal::Tone(440.0),
             form: Form::Aiff,
+            compression_name: String::new(),
             before_ssnd: Vec::new(),
             after_ssnd: Vec::new(),
         }
@@ -140,6 +142,14 @@ impl AiffBuilder {
     /// Make it AIFF-C (form type `AIFC`) with this compression type.
     pub fn aifc(mut self, codec: Codec) -> Self {
         self.form = Form::Aifc(codec);
+        self
+    }
+
+    /// The human-readable compression name of an AIFF-C `COMM` (a pascal string
+    /// after the compression type), empty by default. Writers differ in what they put there.
+    pub fn compression_name(mut self, name: &str) -> Self {
+        assert!(name.len() < 256);
+        self.compression_name = name.to_string();
         self
     }
 
@@ -245,7 +255,13 @@ impl AiffBuilder {
                     Codec::Ulaw => 16,
                     _ => self.bits,
                 };
-                comm_c(self.channels, frames, size, self.rate, codec.fourcc())
+                let mut tail = codec.fourcc().to_vec();
+                tail.push(self.compression_name.len() as u8); // pstring, padded to even
+                tail.extend(self.compression_name.as_bytes());
+                if (1 + self.compression_name.len()) % 2 == 1 {
+                    tail.push(0);
+                }
+                comm_with(self.channels, frames, size, ext80(self.rate), &tail)
             }
         };
         let mut chunks = Vec::new();

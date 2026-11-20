@@ -24,6 +24,7 @@
     # Audio development
     pkg-config
     ffmpeg            # audio_decoder's build.rs generates FLAC test fixtures with it
+    flac              # lossless-encoder (ADR-037) shells out to it; its tests need 1.4 or newer
   ] ++ lib.optionals pkgs.stdenv.isLinux [
     alsa-lib
     pipewire          # link-time dep; pulls ffmpeg transitively — accepted

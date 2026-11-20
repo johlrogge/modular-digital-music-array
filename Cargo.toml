@@ -31,6 +31,7 @@ members = [
     "components/library_search",
     "components/library_service",
     "components/library_service_stub",
+    "components/lossless_encoder",
     "components/mdma_client",
     "components/media_client",
     "components/media_protocol",
@@ -113,6 +114,7 @@ library-projection = { path = "components/library_projection" }
 library-search = { path = "components/library_search" }
 library-service = { path = "components/library_service" }
 library-service-stub = { path = "components/library_service_stub" }
+lossless-encoder = { path = "components/lossless_encoder" }
 mdma-client = { path = "components/mdma_client" }
 media-client = { path = "components/media_client" }
 media-protocol = { path = "components/media_protocol" }

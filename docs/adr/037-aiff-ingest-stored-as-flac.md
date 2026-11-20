@@ -47,14 +47,18 @@ Accepted, 2026-11-20 (Joakim decided). Not yet implemented.
    1. COMM channels, rate and frames equal STREAMINFO.
    2. PcmHash(AIFF) equals PcmHash(FLAC). Claxon decodes this, independently of libFLAC.
    3. `flac -d --keep-foreign-metadata` rebuilds a file whose SHA-256 equals the AIFF's ContentHash.
-   4. The tag facts read from the FLAC equal those read from the AIFF. Only tag facts are compared (not file or name facts), and the FLAC's PICTURE blocks match the AIFF's APIC frames in count and types.
+   4. The tag facts read from the FLAC equal those read from the AIFF. Only tag facts are compared (not file or name facts). The FLAC's PICTURE blocks match the AIFF's APIC frames in count, type, MIME type and bytes. One exception: `EncoderSoftware` facts in the FLAC that the AIFF does not state are ignored, because lofty reads the Vorbis vendor string (libFLAC, or empty once the tags are rewritten) as one.
 
-   If any check fails or can't run, the conversion is refused and decision 1's fallback applies: the AIFF is stored as AIFF, and the reason is logged and shown in the ingest result. With today's PcmHash that covers:
+   If any check fails, the file is **refused** and decision 1's fallback applies: the AIFF is stored as AIFF, and the reason is logged and shown in the ingest result. With today's PcmHash and libFLAC that covers:
    - float and compressed AIFF-C;
    - more than 2 channels;
-   - 32-bit, and depths claxon can't decode;
+   - bit depths other than 8, 12, 16, 20 and 24. These are exactly the depths claxon decodes (libFLAC writes the others with the STREAMINFO fallback, which claxon does not take), so 32-bit is refused;
    - non-integer sample rates;
-   - any rebuild mismatch.
+   - any rebuild mismatch;
+   - **every AIFF-C, with libFLAC 1.5.0** (the only version tested; libFLAC-version dependent, and the Pi's version has to be checked in phase 0/9). `twos` fails at encode (`can't handle AIFF-C compression type`). `NONE` and `sowt` encode but fail check 5.3 (`stored main chunk length differs from written length`), with or without FVER and ID3, whatever the compression name. A libFLAC that handles AIFF-C turns these into conversions with no code change;
+   - tags lofty cannot read. lofty 0.18.2 skips the pad byte of an odd-length `COMT` chunk twice and loses its place (`no "SSND" chunk`), so the tag facts cannot be read and the file is refused. Phase 4 makes AIFF-blob ingest tolerate unreadable tags (file and name facts only, with a warning in the ingest result), so no AIFF is left behind. Whether a newer lofty fixes this has not been verified (the registry cache here holds the index only, up to 0.25.5, no sources); upgrading is a separate change.
+
+   **Refusal vs environment.** Only a refusal, which is about the file, gives an AIFF blob. A failure of the machine (no `flac`, or one older than 1.4; staging-directory or staged-file I/O; a `flac` that cannot be started or is killed) is an *environment error*: the ingest stays pending and is retried, and the file is not stored as AIFF because of it. The encoder returns the two as separate error kinds.
 6. **Identity.**
    - The blob's ContentHash is the entity key.
    - A new fact `EncodedFrom(ContentHash)` records the source AIFF's hash. It is multi-valued and united on merge (ADR-013), and it is part of the ingest dedup set. Re-ingesting the same AIFF is then a duplicate, with no decode.
@@ -62,6 +66,7 @@ Accepted, 2026-11-20 (Joakim decided). Not yet implemented.
 7. **Where it runs.**
    - Conversion runs on a background worker at nice 19 / idle IO, never on the IPC thread.
    - It stages in `/music/staging/<source-hash>.flac`.
+   - Phase 6's startup sweep removes `*.encoding.flac`, `*.rebuilt.aiff` and orphaned `<hex>.flac` in staging, and never promotes a leftover.
    - The order is: blob rename, then facts, then removal of the source.
    - The ingest protocol gains a pending state.
 8. **The source AIFF** is deleted after a successful, verified conversion. Check 5.3 proves the FLAC rebuilds it byte for byte.
@@ -76,7 +81,7 @@ Accepted, 2026-11-20 (Joakim decided). Not yet implemented.
 
 ## Testing
 
-- **No fixture files in the repo.** AIFF files are built in memory at test time by the `audio-fixtures` component (`components/audio_fixtures`, dev-dependency only). `AiffBuilder` makes synthetic tones or noise at 8 to 32 bits, mono or stereo, AIFF or AIFF-C (`NONE`, `twos`, `sowt`). Depths that are not a multiple of 8 are left-justified in their byte container. The builder adds extra chunks and an `ID3 ` chunk (v2.3 and v2.4). The ID3 tag carries TIT2/TPE1/TALB/TCON/TDRC (v2.4) or TYER (v2.3)/TRCK/TPOS/TBPM/TKEY/COMM/TXXX (two)/USLT/POPM, two APICs (front and back), a GEOB "Serato Markers_" and a PRIV "TRAKTOR4". Extra chunks are MARK/INST/COMT/ANNO, including an odd-length chunk with its pad byte. Refusal cases are fl32, ulaw, 3 channels and 32-bit. The builder's tests parse its output with lofty, and `audio_hash` tests read it back with PcmHash.
+- **No fixture files in the repo.** AIFF files are built in memory at test time by the `audio-fixtures` component (`components/audio_fixtures`, dev-dependency only). `AiffBuilder` makes synthetic tones or noise at 8 to 32 bits, mono or stereo, AIFF or AIFF-C (`NONE`, `twos`, `sowt`). Depths that are not a multiple of 8 are left-justified in their byte container. The builder adds extra chunks and an `ID3 ` chunk (v2.3 and v2.4). The ID3 tag carries TIT2/TPE1/TALB/TCON/TDRC (v2.4) or TYER (v2.3)/TRCK/TPOS/TBPM/TKEY/COMM/TXXX (two)/USLT/POPM, two APICs (front and back), a GEOB "Serato Markers_" and a PRIV "TRAKTOR4". Extra chunks are MARK/INST/COMT/ANNO, including an odd-length chunk with its pad byte. Refusal cases are fl32, ulaw, 3 channels and 32-bit. The builder makes `twos`, `NONE` and `sowt` files because PcmHash reads them, but with libFLAC 1.5.0 none of them converts (decision 5): the encoder's tests pin the refusal per codec, and a libFLAC that fixes it flips them to verified. The builder's tests parse its output with lofty, and `audio_hash` tests read it back with PcmHash.
 - **No real, copyrighted audio in the repo.** An ignored test runs the full conversion and verification against local real files given by an environment variable, `MDMA_REAL_AIFF_DIR`:
   - a Bandcamp release downloaded as `aiff-lossless`, which covers the common case;
   - a Beatport download, which covers most of the rest.
@@ -85,6 +90,7 @@ Accepted, 2026-11-20 (Joakim decided). Not yet implemented.
 
 - FLAC blobs carry the original chunks. Cover art is stored twice: inside the ID3 chunk and as a PICTURE block.
 - AIFF blobs exist for unverifiable files. Playback, AudioHash, waveforms and export must handle them.
+- **No space saving for AIFF-C**, while libFLAC cannot round-trip it. Phase 9 measures how common AIFF-C is in the real libraries.
 - MDMA AIFF exports (16-bit for sources of 16 bits or less, 24-bit otherwise, ≤48 kHz) PcmHash-match the stored FLAC. Exports resampled from >48 kHz do not (ADR-012).
 - `MusicValue` gains `EncodedFrom`, and the ingest protocol gains a pending state. Per ADR-004, gateway, library and console redeploy together.
 - **Cost** (to be measured on a Pi): about 10–15 s per 6-minute 24-bit track, in the background.

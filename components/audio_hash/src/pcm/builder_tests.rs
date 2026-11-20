@@ -7,7 +7,7 @@ use audio_fixtures::testkit::{comt_payload, id3, inst_payload, mark_payload, Aif
 use pretty_assertions::assert_eq;
 use rstest::rstest;
 
-use super::{pcm_hash_reader, PcmHashError};
+use super::{pcm_hash_reader, PcmHashError, Unsupported};
 
 fn hash(b: &AiffBuilder) -> music_primitives::PcmHash {
     pcm_hash_reader(Cursor::new(b.build())).expect("PcmHash reads it")
@@ -69,8 +69,50 @@ fn three_channels_are_refused() {
     let bytes = AiffBuilder::new().channels(3).build();
     assert!(matches!(
         pcm_hash_reader(Cursor::new(&bytes)),
-        Err(PcmHashError::Unsupported("more than 2 channels"))
+        Err(PcmHashError::Unsupported(Unsupported::MoreThanTwoChannels))
     ));
+}
+
+#[rstest]
+#[case(8, 1)]
+#[case(16, 2)]
+#[case(20, 2)]
+#[case(24, 1)]
+#[case(32, 2)]
+fn aiff_info_reports_comm(#[case] bits: u16, #[case] channels: u16) {
+    let bytes = AiffBuilder::new()
+        .bits(bits)
+        .channels(channels)
+        .rate(48_000)
+        .frames(1234)
+        .build();
+    let info = super::pcm_info_reader(Cursor::new(&bytes)).expect("info");
+    assert_eq!(
+        info,
+        super::PcmInfo {
+            container: crate::Container::Aiff,
+            channels: channels as u8,
+            sample_rate: 48_000,
+            frames: 1234,
+            bits_per_sample: bits as u8,
+        }
+    );
+}
+
+#[test]
+fn aiff_info_refuses_what_the_hash_refuses_with_typed_reasons() {
+    let info = |b: &AiffBuilder| super::pcm_info_reader(Cursor::new(b.build()));
+    assert!(matches!(
+        info(&AiffBuilder::new().channels(3)),
+        Err(PcmHashError::Unsupported(Unsupported::MoreThanTwoChannels))
+    ));
+    for codec in [Codec::Fl32, Codec::Ulaw] {
+        assert!(matches!(
+            info(&AiffBuilder::new().aifc(codec)),
+            Err(PcmHashError::Unsupported(Unsupported::CompressedAiffC))
+        ));
+    }
+    assert!(info(&AiffBuilder::new().bits(32).channels(1).rate(48_000)).is_ok());
 }
 
 #[test]

@@ -27,6 +27,8 @@ music-facts = { workspace = true }
 music-primitives = { workspace = true }
 audio-metadata = { workspace = true }
 audio-hash = { workspace = true }
+# ADR-037 phase 6: conversion worker
+lossless-encoder = { workspace = true }
 library-ipc-protocol = { workspace = true }
 acid-client = { workspace = true, features = ["music"] }
 event-protocol = { workspace = true }

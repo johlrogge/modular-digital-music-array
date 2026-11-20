@@ -126,6 +126,22 @@ impl TrackMetadata {
     }
 }
 
+/// The tag every reader of the library looks at: the file type's primary tag,
+/// else the first one.
+pub fn choose_tag(file: &lofty::TaggedFile) -> Option<&lofty::Tag> {
+    file.primary_tag().or_else(|| file.first_tag())
+}
+
+/// A copy of the file's [`choose_tag`] tag, whole: items and every picture, in
+/// order and without deduplication. `None` when the file has no tag.
+///
+/// This hands out lofty's `Tag` for callers that rewrite tags (the AIFF to FLAC
+/// encoder); readers want [`extract_metadata`] or [`extract_pictures`].
+pub fn read_tag(path: impl AsRef<Path>) -> Result<Option<lofty::Tag>, MetadataError> {
+    let file = Probe::open(path.as_ref())?.read()?;
+    Ok(choose_tag(&file).cloned())
+}
+
 pub fn extract_metadata(path: impl AsRef<Path>) -> Result<TrackMetadata, MetadataError> {
     let path = path.as_ref();
 
@@ -139,9 +155,7 @@ pub fn extract_metadata(path: impl AsRef<Path>) -> Result<TrackMetadata, Metadat
     let properties = tagged_file.properties();
 
     // Try to get the primary tag, fall back to first available tag
-    let tag = tagged_file
-        .primary_tag()
-        .or_else(|| tagged_file.first_tag());
+    let tag = choose_tag(&tagged_file);
 
     let mut metadata = TrackMetadata {
         file_path: path.to_path_buf(),
@@ -456,6 +470,33 @@ mod tests {
         let meta = extract_metadata(tmp.path()).expect("extract");
         assert_eq!(meta.bpm, Some(128.0));
         assert_eq!(meta.key.as_deref(), Some("Abm"));
+    }
+
+    #[test]
+    fn read_tag_keeps_every_picture_where_extract_pictures_dedupes() {
+        let mut tmp = NamedTempFile::with_suffix(".aiff").expect("tmpfile");
+        tmp.write_all(&tiny_aiff()).expect("write aiff");
+        tmp.flush().expect("flush");
+        assert!(read_tag(tmp.path()).expect("read").is_none());
+
+        let mut tag = Tag::new(TagType::Id3v2);
+        for pic_type in [LoftyPictureType::CoverFront, LoftyPictureType::CoverBack] {
+            tag.push_picture(Picture::new_unchecked(
+                pic_type,
+                Some(MimeType::Png),
+                None,
+                b"same-bytes".to_vec(),
+            ));
+        }
+        tag.save_to_path(tmp.path()).expect("save tag");
+
+        let read = read_tag(tmp.path()).expect("read").expect("a tag");
+        let types: Vec<_> = read.pictures().iter().map(|p| p.pic_type()).collect();
+        assert_eq!(
+            types,
+            vec![LoftyPictureType::CoverFront, LoftyPictureType::CoverBack]
+        );
+        assert_eq!(extract_pictures(tmp.path()).expect("extract").len(), 1);
     }
 
     #[test]

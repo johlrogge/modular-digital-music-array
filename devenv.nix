@@ -41,8 +41,8 @@ in
     picocom               # Pi serial console (ttyAMA0, 115200) for boot/hang debugging
     gh
     gitflow               # Git-flow branching workflow
-    # Fixture regeneration for components/audio_hash/testdata/pcm (ADR-012)
-    flac                  # libFLAC command-line tools
+    # Fixture regeneration for components/audio_hash/testdata/pcm (ADR-012);
+    # flac itself is in nix/ci-base.nix (lossless-encoder tests need it in CI)
     sox
   ] ++ lib.optionals (!isCI && pkgs.stdenv.isLinux) [
     # Bevy (dj-workspace) graphics stack — laptop-only, Linux only.

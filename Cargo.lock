@@ -5740,6 +5740,7 @@ dependencies = [
  "library-projection",
  "library-search",
  "lofty",
+ "lossless-encoder",
  "music-facts",
  "music-primitives",
  "nng",
@@ -5900,6 +5901,24 @@ name = "log"
 version = "0.4.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
+
+[[package]]
+name = "lossless-encoder"
+version = "0.42.0"
+dependencies = [
+ "audio-fixtures",
+ "audio-hash",
+ "audio-metadata",
+ "libc",
+ "library-ingestion",
+ "lofty",
+ "music-facts",
+ "music-primitives",
+ "pretty_assertions",
+ "rstest",
+ "tempfile",
+ "thiserror 1.0.69",
+]
 
 [[package]]
 name = "lru"

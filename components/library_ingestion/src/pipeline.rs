@@ -220,8 +220,9 @@ pub struct IndexedTrack {
 // Helper functions
 // =============================================================================
 
-/// Compute SHA256 hash of file contents (streaming, not loading into memory)
-fn compute_hash(path: &std::path::Path) -> Result<ContentHash, IngestError> {
+/// Compute SHA256 hash of file contents (streaming, not loading into memory):
+/// the file's [`ContentHash`] (ADR-003).
+pub fn compute_hash(path: &std::path::Path) -> Result<ContentHash, IngestError> {
     use sha2::{Digest, Sha256};
     use std::io::Read;
 

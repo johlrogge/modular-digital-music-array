@@ -12,7 +12,10 @@ use std::path::Path;
 use music_primitives::AudioHash;
 use sha2::{Digest, Sha256};
 
-pub use pcm::{pcm_hash, pcm_hash_reader, PcmHashError};
+pub use pcm::{
+    pcm_hash, pcm_hash_reader, pcm_info, pcm_info_reader, PcmHashError, PcmInfo, Unsupported,
+    FLAC_HASHABLE_BIT_DEPTHS,
+};
 
 mod aiff;
 mod flac;

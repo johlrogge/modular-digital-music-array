@@ -5,7 +5,7 @@ use std::io::{Read, Seek};
 use std::ops::Range;
 
 use super::raw::{ContainerBytes, EightBit, RawPcmLayout};
-use super::{Channels, PcmHashError, SampleRate};
+use super::{Channels, PcmHashError, PcmInfo, SampleRate, Unsupported};
 use crate::iff::Endian;
 use crate::tags::{be_u16, be_u32, read_at};
 use crate::{aiff, Container};
@@ -48,6 +48,8 @@ struct Comm {
     frames: u64,
     container: ContainerBytes,
     rate: SampleRate,
+    /// Bits per sample as declared (`sampleSize`), 1..=32.
+    sample_size: u16,
 }
 
 fn parse_comm<R: Read + Seek>(
@@ -72,7 +74,7 @@ fn parse_comm<R: Read + Seek>(
         match &b[18..22] {
             b"NONE" | b"twos" => Endian::Big,
             b"sowt" => Endian::Little,
-            _ => return Err(PcmHashError::Unsupported("aiff-c: compressed audio")),
+            _ => return Err(PcmHashError::Unsupported(Unsupported::CompressedAiffC)),
         }
     } else {
         Endian::Big
@@ -85,20 +87,19 @@ fn parse_comm<R: Read + Seek>(
     }
     // ceil(sampleSize / 8) bytes; more than 4 means sampleSize over 32 bits.
     let container = ContainerBytes::new(sample_size.div_ceil(8))
-        .ok_or(PcmHashError::Unsupported("aiff: sample size over 32 bits"))?;
+        .ok_or(PcmHashError::Unsupported(Unsupported::SampleSizeOver32))?;
     let mut ext = [0u8; 10];
     ext.copy_from_slice(&b[8..18]);
     let rate = extended_to_u32(&ext)
         .and_then(SampleRate::new)
-        .ok_or(PcmHashError::Unsupported(
-            "aiff: sample rate is not an integer",
-        ))?;
+        .ok_or(PcmHashError::Unsupported(Unsupported::NonIntegerRate))?;
     Ok(Comm {
         order,
         channels,
         frames: u64::from(be_u32(&b, 2)),
         container,
         rate,
+        sample_size,
     })
 }
 
@@ -106,6 +107,25 @@ pub(crate) fn layout<R: Read + Seek>(
     r: &mut R,
     file_len: u64,
 ) -> Result<RawPcmLayout, PcmHashError> {
+    parse(r, file_len).map(|(layout, _)| layout)
+}
+
+/// The stream properties COMM declares, after the same validation as the
+/// hash (SSND length against the frame count included).
+pub(crate) fn info<R: Read + Seek>(r: &mut R, file_len: u64) -> Result<PcmInfo, PcmHashError> {
+    let (layout, sample_size) = parse(r, file_len)?;
+    Ok(PcmInfo {
+        container: C,
+        channels: layout.channels().count() as u8,
+        sample_rate: layout.rate().get(),
+        frames: layout.frames(),
+        // At most 32: the container is at most 4 bytes.
+        bits_per_sample: sample_size as u8,
+    })
+}
+
+/// The layout and COMM's `sampleSize` (bits per sample, as declared).
+fn parse<R: Read + Seek>(r: &mut R, file_len: u64) -> Result<(RawPcmLayout, u16), PcmHashError> {
     let l = aiff::layout(r, file_len)?;
     let c = parse_comm(r, &l.comm, l.is_aifc)?;
 
@@ -120,7 +140,7 @@ pub(crate) fn layout<R: Read + Seek>(
         return Err(PcmHashError::malformed(C, "SSND offset past end of chunk"));
     }
     // The sample bytes after `offset` must be exactly numSampleFrames frames.
-    RawPcmLayout::new(
+    let layout = RawPcmLayout::new(
         c.order,
         EightBit::Signed,
         c.container,
@@ -129,5 +149,6 @@ pub(crate) fn layout<R: Read + Seek>(
         samples_start..l.ssnd.end,
     )
     .filter(|layout| layout.frames() == c.frames)
-    .ok_or_else(|| PcmHashError::malformed(C, "SSND length does not match COMM frame count"))
+    .ok_or_else(|| PcmHashError::malformed(C, "SSND length does not match COMM frame count"))?;
+    Ok((layout, c.sample_size))
 }

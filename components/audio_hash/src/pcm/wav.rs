@@ -3,7 +3,7 @@
 use std::io::{Read, Seek, SeekFrom};
 
 use super::raw::{ContainerBytes, EightBit, RawPcmLayout};
-use super::{Channels, PcmHashError, SampleRate};
+use super::{Channels, PcmHashError, SampleRate, Unsupported};
 use crate::iff::Endian;
 use crate::tags::{le_u16, le_u32};
 use crate::{wav, Container};
@@ -43,18 +43,18 @@ pub(crate) fn layout<R: Read + Seek>(
         }
         let guid = &fmt[24..40];
         if guid[4..] != GUID_TAIL {
-            return Err(PcmHashError::Unsupported("wav: unknown SubFormat"));
+            return Err(PcmHashError::Unsupported(Unsupported::WavUnknownSubFormat));
         }
         tag = match le_u32(guid, 0) {
             1 => FORMAT_PCM,
             3 => FORMAT_FLOAT,
-            _ => return Err(PcmHashError::Unsupported("wav: non-PCM SubFormat")),
+            _ => return Err(PcmHashError::Unsupported(Unsupported::WavNonPcmSubFormat)),
         };
     }
     match tag {
         FORMAT_PCM => {}
-        FORMAT_FLOAT => return Err(PcmHashError::Unsupported("wav: float PCM")),
-        _ => return Err(PcmHashError::Unsupported("wav: non-PCM format")),
+        FORMAT_FLOAT => return Err(PcmHashError::Unsupported(Unsupported::WavFloat)),
+        _ => return Err(PcmHashError::Unsupported(Unsupported::WavNonPcmFormat)),
     }
 
     let channel_count = le_u16(&fmt, 2);
@@ -71,7 +71,7 @@ pub(crate) fn layout<R: Read + Seek>(
     // ADR-012: stored bits come from the block align; wBitsPerSample,
     // wValidBitsPerSample and dwChannelMask are ignored.
     let container = ContainerBytes::new(block_align / channel_count).ok_or(
-        PcmHashError::Unsupported("wav: sample container over 4 bytes"),
+        PcmHashError::Unsupported(Unsupported::WavContainerOver4Bytes),
     )?;
 
     // `data` must be whole frames. With an unbounded (0xFFFFFFFF) data size

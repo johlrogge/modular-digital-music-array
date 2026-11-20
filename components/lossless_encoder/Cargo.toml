@@ -1,0 +1,26 @@
+[package]
+name = "lossless-encoder"
+version.workspace = true
+edition = "2021"
+authors = ["MDMA Development Team"]
+repository = "https://github.com/johlrogge/modular-digital-music-array"
+license = "MIT"
+
+[package.metadata.polylith]
+interface = "lossless-encoder"
+
+[dependencies]
+audio-hash = { workspace = true }
+audio-metadata = { workspace = true }
+library-ingestion = { workspace = true }
+libc = { workspace = true }
+lofty = { workspace = true }
+music-facts = { workspace = true }
+music-primitives = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+audio-fixtures = { workspace = true }
+pretty_assertions = { workspace = true }
+rstest = { workspace = true }
+tempfile = { workspace = true }

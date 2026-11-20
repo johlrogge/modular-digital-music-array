@@ -90,6 +90,14 @@ impl RawPcmLayout {
     pub fn frames(&self) -> u64 {
         self.frames
     }
+
+    pub fn channels(&self) -> Channels {
+        self.channels
+    }
+
+    pub fn rate(&self) -> SampleRate {
+        self.rate
+    }
 }
 
 /// Sign-extended, right-justified value of one stored sample.
