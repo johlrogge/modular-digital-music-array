@@ -83,41 +83,61 @@ pub enum TranscoderError {
 
 // ── Public API ─────────────────────────────────────────────────────────────────
 
-/// Transcode `source` audio to `output` in the given `format`, embedding `meta`
+/// What is known about a source file; the transcoder decides from it the PCM
+/// bit depth, the CDJ downsample and the trimming of encoder padding.
+///
+/// Every field may be unknown: the file is then exported as-is (risk of
+/// "illegal format" on CDJs for high-rate sources).
+#[derive(Debug, Clone, Default)]
+pub struct SourceAudio {
+    /// The source's file extension without the dot (`m4a`, `flac`, ...); empty
+    /// when unknown.
+    pub ext: String,
+    /// Sample rate in Hz.
+    pub sample_rate: Option<u32>,
+    /// Bit depth.
+    pub bit_depth: Option<u8>,
+    /// Duration as the container states it; zero counts as unknown.
+    pub duration: Option<std::time::Duration>,
+}
+
+/// Transcode `input` audio to `output` in the given `format`, embedding `meta`
 /// tags and passing through cover art from the source via ffmpeg.
 ///
-/// `source_sample_rate` — pass the known sample rate of the source file so that
-/// AIFF/WAV exports can be downsampled to ≤ 48 kHz when required by CDJ
-/// hardware.  Pass `None` if the rate is unknown; the file will be exported
-/// as-is (risk of "illegal format" on CDJs for high-rate sources).
-///
-/// When a downsample is applied this function logs at `info!` level with the
-/// source rate, target rate, and source file path so the user can audit which
-/// tracks were resampled.
+/// `source` describes the input: AIFF/WAV exports are downsampled to ≤ 48 kHz
+/// when required by CDJ hardware (logged at `info!` level with the source rate,
+/// target rate and file path, so the user can audit which tracks were
+/// resampled), are 16-bit for sources of 16 bits or less and 24-bit otherwise,
+/// and AAC sources are cut at their container duration, dropping the trailing
+/// encoder padding.
 ///
 /// ffmpeg must be available on `$PATH`. Cover art is preserved automatically
 /// via `-map_metadata 0`.
 pub fn transcode(
-    source: &Path,
+    input: &Path,
     output: &Path,
     format: &ExportFormat,
     meta: &ExportMetadata,
-    source_sample_rate: Option<u32>,
+    source: &SourceAudio,
 ) -> Result<(), TranscoderError> {
-    // Log when a CDJ-required downsample will be applied.
-    if matches!(format, ExportFormat::Aiff | ExportFormat::Wav) {
-        if let Some(src_hz) = source_sample_rate {
-            if let Some(target_hz) = ffmpeg::cdj_target_rate(src_hz) {
-                tracing::info!(
-                    source = %source.display(),
-                    src_hz,
-                    target_hz,
-                    "downsampling to CDJ-safe rate"
-                );
-            }
-        }
+    if let (Some(src_hz), Some(target_hz)) =
+        (source.sample_rate, source.cdj_downsample_rate(format))
+    {
+        tracing::info!(
+            source = %input.display(),
+            src_hz,
+            target_hz,
+            "downsampling to CDJ-safe rate"
+        );
     }
-    ffmpeg::run_ffmpeg(source, output, format, meta, source_sample_rate)
+    ffmpeg::run_ffmpeg(input, output, format, meta, source)
+}
+
+/// The bit rate in kbps of uncompressed PCM, as rekordbox writes it to the
+/// `BitRate` attribute: `sample_rate × bit_depth × channels / 1000`
+/// (1411 for 16-bit/44.1 kHz stereo, 2116 for 24-bit).
+pub fn pcm_bitrate_kbps(sample_rate: u32, bit_depth: u8, channels: u16) -> u32 {
+    (u64::from(sample_rate) * u64::from(bit_depth) * u64::from(channels) / 1000) as u32
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────────
@@ -167,6 +187,16 @@ mod tests {
             "extension() must equal suffix() without leading dot for {:?}",
             fmt
         );
+    }
+
+    #[rstest]
+    #[case(44_100, 16, 2, 1411)]
+    #[case(48_000, 16, 2, 1536)]
+    #[case(44_100, 24, 2, 2116)]
+    #[case(48_000, 24, 2, 2304)]
+    #[case(44_100, 16, 1, 705)]
+    fn pcm_bitrate(#[case] rate: u32, #[case] depth: u8, #[case] ch: u16, #[case] kbps: u32) {
+        assert_eq!(pcm_bitrate_kbps(rate, depth, ch), kbps);
     }
 
     // ── FormatCategory ────────────────────────────────────────────────────────

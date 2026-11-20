@@ -6131,6 +6131,7 @@ dependencies = [
 name = "mdma-cli"
 version = "0.41.0"
 dependencies = [
+ "audio-metadata",
  "audio-transcoder",
  "bpaf",
  "chrono",

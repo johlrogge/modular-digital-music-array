@@ -146,7 +146,9 @@ fn generate_facts_from_metadata(
     }
 
     if let Some(ref key_str) = metadata.key {
-        if let Ok(key) = Key::from_traditional(key_str) {
+        // Any notation: our own exports write the short form (`Abm`, ID3v2 TKEY),
+        // third-party taggers write Camelot, Open Key or the long form.
+        if let Ok(key) = key_str.parse::<Key>() {
             facts.push((MusicValue::Key(key), source.clone()));
         }
     }
@@ -434,6 +436,39 @@ mod tests {
             .iter()
             .any(|(v, _)| matches!(v, MusicValue::SampleRate(_))));
         assert!(facts.iter().any(|(v, _)| matches!(v, MusicValue::Title(_))));
+    }
+
+    /// A tag key in any notation becomes the same Key fact; garbage becomes none.
+    #[rstest]
+    #[case("Abm", Some("G#m"))]
+    #[case("C", Some("C"))]
+    #[case("F#m", Some("F#m"))]
+    #[case("Bb", Some("A#"))]
+    #[case("8A", Some("Am"))]
+    #[case("1m", Some("Am"))]
+    #[case("A Minor", Some("Am"))]
+    #[case("C Major", Some("C"))]
+    #[case("nonsense", None)]
+    fn tag_key_in_any_notation_becomes_a_key_fact(
+        #[case] tag: &str,
+        #[case] expected: Option<&str>,
+    ) {
+        let mut metadata = make_metadata(Some("T"), None, None, "/music/inbox/x.aiff");
+        metadata.key = Some(tag.to_string());
+        let library = FactSource::new("mdma-library", "test", "FilesystemScan");
+        let facts = generate_facts_from_metadata(
+            &ContentHash::new("sha256:abc".to_string()),
+            &metadata,
+            &std::collections::HashMap::new(),
+            &library,
+            &library,
+        )
+        .unwrap();
+        let key = facts.iter().find_map(|(v, _)| match v {
+            MusicValue::Key(k) => Some(*k),
+            _ => None,
+        });
+        assert_eq!(key, expected.map(|e| e.parse::<Key>().unwrap()));
     }
 
     #[test]

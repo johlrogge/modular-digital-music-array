@@ -15,7 +15,7 @@ use color_eyre::eyre::{bail, eyre};
 use color_eyre::Result;
 use hicli::Arg;
 use library_ipc_client::{track_hashes, unresolved_entries};
-use library_ipc_client::{ContentHash, PlaylistEntry, TrackInfo};
+use library_ipc_client::{ContentHash, Key, PlaylistEntry, TrackInfo};
 use music_facts::MusicValue;
 use playlist_import::{format_write_outcome, write_playlist, LibraryTrackLookup};
 use rekordbox_roundtrip::Stars;
@@ -96,6 +96,79 @@ pub(crate) struct RekordboxImportArgs {
     pub(crate) path: ExistingFileArg,
 }
 
+/// The key of a rekordbox `Tonality`. rekordbox writes Camelot (`8A`) as well as
+/// traditional notation (`Abm`, `C`, `F#m`, `Bb`); `Key`'s parser takes both.
+fn parse_tonality(tonality: &str) -> Option<Key> {
+    tonality.parse::<Key>().ok()
+}
+
+/// The `BitRate` (kbps) and `SampleRate` (Hz) the export XML states for a track.
+///
+/// They must describe the exported file: after an AIFF/WAV transcode the source's
+/// facts (FLAC's compressed kbps, a 96 kHz rate that was downsampled) are wrong.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ExportedAudio {
+    bitrate: Option<u32>,
+    sample_rate: Option<u32>,
+}
+
+impl ExportedAudio {
+    /// The values of the source file, right for an untouched (`Original`) export.
+    fn of_source(track: &TrackInfo) -> Self {
+        Self {
+            bitrate: track.audio.bitrate.map(|b| b.value()),
+            sample_rate: track.audio.sample_rate.map(|s| s.value()),
+        }
+    }
+
+    /// Uncompressed PCM of the given format; the bit rate is computed the way
+    /// rekordbox does (see [`audio_transcoder::pcm_bitrate_kbps`]).
+    fn of_pcm(sample_rate: u32, bit_depth: u8, channels: u16) -> Self {
+        Self {
+            bitrate: Some(audio_transcoder::pcm_bitrate_kbps(
+                sample_rate,
+                bit_depth,
+                channels,
+            )),
+            sample_rate: Some(sample_rate),
+        }
+    }
+
+    /// Read the real format back from an exported AIFF/WAV file. When it cannot be
+    /// read, the values are omitted: the source's would be wrong.
+    fn of_exported_pcm_file(path: &std::path::Path) -> Self {
+        match audio_metadata::extract_metadata(path) {
+            Ok(audio_metadata::TrackMetadata {
+                sample_rate: Some(rate),
+                bit_depth: Some(depth),
+                channels: Some(channels),
+                ..
+            }) => Self::of_pcm(rate, depth, channels),
+            _ => {
+                eprintln!(
+                    "warning: cannot read the audio format of {}; BitRate and SampleRate are omitted from the XML",
+                    path.display()
+                );
+                Self {
+                    bitrate: None,
+                    sample_rate: None,
+                }
+            }
+        }
+    }
+
+    /// The values for a track exported under `format`: read back from the file
+    /// when the destination is a PCM container (AIFF/WAV, whether transcoded or an
+    /// already-PCM source served unchanged), the source's otherwise.
+    fn of_export(format: &ExportFormat, path: &std::path::Path, track: &TrackInfo) -> Self {
+        if format.static_extension().is_some() {
+            Self::of_exported_pcm_file(path)
+        } else {
+            Self::of_source(track)
+        }
+    }
+}
+
 /// Build a single `RekordboxTrack` from MDMA metadata and file facts.
 ///
 /// `dest_path` must be the already-canonicalised destination used for planning —
@@ -110,6 +183,7 @@ fn build_rekordbox_track(
     ext: &str,
     size: u64,
     facts: &[(String, String)],
+    audio: &ExportedAudio,
 ) -> rekordbox_xml::RefreshedTrack {
     let find_fact = |name: &str| -> Option<String> {
         facts
@@ -118,8 +192,10 @@ fn build_rekordbox_track(
             .map(|(_, v)| v.clone())
     };
 
-    let bitrate = track.audio.bitrate.map(|b| b.value());
-    let sample_rate = track.audio.sample_rate.map(|s| s.value());
+    let ExportedAudio {
+        bitrate,
+        sample_rate,
+    } = *audio;
     let year = find_fact("Year").or_else(|| find_fact("RecordingYear"));
     let label = find_fact("Label");
     let comment = find_fact("Comment");
@@ -484,12 +560,14 @@ pub(crate) fn export(args: RekordboxExportArgs, ctx: &Ctx) -> Result<()> {
                 .map(|(_hash, facts)| facts)
                 .unwrap_or_default();
             exported.push((track.content_hash.clone(), Stars::from_energy(track.energy)));
+            let audio = ExportedAudio::of_export(&format_owned, &actual_dest, track);
             refreshed.push(build_rekordbox_track(
                 track,
                 &actual_dest,
                 &actual_ext,
                 size,
                 &facts,
+                &audio,
             ));
         }
     }
@@ -649,7 +727,7 @@ fn print_write_outcome(name: &str, track_count: usize, created: bool) {
 /// ```
 #[hicli::command]
 pub(crate) fn import(args: RekordboxImportArgs, ctx: &Ctx) -> Result<()> {
-    use library_ipc_client::{Bpm, Key};
+    use library_ipc_client::Bpm;
     use std::collections::HashMap;
 
     let RekordboxImportArgs {
@@ -892,8 +970,21 @@ pub(crate) fn import(args: RekordboxImportArgs, ctx: &Ctx) -> Result<()> {
             }
 
             // Write Key (Tonality) if available
-            if let Some(ref tonality) = rb_track.tonality {
-                if let Ok(key) = Key::from_camelot(tonality) {
+            if let Some(tonality) = rb_track
+                .tonality
+                .as_deref()
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+            {
+                let key = parse_tonality(tonality);
+                if key.is_none() {
+                    eprintln!(
+                        "warning: unrecognised Tonality '{}' for {} - {}; no Key written",
+                        tonality, rb_track.artist, rb_track.name
+                    );
+                    errors += 1;
+                }
+                if let Some(key) = key {
                     let already_current = existing
                         .as_ref()
                         .and_then(|t| t.key)
@@ -1259,6 +1350,7 @@ mod tests {
                 "aiff",
                 1,
                 &[],
+                &super::ExportedAudio::of_source(&track),
             );
             assert_eq!(built.rating, rating, "energy {energy:?}");
         }
@@ -1334,10 +1426,125 @@ mod tests {
             "aiff",
             1,
             &facts,
+            &super::ExportedAudio::of_source(&track),
         );
         let xml = rekordbox_xml::merge_export(None, vec![built], &[]).to_xml();
         assert!(xml.contains("BitRate=\"1411\""), "{xml}");
         assert!(xml.contains("SampleRate=\"44100\""), "{xml}");
+    }
+
+    /// A 96 kHz FLAC exported as 16-bit/48 kHz AIFF states the exported file's
+    /// rates, not the source's.
+    #[test]
+    fn export_writes_the_format_of_the_exported_file_not_the_source() {
+        use library_ipc_client::{AudioProperties, Bitrate, SampleRate};
+        let hash = format!("sha256:{}", "a".repeat(64));
+        let track = library_ipc_client::TrackInfo {
+            audio: AudioProperties {
+                bitrate: Some(Bitrate::new(3000)),
+                sample_rate: Some(SampleRate::new(96000)),
+                ..AudioProperties::default()
+            },
+            ..crate::test_support::track(&hash)
+        };
+        let built = super::build_rekordbox_track(
+            &track,
+            std::path::Path::new("/x/a.aiff"),
+            "aiff",
+            1,
+            &[],
+            &super::ExportedAudio::of_pcm(48000, 16, 2),
+        );
+        let xml = rekordbox_xml::merge_export(None, vec![built], &[]).to_xml();
+        assert!(xml.contains("BitRate=\"1536\""), "{xml}");
+        assert!(xml.contains("SampleRate=\"48000\""), "{xml}");
+    }
+
+    #[test]
+    fn pcm_audio_is_computed_from_rate_depth_and_channels() {
+        for (rate, depth, channels, kbps) in [
+            (44_100, 16, 2, 1411),
+            (44_100, 24, 2, 2116),
+            (48_000, 16, 2, 1536),
+            (48_000, 24, 2, 2304),
+        ] {
+            assert_eq!(
+                super::ExportedAudio::of_pcm(rate, depth, channels),
+                super::ExportedAudio {
+                    bitrate: Some(kbps),
+                    sample_rate: Some(rate)
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn an_original_export_keeps_the_source_values() {
+        use library_ipc_client::{AudioProperties, Bitrate, SampleRate};
+        let hash = format!("sha256:{}", "a".repeat(64));
+        let track = library_ipc_client::TrackInfo {
+            audio: AudioProperties {
+                bitrate: Some(Bitrate::new(320)),
+                sample_rate: Some(SampleRate::new(44100)),
+                ..AudioProperties::default()
+            },
+            ..crate::test_support::track(&hash)
+        };
+        // The path does not exist: an Original export must not read it.
+        let audio = super::ExportedAudio::of_export(
+            &crate::transfer::ExportFormat::Original,
+            std::path::Path::new("/nonexistent/a.aiff"),
+            &track,
+        );
+        assert_eq!(audio, super::ExportedAudio::of_source(&track));
+        assert_eq!(audio.bitrate, Some(320));
+    }
+
+    /// A PCM export whose format cannot be read back states no rates rather than
+    /// the source's, which describe a different file.
+    #[test]
+    fn an_unreadable_pcm_export_omits_the_rates() {
+        let hash = format!("sha256:{}", "a".repeat(64));
+        let track = crate::test_support::track(&hash);
+        let audio = super::ExportedAudio::of_export(
+            &crate::transfer::ExportFormat::Aiff,
+            std::path::Path::new("/nonexistent/a.aiff"),
+            &track,
+        );
+        assert_eq!(
+            audio,
+            super::ExportedAudio {
+                bitrate: None,
+                sample_rate: None
+            }
+        );
+    }
+
+    #[test]
+    fn tonality_in_any_notation_is_a_key() {
+        use library_ipc_client::Key;
+        for (tonality, expected) in [
+            ("Abm", "G#m"),
+            ("C", "C"),
+            ("F#m", "F#m"),
+            ("Bb", "A#"),
+            ("8A", "Am"),
+            ("11B", "A"),
+        ] {
+            let key = super::parse_tonality(tonality)
+                .unwrap_or_else(|| panic!("{tonality} should parse"));
+            assert_eq!(
+                key,
+                expected.parse::<Key>().unwrap(),
+                "{tonality} vs {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn unparseable_tonality_is_not_a_key() {
+        assert_eq!(super::parse_tonality("H#"), None);
+        assert_eq!(super::parse_tonality("nonsense"), None);
     }
 
     #[test]

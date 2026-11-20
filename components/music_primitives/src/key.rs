@@ -224,6 +224,17 @@ impl Key {
         format!("{} {}", self.pitch.as_flat(), self.mode.name())
     }
 
+    /// Get the short traditional notation with flats (e.g. `Abm`, `C`, `Bb`): the
+    /// pitch, then `m` for minor. At most three characters, as the ID3v2 `TKEY`
+    /// frame requires; `FromStr` reads it back.
+    pub fn to_short_flat(&self) -> String {
+        let suffix = match self.mode {
+            Mode::Major => "",
+            Mode::Minor => "m",
+        };
+        format!("{}{}", self.pitch.as_flat(), suffix)
+    }
+
     /// Return the Camelot wheel number (1–12) for this key.
     ///
     /// The number encodes harmonic position on the Camelot wheel independently
@@ -677,6 +688,23 @@ mod tests {
                 assert_eq!(key.to_open_key().parse::<Key>().unwrap(), key);
             }
         }
+    }
+
+    #[rstest]
+    #[case("G#m", "Abm")]
+    #[case("C", "C")]
+    #[case("A#", "Bb")]
+    #[case("F#m", "Gbm")]
+    #[case("Am", "Am")]
+    fn short_flat_notation_is_at_most_three_chars_and_parses_back(
+        #[case] input: &str,
+        #[case] expected: &str,
+    ) {
+        let key: Key = input.parse().unwrap();
+        let short = key.to_short_flat();
+        assert_eq!(short, expected);
+        assert!(short.len() <= 3);
+        assert_eq!(short.parse::<Key>().unwrap(), key);
     }
 
     #[test]
