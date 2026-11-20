@@ -33,6 +33,45 @@ struct Args {
     acid_events_socket: String,
 }
 
+/// On SIGTERM or SIGINT (the IPC loop never returns on its own): stop the AIFF
+/// conversion worker after the job in hand, then exit. An encode longer than the
+/// supervisor's grace period is killed with the process; the startup sweep
+/// removes what it left in staging (ADR-037).
+///
+/// This task needs the multi-threaded runtime (the `#[tokio::main]` default):
+/// `run_ipc_server` blocks the thread `main` runs on, so the task must run on a
+/// worker thread.
+fn stop_on_signal(library: std::sync::Arc<LibraryService>) {
+    tokio::spawn(async move {
+        use tokio::signal::unix::{signal, SignalKind};
+        let (Ok(mut term), Ok(mut int)) = (
+            signal(SignalKind::terminate()),
+            signal(SignalKind::interrupt()),
+        ) else {
+            tracing::warn!(
+                "Could not listen for SIGTERM; the conversion worker is not stopped on exit"
+            );
+            return;
+        };
+        tokio::select! {
+            _ = term.recv() => {}
+            _ = int.recv() => {}
+        }
+        tracing::info!("Stopping");
+        // Wait briefly for the job in hand, then exit anyway: the crash order makes an
+        // interrupted conversion safe, and the flac child dies with us.
+        let ended = tokio::task::spawn_blocking(move || {
+            library.shutdown_conversions_timeout(std::time::Duration::from_secs(3))
+        })
+        .await
+        .unwrap_or(false);
+        if !ended {
+            tracing::warn!("A conversion was still running; exiting without it");
+        }
+        std::process::exit(0);
+    });
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     color_eyre::install()?;
@@ -82,7 +121,13 @@ async fn main() -> Result<()> {
     spawn_fact_subscriber(std::sync::Arc::clone(&library));
 
     // Run IPC server (blocking)
-    run_ipc_server(library, &args.socket)?;
+    stop_on_signal(std::sync::Arc::clone(&library));
+
+    let served = run_ipc_server(std::sync::Arc::clone(&library), &args.socket);
+
+    // Stop the AIFF conversion worker after the job in hand, whatever ended the server.
+    library.shutdown_conversions();
+    served?;
 
     Ok(())
 }

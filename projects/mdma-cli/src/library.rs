@@ -21,7 +21,9 @@ pub(crate) fn reindex_covers(ctx: &Ctx) -> Result<()> {
         },
     )?;
     match result {
-        IngestResult::Success { message, .. } => println!("{}", message),
+        IngestResult::Success { message, .. } | IngestResult::Pending { message } => {
+            println!("{}", message)
+        }
         IngestResult::Failure { message } => return Err(eyre!("{}", message)),
     }
     Ok(())

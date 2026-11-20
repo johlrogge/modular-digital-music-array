@@ -5740,6 +5740,7 @@ version = "0.4.0"
 dependencies = [
  "acid-client",
  "acid-service",
+ "audio-fixtures",
  "audio-hash",
  "audio-metadata",
  "chrono",

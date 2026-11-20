@@ -340,6 +340,9 @@ async fn forget_update(state: &AppState, pkg: &PackageName) {
 struct IngestResultJson {
     path: String,
     success: bool,
+    /// An AIFF queued for conversion to FLAC (ADR-037): accepted, not stored yet.
+    /// `success` is true for it too (the page's summary counts it as ingested).
+    pending: bool,
     message: String,
     hash: Option<String>,
 }
@@ -434,15 +437,24 @@ async fn ingest_all(State(state): State<Arc<AppState>>) -> impl IntoResponse {
             let json_results: Vec<IngestResultJson> = results
                 .into_iter()
                 .map(|item| match item.result {
-                    IngestResult::Success { hash, message } => IngestResultJson {
+                    IngestResult::Success { hash, message, .. } => IngestResultJson {
                         path: item.path.to_string(),
                         success: true,
+                        pending: false,
                         message,
                         hash: hash.map(|h| h.as_str().to_owned()),
+                    },
+                    IngestResult::Pending { message } => IngestResultJson {
+                        path: item.path.to_string(),
+                        success: true,
+                        pending: true,
+                        message,
+                        hash: None,
                     },
                     IngestResult::Failure { message } => IngestResultJson {
                         path: item.path.to_string(),
                         success: false,
+                        pending: false,
                         message,
                         hash: None,
                     },

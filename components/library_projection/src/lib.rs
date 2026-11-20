@@ -348,6 +348,24 @@ pub fn track_encoded_from<'a>(
     })
 }
 
+/// Every `EncodedFrom` alias of the live tracks, keyed by [`hash_key`] of the source
+/// file and answering the track's own `content_hash`: [`track_encoded_from`] for all
+/// sources at once, for a service that asks on every ingest. Built from the same
+/// predicate (a merge loser awaiting retirement is skipped, a soft-deleted track
+/// still counts), and where two tracks claim one source the first in `tracks` wins,
+/// as `track_encoded_from` finds it.
+pub fn encoded_from_index(tracks: &[IndexedTrackInfo]) -> HashMap<String, ContentHash> {
+    let mut index = HashMap::new();
+    for track in tracks.iter().filter(|t| !t.is_retired()) {
+        for source in track.encoded_from() {
+            index
+                .entry(hash_key(source.as_str()))
+                .or_insert_with(|| track.content_hash.clone());
+        }
+    }
+    index
+}
+
 /// Apply a single `MusicValue` fact (with its source) to a mutable `IndexedTrackInfo`.
 ///
 /// ## Assert
@@ -2012,6 +2030,42 @@ mod tests {
         assert!(tracks[0].is_hidden());
         let found = track_encoded_from(&tracks, &ContentHash::new("sha256:aiff"));
         assert_eq!(found.map(|t| t.content_hash.as_str()), Some("sha256:flac"));
+    }
+
+    /// The index answers exactly what `track_encoded_from` does, for every source,
+    /// through a merge (winner and loser), a soft delete and a retract.
+    #[test]
+    fn encoded_from_index_agrees_with_track_encoded_from() {
+        let s = src("ingest", "1.0.0");
+        let mut facts = merged("sha256:win", "sha256:lose", None);
+        facts.extend([
+            assert_fact("sha256:win", encoded_from("sha256:aiffW"), 5, &s),
+            assert_fact("sha256:win", encoded_from("sha256:AIFFL"), 6, &s),
+            assert_fact("sha256:gone", encoded_from("sha256:aiffG"), 7, &s),
+            retract_fact("sha256:gone", encoded_from("sha256:aiffG"), 8, &s),
+            assert_fact("sha256:hid", encoded_from("sha256:aiffH"), 9, &s),
+            assert_fact(
+                "sha256:hid",
+                MusicValue::Deleted { timestamp: ts(10) },
+                10,
+                &s,
+            ),
+        ]);
+        let tracks = project(facts).tracks;
+        let index = encoded_from_index(&tracks);
+        for source in [
+            "sha256:aiffW",
+            "sha256:aiffL",
+            "aiffl",
+            "sha256:aiffG",
+            "sha256:aiffH",
+            "sha256:unknown",
+        ] {
+            let truth = track_encoded_from(&tracks, &ContentHash::new(source))
+                .map(|t| t.content_hash.clone());
+            assert_eq!(index.get(&hash_key(source)).cloned(), truth, "{source}");
+        }
+        assert_eq!(index.len(), 3, "{index:?}");
     }
 
     #[test]

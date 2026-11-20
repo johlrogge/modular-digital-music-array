@@ -1284,6 +1284,74 @@ pub struct ServiceStatus {
     /// Fact-log lines skipped since startup because they did not parse.
     #[serde(default)]
     pub unparseable_lines: usize,
+    /// Inbox files the conversion worker holds (ADR-037): queued, being converted,
+    /// waiting to retry, or given up on. Absent on the wire from nodes that predate
+    /// it, which reads as none.
+    #[serde(default)]
+    pub conversions: Vec<InboxConversion>,
+}
+
+/// An inbox file the conversion worker holds, and where it is.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InboxConversion {
+    pub path: InboxPath,
+    pub state: ConversionState,
+}
+
+/// Where an inbox file is in the conversion worker (ADR-037).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum ConversionState {
+    /// Waiting for its turn.
+    Queued,
+    /// The worker is converting it now.
+    Converting,
+    /// The machine failed (no `flac`, disk I/O); it is tried again later.
+    Retrying { attempt: u32, last_error: String },
+    /// Retried to the limit. The file is still in the inbox; ingesting it again
+    /// starts over.
+    Failed { message: String },
+}
+
+impl std::fmt::Display for ConversionState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Queued => write!(f, "queued for conversion"),
+            Self::Converting => write!(f, "converting"),
+            Self::Retrying {
+                attempt,
+                last_error,
+            } => write!(
+                f,
+                "conversion failed (attempt {attempt}), retrying: {last_error}"
+            ),
+            Self::Failed { message } => write!(f, "conversion failed: {message}"),
+        }
+    }
+}
+
+/// Something an ingest went on without, as the ingest result reports it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum IngestWarning {
+    /// The file's tags could not be read; it is stored without tag facts.
+    TagsUnreadable { detail: String },
+    /// An AIFF that could not be converted to FLAC and verified is stored as an AIFF
+    /// blob (ADR-037).
+    StoredAsAiff { reason: String },
+}
+
+impl std::fmt::Display for IngestWarning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TagsUnreadable { detail } => {
+                write!(f, "tags unreadable, stored without them ({detail})")
+            }
+            Self::StoredAsAiff { reason } => {
+                write!(f, "not converted to FLAC, stored as AIFF ({reason})")
+            }
+        }
+    }
 }
 
 /// Result of a single file ingestion.
@@ -1292,9 +1360,22 @@ pub struct ServiceStatus {
 pub enum IngestResult {
     Success {
         hash: Option<ContentHash>,
+        /// Free text, for clients that do not read `warnings`.
         message: String,
+        /// What the ingest went on without. Not sent when there is none, so the
+        /// JSON of a plain success is what older clients know; absent on the wire
+        /// from nodes that predate it.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        warnings: Vec<IngestWarning>,
     },
     Failure {
+        message: String,
+    },
+    /// Accepted, and finishing in the background (an AIFF being converted to
+    /// FLAC, ADR-037): the file stays in the inbox until the conversion is done.
+    /// Progress is in `ServiceStatus::conversions`. A client that predates this
+    /// state cannot read it (ADR-004: the services redeploy together).
+    Pending {
         message: String,
     },
 }
@@ -3057,6 +3138,7 @@ mod tests {
         let result = IngestResult::Success {
             hash: Some(hash.clone()),
             message: "ingested".to_string(),
+            warnings: Vec::new(),
         };
         let json = serde_json::to_string(&result).unwrap();
         let decoded: IngestResult = serde_json::from_str(&json).unwrap();
@@ -3064,11 +3146,149 @@ mod tests {
         if let IngestResult::Success {
             hash: h,
             message: m,
+            warnings,
         } = decoded
         {
             assert_eq!(h, Some(hash));
             assert_eq!(m, "ingested");
+            assert!(warnings.is_empty());
         }
+    }
+
+    /// A success without warnings is the JSON older clients know, and that JSON still
+    /// decodes: `warnings` is absent from it.
+    #[test]
+    fn a_plain_success_is_the_json_older_clients_know() {
+        let json = r#"{"status":"success","hash":"sha256:abc","message":"ok"}"#;
+        let decoded: IngestResult = serde_json::from_str(json).unwrap();
+        match &decoded {
+            IngestResult::Success {
+                hash,
+                message,
+                warnings,
+            } => {
+                assert_eq!(hash.as_ref().unwrap().as_str(), "sha256:abc");
+                assert_eq!(message, "ok");
+                assert!(warnings.is_empty());
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(serde_json::to_string(&decoded).unwrap(), json);
+    }
+
+    #[test]
+    fn success_warnings_are_typed_on_the_wire() {
+        let result = IngestResult::Success {
+            hash: None,
+            message: "File ingested with warnings".into(),
+            warnings: vec![
+                IngestWarning::TagsUnreadable {
+                    detail: "no SSND".into(),
+                },
+                IngestWarning::StoredAsAiff {
+                    reason: "float or compressed audio".into(),
+                },
+            ],
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        assert_eq!(
+            json,
+            r#"{"status":"success","hash":null,"message":"File ingested with warnings","warnings":[{"kind":"tags_unreadable","detail":"no SSND"},{"kind":"stored_as_aiff","reason":"float or compressed audio"}]}"#
+        );
+        let decoded: IngestResult = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            decoded,
+            IngestResult::Success { warnings, .. } if warnings.len() == 2
+        ));
+    }
+
+    /// An older client reads the new success JSON: it ignores the field it does not
+    /// know (this is the shape of the old enum variant).
+    #[test]
+    fn an_older_client_ignores_the_warnings_field() {
+        #[derive(Debug, Deserialize)]
+        #[serde(tag = "status", rename_all = "snake_case")]
+        enum OldIngestResult {
+            Success {
+                #[allow(dead_code)]
+                hash: Option<ContentHash>,
+                message: String,
+            },
+            #[allow(dead_code)]
+            Failure { message: String },
+        }
+        let json = serde_json::to_string(&IngestResult::Success {
+            hash: None,
+            message: "m".into(),
+            warnings: vec![IngestWarning::StoredAsAiff { reason: "r".into() }],
+        })
+        .unwrap();
+        let old: OldIngestResult = serde_json::from_str(&json).unwrap();
+        assert!(matches!(old, OldIngestResult::Success { message, .. } if message == "m"));
+    }
+
+    #[test]
+    fn ingest_result_pending_golden_json() {
+        let result = IngestResult::Pending {
+            message: "Converting to FLAC in the background".into(),
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        assert_eq!(
+            json,
+            r#"{"status":"pending","message":"Converting to FLAC in the background"}"#
+        );
+        assert!(matches!(
+            serde_json::from_str::<IngestResult>(&json).unwrap(),
+            IngestResult::Pending { .. }
+        ));
+    }
+
+    #[test]
+    fn service_status_conversions_golden_json_and_old_nodes() {
+        let status = ServiceStatus {
+            version: "1".into(),
+            tracks_indexed: 1,
+            facts_count: 2,
+            inbox_queue_size: 3,
+            uptime_seconds: 4,
+            unparseable_lines: 0,
+            conversions: vec![
+                InboxConversion {
+                    path: InboxPath::new("a.aiff").unwrap(),
+                    state: ConversionState::Queued,
+                },
+                InboxConversion {
+                    path: InboxPath::new("b.aiff").unwrap(),
+                    state: ConversionState::Converting,
+                },
+                InboxConversion {
+                    path: InboxPath::new("c.aiff").unwrap(),
+                    state: ConversionState::Retrying {
+                        attempt: 2,
+                        last_error: "no flac".into(),
+                    },
+                },
+                InboxConversion {
+                    path: InboxPath::new("d.aiff").unwrap(),
+                    state: ConversionState::Failed {
+                        message: "gave up".into(),
+                    },
+                },
+            ],
+        };
+        let json = serde_json::to_string(&status).unwrap();
+        assert!(json.contains(
+            r#""conversions":[{"path":"a.aiff","state":{"state":"queued"}},{"path":"b.aiff","state":{"state":"converting"}},{"path":"c.aiff","state":{"state":"retrying","attempt":2,"last_error":"no flac"}},{"path":"d.aiff","state":{"state":"failed","message":"gave up"}}]"#
+        ), "{json}");
+        let back: ServiceStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.conversions, status.conversions);
+
+        // A node that predates the field sends none.
+        let old: ServiceStatus = serde_json::from_str(
+            r#"{"version":"1","tracks_indexed":1,"facts_count":2,"inbox_queue_size":0,"uptime_seconds":3}"#,
+        )
+        .unwrap();
+        assert!(old.conversions.is_empty());
     }
 
     #[test]

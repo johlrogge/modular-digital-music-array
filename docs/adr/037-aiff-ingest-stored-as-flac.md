@@ -68,13 +68,15 @@ Accepted, 2026-11-20 (Joakim decided). Not yet implemented.
    - It stages in `/music/staging/<source-hash>.flac`.
    - Phase 6's startup sweep removes `*.encoding.flac`, `*.rebuilt.aiff` and orphaned `<hex>.flac` in staging, and never promotes a leftover.
    - The order is: blob rename, then facts, then removal of the source.
+   - A queued job keeps the request's writer and facts in a sidecar, `staging/jobs/<hash of the path>.json`, until it ends stored or its file is gone; the startup sweep leaves that directory alone and re-queues from it (an orphan sidecar is removed).
+   - On SIGTERM or SIGINT `mdma-library` stops the worker after the job in hand. An encode can outlast the supervisor's wait: `sv stop` waits 7 s and reports a timeout; the process is killed only by `sv force-stop` or the system shutdown. The library bounds its own wait (3 s) and exits; the `flac` child dies with it (`PR_SET_PDEATHSIG`), and the startup sweep removes what an interrupted encode left in staging.
    - The ingest protocol gains a pending state.
 8. **The source AIFF** is deleted after a successful, verified conversion. Check 5.3 proves the FLAC rebuilds it byte for byte.
 9. **Same audio, different bytes.** A retagged AIFF, or an MDMA-exported AIFF re-imported, becomes a new track with an equal PcmHash. It is handled by the ADR-013 dedup scan, which offers the merge for confirmation.
 
 ## Why
 
-- Lossless decoding is bit-exact, and check 5.3 proves the original file can be recovered byte for byte: the audio and every chunk. Deleting the source loses nothing, and no sidecar or archive copy has to be kept consistent.
+- Lossless decoding is bit-exact, and check 5.3 proves the original file can be recovered byte for byte: the audio and every chunk. Deleting the source loses nothing, and no metadata sidecar or archive copy has to be kept consistent.
 - One acceptance rule replaces a per-variant table. Widening PcmHash later widens what converts.
 - Facts from the source mean the conversion can't change what the library knows.
 - Falling back to an AIFF blob means no user file is left behind.

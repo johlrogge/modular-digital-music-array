@@ -42,6 +42,9 @@ pub enum IngestError {
 pub enum IngestWarning {
     /// The file's tags could not be read; it is stored without tag facts.
     TagsUnreadable { detail: String },
+    /// An AIFF the encoder refused (it cannot be converted to FLAC and verified) is
+    /// stored as an AIFF blob.
+    StoredAsAiff { reason: String },
 }
 
 impl std::fmt::Display for IngestWarning {
@@ -49,6 +52,9 @@ impl std::fmt::Display for IngestWarning {
         match self {
             Self::TagsUnreadable { detail } => {
                 write!(f, "tags unreadable, stored without them ({detail})")
+            }
+            Self::StoredAsAiff { reason } => {
+                write!(f, "not converted to FLAC, stored as AIFF ({reason})")
             }
         }
     }
@@ -118,6 +124,16 @@ impl InboxFile {
     /// Validate the file and compute its hash
     /// Consumes self, transferring ownership to ValidatedAudio
     pub fn validate(self) -> Result<ValidatedAudio, IngestError> {
+        self.validate_accepting(AudioFormat::is_ingestible)
+    }
+
+    /// [`validate`](Self::validate) with a policy of the caller's for which formats
+    /// are accepted. The library service uses it to take AIFF before phase 8 of
+    /// ADR-037 makes `is_ingestible` say so, and in tests.
+    pub fn validate_accepting(
+        self,
+        accepts: impl Fn(&AudioFormat) -> bool,
+    ) -> Result<ValidatedAudio, IngestError> {
         // Check file exists
         if !self.path.exists() {
             return Err(IngestError::FileNotFound(self.path));
@@ -129,7 +145,7 @@ impl InboxFile {
             .ok_or_else(|| IngestError::UnsupportedFormat(ext.to_string()))?;
 
         // Only ingestible formats are accepted; AIFF is still export-only
-        if !format.is_ingestible() {
+        if !accepts(&format) {
             return Err(IngestError::NonIngestibleFormat);
         }
 

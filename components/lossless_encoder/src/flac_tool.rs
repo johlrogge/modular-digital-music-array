@@ -141,8 +141,10 @@ impl FlacTool {
     ) -> Result<(), EncodeError> {
         // The version check has passed, so the program exists: a failure to
         // start it now is the machine's (permissions, resources), not "missing".
-        let output = Command::new(&self.binary)
-            .args(args)
+        let mut command = Command::new(&self.binary);
+        command.args(args);
+        die_with_parent(&mut command);
+        let output = command
             .output()
             .map_err(|e| EnvironmentError::Spawn(format!("{}: {e}", self.binary.display())))?;
         if output.status.success() {
@@ -155,6 +157,27 @@ impl FlacTool {
         Err(Refusal::new(failure, detail).into())
     }
 }
+
+/// Have the kernel kill the child with SIGKILL when the thread that started it
+/// ends (here: the conversion worker, so the process ending takes flac with it
+/// instead of leaving it to finish a half-wanted encode). Linux only.
+#[cfg(target_os = "linux")]
+fn die_with_parent(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: the closure runs between fork and exec and only makes the async-signal-safe
+    // `prctl` call, with integer arguments.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn die_with_parent(_command: &mut Command) {}
 
 #[cfg(test)]
 mod tests {

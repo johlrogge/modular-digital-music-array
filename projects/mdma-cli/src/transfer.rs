@@ -321,6 +321,10 @@ pub(crate) fn upload(args: UploadArgs, ctx: &Ctx) -> Result<Success> {
                 println!("  OK: {} -> {}", filename, hash_str);
                 success_count += 1;
             }
+            Ok(mdma_client::IngestResult::Pending { message }) => {
+                println!("  PENDING: {} - {}", filename, message);
+                success_count += 1;
+            }
             Ok(mdma_client::IngestResult::Failure { message }) => {
                 eprintln!("  FAIL: {} - {}", filename, message);
                 fail_count += 1;

@@ -207,6 +207,13 @@ fn format_status(status: &library_ipc_client::ServiceStatus) -> String {
             status.unparseable_lines
         ));
     }
+    for c in &status.conversions {
+        text.push_str(&format!(
+            "Conversion:      {} ({})\n",
+            c.path.as_str(),
+            c.state
+        ));
+    }
     text
 }
 
@@ -606,7 +613,24 @@ mod tests {
             inbox_queue_size: 3,
             uptime_seconds: 4,
             unparseable_lines,
+            conversions: Vec::new(),
         }
+    }
+
+    #[test]
+    fn status_text_lists_the_conversions_the_worker_holds() {
+        use library_ipc_client::{ConversionState, InboxConversion, InboxPath};
+        let mut status = service_status(0);
+        assert!(!format_status(&status).contains("Conversion:"));
+        status.conversions = vec![InboxConversion {
+            path: InboxPath::new("a.aiff").unwrap(),
+            state: ConversionState::Converting,
+        }];
+        let text = format_status(&status);
+        assert!(
+            text.contains("Conversion:      a.aiff (converting)"),
+            "{text}"
+        );
     }
 
     #[test]

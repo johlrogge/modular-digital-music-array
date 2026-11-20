@@ -2123,6 +2123,15 @@ pub async fn run_download_worker(service: Arc<BandcampService>) {
                                                         "Auto-ingested into library"
                                                     );
                                                 }
+                                                Ok(library_ipc_client::IngestResult::Pending {
+                                                    message,
+                                                }) => {
+                                                    tracing::info!(
+                                                        file = %filename,
+                                                        msg = %message,
+                                                        "Library is converting the file in the background"
+                                                    );
+                                                }
                                                 Ok(library_ipc_client::IngestResult::Failure {
                                                     message,
                                                 }) => {
