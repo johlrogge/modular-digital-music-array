@@ -93,7 +93,10 @@ mdma fact set sha256:abc12345 energy 9
 # Import Rekordbox XML and land beat-grid / memory-cue facts — new in 0.25.0
 mdma rekordbox import --enrich rekordbox.xml
 
-# Export memory cues back to Rekordbox (MDMA never writes beat grids back)
+# Same, with a TSV report of unmatched, weak and shared tracks (works with --dry-run)
+mdma rekordbox import --enrich --report import-report.tsv rekordbox.xml
+
+# Export to Rekordbox (cues, and the stored MDMA beat grid as TEMPO)
 mdma rekordbox export --output rekordbox-out.xml
 
 # List your Bandcamp playlists and import one (preview with --dry-run)
@@ -280,7 +283,7 @@ Quick install is at the [top](#install). Every `vX.Y.Z` release publishes `mdma-
 
 ```bash
 # Install a specific release
-curl -fsSL https://raw.githubusercontent.com/johlrogge/modular-digital-music-array/master/scripts/install-mdma.sh | bash -s v0.41.0
+curl -fsSL https://raw.githubusercontent.com/johlrogge/modular-digital-music-array/master/scripts/install-mdma.sh | bash -s v0.42.0
 
 # Install to a user-writable location (no sudo)
 curl -fsSL https://raw.githubusercontent.com/johlrogge/modular-digital-music-array/master/scripts/install-mdma.sh | MDMA_INSTALL_DIR=~/.local/bin bash
@@ -298,6 +301,19 @@ cp target/release/mdma /usr/local/bin/
 ---
 
 See [ROADMAP.md](ROADMAP.md) for detailed status and planned work.
+
+---
+
+## What's new in 0.42
+
+### New console only, rekordbox round-trip fidelity
+
+- **Console:** every Settings page (Speakers, Theme, Add music, Bandcamp, Updates, About, Advanced) lives in the new console. The classic console is removed and `/classic` redirects to `/`. No more Google Fonts requests.
+- **rekordbox export:** 16-bit sources stay 16-bit in AIFF/WAV; XML `BitRate`/`SampleRate` are read back from the exported file; AAC/M4A trailing encoder padding is trimmed; AIFF gets ID3 `TBPM` and `TKEY` without duplicate source tags. The stored MDMA beat grid is exported as `TEMPO`, and no `TEMPO` is written without a grid (ADR-005 amended).
+- **rekordbox import:** tonality in any notation; `--report FILE` writes a TSV of problem tracks and playlist drops (works with `--dry-run`); placeholder grids from old exports and drifting multi-anchor grids are skipped; one grid per library track; accented file names decode correctly.
+- **Tags and CLI:** tag keys in any notation and ID3 `TBPM`/`TKEY` become BPM/key facts; `mdma fact` accepts every key notation.
+
+**Upgrade notes:** units provisioned before 0.26.1 must run `migrate-bootfs` before `xbps-install -Su` (#65, #128). Skipping it bricked prod on 2026-11-19. See CHANGELOG.md.
 
 ---
 
