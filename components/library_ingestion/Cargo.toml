@@ -12,8 +12,6 @@ license = "MIT"
 interface = "library-ingestion"
 
 [dependencies]
-# Not used yet: wired into ingestion in the next branch (ADR-010).
-audio-hash = { workspace = true }
 thiserror = "1.0"
 tracing = "0.1"
 chrono = "0.4"
@@ -31,6 +29,8 @@ hex = "0.4"
 pathdiff = "0.2"
 
 [dev-dependencies]
+# Generated AIFF fixtures (ADR-037).
+audio-fixtures = { workspace = true }
 pretty_assertions = "1"
 rstest = "0.26"
 tempfile = "3"

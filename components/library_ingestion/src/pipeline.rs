@@ -149,13 +149,8 @@ impl ValidatedAudio {
         content: &FactSource,
     ) -> Result<ExtractedTrack, IngestError> {
         // Only read metadata, not audio data
-        let facts = crate::fact_generator::generate_facts(
-            &self.path,
-            &self.content_hash,
-            self.format,
-            library,
-            content,
-        )?;
+        let facts =
+            crate::fact_generator::generate_facts(&self.path, self.format, library, content)?;
 
         Ok(ExtractedTrack {
             path: self.path,

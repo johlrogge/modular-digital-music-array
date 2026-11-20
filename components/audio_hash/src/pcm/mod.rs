@@ -21,6 +21,8 @@ mod raw;
 mod wav;
 
 #[cfg(test)]
+mod builder_tests;
+#[cfg(test)]
 mod real_fixtures;
 
 const DOMAIN: &[u8] = b"mdma-pcmhash\0v1\0";

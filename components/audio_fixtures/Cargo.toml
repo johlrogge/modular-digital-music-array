@@ -1,0 +1,19 @@
+[package]
+name = "audio-fixtures"
+version.workspace = true
+edition = "2021"
+authors = ["MDMA Development Team"]
+repository = "https://github.com/johlrogge/modular-digital-music-array"
+license = "MIT"
+
+[package.metadata.polylith]
+interface = "audio-fixtures"
+
+# Pure byte builders: no dependencies. Used as a dev-dependency by the crates
+# whose tests need generated AIFF files.
+[dependencies]
+
+[dev-dependencies]
+lofty = { workspace = true }
+pretty_assertions = { workspace = true }
+rstest = { workspace = true }

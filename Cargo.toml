@@ -88,6 +88,7 @@ acid-protocol = { path = "components/acid_protocol" }
 acid-service = { path = "components/acid_service" }
 admin-ipc-protocol = { path = "components/admin_ipc_protocol" }
 audio-decoder = { path = "components/audio_decoder" }
+audio-fixtures = { path = "components/audio_fixtures" }
 audio-hash = { path = "components/audio_hash" }
 audio-metadata = { path = "components/audio_metadata" }
 audio-output = { path = "components/audio_output" }
