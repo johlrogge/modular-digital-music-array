@@ -10,7 +10,7 @@ Semantic mapping between Rekordbox XML types and MDMA music facts.
 
 Converts Rekordbox `<TEMPO>` grid anchors and `<POSITION_MARK>` cue points to typed MDMA `MusicValue` facts, and converts MDMA memory-cue facts back to Rekordbox position marks for export.
 
-**Rekordbox is the beat-grid master.** MDMA reads `<TEMPO>` on import and stores it as a `BeatGrid` fact, but never writes `<TEMPO>` back on export.
+**MDMA owns grids on export** (ADR-005, amended). MDMA reads `<TEMPO>` on import and stores it as a `BeatGrid` fact. Export writes the stored MDMA grid as `<TEMPO>`, and writes no `<TEMPO>` for a track without a grid. The old placeholder `<TEMPO>` is never written.
 
 Key functions:
 
