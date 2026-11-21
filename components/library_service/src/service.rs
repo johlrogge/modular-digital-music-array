@@ -870,8 +870,6 @@ impl LibraryService {
 
     /// Backfill Format facts for tracks that have a file path but no Format fact
     fn backfill_format_facts(&self, has_format: &HashSet<String>) {
-        use music_facts::MusicFormat;
-
         let tracks = self.tracks.lock().unwrap();
 
         // Find tracks needing backfill; a track a `Replaces` retired gets nothing.
@@ -882,7 +880,8 @@ impl LibraryService {
             .filter(|t| !t.blob_path.as_os_str().is_empty())
             .filter_map(|t| {
                 let ext = t.blob_path.extension()?.to_str()?;
-                let music_format = AudioFormat::from_extension(ext).map(MusicFormat::from)?;
+                let music_format =
+                    AudioFormat::from_extension(ext).map(crate::fact_generator::music_format)?;
                 Some((t.content_hash.clone(), music_format))
             })
             .collect();
@@ -2876,8 +2875,7 @@ impl LibraryService {
         }
 
         // Stage 1 and 2: the inbox file, validated, with its hash
-        let validated =
-            InboxFile::new(path.to_path_buf()).validate_accepting(|f| self.accepts_format(f))?;
+        let validated = InboxFile::new(path.to_path_buf()).validate()?;
         let provenance = self.client_provenance(writer, facts);
 
         // Dedup before any work: by content hash, then by `EncodedFrom` alias.

@@ -97,9 +97,6 @@ impl RetryPolicy {
 /// `flac` on PATH and today's ingest policy.
 pub struct ConversionConfig {
     encoder: Encoder,
-    /// Take AIFF files in ingest before `AudioFormat::is_ingestible` does (ADR-037
-    /// phase 8 removes this and its uses).
-    accept_aiff: bool,
     retry: RetryPolicy,
     /// Test hook: called with the source AIFF after its facts are written and before
     /// it is removed, to change it in that window.
@@ -111,7 +108,6 @@ impl Default for ConversionConfig {
     fn default() -> Self {
         Self {
             encoder: Encoder::new(),
-            accept_aiff: false,
             retry: RetryPolicy::default(),
             #[cfg(test)]
             before_source_removal: None,
@@ -123,12 +119,6 @@ impl ConversionConfig {
     /// Encode with this encoder (a given `flac` binary, say).
     pub fn with_encoder(mut self, encoder: Encoder) -> Self {
         self.encoder = encoder;
-        self
-    }
-
-    /// Whether ingest takes AIFF files, ahead of `AudioFormat::is_ingestible`.
-    pub fn accepting_aiff(mut self, accept: bool) -> Self {
-        self.accept_aiff = accept;
         self
     }
 
@@ -223,10 +213,6 @@ impl Conversions {
             wake: Condvar::new(),
             worker: Mutex::new(None),
         }
-    }
-
-    pub(super) fn accepts(&self, format: &AudioFormat) -> bool {
-        format.is_ingestible() || (*format == AudioFormat::Aiff && self.config.accept_aiff)
     }
 
     fn lock(&self) -> MutexGuard<'_, Queue> {
@@ -461,10 +447,6 @@ fn end_for_error(error: ServiceError) -> JobEnd {
 }
 
 impl LibraryService {
-    pub(super) fn accepts_format(&self, format: &AudioFormat) -> bool {
-        self.conversions.accepts(format)
-    }
-
     fn staging_dir(&self) -> PathBuf {
         self.music_dir.join(STAGING_DIR)
     }
@@ -495,9 +477,6 @@ impl LibraryService {
     /// sidecar in `staging/jobs`); an AIFF with no sidecar is queued as a plain ingest.
     pub(super) fn recover_conversions(&self) {
         self.sweep_staging();
-        if !self.accepts_format(&AudioFormat::Aiff) {
-            return;
-        }
         let mut jobs = self.load_job_contexts();
         for path in self.get_inbox_queue_internal() {
             let is_aiff = path
@@ -680,9 +659,7 @@ impl LibraryService {
     /// Run one job to its end, on the calling thread, through its own ACID client
     /// (the request thread uses the service's).
     pub(super) fn convert_job(&self, job: &Job) -> JobEnd {
-        let validated = match crate::pipeline::InboxFile::new(job.path.clone())
-            .validate_accepting(|f| self.accepts_format(f))
-        {
+        let validated = match crate::pipeline::InboxFile::new(job.path.clone()).validate() {
             Ok(v) => v,
             Err(IngestError::FileNotFound(_)) => return JobEnd::SourceGone,
             Err(e) => return end_for_error(e.into()),

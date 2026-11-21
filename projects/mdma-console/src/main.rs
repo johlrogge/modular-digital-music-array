@@ -387,7 +387,7 @@ async fn upload_file(
 
         // Check if ZIP — extract audio files, then remove the ZIP
         let file_type = inbox_utils::detect_file_type(&dest);
-        if file_type == Some("zip") {
+        if file_type == Some(inbox_utils::Upload::Zip) {
             match inbox_utils::extract_zip(&dest, &inbox_dir) {
                 Ok(extracted) => {
                     let _ = std::fs::remove_file(&dest);
@@ -402,12 +402,6 @@ async fn upload_file(
             }
         } else if inbox_utils::is_ingestible_audio(&dest) {
             results.push(serde_json::json!({"file": file_name, "success": true}));
-        } else if inbox_utils::is_audio_file(&dest) {
-            // Recognized audio format but not accepted for ingest (AIFF is export-only)
-            let _ = std::fs::remove_file(&dest);
-            results.push(
-                serde_json::json!({"file": file_name, "error": inbox_utils::NON_INGESTIBLE_ERROR}),
-            );
         } else {
             let _ = std::fs::remove_file(&dest);
             results.push(

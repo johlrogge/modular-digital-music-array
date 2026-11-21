@@ -1,34 +1,15 @@
 //! MP3: audio is everything after the head ID3v2 chain and zero padding,
 //! minus trailing tags. The Xing/LAME frame stays in the range.
 
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek};
 use std::ops::Range;
+
+use audio_format::{is_frame_sync, zero_padding};
 
 use crate::tags::{head_id3v2_len, read_at, strip_trailers};
 use crate::{AudioHashError, Container};
 
 const C: Container = Container::Mp3;
-
-/// Upper bound on zero padding skipped after the tag chain.
-pub(crate) const MAX_ZERO_PADDING: u64 = 64 * 1024;
-
-/// MPEG audio frame sync: `0xFF` then a byte with the top three bits set.
-pub(crate) fn is_frame_sync(b: [u8; 2]) -> bool {
-    b[0] == 0xFF && b[1] & 0xE0 == 0xE0
-}
-
-/// Number of leading zero bytes at `start`, bounded by `MAX_ZERO_PADDING`.
-pub(crate) fn zero_padding<R: Read + Seek>(
-    r: &mut R,
-    start: u64,
-    file_len: u64,
-) -> Result<u64, AudioHashError> {
-    let n = file_len.saturating_sub(start).min(MAX_ZERO_PADDING) as usize;
-    let mut buf = vec![0u8; n];
-    r.seek(SeekFrom::Start(start))?;
-    r.read_exact(&mut buf)?;
-    Ok(buf.iter().take_while(|b| **b == 0).count() as u64)
-}
 
 // A single-element Vec of a Range is exactly what we mean here.
 #[allow(clippy::single_range_in_vec_init)]

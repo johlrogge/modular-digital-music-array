@@ -49,30 +49,14 @@ fn syncsafe(b: [u8; 4]) -> Option<u64> {
     }
 }
 
-/// Total length of the chain of ID3v2 tags at the start of the file.
+/// Total length of the chain of ID3v2 tags at the start of the file (the one
+/// implementation lives in `audio_format`, beside the sniffer that uses it).
 /// A tag that would extend past EOF is not consumed.
 pub(crate) fn head_id3v2_len<R: Read + Seek>(
     r: &mut R,
     file_len: u64,
 ) -> Result<u64, AudioHashError> {
-    let mut pos = 0u64;
-    loop {
-        if file_len.saturating_sub(pos) < 10 {
-            return Ok(pos);
-        }
-        let h: [u8; 10] = read_at(r, pos)?;
-        if &h[0..3] != b"ID3" || h[3] == 0xFF {
-            return Ok(pos);
-        }
-        let Some(size) = syncsafe([h[6], h[7], h[8], h[9]]) else {
-            return Ok(pos);
-        };
-        let footer = if h[5] & 0x10 != 0 { 10 } else { 0 };
-        match pos.checked_add(10 + size + footer) {
-            Some(next) if next <= file_len => pos = next,
-            _ => return Ok(pos),
-        }
-    }
+    Ok(audio_format::head_id3v2_len(r, file_len)?)
 }
 
 /// Move `end` back over any trailing tag blocks, never below `start`.

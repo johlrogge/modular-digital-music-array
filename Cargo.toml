@@ -8,6 +8,7 @@ members = [
     "components/acid_service",
     "components/admin_ipc_protocol",
     "components/audio_decoder",
+    "components/audio_format",
     "components/audio_hash",
     "components/audio_metadata",
     "components/audio_output",
@@ -90,6 +91,7 @@ acid-service = { path = "components/acid_service" }
 admin-ipc-protocol = { path = "components/admin_ipc_protocol" }
 audio-decoder = { path = "components/audio_decoder" }
 audio-fixtures = { path = "components/audio_fixtures" }
+audio-format = { path = "components/audio_format" }
 audio-hash = { path = "components/audio_hash" }
 audio-metadata = { path = "components/audio_metadata" }
 audio-output = { path = "components/audio_output" }

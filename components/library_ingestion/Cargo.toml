@@ -17,6 +17,7 @@ tracing = "0.1"
 chrono = "0.4"
 
 # Internal components
+audio-format = { workspace = true }
 music-facts = { workspace = true }
 music-primitives = { workspace = true }
 audio-metadata = { workspace = true }

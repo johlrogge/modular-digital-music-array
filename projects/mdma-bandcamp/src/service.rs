@@ -1821,7 +1821,7 @@ impl BandcampService {
     }
 }
 
-use inbox_utils::{detect_file_type, extract_zip, sanitize_filename, unique_path};
+use inbox_utils::{detect_file_type, extract_zip, sanitize_filename, unique_path, Upload};
 
 /// Process a downloaded file - extract if ZIP, move if audio file.
 /// Returns the list of files moved to inbox.
@@ -1835,12 +1835,12 @@ fn process_download_to_inbox(
     tracing::debug!(path = %download_path.display(), file_type = ?file_type, "Detected file type");
 
     match file_type {
-        Some("zip") => extract_zip(download_path, inbox_dir),
-        Some(ext @ ("flac" | "mp3" | "wav" | "aiff")) => {
+        Some(Upload::Zip) => extract_zip(download_path, inbox_dir),
+        Some(Upload::Audio(format)) => {
             // Single track - move directly to inbox with proper name
             let safe_artist = sanitize_filename(artist);
             let safe_title = sanitize_filename(title);
-            let filename = format!("{} - {}.{}", safe_artist, safe_title, ext);
+            let filename = format!("{} - {}.{}", safe_artist, safe_title, format.extension());
             let dest_path = unique_path(inbox_dir, &filename);
 
             std::fs::rename(download_path, &dest_path)?;
@@ -2280,6 +2280,36 @@ mod tests {
             ["Album", "Title", "Artist", "TrackNumber", "Year"]
         );
         assert!(!attributes.iter().any(|a| a == "ItemId" || a == "Source"));
+    }
+
+    // =========================================================================
+    // process_download_to_inbox tests
+    // =========================================================================
+
+    /// A single ALAC/AAC download is an M4A by its `ftyp` box and is named from the
+    /// format's extension.
+    #[test]
+    fn a_single_m4a_download_is_moved_to_the_inbox_as_m4a() {
+        let dir = tempfile::tempdir().unwrap();
+        let download = dir.path().join("download");
+        std::fs::write(&download, b"\0\0\0\x18ftypM4A \0\0\0\0M4A isom").unwrap();
+        let inbox = dir.path().join("inbox");
+        std::fs::create_dir(&inbox).unwrap();
+
+        let moved = process_download_to_inbox(&download, &inbox, "Artist", "Title").unwrap();
+
+        assert_eq!(moved, vec![inbox.join("Artist - Title.m4a")]);
+        assert!(moved[0].exists());
+        assert!(!download.exists());
+    }
+
+    #[test]
+    fn a_download_that_is_not_audio_or_zip_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let download = dir.path().join("download");
+        std::fs::write(&download, b"FORM\0\0\0\x048SVXVHDR").unwrap();
+        let err = process_download_to_inbox(&download, dir.path(), "A", "T").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 
     // =========================================================================

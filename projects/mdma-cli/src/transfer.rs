@@ -44,21 +44,17 @@ pub(crate) struct UploadArgs {
     file: UploadFileArg,
 }
 
-/// What an uploaded file holds, by its magic bytes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum UploadKind {
-    /// A ZIP archive of audio files.
-    Zip,
-    /// A single audio file (FLAC, MP3, WAV or AIFF).
-    Audio,
-}
+#[cfg(test)]
+use inbox_utils::AudioFormat;
+use inbox_utils::Upload;
 
 /// Path to file (audio file or ZIP archive)
 #[derive(Debug, Clone, PartialEq, Eq, Arg)]
 #[arg(positional = "FILE", complete = files)]
 pub(crate) struct UploadFileArg {
     pub(crate) path: std::path::PathBuf,
-    pub(crate) kind: UploadKind,
+    /// What the file holds, by its magic bytes.
+    pub(crate) kind: Upload,
 }
 
 impl std::str::FromStr for UploadFileArg {
@@ -66,14 +62,8 @@ impl std::str::FromStr for UploadFileArg {
 
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         let ExistingFileArg(path) = s.parse()?;
-        let kind = match inbox_utils::detect_file_type(&path) {
-            Some("zip") => UploadKind::Zip,
-            Some("flac" | "mp3" | "wav" | "aiff") => UploadKind::Audio,
-            _ => {
-                return Err(
-                    "unsupported file type: expected an audio file (FLAC, MP3, WAV, AIFF) or a ZIP archive",
-                )
-            }
+        let Some(kind) = inbox_utils::detect_file_type(&path) else {
+            return Err("unsupported file type: expected an audio file or a ZIP archive");
         };
         Ok(Self { path, kind })
     }
@@ -268,7 +258,7 @@ pub(crate) fn upload(args: UploadArgs, ctx: &Ctx) -> Result<Success> {
     // 2. Collect audio files to upload
     let temp_dir = tempfile::tempdir()?;
     let audio_files: Vec<std::path::PathBuf> = match file_type {
-        UploadKind::Zip => {
+        Upload::Zip => {
             println!("Extracting ZIP archive...");
             let extracted = inbox_utils::extract_zip(&file, temp_dir.path())?;
             if extracted.is_empty() {
@@ -277,7 +267,7 @@ pub(crate) fn upload(args: UploadArgs, ctx: &Ctx) -> Result<Success> {
             println!("Found {} audio file(s)", extracted.len());
             extracted
         }
-        UploadKind::Audio => vec![file],
+        Upload::Audio(_) => vec![file],
     };
 
     // 3. SCP each file to the Pi's inbox
@@ -862,7 +852,7 @@ mod tests {
         file.write_all(b"fLaC").unwrap();
         let path = file.path().to_str().unwrap();
         let arg = run_arg::<UploadFileArg>(&[path]).unwrap();
-        assert_eq!(arg.kind, UploadKind::Audio);
+        assert_eq!(arg.kind, Upload::Audio(AudioFormat::Flac));
         assert_eq!(arg.path, file.path());
 
         let err = run_arg::<UploadFileArg>(&["/definitely/not/here.flac"]).unwrap_err();
@@ -1097,13 +1087,26 @@ mod tests {
     }
 
     #[test]
+    fn upload_rejects_iff_and_riff_files_that_are_not_audio() {
+        for magic in [&b"FORM\0\0\0\x048SVXVHDR"[..], b"RIFF\x04\0\0\0AVI LIST"] {
+            let file = file_with(magic);
+            let err = upload_usage_error(file.path().to_str().unwrap());
+            assert!(err.contains("unsupported file type"), "{magic:?}: {err}");
+        }
+    }
+
+    #[test]
     fn upload_accepts_audio_and_zip_by_magic_bytes() {
         for (magic, kind) in [
-            (&b"fLaC"[..], UploadKind::Audio),
-            (b"ID3\x03", UploadKind::Audio),
-            (b"RIFF", UploadKind::Audio),
-            (b"FORM", UploadKind::Audio),
-            (b"PK\x03\x04", UploadKind::Zip),
+            (&b"fLaC"[..], Upload::Audio(AudioFormat::Flac)),
+            (&[0xFF, 0xFB, 0x90, 0x00], Upload::Audio(AudioFormat::Mp3)),
+            (b"RIFF\x04\0\0\0WAVEfmt ", Upload::Audio(AudioFormat::Wav)),
+            (b"FORM\0\0\0\x04AIFF", Upload::Audio(AudioFormat::Aiff)),
+            (
+                b"\0\0\0\x18ftypM4A \0\0\0\0",
+                Upload::Audio(AudioFormat::M4a),
+            ),
+            (b"PK\x03\x04", Upload::Zip),
         ] {
             let file = file_with(magic);
             let arg = upload_file(file.path().to_str().unwrap());

@@ -4,7 +4,6 @@ import { SETTINGS_LINK, pageHead } from "./collections.js";
 import { emptyNote, failReason, failedNote } from "./lists.js";
 import { doneRows, fileNote, inboxFiles, ingestSummary, isConverting, uploadRows } from "./logic.js";
 
-const ACCEPT = ".flac,.mp3,.wav,.m4a,.zip";
 const MAX_ROWS = 200; // the inbox list shows this many; the rest is a count
 const POLL_MS = 2000; // how often the list is read again while a conversion runs
 const MAX_FAILS = 3; // failed polls in a row before the page says so and stops
@@ -14,10 +13,10 @@ export function viewAddMusic(root) {
   const results = h("div", { "aria-live": "polite" });
   const inbox = h("div");
   const head = h("div", { class: "section-head" });
-  const input = h("input", { type: "file", id: "add-music-files", multiple: "", accept: ACCEPT, onchange: () => send() });
+  const input = h("input", { type: "file", id: "add-music-files", multiple: "", onchange: () => send() });
   const ingest = h("button", { class: "btn primary", onclick: () => ingestAll() }, [icon("download", "sm"), "Ingest all"]);
   const uploadBox = h("div", { class: "section" }, [
-    h("label", { class: "field", for: "add-music-files" }, ["Upload FLAC, MP3, WAV, M4A or ZIP", input]),
+    h("label", { class: "field", for: "add-music-files" }, ["Upload music files or a ZIP", input]),
     results,
   ]);
   const heading = (count) => head.replaceChildren(h("h2", {}, ["Inbox", count == null ? null : " ", count == null ? null : h("span", { class: "kicker", text: String(count).padStart(2, "0") })]));
@@ -63,6 +62,7 @@ export function viewAddMusic(root) {
     }
     if (gone || mine !== loads) return;
     fails = 0;
+    if (data.accept) input.accept = data.accept.join(","); // the server's ingest policy, so the page cannot drift from it
     const files = inboxFiles(data);
     const done = doneRows(data);
     heading(files.length);

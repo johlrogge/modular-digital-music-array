@@ -1,7 +1,6 @@
 //! The AIFF conversion worker against the real `flac` (devenv and CI provide it) and
 //! generated AIFF files (`audio-fixtures`), through a service on an in-process ACID
-//! server. AIFF is not ingestible by policy yet (ADR-037 phase 8), so these services
-//! accept it through their `ConversionConfig`.
+//! server.
 
 use super::conversion::{Job, JobEnd};
 use super::tests::{new_acid, service_over, AcidAddrs, AcidGuard};
@@ -23,9 +22,7 @@ fn fast_retry(max_attempts: u32) -> RetryPolicy {
 }
 
 fn config() -> ConversionConfig {
-    ConversionConfig::default()
-        .accepting_aiff(true)
-        .with_retry(fast_retry(3))
+    ConversionConfig::default().with_retry(fast_retry(3))
 }
 
 fn broken_flac() -> ConversionConfig {
@@ -600,11 +597,36 @@ fn an_environment_error_leaves_the_file_retries_and_then_surfaces_the_error() {
 }
 
 #[test]
-fn aiff_is_refused_by_the_default_policy() {
+fn aiff_is_ingested_by_the_default_policy_as_flac_with_either_extension() {
+    // The default config: no flag, the policy is `AudioFormat::is_ingestible`.
     let rig = Rig::new(ConversionConfig::default());
-    rig.put("a.aiff", &AiffBuilder::new().frames(1_000).build());
-    assert!(matches!(rig.ingest("a.aiff"), IngestResult::Failure { .. }));
-    assert_eq!(rig.conversions(), vec![]);
+    let bytes = tagged_aiff();
+    let source = rig.put("Artist - Title.AIF", &bytes);
+
+    assert!(matches!(
+        rig.ingest("Artist - Title.AIF"),
+        IngestResult::Pending { .. }
+    ));
+    wait_for("the source to be removed", || !source.exists());
+
+    let track = only_track(&rig.service);
+    assert_eq!(track.blob_path.extension().unwrap(), "flac");
+    assert_eq!(
+        facts_of(&track, |v| matches!(v, MusicValue::EncodedFrom(_)))
+            .map(|(v, _)| v.clone())
+            .collect::<Vec<_>>(),
+        vec![MusicValue::EncodedFrom(hash_of(&bytes))]
+    );
+    assert_eq!(
+        facts_of(&track, |v| matches!(v, MusicValue::Format(_)))
+            .map(|(v, _)| v.clone())
+            .collect::<Vec<_>>(),
+        vec![MusicValue::Format(MusicFormat::Flac)]
+    );
+    assert_eq!(
+        facts_of(&track, |v| matches!(v, MusicValue::PcmHash(_))).count(),
+        1
+    );
 }
 
 // --- the worker ----------------------------------------------------------------

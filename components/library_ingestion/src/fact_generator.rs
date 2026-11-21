@@ -12,15 +12,15 @@ use std::path::Path;
 
 use crate::pipeline::{AudioFormat, IngestError, IngestWarning};
 
-impl From<AudioFormat> for MusicFormat {
-    fn from(fmt: AudioFormat) -> Self {
-        match fmt {
-            AudioFormat::Flac => MusicFormat::Flac,
-            AudioFormat::Mp3 => MusicFormat::Mp3,
-            AudioFormat::Aiff => MusicFormat::Aiff,
-            AudioFormat::Wav => MusicFormat::Wav,
-            AudioFormat::M4a => MusicFormat::M4a,
-        }
+/// The format fact for an audio format (a function, not `From`: both types are foreign
+/// to this crate).
+pub fn music_format(fmt: AudioFormat) -> MusicFormat {
+    match fmt {
+        AudioFormat::Flac => MusicFormat::Flac,
+        AudioFormat::Mp3 => MusicFormat::Mp3,
+        AudioFormat::Aiff => MusicFormat::Aiff,
+        AudioFormat::Wav => MusicFormat::Wav,
+        AudioFormat::M4a => MusicFormat::M4a,
     }
 }
 
@@ -379,10 +379,7 @@ fn file_facts_from_metadata(
         MusicValue::FilePath(metadata.file_path.clone()),
         library.clone(),
     )];
-    facts.push((
-        MusicValue::Format(MusicFormat::from(format)),
-        library.clone(),
-    ));
+    facts.push((MusicValue::Format(music_format(format)), library.clone()));
     facts.push((MusicValue::AddedAt(chrono::Utc::now()), library.clone()));
 
     if let Some(bit_depth) = metadata.bit_depth {
@@ -477,8 +474,7 @@ mod tests {
         #[case] audio_fmt: AudioFormat,
         #[case] expected_display: &str,
     ) {
-        use music_facts::MusicFormat;
-        let music_fmt = MusicFormat::from(audio_fmt);
+        let music_fmt = music_format(audio_fmt);
         assert_eq!(music_fmt.to_string(), expected_display);
     }
 

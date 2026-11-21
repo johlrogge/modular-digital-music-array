@@ -42,6 +42,9 @@ pub struct InboxView {
     files: Vec<InboxFileView>,
     /// Newest first.
     done: Vec<InboxDoneView>,
+    /// What an upload takes (`.flac`, `.aiff`, ..., `.zip`), for the file input's
+    /// `accept`: derived from the ingest policy, so the page cannot drift from it.
+    accept: Vec<String>,
 }
 
 /// The files waiting in the inbox with the state the worker reports for each, and the
@@ -85,7 +88,11 @@ fn inbox_view(paths: Vec<InboxPath>, conversions: Vec<InboxConversion>) -> Inbox
             _ => None,
         })
         .collect();
-    InboxView { files, done }
+    InboxView {
+        files,
+        done,
+        accept: inbox_utils::upload_accept(),
+    }
 }
 
 /// `GET /api/inbox`: the files waiting in the inbox, as the library lists them, each with its
@@ -203,8 +210,27 @@ mod tests {
                     {"path": "sub/b.mp3", "state": "idle"},
                 ],
                 "done": [],
+                "accept": inbox_utils::upload_accept(),
             })
         );
+    }
+
+    /// The upload's file input takes what ingest takes, AIFF in both spellings
+    /// included, and ZIP archives.
+    #[tokio::test]
+    async fn the_inbox_says_which_extensions_an_upload_takes() {
+        let gw = inbox_gateway(LibraryResponse::InboxQueue(vec![]));
+        let res = send_json(test_app_with(gw.addr()), "GET", "/api/inbox", None).await;
+        let body = body_json(res).await;
+        let accept: Vec<&str> = body["accept"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        for ext in [".flac", ".mp3", ".wav", ".m4a", ".aiff", ".aif", ".zip"] {
+            assert!(accept.contains(&ext), "{ext} missing from {accept:?}");
+        }
     }
 
     #[tokio::test]
@@ -262,6 +288,7 @@ mod tests {
                      "warnings": ["not converted to FLAC, stored as AIFF (r)"]},
                     {"path": "g.aiff", "hash": "sha256:def", "warnings": []},
                 ],
+                "accept": inbox_utils::upload_accept(),
             })
         );
     }
@@ -291,7 +318,9 @@ mod tests {
         let gw = inbox_gateway(LibraryResponse::InboxQueue(vec![]));
         let res = send_json(test_app_with(gw.addr()), "GET", "/api/inbox", None).await;
         assert_eq!(res.status(), StatusCode::OK);
-        assert_eq!(body_json(res).await, json!({"files": [], "done": []}));
+        let body = body_json(res).await;
+        assert_eq!(body["files"], json!([]));
+        assert_eq!(body["done"], json!([]));
     }
 
     #[tokio::test]
