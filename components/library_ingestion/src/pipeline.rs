@@ -20,7 +20,7 @@ pub enum IngestError {
     #[error("Unsupported audio format: {0}")]
     UnsupportedFormat(String),
 
-    #[error("Unsupported format: only FLAC, MP3, WAV, and M4A accepted")]
+    #[error("Unsupported format: not accepted for library ingest")]
     NonIngestibleFormat,
 
     #[error("Failed to compute hash: {0}")]
@@ -36,51 +36,32 @@ pub enum IngestError {
     Io(#[from] std::io::Error),
 }
 
-/// Supported audio formats
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AudioFormat {
-    Flac,
-    Mp3,
-    Aiff,
-    Wav,
-    M4a,
+/// Something an ingest went on without (ADR-037). The library service maps it to the
+/// protocol's typed `IngestWarning` for the ingest result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IngestWarning {
+    /// The file's tags could not be read; it is stored without tag facts.
+    TagsUnreadable { detail: String },
+    /// An AIFF the encoder refused (it cannot be converted to FLAC and verified) is
+    /// stored as an AIFF blob.
+    StoredAsAiff { reason: String },
 }
 
-impl AudioFormat {
-    /// Detect format from file extension
-    pub fn from_extension(ext: &str) -> Option<Self> {
-        match ext.to_lowercase().as_str() {
-            "flac" => Some(Self::Flac),
-            "mp3" => Some(Self::Mp3),
-            "aiff" | "aif" => Some(Self::Aiff),
-            "wav" => Some(Self::Wav),
-            "m4a" => Some(Self::M4a),
-            _ => None,
-        }
-    }
-
-    /// Get canonical file extension
-    pub fn extension(&self) -> &'static str {
+impl std::fmt::Display for IngestWarning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Flac => "flac",
-            Self::Mp3 => "mp3",
-            Self::Aiff => "aiff",
-            Self::Wav => "wav",
-            Self::M4a => "m4a",
+            Self::TagsUnreadable { detail } => {
+                write!(f, "tags unreadable, stored without them ({detail})")
+            }
+            Self::StoredAsAiff { reason } => {
+                write!(f, "not converted to FLAC, stored as AIFF ({reason})")
+            }
         }
     }
-
-    /// Returns true if this format is accepted for library ingest.
-    ///
-    /// WAV is ingestible (no embedded tags expected; metadata derived from filename if absent).
-    /// M4A (MPEG-4 Audio, wrapping AAC or ALAC) is ingestible; lofty reads its metadata.
-    /// AIFF is still export-only and must not be ingested.
-    /// This is the single source of truth for "which formats are ingestible".
-    /// Add new ingestible formats here — all guards derive from this method.
-    pub fn is_ingestible(&self) -> bool {
-        matches!(self, Self::Flac | Self::Mp3 | Self::Wav | Self::M4a)
-    }
 }
+
+/// Supported audio formats (defined in `audio_format`, re-exported so paths keep working).
+pub use audio_format::AudioFormat;
 
 // =============================================================================
 // Stage 1: InboxFile - A file sitting in the inbox
@@ -110,7 +91,7 @@ impl InboxFile {
         let format = AudioFormat::from_extension(ext)
             .ok_or_else(|| IngestError::UnsupportedFormat(ext.to_string()))?;
 
-        // Only ingestible formats are accepted; AIFF is still export-only
+        // Only ingestible formats are accepted
         if !format.is_ingestible() {
             return Err(IngestError::NonIngestibleFormat);
         }
@@ -149,9 +130,8 @@ impl ValidatedAudio {
         content: &FactSource,
     ) -> Result<ExtractedTrack, IngestError> {
         // Only read metadata, not audio data
-        let facts = crate::fact_generator::generate_facts(
+        let generated = crate::fact_generator::generate_facts_tolerant(
             &self.path,
-            &self.content_hash,
             self.format,
             library,
             content,
@@ -161,7 +141,8 @@ impl ValidatedAudio {
             path: self.path,
             format: self.format,
             content_hash: self.content_hash,
-            facts,
+            facts: generated.facts,
+            warnings: generated.warnings,
         })
     }
 }
@@ -176,6 +157,9 @@ pub struct ExtractedTrack {
     pub format: AudioFormat,
     pub content_hash: ContentHash,
     pub facts: Vec<(MusicValue, FactSource)>,
+    /// What the ingest went on without (unreadable tags of an AIFF blob); shown in
+    /// the ingest result.
+    pub warnings: Vec<IngestWarning>,
 }
 
 impl ExtractedTrack {
@@ -225,8 +209,9 @@ pub struct IndexedTrack {
 // Helper functions
 // =============================================================================
 
-/// Compute SHA256 hash of file contents (streaming, not loading into memory)
-fn compute_hash(path: &std::path::Path) -> Result<ContentHash, IngestError> {
+/// Compute SHA256 hash of file contents (streaming, not loading into memory):
+/// the file's [`ContentHash`] (ADR-003).
+pub fn compute_hash(path: &std::path::Path) -> Result<ContentHash, IngestError> {
     use sha2::{Digest, Sha256};
     use std::io::Read;
 
@@ -322,9 +307,22 @@ mod tests {
     #[case(AudioFormat::Mp3, true)]
     #[case(AudioFormat::Wav, true)]
     #[case(AudioFormat::M4a, true)]
-    #[case(AudioFormat::Aiff, false)]
+    #[case(AudioFormat::Aiff, true)]
     fn audio_format_is_ingestible(#[case] format: AudioFormat, #[case] expected: bool) {
         assert_eq!(format.is_ingestible(), expected);
+    }
+
+    #[test]
+    fn ingestible_extensions_are_derived_and_include_both_aiff_spellings() {
+        let exts = AudioFormat::ingestible_extensions();
+        for ext in ["flac", "mp3", "wav", "m4a", "aiff", "aif"] {
+            assert!(exts.contains(&ext), "{ext} missing from {exts:?}");
+        }
+        // Every listed extension maps back to an ingestible format, case-insensitively.
+        for ext in exts {
+            let format = AudioFormat::from_extension(&ext.to_uppercase()).unwrap();
+            assert!(format.is_ingestible());
+        }
     }
 
     #[rstest]
@@ -339,6 +337,40 @@ mod tests {
     #[case("ogg", None)]
     fn audio_format_from_extension(#[case] ext: &str, #[case] expected: Option<AudioFormat>) {
         assert_eq!(AudioFormat::from_extension(ext), expected);
+    }
+
+    /// An AIFF the encoder refuses is stored as an AIFF blob even when its tags
+    /// cannot be read (ADR-037).
+    #[test]
+    fn aiff_with_unreadable_tags_extracts_and_imports_with_a_warning() {
+        use audio_fixtures::testkit::{comt_payload, id3, AiffBuilder};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("01 - Yagya - Empty Streets.aiff");
+        let bytes = AiffBuilder::new()
+            .frames(4_410)
+            .chunk(b"COMT", comt_payload())
+            .id3(id3::full_tag(id3::Id3Version::V24))
+            .build();
+        std::fs::write(&path, &bytes).unwrap();
+        let validated = InboxFile::new(path.clone()).validate().unwrap();
+        assert_eq!(validated.format, AudioFormat::Aiff);
+        let library = FactSource::new("mdma-library", "test", "FilesystemScan");
+        let content = FactSource::new("a-client", "test", "Client");
+
+        let extracted = validated.extract_metadata(&library, &content).unwrap();
+        assert!(matches!(
+            extracted.warnings.as_slice(),
+            [IngestWarning::TagsUnreadable { .. }]
+        ));
+        assert!(extracted
+            .facts
+            .iter()
+            .any(|(v, _)| matches!(v, MusicValue::Title(t) if t.as_str() == "Empty Streets")));
+
+        let music = dir.path().join("music");
+        let indexed = extracted.import(&music).unwrap();
+        assert_eq!(std::fs::read(&indexed.blob_path).unwrap(), bytes);
+        assert_eq!(indexed.blob_path.extension().unwrap(), "aiff");
     }
 
     #[test]
@@ -373,24 +405,26 @@ mod tests {
         );
     }
 
-    #[test]
-    fn validate_rejects_aiff_with_non_ingestible_format_error() {
+    #[rstest]
+    #[case("track.aiff")]
+    #[case("track.AIF")]
+    fn validate_accepts_aiff(#[case] name: &str) {
         let dir = tempfile::tempdir().unwrap();
-        let aiff_path = dir.path().join("track.aiff");
-        std::fs::write(&aiff_path, b"FORM fake aiff data").unwrap();
+        let path = dir.path().join(name);
+        std::fs::write(&path, b"FORM fake aiff data").unwrap();
 
-        let inbox = InboxFile::new(aiff_path);
-        let result = inbox.validate();
+        let validated = InboxFile::new(path).validate().unwrap();
+        assert_eq!(validated.format, AudioFormat::Aiff);
+    }
 
-        match result {
-            Err(IngestError::NonIngestibleFormat) => {
-                let err = IngestError::NonIngestibleFormat;
-                assert_eq!(
-                    err.to_string(),
-                    "Unsupported format: only FLAC, MP3, WAV, and M4A accepted"
-                );
-            }
-            other => panic!("expected NonIngestibleFormat, got: {:?}", other.is_ok()),
-        }
+    #[test]
+    fn validate_rejects_an_unknown_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("track.ogg");
+        std::fs::write(&path, b"OggS").unwrap();
+        assert!(matches!(
+            InboxFile::new(path).validate(),
+            Err(IngestError::UnsupportedFormat(_))
+        ));
     }
 }

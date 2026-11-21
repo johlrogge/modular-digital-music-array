@@ -255,6 +255,7 @@ fn reindex_covers_reports_the_heal_in_its_message() {
         LibraryResponse::IngestResult(IngestResult::Success {
             hash: None,
             message,
+            ..
         }) => {
             assert_eq!(
                 message,

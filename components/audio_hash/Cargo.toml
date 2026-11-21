@@ -10,6 +10,7 @@ license = "MIT"
 interface = "audio-hash"
 
 [dependencies]
+audio-format = { workspace = true }
 claxon = { workspace = true }
 md-5 = { workspace = true }
 music-primitives = { workspace = true }
@@ -17,6 +18,7 @@ sha2 = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
+audio-fixtures = { workspace = true }
 pretty_assertions = { workspace = true }
 proptest = { workspace = true }
 rstest = { workspace = true }

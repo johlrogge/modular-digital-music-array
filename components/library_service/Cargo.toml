@@ -27,6 +27,8 @@ music-facts = { workspace = true }
 music-primitives = { workspace = true }
 audio-metadata = { workspace = true }
 audio-hash = { workspace = true }
+# ADR-037 phase 6: conversion worker
+lossless-encoder = { workspace = true }
 library-ipc-protocol = { workspace = true }
 acid-client = { workspace = true, features = ["music"] }
 event-protocol = { workspace = true }
@@ -51,3 +53,5 @@ playlist-edit = { workspace = true, features = ["test-support"] }
 acid-service = { workspace = true }
 # Tags the fixture blobs of the cover heal tests with a picture
 lofty = "0.18"
+# Builds the AIFF files of the conversion worker tests in memory
+audio-fixtures = { workspace = true }

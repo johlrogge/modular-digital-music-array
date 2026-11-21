@@ -237,6 +237,15 @@ impl IndexedTrackInfo {
         })
     }
 
+    /// Every source file (by ContentHash) this track's blob losslessly rebuilds
+    /// (`EncodedFrom`, ADR-037). A merge unions them (ADR-013).
+    pub fn encoded_from(&self) -> impl Iterator<Item = &ContentHash> {
+        self.provenance.iter().filter_map(|(v, _)| match v {
+            MusicValue::EncodedFrom(h) => Some(h),
+            _ => None,
+        })
+    }
+
     /// Every AudioHash this track holds, as the hash string (version prefix included).
     pub fn audio_hashes(&self) -> impl Iterator<Item = &str> {
         self.provenance.iter().filter_map(|(v, _)| match v {
@@ -317,6 +326,44 @@ impl IndexedTrackInfo {
             self.blob_path = bp;
         }
     }
+}
+
+/// The live track whose blob was encoded from the file with ContentHash `source`
+/// (an `EncodedFrom` fact), if any: "is this incoming file an alias of an existing
+/// track?" for ingest dedup (ADR-037). Compared as [`hash_key`] does (the `sha256:`
+/// prefix and case do not matter), without allocating. A merge loser awaiting
+/// retirement is skipped: its `EncodedFrom` facts live on the winner. A soft-deleted
+/// track still answers, like ContentHash dedup: the file is known, just hidden.
+pub fn track_encoded_from<'a>(
+    tracks: &'a [IndexedTrackInfo],
+    source: &ContentHash,
+) -> Option<&'a IndexedTrackInfo> {
+    fn key(h: &str) -> &str {
+        h.strip_prefix("sha256:").unwrap_or(h)
+    }
+    let wanted = key(source.as_str());
+    tracks.iter().filter(|t| !t.is_retired()).find(|t| {
+        t.encoded_from()
+            .any(|h| key(h.as_str()).eq_ignore_ascii_case(wanted))
+    })
+}
+
+/// Every `EncodedFrom` alias of the live tracks, keyed by [`hash_key`] of the source
+/// file and answering the track's own `content_hash`: [`track_encoded_from`] for all
+/// sources at once, for a service that asks on every ingest. Built from the same
+/// predicate (a merge loser awaiting retirement is skipped, a soft-deleted track
+/// still counts), and where two tracks claim one source the first in `tracks` wins,
+/// as `track_encoded_from` finds it.
+pub fn encoded_from_index(tracks: &[IndexedTrackInfo]) -> HashMap<String, ContentHash> {
+    let mut index = HashMap::new();
+    for track in tracks.iter().filter(|t| !t.is_retired()) {
+        for source in track.encoded_from() {
+            index
+                .entry(hash_key(source.as_str()))
+                .or_insert_with(|| track.content_hash.clone());
+        }
+    }
+    index
 }
 
 /// Apply a single `MusicValue` fact (with its source) to a mutable `IndexedTrackInfo`.
@@ -1859,6 +1906,177 @@ mod tests {
 
     fn title(t: &str) -> MusicValue {
         MusicValue::Title(Title::new(t))
+    }
+
+    fn encoded_from(hash: &str) -> MusicValue {
+        MusicValue::EncodedFrom(ContentHash::new(hash))
+    }
+
+    fn encoded_from_of(track: &IndexedTrackInfo) -> Vec<&str> {
+        track.encoded_from().map(ContentHash::as_str).collect()
+    }
+
+    // ---- EncodedFrom (ADR-037) ---------------------------------------------------
+
+    #[test]
+    fn encoded_from_is_multi_valued_and_a_retract_removes_only_its_own_value() {
+        let s = src("ingest", "1.0.0");
+        let facts = vec![
+            assert_fact("sha256:flac", title("T"), 1, &s),
+            assert_fact("sha256:flac", encoded_from("sha256:aiff1"), 2, &s),
+            assert_fact("sha256:flac", encoded_from("sha256:aiff2"), 3, &s),
+        ];
+        let tracks = project(facts.clone()).tracks;
+        assert_eq!(
+            encoded_from_of(&tracks[0]),
+            ["sha256:aiff1", "sha256:aiff2"]
+        );
+
+        let mut retracted = facts;
+        retracted.push(retract_fact(
+            "sha256:flac",
+            encoded_from("sha256:aiff1"),
+            4,
+            &s,
+        ));
+        let tracks = project(retracted).tracks;
+        assert_eq!(encoded_from_of(&tracks[0]), ["sha256:aiff2"]);
+    }
+
+    #[test]
+    fn encoded_from_retract_by_another_source_changes_nothing() {
+        let (ingest, other) = (src("ingest", "1.0.0"), src("other", "1.0.0"));
+        let facts = vec![
+            assert_fact("sha256:flac", encoded_from("sha256:aiff1"), 1, &ingest),
+            retract_fact("sha256:flac", encoded_from("sha256:aiff1"), 2, &other),
+        ];
+        let tracks = project(facts).tracks;
+        assert_eq!(encoded_from_of(&tracks[0]), ["sha256:aiff1"]);
+    }
+
+    #[test]
+    fn encoded_from_incremental_fold_agrees_with_the_bulk_fold() {
+        let s = src("ingest", "1.0.0");
+        let facts = vec![
+            assert_fact("sha256:flac", encoded_from("sha256:aiff1"), 1, &s),
+            assert_fact("sha256:flac", encoded_from("sha256:aiff2"), 2, &s),
+            retract_fact("sha256:flac", encoded_from("sha256:aiff1"), 3, &s),
+        ];
+        let mut entry = IndexedTrackInfo::new_empty("sha256:flac".to_owned());
+        for f in &facts {
+            apply_fact_to_track(
+                &mut entry,
+                f.value(),
+                *f.timestamp(),
+                f.operation(),
+                f.source(),
+            );
+        }
+        let bulk = project(facts).tracks;
+        assert_eq!(encoded_from_of(&entry), encoded_from_of(&bulk[0]));
+        assert_eq!(encoded_from_of(&entry), ["sha256:aiff2"]);
+    }
+
+    #[test]
+    fn a_merge_winner_holding_the_losers_encoded_from_answers_for_both_sources() {
+        // The merge carries the loser's EncodedFrom to the winner (union, ADR-013).
+        let s = src("ingest", "1.0.0");
+        let mut facts = merged("sha256:win", "sha256:lose", None);
+        facts.extend([
+            assert_fact("sha256:win", encoded_from("sha256:aiffW"), 5, &s),
+            assert_fact("sha256:win", encoded_from("sha256:aiffL"), 6, &s),
+        ]);
+        let tracks = project(facts).tracks;
+        assert_eq!(tracks.len(), 1);
+        for source in ["sha256:aiffW", "sha256:aiffL"] {
+            let alias = track_encoded_from(&tracks, &ContentHash::new(source));
+            assert_eq!(
+                alias.map(|t| t.content_hash.as_str()),
+                Some("sha256:win"),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn track_encoded_from_finds_the_track_and_ignores_prefix_and_case() {
+        let s = src("ingest", "1.0.0");
+        let facts = vec![
+            assert_fact("sha256:flac1", encoded_from("sha256:AB12"), 1, &s),
+            assert_fact("sha256:flac2", encoded_from("sha256:cd34"), 1, &s),
+        ];
+        let tracks = project(facts).tracks;
+        let found = |h: &str| {
+            track_encoded_from(&tracks, &ContentHash::new(h)).map(|t| t.content_hash.to_string())
+        };
+        assert_eq!(found("sha256:ab12").as_deref(), Some("sha256:flac1"));
+        assert_eq!(found("cd34").as_deref(), Some("sha256:flac2"));
+        assert_eq!(found("sha256:ffff"), None);
+    }
+
+    #[test]
+    fn track_encoded_from_still_answers_for_a_soft_deleted_track() {
+        let s = src("ingest", "1.0.0");
+        let facts = vec![
+            assert_fact("sha256:flac", encoded_from("sha256:aiff"), 1, &s),
+            assert_fact(
+                "sha256:flac",
+                MusicValue::Deleted { timestamp: ts(2) },
+                2,
+                &s,
+            ),
+        ];
+        let tracks = project(facts).tracks;
+        assert!(tracks[0].is_hidden());
+        let found = track_encoded_from(&tracks, &ContentHash::new("sha256:aiff"));
+        assert_eq!(found.map(|t| t.content_hash.as_str()), Some("sha256:flac"));
+    }
+
+    /// The index answers exactly what `track_encoded_from` does, for every source,
+    /// through a merge (winner and loser), a soft delete and a retract.
+    #[test]
+    fn encoded_from_index_agrees_with_track_encoded_from() {
+        let s = src("ingest", "1.0.0");
+        let mut facts = merged("sha256:win", "sha256:lose", None);
+        facts.extend([
+            assert_fact("sha256:win", encoded_from("sha256:aiffW"), 5, &s),
+            assert_fact("sha256:win", encoded_from("sha256:AIFFL"), 6, &s),
+            assert_fact("sha256:gone", encoded_from("sha256:aiffG"), 7, &s),
+            retract_fact("sha256:gone", encoded_from("sha256:aiffG"), 8, &s),
+            assert_fact("sha256:hid", encoded_from("sha256:aiffH"), 9, &s),
+            assert_fact(
+                "sha256:hid",
+                MusicValue::Deleted { timestamp: ts(10) },
+                10,
+                &s,
+            ),
+        ]);
+        let tracks = project(facts).tracks;
+        let index = encoded_from_index(&tracks);
+        for source in [
+            "sha256:aiffW",
+            "sha256:aiffL",
+            "aiffl",
+            "sha256:aiffG",
+            "sha256:aiffH",
+            "sha256:unknown",
+        ] {
+            let truth = track_encoded_from(&tracks, &ContentHash::new(source))
+                .map(|t| t.content_hash.clone());
+            assert_eq!(index.get(&hash_key(source)).cloned(), truth, "{source}");
+        }
+        assert_eq!(index.len(), 3, "{index:?}");
+    }
+
+    #[test]
+    fn track_encoded_from_forgets_a_fully_retracted_track() {
+        let s = src("ingest", "1.0.0");
+        let facts = vec![
+            assert_fact("sha256:flac", encoded_from("sha256:aiff"), 1, &s),
+            retract_fact("sha256:flac", encoded_from("sha256:aiff"), 2, &s),
+        ];
+        let tracks = project(facts).tracks;
+        assert!(track_encoded_from(&tracks, &ContentHash::new("sha256:aiff")).is_none());
     }
 
     // ---- per-fact application --------------------------------------------------

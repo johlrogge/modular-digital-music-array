@@ -340,6 +340,9 @@ async fn forget_update(state: &AppState, pkg: &PackageName) {
 struct IngestResultJson {
     path: String,
     success: bool,
+    /// An AIFF queued for conversion to FLAC (ADR-037): accepted, not stored yet.
+    /// `success` is true for it too (the page's summary counts it as ingested).
+    pending: bool,
     message: String,
     hash: Option<String>,
 }
@@ -384,7 +387,7 @@ async fn upload_file(
 
         // Check if ZIP — extract audio files, then remove the ZIP
         let file_type = inbox_utils::detect_file_type(&dest);
-        if file_type == Some("zip") {
+        if file_type == Some(inbox_utils::Upload::Zip) {
             match inbox_utils::extract_zip(&dest, &inbox_dir) {
                 Ok(extracted) => {
                     let _ = std::fs::remove_file(&dest);
@@ -399,12 +402,6 @@ async fn upload_file(
             }
         } else if inbox_utils::is_ingestible_audio(&dest) {
             results.push(serde_json::json!({"file": file_name, "success": true}));
-        } else if inbox_utils::is_audio_file(&dest) {
-            // Recognized audio format but not accepted for ingest (AIFF is export-only)
-            let _ = std::fs::remove_file(&dest);
-            results.push(
-                serde_json::json!({"file": file_name, "error": inbox_utils::NON_INGESTIBLE_ERROR}),
-            );
         } else {
             let _ = std::fs::remove_file(&dest);
             results.push(
@@ -434,15 +431,24 @@ async fn ingest_all(State(state): State<Arc<AppState>>) -> impl IntoResponse {
             let json_results: Vec<IngestResultJson> = results
                 .into_iter()
                 .map(|item| match item.result {
-                    IngestResult::Success { hash, message } => IngestResultJson {
+                    IngestResult::Success { hash, message, .. } => IngestResultJson {
                         path: item.path.to_string(),
                         success: true,
+                        pending: false,
                         message,
                         hash: hash.map(|h| h.as_str().to_owned()),
+                    },
+                    IngestResult::Pending { message } => IngestResultJson {
+                        path: item.path.to_string(),
+                        success: true,
+                        pending: true,
+                        message,
+                        hash: None,
                     },
                     IngestResult::Failure { message } => IngestResultJson {
                         path: item.path.to_string(),
                         success: false,
+                        pending: false,
                         message,
                         hash: None,
                     },
@@ -1345,6 +1351,65 @@ fn export_filename(artist: Option<&str>, title: Option<&str>, ext: &str) -> Stri
     format!("{}.{}", safe, ext)
 }
 
+/// How a blob is exported: the extension and content type of the download, and
+/// whether the blob is served unchanged.
+#[derive(Debug, PartialEq, Eq)]
+struct ExportPlan {
+    ext: String,
+    content_type: String,
+    serve_directly: bool,
+}
+
+use audio_transcoder::{canonical_ext, describe_source, ExportSource};
+
+/// Decide the export of a blob with extension `source_ext` as `req_format`.
+/// `source` is `None` for `original` (nothing was read from the file) and
+/// describes the blob for the converted formats.
+///
+/// `original` always serves the blob unchanged. A PCM export format (`aiff`,
+/// `wav`) serves it unchanged only when it already is what the export would
+/// produce: the same canonical extension, plain PCM, and its rate and depth are
+/// ones the export keeps (`SourceAudio::is_pcm_export_ready`, the transcoder's own
+/// rule). Everything else is transcoded.
+fn export_plan(
+    req_format: &ExportFormatParam,
+    source_ext: &str,
+    source: Option<&ExportSource>,
+) -> ExportPlan {
+    let (ext, content_type) = if req_format.is_passthrough() {
+        let ct = match canonical_ext(source_ext) {
+            "flac" => "audio/flac",
+            "mp3" => "audio/mpeg",
+            "aiff" => "audio/aiff",
+            "wav" => "audio/wav",
+            "ogg" => "audio/ogg",
+            "opus" => "audio/opus",
+            _ => "application/octet-stream",
+        };
+        (source_ext, ct)
+    } else {
+        (
+            req_format.extension().unwrap_or("bin"),
+            req_format
+                .content_type()
+                .unwrap_or("application/octet-stream"),
+        )
+    };
+    let serve_directly = match req_format {
+        ExportFormatParam::Original => true,
+        // PCM exports resample and re-depth: only a blob that needs neither is served
+        ExportFormatParam::Aiff | ExportFormatParam::Wav => {
+            canonical_ext(source_ext) == ext
+                && source.is_some_and(|s| s.plain_pcm && s.audio.is_pcm_export_ready())
+        }
+    };
+    ExportPlan {
+        ext: ext.to_string(),
+        content_type: content_type.to_string(),
+        serve_directly,
+    }
+}
+
 #[derive(serde::Deserialize)]
 struct ExportParams {
     #[serde(default)]
@@ -1394,31 +1459,26 @@ async fn export_track(
     // Determine actual extension and content-type.
     // For Original, derive from blob_path; for others use fixed values.
     let source_ext = blob_extension(&blob_rel).unwrap_or("bin").to_lowercase();
-    let (ext, content_type_str): (String, String) = if req_format.is_passthrough() {
-        let ct = match source_ext.as_str() {
-            "flac" => "audio/flac",
-            "mp3" => "audio/mpeg",
-            "aiff" | "aif" => "audio/aiff",
-            "wav" => "audio/wav",
-            "ogg" => "audio/ogg",
-            "opus" => "audio/opus",
-            _ => "application/octet-stream",
-        };
-        (source_ext.clone(), ct.to_string())
+    // `original` needs nothing from the file; a converted format reads its properties.
+    let source = if req_format.is_passthrough() {
+        None
     } else {
-        let fixed_ext = req_format.extension().unwrap_or("bin");
-        let fixed_ct = req_format
-            .content_type()
-            .unwrap_or("application/octet-stream");
-        (fixed_ext.to_string(), fixed_ct.to_string())
+        let (path, ext) = (blob_path.clone(), source_ext.clone());
+        match tokio::task::spawn_blocking(move || describe_source(&path, &ext)).await {
+            Ok(s) => Some(s),
+            Err(e) => {
+                tracing::error!(error = %e, "Describing the export source failed");
+                return (StatusCode::INTERNAL_SERVER_ERROR, "Export failed").into_response();
+            }
+        }
     };
+    let ExportPlan {
+        ext,
+        content_type: content_type_str,
+        serve_directly,
+    } = export_plan(req_format, &source_ext, source.as_ref());
 
     let filename = export_filename(track.artist.as_deref(), track.title.as_deref(), &ext);
-
-    // Original always takes the direct-serve path.
-    // For converted formats, also take the direct path when source already matches.
-    let serve_directly =
-        req_format.is_passthrough() || source_ext == ext || (source_ext == "aif" && ext == "aiff");
 
     if serve_directly {
         let data = match tokio::fs::read(&blob_path).await {
@@ -1449,6 +1509,8 @@ async fn export_track(
     // Transcode: ffmpeg reads the source directly and writes to a temp file.
     // This is blocking CPU/IO work so we run it in spawn_blocking.
     let transcode_format = req_format.to_transcoder_format();
+    // only `original` has no description, and it never transcodes
+    let source_audio = source.map(|s| s.audio).unwrap_or_default();
 
     let metadata = audio_transcoder::ExportMetadata {
         title: track.title.clone(),
@@ -1465,22 +1527,15 @@ async fn export_track(
             .suffix(ext_suffix)
             .tempfile()
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
-        // Describe the source so the transcoder can downsample for CDJs, keep
-        // 16-bit sources 16-bit and trim AAC padding. Unreadable metadata means
-        // an unknown source: exported as-is.
-        let source_meta = audio_metadata::extract_metadata(&blob_path).ok();
-        let source = audio_transcoder::SourceAudio {
-            ext: source_ext,
-            sample_rate: source_meta.as_ref().and_then(|m| m.sample_rate),
-            bit_depth: source_meta.as_ref().and_then(|m| m.bit_depth),
-            duration: source_meta.as_ref().and_then(|m| m.duration),
-        };
+        // `source` describes the blob so the transcoder can downsample for CDJs,
+        // keep 16-bit sources 16-bit and trim AAC padding. Unreadable metadata
+        // means an unknown source: exported as-is.
         audio_transcoder::transcode(
             &blob_path,
             tmp.path(),
             &transcode_format,
             &metadata,
-            &source,
+            &source_audio,
         )
         .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
         std::fs::read(tmp.path())
@@ -1931,6 +1986,99 @@ mod tests {
     fn cover_art_content_type_case_insensitive() {
         assert_eq!(cover_art_content_type("cover-art/abc.JPG"), "image/jpeg");
         assert_eq!(cover_art_content_type("cover-art/abc.PNG"), "image/png");
+    }
+
+    fn src(rate: Option<u32>, depth: Option<u8>, plain_pcm: bool) -> ExportSource {
+        ExportSource {
+            audio: audio_transcoder::SourceAudio {
+                sample_rate: rate,
+                bit_depth: depth,
+                ..Default::default()
+            },
+            plain_pcm,
+        }
+    }
+
+    fn plan(fmt: &ExportFormatParam, ext: &str, source: &ExportSource) -> ExportPlan {
+        export_plan(fmt, ext, Some(source))
+    }
+
+    #[test]
+    fn canonical_ext_maps_aif_to_aiff_only() {
+        assert_eq!(canonical_ext("aif"), "aiff");
+        assert_eq!(canonical_ext("aiff"), "aiff");
+        assert_eq!(canonical_ext("flac"), "flac");
+    }
+
+    #[test]
+    fn original_always_passes_an_aiff_blob_through() {
+        // ADR-037: whatever the AIFF blob is, `original` serves it as it is.
+        // `original` reads nothing from the file, so it has no description
+        for ext in ["aiff", "aif"] {
+            let plan = export_plan(&ExportFormatParam::Original, ext, None);
+            assert!(plan.serve_directly);
+            assert_eq!(plan.content_type, "audio/aiff");
+            assert_eq!(plan.ext, ext);
+        }
+    }
+
+    #[test]
+    fn plain_aiff_within_the_limits_is_served_for_format_aiff() {
+        for ext in ["aiff", "aif"] {
+            for (rate, depth) in [(44_100, 16), (48_000, 24), (44_100, 24)] {
+                let source = src(Some(rate), Some(depth), true);
+                let plan = plan(&ExportFormatParam::Aiff, ext, &source);
+                assert!(plan.serve_directly, "{ext} {rate} {depth}");
+                // named .aiff even for an .aif blob
+                assert_eq!(plan.ext, "aiff");
+                assert_eq!(plan.content_type, "audio/aiff");
+            }
+        }
+    }
+
+    #[test]
+    fn blobs_outside_the_export_rules_are_transcoded_for_the_pcm_formats() {
+        let cases = [
+            (
+                "AIFF-C or codec",
+                "aiff",
+                src(Some(44_100), Some(16), false),
+            ),
+            ("above 48 kHz", "aiff", src(Some(96_000), Some(24), true)),
+            ("32-bit", "aiff", src(Some(44_100), Some(32), true)),
+            ("20-bit", "aiff", src(Some(44_100), Some(20), true)),
+            ("8-bit", "aiff", src(Some(44_100), Some(8), true)),
+            ("unknown properties", "aiff", src(None, None, true)),
+            ("flac blob", "flac", src(Some(44_100), Some(16), true)),
+        ];
+        for (what, ext, source) in cases {
+            assert!(
+                !plan(&ExportFormatParam::Aiff, ext, &source).serve_directly,
+                "{what}"
+            );
+        }
+    }
+
+    #[test]
+    fn wav_follows_the_same_rule_as_aiff() {
+        let wav = |source: &ExportSource| plan(&ExportFormatParam::Wav, "wav", source);
+        assert!(wav(&src(Some(44_100), Some(16), true)).serve_directly);
+        assert!(wav(&src(Some(48_000), Some(24), true)).serve_directly);
+        assert!(!wav(&src(Some(96_000), Some(24), true)).serve_directly);
+        assert!(!wav(&src(Some(44_100), Some(32), true)).serve_directly);
+        assert!(!wav(&src(None, None, true)).serve_directly);
+        assert!(!wav(&src(Some(44_100), Some(16), false)).serve_directly);
+    }
+
+    #[test]
+    fn a_blob_of_another_format_is_transcoded_to_wav() {
+        let aiff = src(Some(44_100), Some(16), true);
+        let p = plan(&ExportFormatParam::Wav, "aiff", &aiff);
+        assert!(!p.serve_directly);
+        assert_eq!(
+            (p.ext.as_str(), p.content_type.as_str()),
+            ("wav", "audio/wav")
+        );
     }
 
     #[test]

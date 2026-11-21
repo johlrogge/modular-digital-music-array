@@ -15,6 +15,12 @@ impl ContentHash {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// The digest without the `sha256:` prefix (the whole value when it has
+    /// none, as for a short form that was typed without it).
+    pub fn hex(&self) -> &str {
+        self.0.strip_prefix(CANONICAL_PREFIX).unwrap_or(&self.0)
+    }
 }
 
 impl Display for ContentHash {
@@ -46,6 +52,11 @@ impl CanonicalHash {
 
     pub fn as_content_hash(&self) -> &ContentHash {
         &self.0
+    }
+
+    /// The 64 lowercase hex digits, without the `sha256:` prefix.
+    pub fn hex(&self) -> &str {
+        self.0.hex()
     }
 }
 

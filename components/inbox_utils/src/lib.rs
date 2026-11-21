@@ -2,64 +2,105 @@
 
 use std::path::{Path, PathBuf};
 
-/// All recognized audio file extensions (used for ZIP extraction filtering).
-pub const AUDIO_EXTENSIONS: &[&str] = &["flac", "mp3", "wav", "aif", "aiff", "m4a"];
+pub use audio_format::AudioFormat;
 
-/// Ingestible audio file extensions — FLAC, MP3, WAV, and M4A are accepted for library ingest.
-///
-/// WAV is ingestible (no embedded tags expected; metadata derived from filename if absent).
-/// M4A (MPEG-4 Audio, wrapping AAC or ALAC) is ingestible; metadata is read by lofty.
-/// AIFF is still export-only and must not be ingested.
-/// This is derived from the same policy as `AudioFormat::is_ingestible()` in `library_service`.
-/// When adding a new ingestible format, update both this list and that method.
-pub const INGEST_EXTENSIONS: &[&str] = &["flac", "mp3", "wav", "m4a"];
-
-/// Human-readable error message for non-ingestible audio files (used in HTTP responses).
-///
-/// Centralised here so the console and any other HTTP layer show consistent messaging.
-pub const NON_INGESTIBLE_ERROR: &str = "Unsupported format: only FLAC, MP3, WAV, and M4A accepted";
+fn audio_format(path: &Path) -> Option<AudioFormat> {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .and_then(AudioFormat::from_extension)
+}
 
 /// Check if a file has any recognized audio extension.
 pub fn is_audio_file(path: &Path) -> bool {
-    path.extension()
-        .and_then(|ext| ext.to_str())
-        .map(|ext| AUDIO_EXTENSIONS.contains(&ext.to_lowercase().as_str()))
-        .unwrap_or(false)
+    audio_format(path).is_some()
 }
 
-/// Check if a file has an ingestible audio extension (FLAC, MP3, WAV, or M4A).
+/// Check if a file has an ingestible audio extension (case-insensitive).
 ///
-/// AIFF is recognized as audio but is an export-only format and must not be ingested.
-/// WAV is ingestible (no embedded tags expected; metadata derived from filename if absent).
-/// M4A (MPEG-4 Audio, wrapping AAC or ALAC) is ingestible.
+/// The policy is `AudioFormat::is_ingestible`, the single source of truth; nothing
+/// here lists extensions.
 pub fn is_ingestible_audio(path: &Path) -> bool {
-    path.extension()
-        .and_then(|ext| ext.to_str())
-        .map(|ext| INGEST_EXTENSIONS.contains(&ext.to_lowercase().as_str()))
-        .unwrap_or(false)
+    audio_format(path).is_some_and(|f| f.is_ingestible())
 }
 
-/// Detect file type by magic bytes.
-pub fn detect_file_type(path: &Path) -> Option<&'static str> {
-    use std::io::Read;
-    let mut file = std::fs::File::open(path).ok()?;
-    let mut magic = [0u8; 4];
-    file.read_exact(&mut magic).ok()?;
+/// The extensions an upload accepts, for a file input's `accept` attribute: every
+/// ingestible extension with its dot, and `.zip`.
+pub fn upload_accept() -> Vec<String> {
+    AudioFormat::ingestible_extensions()
+        .into_iter()
+        .map(|ext| format!(".{ext}"))
+        .chain(std::iter::once(".zip".to_string()))
+        .collect()
+}
 
-    match &magic {
-        // ZIP: PK\x03\x04
-        [0x50, 0x4B, 0x03, 0x04] => Some("zip"),
-        // FLAC: fLaC
-        [0x66, 0x4C, 0x61, 0x43] => Some("flac"),
-        // MP3: ID3 or \xFF\xFB
-        [0x49, 0x44, 0x33, _] => Some("mp3"),
-        [0xFF, 0xFB, _, _] => Some("mp3"),
-        // WAV: RIFF
-        [0x52, 0x49, 0x46, 0x46] => Some("wav"),
-        // AIFF: FORM
-        [0x46, 0x4F, 0x52, 0x4D] => Some("aiff"),
-        _ => None,
+/// What an uploaded or downloaded file holds, by its content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Upload {
+    /// A ZIP archive of audio files.
+    Zip,
+    /// A single audio file of this format.
+    Audio(AudioFormat),
+}
+
+/// Detect what a file is by magic bytes: a ZIP archive, or audio as `audio_format::sniff`
+/// (the one sniffer) identifies it. `None` for anything else, or if it cannot be read.
+pub fn detect_file_type(path: &Path) -> Option<Upload> {
+    use std::io::{Read, Seek};
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    let mut magic = [0u8; 4];
+    if file.read_exact(&mut magic).is_ok() && magic == *b"PK\x03\x04" {
+        return Some(Upload::Zip);
     }
+    file.rewind().ok()?;
+    let audio_format::Sniffed::Format(format) = audio_format::sniff(&mut file, len).ok()? else {
+        return None;
+    };
+    // The sniffer says "MP4 container"; uploads only take what ingest takes, and an
+    // MP4 that is a picture or a video is not an `.m4a`.
+    if !format.is_ingestible() {
+        return None;
+    }
+    if format == AudioFormat::M4a {
+        file.rewind().ok()?;
+        let mut head = Vec::new();
+        file.take(FTYP_READ_LIMIT).read_to_end(&mut head).ok()?;
+        if !is_audio_mp4(&head) {
+            return None;
+        }
+    }
+    Some(Upload::Audio(format))
+}
+
+/// How much of the head is read to see the `ftyp` brands.
+const FTYP_READ_LIMIT: u64 = 256;
+
+/// Major brands of an MP4 that holds audio, or may (`isom`, `mp42`, ... name the
+/// ISO base format, which carries audio or video; only the codec tells, and the
+/// ingest reads that).
+const AUDIO_MP4_BRANDS: [&[u8; 4]; 9] = [
+    b"M4A ", b"M4B ", b"M4P ", b"mp41", b"mp42", b"isom", b"iso2", b"iso4", b"dash",
+];
+
+/// Brands that say audio outright, wherever they stand in the list.
+const AUDIO_ONLY_BRANDS: [&[u8; 4]; 2] = [b"M4A ", b"M4B "];
+
+/// Whether the `ftyp` box at the start of `head` is that of an audio MP4: its major
+/// brand is an ISO/audio one, or an M4A/M4B brand is among the compatible ones. A HEIC
+/// (`heic`, `mif1`), QuickTime (`qt  `) or 3GP (`3gp4`) file is not.
+fn is_audio_mp4(head: &[u8]) -> bool {
+    if head.len() < 16 || &head[4..8] != b"ftyp" {
+        return false;
+    }
+    let size = u32::from_be_bytes([head[0], head[1], head[2], head[3]]) as usize;
+    let end = size.clamp(16, head.len());
+    let major = &head[8..12];
+    AUDIO_MP4_BRANDS.iter().any(|b| major == &b[..])
+        || head[16..end]
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .any(|c| AUDIO_ONLY_BRANDS.contains(&c))
 }
 
 /// Sanitize a string for use in filenames.
@@ -118,9 +159,9 @@ pub fn extract_zip(zip_path: &Path, output_dir: &Path) -> Result<Vec<PathBuf>, s
             None => continue, // Skip entries with invalid paths
         };
 
-        // Only extract ingestible audio files (FLAC, MP3, WAV, and M4A)
+        // Only extract ingestible audio files
         if !is_ingestible_audio(&entry_path) {
-            tracing::debug!(path = %entry_path.display(), "Skipping non-ingestible file (only FLAC, MP3, WAV, and M4A accepted)");
+            tracing::debug!(path = %entry_path.display(), "Skipping non-ingestible file");
             continue;
         }
 
@@ -179,27 +220,82 @@ mod tests {
     #[case("track.WAV", true)]
     #[case("track.m4a", true)]
     #[case("track.M4A", true)]
-    #[case("track.aif", false)]
-    #[case("track.aiff", false)]
+    #[case("track.aif", true)]
+    #[case("track.AIF", true)]
+    #[case("track.aiff", true)]
+    #[case("track.AIFF", true)]
     #[case("cover.jpg", false)]
     #[case("noext", false)]
-    fn ingestible_audio_flac_mp3_wav_and_m4a(#[case] filename: &str, #[case] expected: bool) {
+    fn ingestible_audio_follows_the_ingest_policy(#[case] filename: &str, #[case] expected: bool) {
         assert_eq!(is_ingestible_audio(Path::new(filename)), expected);
     }
 
+    #[test]
+    fn upload_accept_lists_the_ingestible_extensions_and_zip() {
+        let accept = upload_accept();
+        for ext in [".flac", ".mp3", ".wav", ".m4a", ".aiff", ".aif", ".zip"] {
+            assert!(accept.iter().any(|a| a == ext), "{ext} missing: {accept:?}");
+        }
+        // Everything listed but `.zip` is ingestible per `is_ingestible_audio`.
+        for ext in accept.iter().filter(|a| *a != ".zip") {
+            assert!(is_ingestible_audio(Path::new(&format!("x{ext}"))));
+        }
+    }
+
     #[rstest]
-    #[case(b"fLaC\x00\x00" as &[u8], Some("flac"))]
-    #[case(b"\x50\x4B\x03\x04extra", Some("zip"))]
-    #[case(b"\x49\x44\x33\x04data", Some("mp3"))]
-    #[case(b"\xFF\xFBdata\x00", Some("mp3"))]
-    #[case(b"RIFFdata", Some("wav"))]
-    #[case(b"FORMdata", Some("aiff"))]
+    #[case(b"fLaC\x00\x00" as &[u8], Some(Upload::Audio(AudioFormat::Flac)))]
+    #[case(b"\x50\x4B\x03\x04extra", Some(Upload::Zip))]
+    #[case(b"\xFF\xFBdata\x00", Some(Upload::Audio(AudioFormat::Mp3)))]
+    #[case(b"RIFF\x04\0\0\0WAVEfmt ", Some(Upload::Audio(AudioFormat::Wav)))]
+    #[case(b"FORM\0\0\0\x04AIFF", Some(Upload::Audio(AudioFormat::Aiff)))]
+    #[case(b"FORM\0\0\0\x04AIFCCOMM", Some(Upload::Audio(AudioFormat::Aiff)))]
+    #[case(b"\0\0\0\x18ftypM4A \0\0\0\0", Some(Upload::Audio(AudioFormat::M4a)))]
+    #[case(
+        b"\0\0\0\x18ftypisom\0\0\0\0mp42",
+        Some(Upload::Audio(AudioFormat::M4a))
+    )]
+    // a 3GP whose compatible brands say M4A is audio
+    #[case(
+        b"\0\0\0\x18ftyp3gp4\0\0\0\0M4A ",
+        Some(Upload::Audio(AudioFormat::M4a))
+    )]
+    // MP4 containers that are not audio: HEIC, QuickTime MOV, 3GP
+    #[case(b"\0\0\0\x18ftypheic\0\0\0\0mif1", None)]
+    #[case(b"\0\0\0\x18ftypqt  \0\0\0\0qt  ", None)]
+    #[case(b"\0\0\0\x18ftyp3gp4\x00\x00\x00\x003gp4", None)]
+    // not audio: an 8SVX IFF, a non-WAVE RIFF, a bare ID3 stub, zeros
+    #[case(b"FORM\0\0\0\x048SVXVHDR", None)]
+    #[case(b"RIFF\x04\0\0\0AVI LIST", None)]
+    #[case(b"\x49\x44\x33\x04data", None)]
     #[case(b"\x00\x00\x00\x00", None)]
-    fn magic_byte_detection(#[case] bytes: &[u8], #[case] expected: Option<&'static str>) {
+    fn magic_byte_detection(#[case] bytes: &[u8], #[case] expected: Option<Upload>) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test_file");
         std::fs::write(&path, bytes).unwrap();
         assert_eq!(detect_file_type(&path), expected);
+    }
+
+    #[test]
+    fn id3_prefixed_flac_and_mp3_are_told_apart() {
+        // A 20-byte ID3v2.4 tag (10-byte header, 10 bytes of body), then the audio.
+        let tag = |body: &[u8]| {
+            let mut v = b"ID3\x04\0\0\0\0\0\x0a".to_vec();
+            v.extend([0u8; 10]);
+            v.extend(body);
+            v
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test_file");
+        std::fs::write(&path, tag(b"fLaC\0\0\0\0")).unwrap();
+        assert_eq!(
+            detect_file_type(&path),
+            Some(Upload::Audio(AudioFormat::Flac))
+        );
+        std::fs::write(&path, tag(&[0xFF, 0xFB, 0x90, 0x00])).unwrap();
+        assert_eq!(
+            detect_file_type(&path),
+            Some(Upload::Audio(AudioFormat::Mp3))
+        );
     }
 
     #[rstest]
@@ -279,7 +375,7 @@ mod tests {
     }
 
     #[test]
-    fn extract_zip_extracts_wav_and_m4a_skips_aiff() {
+    fn extract_zip_extracts_audio_including_aiff_and_skips_the_rest() {
         let dir = tempfile::tempdir().unwrap();
         let zip_path = dir.path().join("test.zip");
         let output_dir = dir.path().join("output");
@@ -304,11 +400,16 @@ mod tests {
         zip_writer.start_file("track.aiff", options).unwrap();
         zip_writer.write_all(b"FORM fake aiff data").unwrap();
 
+        zip_writer.start_file("Other.AIF", options).unwrap();
+        zip_writer.write_all(b"FORM fake aiff data").unwrap();
+
+        zip_writer.start_file("cover.jpg", options).unwrap();
+        zip_writer.write_all(b"fake image data").unwrap();
+
         zip_writer.finish().unwrap();
 
         let extracted = extract_zip(&zip_path, &output_dir).unwrap();
-        // FLAC, WAV, and M4A should be extracted; AIFF is still export-only
-        assert_eq!(extracted.len(), 3);
+        assert_eq!(extracted.len(), 5);
         let names: Vec<String> = extracted
             .iter()
             .filter_map(|p| {
@@ -320,5 +421,7 @@ mod tests {
         assert!(names.contains(&"track.flac".to_string()));
         assert!(names.contains(&"track.wav".to_string()));
         assert!(names.contains(&"track.m4a".to_string()));
+        assert!(names.contains(&"track.aiff".to_string()));
+        assert!(names.contains(&"Other.AIF".to_string()));
     }
 }

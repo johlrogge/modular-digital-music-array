@@ -237,6 +237,7 @@ impl LibraryService {
                     inbox_queue_size: 0,
                     uptime_seconds: self.start_time.elapsed().as_secs(),
                     unparseable_lines: 0,
+                    conversions: Vec::new(),
                 };
                 LibraryResponse::Status(status)
             }

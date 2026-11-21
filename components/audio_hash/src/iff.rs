@@ -37,6 +37,25 @@ pub(crate) fn walk<R: Read + Seek, const N: usize>(
     wanted: [&[u8; 4]; N],
     unbounded: Option<&Unbounded>,
 ) -> Result<[Option<Range<u64>>; N], AudioHashError> {
+    walk_with(
+        r, file_len, container, order, start, wanted, unbounded, false,
+    )
+}
+
+/// [`walk`], optionally clamping a chunk that reaches past the end of the file
+/// to the end of the file (a truncated download) instead of failing. Playback
+/// uses this; hashing does not.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn walk_with<R: Read + Seek, const N: usize>(
+    r: &mut R,
+    file_len: u64,
+    container: Container,
+    order: Endian,
+    start: u64,
+    wanted: [&[u8; 4]; N],
+    unbounded: Option<&Unbounded>,
+    clamp_truncated: bool,
+) -> Result<[Option<Range<u64>>; N], AudioHashError> {
     let mut found: [Option<Range<u64>>; N] = std::array::from_fn(|_| None);
     let mut pos = start;
     while found.iter().any(Option::is_none) && file_len.saturating_sub(pos) >= 8 {
@@ -52,6 +71,11 @@ pub(crate) fn walk<R: Read + Seek, const N: usize>(
             file_len
         } else {
             payload + size
+        };
+        let end = if clamp_truncated {
+            end.min(file_len)
+        } else {
+            end
         };
         if end > file_len {
             return Err(container.malformed(match ub {

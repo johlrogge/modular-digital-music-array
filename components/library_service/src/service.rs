@@ -9,7 +9,7 @@ use crate::ipc::{
     OrphanInfo, OrphanReason, PlaylistName, ProtocolError, ServiceStatus, TrackInfo, TrackQuery,
     Unmark,
 };
-use crate::pipeline::InboxFile;
+use crate::pipeline::{AudioFormat, InboxFile};
 use crate::sources::{self, LibrarySources, ReleaseVersion};
 use acid_client::AcidClient;
 use event_protocol::{acid_event_from_topic_message, AcidEvent, TOPIC_ACID};
@@ -32,6 +32,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use thiserror::Error;
 
+pub use conversion::{ConversionConfig, RetryPolicy};
+
 #[derive(Debug, Error)]
 pub enum ServiceError {
     #[error("IPC error: {0}")]
@@ -45,6 +47,12 @@ pub enum ServiceError {
 
     #[error("ACID client error: {0}")]
     Acid(#[from] acid_client::ClientError),
+
+    /// An AIFF is converted in the background, so there is no hash to answer yet. It
+    /// was queued; only the callers that need the track at once (`track replace`) see
+    /// this.
+    #[error("the file is an AIFF, converted in the background: it was queued, not stored yet")]
+    ConversionPending,
 }
 
 /// Library service state
@@ -72,6 +80,16 @@ pub struct LibraryService {
     fact_index: Mutex<HashMap<FactType, HashSet<String>>>,
     /// Set of known content hashes for dedup on ingest
     content_hashes: Mutex<HashSet<String>>,
+    /// The source files of the live tracks' `EncodedFrom` facts (`hash_key` of the
+    /// source) and the track each belongs to: an AIFF that was converted is a
+    /// duplicate on ingest (ADR-037). Rebuilt from `tracks` whenever the projection
+    /// catches up (`drop_non_live`), so it follows ingest, merge and retract like
+    /// `content_hashes` does; it answers what `library_projection::track_encoded_from`
+    /// does. Lock order: after `content_hashes`.
+    encoded_aliases: Mutex<HashMap<String, ContentHash>>,
+    /// The AIFF conversion worker's queue (ADR-037). Lock order: independent; take it
+    /// alone and never together with another lock in this list.
+    conversions: Arc<conversion::Conversions>,
     /// Current position in the ACID fact stream (opaque cursor string).
     ///
     /// This mutex is also the *catch-up lock*: `catch_up_with` holds it across
@@ -183,6 +201,18 @@ pub struct LibraryService {
     /// change (a re-ingest) in that window.
     #[cfg(test)]
     merge_pre_archive_hook: Mutex<Option<IdentityWriteHook>>,
+    /// Test-only: called by `ingest_duplicate` with the entity it found, before it
+    /// takes the retire gate to write, to inject a concurrent merge in that window.
+    #[cfg(test)]
+    duplicate_pre_write_hook: Mutex<Option<IdentityWriteHook>>,
+}
+
+impl Drop for LibraryService {
+    /// The conversion worker ends with the service (it does not wait: it may be the
+    /// thread that drops the last handle).
+    fn drop(&mut self) {
+        self.conversions.request_shutdown();
+    }
 }
 
 fn playlist_not_found(name: &PlaylistName) -> ProtocolError {
@@ -321,6 +351,9 @@ fn commit_playlist(path: &std::path::Path, planned: playlist_edit::Planned) -> L
 type IdentityWriteHook = Box<dyn Fn(&LibraryService, &ContentHash) + Send + Sync>;
 
 mod backfill;
+mod conversion;
+#[cfg(test)]
+mod conversion_tests;
 #[cfg(test)]
 mod cover_tests;
 mod dedup;
@@ -542,6 +575,26 @@ impl LibraryService {
         acid_events_socket: &str,
         version: ReleaseVersion,
     ) -> Result<Arc<Self>, ServiceError> {
+        Self::new_with_conversion(
+            music_dir,
+            metadata_dir,
+            acid_socket,
+            acid_events_socket,
+            version,
+            ConversionConfig::default(),
+        )
+    }
+
+    /// [`new_with_events`](Self::new_with_events) with the AIFF conversion worker
+    /// built from `conversion`.
+    pub fn new_with_conversion(
+        music_dir: PathBuf,
+        metadata_dir: PathBuf,
+        acid_socket: &str,
+        acid_events_socket: &str,
+        version: ReleaseVersion,
+        conversion: ConversionConfig,
+    ) -> Result<Arc<Self>, ServiceError> {
         // Connect to ACID service for writing and streaming
         let acid_client = AcidClient::connect(acid_socket)?;
 
@@ -551,6 +604,7 @@ impl LibraryService {
 
         let tracks_count = loaded.tracks.len();
         let album_cover_cache = AlbumCovers::build(&loaded.tracks);
+        let encoded_aliases = library_projection::encoded_from_index(&loaded.tracks);
 
         // The fallible bootstrap above runs before `new_cyclic`, whose closure cannot fail.
         let service = Arc::new_cyclic(|self_ref| Self {
@@ -566,6 +620,8 @@ impl LibraryService {
             album_cover_cache: Mutex::new(album_cover_cache),
             fact_index: Mutex::new(loaded.fact_index),
             content_hashes: Mutex::new(loaded.content_hashes),
+            encoded_aliases: Mutex::new(encoded_aliases),
+            conversions: Arc::new(conversion::Conversions::new(conversion)),
             cursor: Mutex::new(final_cursor),
             event_cursor: Mutex::new(None),
             lineage: Mutex::new(LineageLog::default()),
@@ -585,6 +641,8 @@ impl LibraryService {
             merge_pre_write_hook: Mutex::new(None),
             #[cfg(test)]
             merge_pre_archive_hook: Mutex::new(None),
+            #[cfg(test)]
+            duplicate_pre_write_hook: Mutex::new(None),
         });
 
         // Backfill Format facts for tracks that don't have one yet
@@ -617,6 +675,11 @@ impl LibraryService {
 
         // Ensure playlists directory exists so writes never fail on a fresh install
         std::fs::create_dir_all(service.metadata_dir.join("playlists"))?;
+
+        // The conversion worker: sweep what a crash left in staging and queue the
+        // AIFFs still in the inbox, then start it.
+        service.recover_conversions();
+        service.start_conversion_worker();
 
         Ok(service)
     }
@@ -807,9 +870,6 @@ impl LibraryService {
 
     /// Backfill Format facts for tracks that have a file path but no Format fact
     fn backfill_format_facts(&self, has_format: &HashSet<String>) {
-        use crate::pipeline::AudioFormat;
-        use music_facts::MusicFormat;
-
         let tracks = self.tracks.lock().unwrap();
 
         // Find tracks needing backfill; a track a `Replaces` retired gets nothing.
@@ -820,7 +880,8 @@ impl LibraryService {
             .filter(|t| !t.blob_path.as_os_str().is_empty())
             .filter_map(|t| {
                 let ext = t.blob_path.extension()?.to_str()?;
-                let music_format = AudioFormat::from_extension(ext).map(MusicFormat::from)?;
+                let music_format =
+                    AudioFormat::from_extension(ext).map(crate::fact_generator::music_format)?;
                 Some((t.content_hash.clone(), music_format))
             })
             .collect();
@@ -1190,6 +1251,9 @@ impl LibraryService {
         let mut tracks = self.tracks.lock().unwrap();
         let mut content_hashes = self.content_hashes.lock().unwrap();
         retain_live(&mut tracks, &mut content_hashes);
+        // The aliases follow the swept index: an ingest, a merge (the winner holds the
+        // loser's) or a retract changes them, and this is where each of those lands.
+        *self.encoded_aliases.lock().unwrap() = library_projection::encoded_from_index(&tracks);
         self.tracks_indexed.store(tracks.len(), Ordering::Relaxed);
         *self.album_cover_cache.lock().unwrap() = AlbumCovers::build(&tracks);
     }
@@ -1298,18 +1362,25 @@ impl LibraryService {
         hash: &ContentHash,
         facts: &[(MusicValue, music_facts::FactSource)],
     ) -> Result<usize, acid_client::ClientError> {
-        let retracted = self.acid_client.retract_music_facts(hash, facts)?;
-        self.catch_up_after_write();
+        self.retract_and_project_with(&self.acid_client, hash, facts)
+    }
+
+    /// [`retract_and_project`](Self::retract_and_project) through an explicit ACID
+    /// client (see [`write_and_project_with`](Self::write_and_project_with)).
+    fn retract_and_project_with(
+        &self,
+        client: &AcidClient,
+        hash: &ContentHash,
+        facts: &[(MusicValue, music_facts::FactSource)],
+    ) -> Result<usize, acid_client::ClientError> {
+        let retracted = client.retract_music_facts(hash, facts)?;
+        self.catch_up_after_write_with(client);
         Ok(retracted)
     }
 
     /// `catch_up` for write paths: the ACID write already succeeded and is
     /// durable, so a failed read here only delays visibility until the
     /// subscriber's next catch-up. Log and carry on.
-    fn catch_up_after_write(&self) {
-        self.catch_up_after_write_with(&self.acid_client);
-    }
-
     fn catch_up_after_write_with(&self, client: &AcidClient) {
         if let Err(e) = self.catch_up_with(client) {
             tracing::warn!(error = %e, "catch_up after ACID write failed; subscriber will converge");
@@ -1346,6 +1417,7 @@ impl LibraryService {
                     inbox_queue_size: self.get_inbox_queue_internal().len(),
                     uptime_seconds: self.start_time.elapsed().as_secs(),
                     unparseable_lines: self.unparseable_lines.load(Ordering::Relaxed),
+                    conversions: self.conversion_status(),
                 };
                 LibraryResponse::Status(status)
             }
@@ -1616,6 +1688,7 @@ impl LibraryService {
                         "Cover art: {} present, {} repaired, {} extracted, {} without art, {} failed",
                         s.present, s.repaired, s.extracted, s.no_art, s.failed
                     ),
+                    warnings: Vec::new(),
                 })
             }
 
@@ -1947,12 +2020,12 @@ impl LibraryService {
     /// not reentrant. Production retires only through `merge_into`.
     fn retract_all_entity_facts_locked(
         &self,
+        client: &AcidClient,
         _gate: &RetireGuard<'_>,
         hash: &ContentHash,
     ) -> Result<usize, String> {
         // Read all fact lines for this entity from ACID
-        let lines = self
-            .acid_client
+        let lines = client
             .read_entity(hash.as_str())
             .map_err(|e| format!("Failed to read entity from ACID: {}", e))?;
 
@@ -1983,7 +2056,7 @@ impl LibraryService {
         // projection drops the entity, so resolve_hash returns TrackNotFound. This is
         // a hard delete: the old identity is gone, not hidden.
         let count = self
-            .retract_and_project(hash, &to_retract)
+            .retract_and_project_with(client, hash, &to_retract)
             .map_err(|e| format!("Failed to retract facts via ACID: {}", e))?;
 
         tracing::info!(
@@ -2028,7 +2101,7 @@ impl LibraryService {
             Err(message) => return LibraryResponse::Error(ProtocolError::Internal { message }),
         };
         let source = self.sources.user_default.clone();
-        match self.merge_into(&new_hash, &old_full, &source, carry) {
+        match self.merge_into(&self.acid_client, &new_hash, &old_full, &source, carry) {
             Ok(outcome) => LibraryResponse::TrackReplaced {
                 new_hash,
                 playlists_rewritten: outcome.playlists_rewritten,
@@ -2058,6 +2131,7 @@ impl LibraryService {
     /// of `Replaces(loser)`.
     fn merge_into(
         &self,
+        client: &AcidClient,
         winner: &ContentHash,
         loser: &ContentHash,
         source: &music_facts::FactSource,
@@ -2107,10 +2181,10 @@ impl LibraryService {
             let ancestors = self.ancestor_replaces(loser);
             let retired = self.retired_files(loser);
 
-            self.write_merge_facts(&gate, winner, loser, ancestors, source, carry)?;
+            self.write_merge_facts(client, &gate, winner, loser, ancestors, source, carry)?;
 
             // The crux: after this, resolve_hash(loser) -> TrackNotFound.
-            self.retract_all_entity_facts_locked(&gate, loser)
+            self.retract_all_entity_facts_locked(client, &gate, loser)
                 .map_err(|e| ProtocolError::Internal {
                     message: format!("Failed to retract old track facts: {}", e),
                 })?;
@@ -2119,7 +2193,7 @@ impl LibraryService {
 
         // Neither of these takes the gate (it is not reentrant), and neither needs it.
         let playlists_rewritten = self.rewrite_playlists_replace_hash(loser, winner);
-        self.refresh_lineage();
+        self.refresh_lineage_with(client);
 
         Ok(MergeOutcome {
             playlists_rewritten,
@@ -2133,8 +2207,10 @@ impl LibraryService {
     /// The winner never replaces itself (a revert A -> B -> A has A among B's
     /// ancestors), and a `Replaces` it already holds is not asserted again, so
     /// repeating a merge that crashed before its retire adds nothing twice.
+    #[allow(clippy::too_many_arguments)]
     fn write_merge_facts(
         &self,
+        client: &AcidClient,
         _gate: &RetireGuard<'_>,
         winner: &ContentHash,
         loser: &ContentHash,
@@ -2186,7 +2262,7 @@ impl LibraryService {
 
         // Read-your-writes (issue #44): the write is projected immediately, through
         // the same path the subscriber uses, so back-to-back replaces see each other.
-        self.write_and_project(winner, &facts)
+        self.write_and_project_with(client, winner, &facts)
             .map(|_| ())
             .map_err(|e| ProtocolError::Internal {
                 message: format!("Failed to assert Replaces facts: {}", e),
@@ -2208,7 +2284,15 @@ impl LibraryService {
             .map(|h| (h, source.clone()))
             .collect();
         let gate = self.retire_gate.lock().unwrap();
-        self.write_merge_facts(&gate, new_hash, old_full, ancestors, &source, Vec::new())
+        self.write_merge_facts(
+            &self.acid_client,
+            &gate,
+            new_hash,
+            old_full,
+            ancestors,
+            &source,
+            Vec::new(),
+        )
     }
 
     /// Whether `hash` is an indexed track (hidden ones included).
@@ -2623,6 +2707,12 @@ impl LibraryService {
     /// stream, so that what must not act on a stale lineage (the archiving of a cover)
     /// can tell; it must also have refreshed after the writes it depends on.
     fn refresh_lineage(&self) {
+        self.refresh_lineage_with(&self.acid_client);
+    }
+
+    /// [`refresh_lineage`](Self::refresh_lineage) reading through `client` (a thread
+    /// other than the request thread must use its own).
+    fn refresh_lineage_with(&self, client: &AcidClient) {
         const PAGE_SIZE: usize = 10_000;
 
         // Held for the whole refresh, like `cursor` in `catch_up_with`: concurrent
@@ -2635,10 +2725,7 @@ impl LibraryService {
         let mut caught_up = true;
 
         loop {
-            let chunk = match self
-                .acid_client
-                .read_stream(current_cursor.clone(), PAGE_SIZE)
-            {
+            let chunk = match client.read_stream(current_cursor.clone(), PAGE_SIZE) {
                 Ok(c) => c,
                 Err(e) => {
                     tracing::warn!(
@@ -2695,10 +2782,19 @@ impl LibraryService {
     ) -> IngestResult {
         let path = self.resolve_inbox_path(inbox_path);
 
-        match self.ingest_file_internal(&path, writer, facts) {
-            Ok(hash) => IngestResult::Success {
-                hash: Some(hash),
-                message: "File ingested successfully".to_string(),
+        match self.ingest_file_reporting(&path, writer, facts) {
+            Ok(IngestOutcome::Stored { hash, warnings }) => {
+                let warnings = conversion::wire_warnings(&warnings);
+                IngestResult::Success {
+                    hash: Some(hash),
+                    message: ingest_success_message(&warnings),
+                    warnings,
+                }
+            }
+            Ok(IngestOutcome::Pending) => IngestResult::Pending {
+                message: "Converting to FLAC in the background; the file stays in the inbox \
+                          until it is done"
+                    .to_string(),
             },
             Err(e) => IngestResult::Failure {
                 message: e.to_string(),
@@ -2720,6 +2816,7 @@ impl LibraryService {
             Ok(()) => IngestResult::Success {
                 hash: None,
                 message: format!("Deleted: {}", inbox_path.as_str()),
+                warnings: Vec::new(),
             },
             Err(e) => IngestResult::Failure {
                 message: format!("Failed to delete: {}", e),
@@ -2748,10 +2845,28 @@ impl LibraryService {
     /// tags itself as it reads them from the file.
     fn ingest_file_internal(
         &self,
-        path: &PathBuf,
+        path: &Path,
         writer: Option<&music_facts::FactSource>,
         facts: &[MusicValue],
     ) -> Result<ContentHash, ServiceError> {
+        match self.ingest_file_reporting(path, writer, facts)? {
+            IngestOutcome::Stored { hash, .. } => Ok(hash),
+            IngestOutcome::Pending => Err(ServiceError::ConversionPending),
+        }
+    }
+
+    /// [`Self::ingest_file_internal`], with the warnings for the ingest result: what
+    /// the ingest went on without (the tags of an AIFF blob that could not be read).
+    ///
+    /// One path per outcome: validate and hash, answer a duplicate (the file's own
+    /// hash, or an `EncodedFrom` alias of a track), and otherwise store, except that
+    /// an AIFF is queued for the conversion worker, which ends in the same stores.
+    fn ingest_file_reporting(
+        &self,
+        path: &Path,
+        writer: Option<&music_facts::FactSource>,
+        facts: &[MusicValue],
+    ) -> Result<IngestOutcome, ServiceError> {
         if !path.exists() {
             return Err(ServiceError::Io(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
@@ -2759,115 +2874,243 @@ impl LibraryService {
             )));
         }
 
-        // The sources of this ingest: what the library computes carries its own; the
-        // tags and the client's facts carry the writer's.
-        let scan_source = self.sources.scan.clone();
-        let derived_source = self.sources.derived.clone();
-        let content_source = writer.cloned().unwrap_or_else(|| scan_source.clone());
-        let provenance: Vec<(MusicValue, music_facts::FactSource)> = facts
-            .iter()
-            .map(|f| (f.clone(), content_source.clone()))
-            .collect();
+        // Stage 1 and 2: the inbox file, validated, with its hash
+        let validated = InboxFile::new(path.to_path_buf()).validate()?;
+        let provenance = self.client_provenance(writer, facts);
 
-        // Stage 1: Create inbox file
-        let inbox = InboxFile::new(path.clone());
-
-        // Stage 2: Validate and compute hash
-        let validated = inbox.validate()?;
-        let content_hash = validated.content_hash.clone();
-
-        // Dedup: if content hash already exists, still append any new source facts
-        //
-        // Copy the answer out and drop the guard immediately: nothing below may run
-        // while holding `content_hashes` (lock order is cursor -> tracks ->
-        // fact_index -> content_hashes, and the ACID write below is IPC).
-        let is_duplicate = self
-            .content_hashes
-            .lock()
-            .unwrap()
-            .contains(content_hash.as_str());
-        if is_duplicate {
-            tracing::info!(
-                hash = %content_hash.as_str(),
-                path = %path.display(),
-                "Duplicate content hash, removing inbox file"
-            );
-
-            // An ingest with a writer (a client resync) may follow a retract of
-            // what that writer wrote earlier. Read the tags before the file goes, so
-            // what the track lost can be asserted again. Only provenance-tracked
-            // facts: FilePath and AddedAt describe the first import and must not be
-            // rewritten.
-            let tag_facts: Vec<(MusicValue, music_facts::FactSource)> = if writer.is_some() {
-                match validated.extract_metadata(&scan_source, &content_source) {
-                    Ok(extracted) => extracted
-                        .facts
-                        .into_iter()
-                        .filter(|(v, _)| is_provenance_tracked(v))
-                        .collect(),
-                    Err(e) => {
-                        tracing::warn!(error = %e, "Could not re-read tags of a duplicate");
-                        Vec::new()
-                    }
-                }
+        // Dedup before any work: by content hash, then by `EncodedFrom` alias.
+        if let Some(entity) = self.known_entity(&validated.content_hash) {
+            let (entity, gained_item_id) =
+                self.ingest_duplicate(&self.acid_client, validated, &entity, writer, provenance);
+            // A new ItemId may be the last piece the self-heal was waiting for.
+            // (The gate is let go of by now: the self-heal takes it itself.)
+            let hash = if gained_item_id {
+                self.self_heal_after_ingest(&entity)
             } else {
-                Vec::new()
+                entity
             };
-            let _ = std::fs::remove_file(path);
-
-            // Append source facts that don't exist yet for this track
-            let mut new_facts = provenance;
-            new_facts.extend(tag_facts);
-            if !new_facts.is_empty() {
-                // Keep only the facts the track does not hold yet: an ItemId it lacks,
-                // a Source only if it has none, and a tag fact only if no equal value
-                // from the same source is live.
-                let gained_item_id = {
-                    let tracks = self.tracks.lock().unwrap();
-                    match tracks
-                        .iter()
-                        .find(|t| t.content_hash.as_str() == content_hash.as_str())
-                    {
-                        Some(t) => {
-                            new_facts.retain(|(v, s)| match v {
-                                MusicValue::ItemId(id) => {
-                                    !t.item_ids().any(|held| held == id.as_str())
-                                }
-                                MusicValue::Source(_) => t.source.is_none(),
-                                _ => !t.is_live_from(v, s),
-                            });
-                            new_facts
-                                .iter()
-                                .any(|(v, _)| matches!(v, MusicValue::ItemId(_)))
-                        }
-                        None => {
-                            new_facts.clear();
-                            false
-                        }
-                    }
-                };
-
-                if !new_facts.is_empty()
-                    && self.write_and_project(&content_hash, &new_facts).is_ok()
-                {
-                    tracing::info!(
-                        hash = %content_hash.as_str(),
-                        facts = new_facts.len(),
-                        "Appended source facts to existing track"
-                    );
-                    // A new ItemId may be the last piece the self-heal was waiting for.
-                    if gained_item_id {
-                        return Ok(self.self_heal_after_ingest(&content_hash));
-                    }
-                }
-            }
-
-            return Ok(content_hash);
+            return Ok(IngestOutcome::Stored {
+                hash,
+                warnings: Vec::new(),
+            });
         }
 
+        // The format decision: an AIFF converts in the background. Two requests for
+        // the same new AIFF may both get here, which is fine: the job dedups itself
+        // before it encodes, and the queue holds a path once.
+        if validated.format == AudioFormat::Aiff {
+            self.enqueue_conversion(conversion::Job::new(
+                path.to_path_buf(),
+                writer.cloned(),
+                facts.to_vec(),
+            ));
+            return Ok(IngestOutcome::Pending);
+        }
+
+        let (hash, warnings) = self.store_validated(&self.acid_client, validated, writer, facts)?;
+        // AudioHash and ItemId are durable together now. Never fails the ingest.
+        Ok(IngestOutcome::Stored {
+            hash: self.self_heal_after_ingest(&hash),
+            warnings,
+        })
+    }
+
+    /// The client's facts, stated by the writer (or, with none, by the library's own
+    /// scan source, as it reads the tags itself).
+    fn client_provenance(
+        &self,
+        writer: Option<&music_facts::FactSource>,
+        facts: &[MusicValue],
+    ) -> Vec<(MusicValue, music_facts::FactSource)> {
+        let content = writer.cloned().unwrap_or_else(|| self.sources.scan.clone());
+        facts.iter().map(|f| (f.clone(), content.clone())).collect()
+    }
+
+    /// The entity a file with this ContentHash is a duplicate of: the track with that
+    /// hash, or the track whose blob was encoded from it (`EncodedFrom`).
+    ///
+    /// Copies the answer out and drops each guard at once: nothing after it may run
+    /// while holding them (lock order is cursor -> tracks -> fact_index ->
+    /// content_hashes -> encoded_aliases, and ACID writes are IPC).
+    fn known_entity(&self, hash: &ContentHash) -> Option<ContentHash> {
+        let known = self.content_hashes.lock().unwrap().contains(hash.as_str());
+        if known {
+            return Some(hash.clone());
+        }
+        self.encoded_aliases
+            .lock()
+            .unwrap()
+            .get(&hash_key(hash.as_str()))
+            .cloned()
+    }
+
+    /// A duplicate file: remove it from the inbox, and still append any new source
+    /// facts to the existing track `entity`. Answers the entity that is live now (a
+    /// merge may have moved it to the winner) and whether it gained an ItemId.
+    fn ingest_duplicate(
+        &self,
+        client: &AcidClient,
+        validated: crate::pipeline::ValidatedAudio,
+        entity: &ContentHash,
+        writer: Option<&music_facts::FactSource>,
+        provenance: Vec<(MusicValue, music_facts::FactSource)>,
+    ) -> (ContentHash, bool) {
+        let path = validated.path.clone();
+        let content_hash = validated.content_hash.clone();
+        tracing::info!(
+            hash = %validated.content_hash.as_str(),
+            entity = %entity.as_str(),
+            path = %path.display(),
+            "Duplicate content hash, removing inbox file"
+        );
+
+        // An ingest with a writer (a client resync) may follow a retract of
+        // what that writer wrote earlier. Read the tags before the file goes, so
+        // what the track lost can be asserted again. Only provenance-tracked
+        // facts: FilePath and AddedAt describe the first import and must not be
+        // rewritten.
+        let tag_facts: Vec<(MusicValue, music_facts::FactSource)> = if let Some(writer) = writer {
+            match validated.extract_metadata(&self.sources.scan, writer) {
+                Ok(extracted) => extracted
+                    .facts
+                    .into_iter()
+                    .filter(|(v, _)| is_provenance_tracked(v))
+                    .collect(),
+                Err(e) => {
+                    tracing::warn!(error = %e, "Could not re-read tags of a duplicate");
+                    Vec::new()
+                }
+            }
+        } else {
+            Vec::new()
+        };
+        let _ = std::fs::remove_file(&path);
+
+        // Append source facts that don't exist yet for this track
+        let mut new_facts = provenance;
+        new_facts.extend(tag_facts);
+        if new_facts.is_empty() {
+            return (entity.clone(), false);
+        }
+
+        #[cfg(test)]
+        if let Some(hook) = self.duplicate_pre_write_hook.lock().unwrap().as_ref() {
+            hook(self, entity);
+        }
+
+        // ACID has no conditional write, and a merge that retired `entity` since it
+        // was found would see this write as a fact it did not retract: the loser
+        // would live again as a ghost. So hold `retire_gate` from asking again
+        // until the write returns (as the identity backfill does): either the merge
+        // finished first (the alias now names the winner) or it starts after.
+        let _gate = self.retire_gate.lock().unwrap();
+        let Some(entity) = self.known_entity(&content_hash) else {
+            return (entity.clone(), false);
+        };
+        let mut entity = entity;
+
+        // Keep only the facts the track does not hold yet: an ItemId it lacks,
+        // a Source only if it has none, and a tag fact only if no equal value
+        // from the same source is live.
+        let gained_item_id = {
+            let tracks = self.tracks.lock().unwrap();
+            let find = |h: &ContentHash| tracks.iter().find(|t| t.content_hash == *h);
+            // A track a `Replaces` retired (its retract failed, so it is still live
+            // and known) takes no fact: they go to the winner, if that is live.
+            let target = match find(&entity) {
+                Some(t) if t.is_retired() => {
+                    let winner = t.retired_by.as_deref().and_then(|key| {
+                        let key = hash_key(key);
+                        tracks
+                            .iter()
+                            .find(|w| hash_key(w.content_hash.as_str()) == key)
+                    });
+                    match winner {
+                        Some(w) if !w.is_retired() => {
+                            entity = w.content_hash.clone();
+                            Some(w)
+                        }
+                        _ => {
+                            tracing::warn!(
+                                entity = %entity.as_str(),
+                                "A duplicate's track was retired and its winner is not live; nothing written"
+                            );
+                            None
+                        }
+                    }
+                }
+                other => other,
+            };
+            match target {
+                Some(t) => {
+                    new_facts.retain(|(v, s)| match v {
+                        MusicValue::ItemId(id) => !t.item_ids().any(|held| held == id.as_str()),
+                        MusicValue::Source(_) => t.source.is_none(),
+                        _ => !t.is_live_from(v, s),
+                    });
+                    new_facts
+                        .iter()
+                        .any(|(v, _)| matches!(v, MusicValue::ItemId(_)))
+                }
+                None => {
+                    new_facts.clear();
+                    false
+                }
+            }
+        };
+        let entity = &entity;
+
+        if !new_facts.is_empty()
+            && self
+                .write_and_project_with(client, entity, &new_facts)
+                .is_ok()
+        {
+            tracing::info!(
+                hash = %entity.as_str(),
+                facts = new_facts.len(),
+                "Appended source facts to existing track"
+            );
+            return (entity.clone(), gained_item_id);
+        }
+        (entity.clone(), false)
+    }
+
+    /// Store a validated file as it is: its metadata (the tags, tolerantly for an
+    /// AIFF), then the shared store. The one store of every format, and of an AIFF the
+    /// encoder refused.
+    fn store_validated(
+        &self,
+        client: &AcidClient,
+        validated: crate::pipeline::ValidatedAudio,
+        writer: Option<&music_facts::FactSource>,
+        facts: &[MusicValue],
+    ) -> Result<(ContentHash, Vec<library_ingestion::IngestWarning>), ServiceError> {
+        let content_source = writer.cloned().unwrap_or_else(|| self.sources.scan.clone());
         // Stage 3: Extract metadata
-        let extracted = validated.extract_metadata(&scan_source, &content_source)?;
+        let extracted = validated.extract_metadata(&self.sources.scan, &content_source)?;
+        self.store_extracted(
+            client,
+            extracted,
+            Vec::new(),
+            self.client_provenance(writer, facts),
+        )
+    }
+
+    /// Stages 4 and 5 and the write: blob (rename), then cover art and identity, then
+    /// the facts (`extracted`'s, those the caller adds as `extra`, the client's
+    /// `provenance`), through `client`. The crash order of ADR-037: the blob is in
+    /// place before its facts are written, so a crash between them leaves a blob no
+    /// fact names and the source still where it was.
+    fn store_extracted(
+        &self,
+        client: &AcidClient,
+        extracted: crate::pipeline::ExtractedTrack,
+        extra: Vec<(MusicValue, music_facts::FactSource)>,
+        provenance: Vec<(MusicValue, music_facts::FactSource)>,
+    ) -> Result<(ContentHash, Vec<library_ingestion::IngestWarning>), ServiceError> {
+        let content_hash = extracted.content_hash.clone();
         let mut facts = extracted.facts.clone();
+        let warnings = extracted.warnings.clone();
 
         // Stage 4: Import to blob storage
         let indexed = extracted.import(&self.music_dir)?;
@@ -2878,16 +3121,18 @@ impl LibraryService {
         if let Some(ref rel_path) = cover_art_path {
             facts.push((
                 MusicValue::CoverArtPath(rel_path.to_string_lossy().to_string()),
-                derived_source.clone(),
+                self.sources.derived.clone(),
             ));
         }
 
-        // Identity: AudioHash v1 (PcmHash is left to the explicit backfill). A failure
-        // is logged and simply yields no fact; ingest continues.
+        // Identity: AudioHash v1 (PcmHash is left to the explicit backfill, unless the
+        // caller already has it). A failure is logged and simply yields no fact;
+        // ingest continues.
         facts.extend(
             identity_facts_for_blob(&blob_path, BlobFactSet::INGEST, &self.sources.blob_facts())
                 .facts,
         );
+        facts.extend(extra);
 
         // Add the client's provenance facts
         facts.extend(provenance);
@@ -2899,10 +3144,30 @@ impl LibraryService {
         //
         // blob_path is derived from the FilePath fact via blob_path_for — always
         // RELATIVE (blobs/<2ch>/<hash>.<ext>), identical to every other projection.
-        self.write_and_project(&content_hash, &facts)?;
+        self.write_and_project_with(client, &content_hash, &facts)?;
+        Ok((content_hash, warnings))
+    }
+}
 
-        // AudioHash and ItemId are durable together now. Never fails the ingest.
-        Ok(self.self_heal_after_ingest(&content_hash))
+/// How an ingest of one file ended.
+enum IngestOutcome {
+    /// In the library (or a duplicate of what is), with what it went on without.
+    Stored {
+        hash: ContentHash,
+        warnings: Vec<library_ingestion::IngestWarning>,
+    },
+    /// Queued for the conversion worker (an AIFF): the file stays in the inbox.
+    Pending,
+}
+
+/// The message of a successful ingest, with the warnings the ingest went on
+/// with, for clients that do not read the typed warnings of the result.
+fn ingest_success_message(warnings: &[crate::ipc::IngestWarning]) -> String {
+    if warnings.is_empty() {
+        "File ingested successfully".to_string()
+    } else {
+        let texts: Vec<String> = warnings.iter().map(ToString::to_string).collect();
+        format!("File ingested with warnings: {}", texts.join("; "))
     }
 }
 
@@ -3648,6 +3913,30 @@ mod tests {
             acid_handle,
             (facts_addr, events_addr),
         )
+    }
+
+    /// A new in-process ACID server: its guard and addresses.
+    pub(super) fn new_acid() -> (AcidGuard, AcidAddrs) {
+        let (guard, facts_addr, events_addr) = spawn_acid_server();
+        (guard, (facts_addr, events_addr))
+    }
+
+    /// A service over `music_dir` (which the caller keeps) and the log of the ACID
+    /// server at `addrs`, with the AIFF conversion worker built from `conversion`.
+    pub(super) fn service_over(
+        music_dir: &Path,
+        addrs: &AcidAddrs,
+        conversion: ConversionConfig,
+    ) -> Arc<LibraryService> {
+        LibraryService::new_with_conversion(
+            music_dir.to_path_buf(),
+            tempfile::tempdir().unwrap().keep(),
+            &addrs.0,
+            &addrs.1,
+            test_version(),
+            conversion,
+        )
+        .unwrap()
     }
 
     /// A fresh service over the log of a running ACID server: a restart, which
@@ -5381,6 +5670,25 @@ mod tests {
             source: None,
         });
         assert!(matches!(resp, LibraryResponse::FactRetracted), "{resp:?}");
+    }
+
+    #[test]
+    fn ingest_message_carries_the_warnings() {
+        use crate::ipc::IngestWarning;
+        assert_eq!(ingest_success_message(&[]), "File ingested successfully");
+        let warnings = [
+            IngestWarning::TagsUnreadable {
+                detail: "no SSND".into(),
+            },
+            IngestWarning::TagsUnreadable {
+                detail: "other".into(),
+            },
+        ];
+        assert_eq!(
+            ingest_success_message(&warnings),
+            "File ingested with warnings: tags unreadable, stored without them (no SSND); \
+             tags unreadable, stored without them (other)"
+        );
     }
 
     /// Facts without a writer have no source to state them: the ingest is refused.
@@ -10408,7 +10716,7 @@ mod tests {
     /// Hard-retire `h` the way production does: under `retire_gate`.
     pub(super) fn retire(s: &LibraryService, h: &ContentHash) -> Result<usize, String> {
         let gate = s.retire_gate.lock().unwrap();
-        s.retract_all_entity_facts_locked(&gate, h)
+        s.retract_all_entity_facts_locked(&s.acid_client, &gate, h)
     }
 
     /// Write a Title for `hash` to ACID and project it, creating the track.

@@ -21,6 +21,8 @@ mod raw;
 mod wav;
 
 #[cfg(test)]
+mod builder_tests;
+#[cfg(test)]
 mod real_fixtures;
 
 const DOMAIN: &[u8] = b"mdma-pcmhash\0v1\0";
@@ -32,7 +34,7 @@ pub enum PcmHashError {
     #[error("container: {0}")]
     Container(#[from] AudioHashError),
     #[error("unsupported: {0}")]
-    Unsupported(&'static str),
+    Unsupported(Unsupported),
     #[error("decode: {0}")]
     Decode(&'static str),
     #[error("decoded samples do not match the STREAMINFO MD5")]
@@ -59,6 +61,162 @@ impl PcmHashError {
     }
 }
 
+/// Why a file is outside PcmHash's scope (ADR-012): well-formed, but not hashable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum Unsupported {
+    #[error("more than 2 channels")]
+    MoreThanTwoChannels,
+    /// AIFF-C with a compression type other than `NONE`, `twos` or `sowt`
+    /// (float included).
+    #[error("aiff-c: compressed audio")]
+    CompressedAiffC,
+    #[error("aiff: sample size over 32 bits")]
+    SampleSizeOver32,
+    #[error("aiff: sample rate is not an integer")]
+    NonIntegerRate,
+    #[error("mp3: lossy")]
+    Mp3Lossy,
+    #[error("mp4: not supported")]
+    Mp4,
+    /// `pcm_info` and `stream_info` read AIFF and FLAC only; this is any other
+    /// container asked for its stream properties.
+    #[error("stream info: only AIFF and FLAC")]
+    StreamInfoContainer,
+    /// A file that is not an AIFF was asked for an AIFF sample layout.
+    #[error("not an AIFF")]
+    NotAiff,
+    #[error("wav: unknown SubFormat")]
+    WavUnknownSubFormat,
+    #[error("wav: non-PCM SubFormat")]
+    WavNonPcmSubFormat,
+    #[error("wav: float PCM")]
+    WavFloat,
+    #[error("wav: non-PCM format")]
+    WavNonPcmFormat,
+    #[error("wav: sample container over 4 bytes")]
+    WavContainerOver4Bytes,
+    /// A FLAC feature claxon does not decode, as it words it (for instance a
+    /// bit depth that needs the STREAMINFO fallback).
+    #[error("flac decoder: {0}")]
+    FlacDecoder(&'static str),
+}
+
+/// Bit depths the FLAC decoder behind [`pcm_hash`] reads. Claxon takes the depth
+/// from the frame header, which libFLAC writes as a code only for these;
+/// any other depth needs the STREAMINFO fallback, which claxon does not do.
+pub const FLAC_HASHABLE_BIT_DEPTHS: [u8; 5] = [8, 12, 16, 20, 24];
+
+/// Byte order of PCM samples.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ByteOrder {
+    Big,
+    Little,
+}
+
+/// How a stream's samples are stored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SampleEncoding {
+    /// Plain integer PCM as the container defines it (a plain AIFF's big-endian
+    /// samples).
+    Pcm { order: ByteOrder },
+    /// Anything else, named by a four-character code: `flac` for FLAC, and for an
+    /// AIFF-C its compression type (`NONE`, `twos`, `sowt`, `fl32`, `ulaw`, ...),
+    /// whether or not the samples are integer PCM, as AIFF-C is not a plain AIFF.
+    Other([u8; 4]),
+}
+
+/// The stream properties a container declares, read without decoding samples.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PcmInfo {
+    /// [`Container::Aiff`] or [`Container::Flac`].
+    pub container: Container,
+    pub channels: u8,
+    pub sample_rate: u32,
+    /// Sample frames. FLAC: STREAMINFO's total samples, 0 when it does not say.
+    pub frames: u64,
+    pub bits_per_sample: u8,
+    pub encoding: SampleEncoding,
+}
+
+impl PcmInfo {
+    /// `frames / sample_rate`, truncated to a nanosecond. Zero when the container
+    /// does not state the frame count (FLAC without total samples). A zero rate
+    /// counts as 1 Hz, so this never divides by zero.
+    pub fn duration(&self) -> std::time::Duration {
+        let nanos = u128::from(self.frames) * 1_000_000_000 / u128::from(self.sample_rate.max(1));
+        std::time::Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX))
+    }
+}
+
+/// The stream properties of the AIFF or FLAC file at `path`.
+pub fn pcm_info(path: &Path) -> Result<PcmInfo, PcmHashError> {
+    pcm_info_reader(File::open(path)?)
+}
+
+/// The stream properties of a seekable AIFF or FLAC byte source. AIFF is
+/// validated like [`pcm_hash`] does (supported format, SSND against COMM).
+pub fn pcm_info_reader<R: Read + Seek>(mut r: R) -> Result<PcmInfo, PcmHashError> {
+    let file_len = r.seek(SeekFrom::End(0))?;
+    match sniff::sniff(&mut r, file_len)? {
+        Container::Flac => flac::info(&mut r, file_len),
+        Container::Aiff => aiff::info(&mut r, file_len),
+        _ => Err(PcmHashError::Unsupported(Unsupported::StreamInfoContainer)),
+    }
+}
+
+/// What an AIFF or FLAC file declares about its stream (`COMM`, STREAMINFO),
+/// without PcmHash's support check: an AIFF-C of any compression type (float,
+/// `ulaw`) and the sample data are not looked at. [`pcm_info`] is this plus the
+/// PcmHash validation.
+pub fn stream_info(path: &Path) -> Result<PcmInfo, PcmHashError> {
+    stream_info_reader(File::open(path)?)
+}
+
+/// [`stream_info`] of a seekable byte source.
+pub fn stream_info_reader<R: Read + Seek>(mut r: R) -> Result<PcmInfo, PcmHashError> {
+    let file_len = r.seek(SeekFrom::End(0))?;
+    match sniff::sniff(&mut r, file_len)? {
+        Container::Flac => flac::info(&mut r, file_len),
+        Container::Aiff => aiff::stream_info(&mut r, file_len),
+        _ => Err(PcmHashError::Unsupported(Unsupported::StreamInfoContainer)),
+    }
+}
+
+pub use aiff::AiffPcmLayout;
+
+/// The sample layout of an AIFF / AIFF-C integer PCM stream (plain AIFF, or
+/// AIFF-C `NONE`/`twos`/`sowt`; mono or stereo), validated strictly like
+/// [`pcm_hash`]: SSND must hold exactly COMM's frame count.
+///
+/// A file that is not an AIFF is `Unsupported(NotAiff)` (or
+/// `AudioHashError::UnsupportedContainer` when not audio at all); an AIFF
+/// outside the integer-PCM scope (float, `ulaw`, more than two channels, ...)
+/// is another `Unsupported`; a malformed or truncated one is `Container`.
+pub fn aiff_pcm_layout<R: Read + Seek>(r: R) -> Result<AiffPcmLayout, PcmHashError> {
+    aiff_layout(r, aiff::Strictness::Strict)
+}
+
+/// [`aiff_pcm_layout`] for playback: the frames are bounded by
+/// `min(COMM's frame count, whole frames in SSND and in the file)`, so a
+/// truncated file plays what it has and bytes after the last frame are not
+/// played. Compare [`AiffPcmLayout::frames`] with
+/// [`AiffPcmLayout::declared_frames`] to see whether it differed. Only a file
+/// with no usable COMM or SSND, or an unsupported codec, is an error.
+pub fn aiff_pcm_layout_lenient<R: Read + Seek>(r: R) -> Result<AiffPcmLayout, PcmHashError> {
+    aiff_layout(r, aiff::Strictness::Lenient)
+}
+
+fn aiff_layout<R: Read + Seek>(
+    mut r: R,
+    strictness: aiff::Strictness,
+) -> Result<AiffPcmLayout, PcmHashError> {
+    let file_len = r.seek(SeekFrom::End(0))?;
+    match sniff::sniff(&mut r, file_len)? {
+        Container::Aiff => aiff::pcm_layout(&mut r, file_len, strictness),
+        _ => Err(PcmHashError::Unsupported(Unsupported::NotAiff)),
+    }
+}
+
 /// Hash the decoded samples of the file at `path`.
 pub fn pcm_hash(path: &Path) -> Result<PcmHash, PcmHashError> {
     pcm_hash_reader(File::open(path)?)
@@ -70,8 +228,8 @@ pub fn pcm_hash_reader<R: Read + Seek>(mut r: R) -> Result<PcmHash, PcmHashError
     let container = sniff::sniff(&mut r, file_len)?;
     match container {
         Container::Flac => flac::hash(&mut r, file_len),
-        Container::Mp3 => Err(PcmHashError::Unsupported("mp3: lossy")),
-        Container::Mp4 => Err(PcmHashError::Unsupported("mp4: not supported")),
+        Container::Mp3 => Err(PcmHashError::Unsupported(Unsupported::Mp3Lossy)),
+        Container::Mp4 => Err(PcmHashError::Unsupported(Unsupported::Mp4)),
         Container::Wav => {
             let layout = wav::layout(&mut r, file_len)?;
             raw::hash(&mut r, &layout)
@@ -111,7 +269,7 @@ impl ChannelsError {
     fn for_container(self, container: Container) -> PcmHashError {
         match self {
             ChannelsError::Zero => PcmHashError::malformed(container, "zero channels"),
-            ChannelsError::TooMany => PcmHashError::Unsupported("more than 2 channels"),
+            ChannelsError::TooMany => PcmHashError::Unsupported(Unsupported::MoreThanTwoChannels),
         }
     }
 }
@@ -156,6 +314,10 @@ pub(crate) struct StoredBits(u8);
 impl StoredBits {
     pub fn new(bits: u8) -> Option<Self> {
         (1..=32).contains(&bits).then_some(StoredBits(bits))
+    }
+
+    pub fn get(self) -> u8 {
+        self.0
     }
 
     /// Left shift that justifies a stored sample to 32 bits.
@@ -286,6 +448,31 @@ impl PcmHasher {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn info(frames: u64, sample_rate: u32) -> PcmInfo {
+        PcmInfo {
+            container: Container::Aiff,
+            channels: 2,
+            sample_rate,
+            frames,
+            bits_per_sample: 16,
+            encoding: SampleEncoding::Pcm {
+                order: ByteOrder::Big,
+            },
+        }
+    }
+
+    #[test]
+    fn duration_is_frames_over_rate() {
+        use std::time::Duration;
+        assert_eq!(info(44_100, 44_100).duration(), Duration::from_secs(1));
+        assert_eq!(info(22_050, 44_100).duration(), Duration::from_millis(500));
+        // 1 frame at 44.1 kHz is 22675.736... ns, truncated
+        assert_eq!(info(1, 44_100).duration(), Duration::from_nanos(22_675));
+        assert_eq!(info(0, 44_100).duration(), Duration::ZERO);
+        assert_eq!(info(5, 0).duration(), Duration::from_secs(5));
+    }
+
     use crate::fixtures::*;
     use pretty_assertions::assert_eq;
     use std::io::Cursor;
@@ -1108,7 +1295,7 @@ mod tests {
         let b = flac(&[si_block(3, 16, 0, [0; 16])], &golden_frames());
         assert!(matches!(
             pcm(&b),
-            Err(PcmHashError::Unsupported("more than 2 channels"))
+            Err(PcmHashError::Unsupported(Unsupported::MoreThanTwoChannels))
         ));
         // zero sample rate
         let b = flac(

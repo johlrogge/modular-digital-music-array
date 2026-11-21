@@ -72,7 +72,7 @@ impl BlobFactSet {
 pub struct IdentityFacts {
     pub facts: Vec<(MusicValue, FactSource)>,
     /// One message per requested hash that failed. Expected "unsupported"
-    /// outcomes (e.g. PcmHash of an MP3, AudioHash of AIFF) are not errors and
+    /// outcomes (e.g. PcmHash of an MP3, AudioHash of RF64) are not errors and
     /// are not listed.
     pub errors: Vec<String>,
 }
@@ -339,11 +339,12 @@ mod tests {
     }
 
     #[test]
-    fn aiff_has_no_audio_hash_and_no_error() {
+    fn aiff_gets_an_audio_hash_and_no_error() {
         let dir = tempfile::tempdir().unwrap();
         let p = write(dir.path(), "a.aiff", S16_AIFF);
         let f = identity_facts_for_blob(&p, BlobFactSet::INGEST, &source());
-        assert!(f.facts.is_empty());
+        assert_eq!(f.facts.len(), 1);
+        assert!(matches!(f.facts[0].0, MusicValue::AudioHash(_)));
         assert!(f.errors.is_empty(), "{:?}", f.errors);
     }
 

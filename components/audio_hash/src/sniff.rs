@@ -1,48 +1,22 @@
 //! Container identification from content (never from the file extension).
 
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek};
 
-use crate::mp3::{is_frame_sync, zero_padding};
-use crate::tags::{head_id3v2_len, read_at};
+use audio_format::{AudioFormat, Sniffed};
+
 use crate::{AudioHashError, Container};
 
+/// The container of the file, by content. The sniffing itself is `audio_format::sniff`,
+/// the one sniffer; this maps its answer to the hash's containers.
 pub(crate) fn sniff<R: Read + Seek>(r: &mut R, file_len: u64) -> Result<Container, AudioHashError> {
-    let id3 = head_id3v2_len(r, file_len)?;
-    let avail = file_len - id3;
-    let mut head = [0u8; 12];
-    let n = avail.min(12) as usize;
-    if n > 0 {
-        r.seek(SeekFrom::Start(id3))?;
-        r.read_exact(&mut head[..n])?;
+    match audio_format::sniff(r, file_len)? {
+        Sniffed::Format(AudioFormat::Flac) => Ok(Container::Flac),
+        Sniffed::Format(AudioFormat::Mp3) => Ok(Container::Mp3),
+        Sniffed::Format(AudioFormat::Wav) => Ok(Container::Wav),
+        Sniffed::Format(AudioFormat::M4a) => Ok(Container::Mp4),
+        Sniffed::Format(AudioFormat::Aiff) => Ok(Container::Aiff),
+        Sniffed::Rf64 | Sniffed::Unknown => Err(AudioHashError::UnsupportedContainer),
     }
-    let head = &head[..n];
-
-    if head.starts_with(b"fLaC") {
-        return Ok(Container::Flac);
-    }
-    // WAV, RF64 and MP4 are only recognised at offset 0: their layouts read
-    // from the start of the file, not after an ID3 chain.
-    if id3 == 0 {
-        if head.len() >= 12 && &head[0..4] == b"RIFF" && &head[8..12] == b"WAVE" {
-            return Ok(Container::Wav);
-        }
-        if head.len() >= 12 && &head[0..4] == b"FORM" && matches!(&head[8..12], b"AIFF" | b"AIFC") {
-            return Ok(Container::Aiff);
-        }
-        if head.starts_with(b"RF64") {
-            return Err(AudioHashError::UnsupportedContainer);
-        }
-        if head.len() >= 8 && &head[4..8] == b"ftyp" {
-            return Ok(Container::Mp4);
-        }
-    }
-    // MP3 last: tolerate bounded zero padding after the tag chain. Every other
-    // magic check has already run, so this cannot capture another format.
-    let start = id3 + zero_padding(r, id3, file_len)?;
-    if file_len.saturating_sub(start) >= 2 && is_frame_sync(read_at(r, start)?) {
-        return Ok(Container::Mp3);
-    }
-    Err(AudioHashError::UnsupportedContainer)
 }
 
 #[cfg(test)]

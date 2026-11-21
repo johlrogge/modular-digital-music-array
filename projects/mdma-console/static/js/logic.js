@@ -70,13 +70,30 @@ export function uploadRows(data) {
   return (data && Array.isArray(data.files) ? data.files : []).map((f) => ({ name: f.file, ok: !f.error, text: f.error || "Added to the inbox" }));
 }
 
-/** One line for POST /ingest-all's answer ([{ path, success, message }]). */
+/** One line for POST /ingest-all's answer ([{ path, success, pending, message }]); a pending file is still converting. */
 export function ingestSummary(results) {
   const all = Array.isArray(results) ? results : [];
   if (!all.length) return "Nothing to ingest";
-  const ok = all.filter((r) => r.success).length;
-  const failed = all.length - ok;
-  return "Ingested " + plural(ok, "file") + (failed ? ", " + failed + " failed" : "");
+  const failed = all.filter((r) => !r.success).length;
+  const converting = all.filter((r) => r.success && r.pending).length;
+  return "Ingested " + plural(all.length - failed - converting, "file") + (converting ? ", converting " + converting : "") + (failed ? ", " + failed + " failed" : "");
+}
+
+/** The files of GET /api/inbox ({ files: [{ path, state, attempt?, error? }], done: [{ path, warnings }] }). */
+export const inboxFiles = (data) => (data && Array.isArray(data.files) ? data.files : []);
+
+/** True while a file is queued, converting or retrying: the page polls only then. */
+export const isConverting = (data) => inboxFiles(data).some((f) => ["queued", "converting", "retrying"].includes(f.state));
+
+/** What an inbox row says of its file's conversion; "" for a file the converter does not hold. */
+export function fileNote(f) {
+  const notes = { queued: "Waiting to convert", converting: "Converting to FLAC…", retrying: "Retrying after attempt " + f.attempt + ": " + f.error, failed: "Failed: " + f.error };
+  return notes[f.state] || "";
+}
+
+/** Rows for the recently converted files of GET /api/inbox: [{ name, text }], the warnings if there are any. */
+export function doneRows(data) {
+  return (data && Array.isArray(data.done) ? data.done : []).map((d) => ({ name: d.path, text: (d.warnings || []).join("; ") || "Added to the library" }));
 }
 
 /**

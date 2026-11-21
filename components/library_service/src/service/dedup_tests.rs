@@ -682,7 +682,15 @@ fn a_rerun_after_a_crash_before_the_retire_completes_without_duplicating_facts()
         .unwrap();
     let gate = service.retire_gate.lock().unwrap();
     service
-        .write_merge_facts(&gate, &new, &old, vec![], &test_sources().dedup, carry)
+        .write_merge_facts(
+            &service.acid_client,
+            &gate,
+            &new,
+            &old,
+            vec![],
+            &test_sources().dedup,
+            carry,
+        )
         .unwrap();
     drop(gate);
     // The loser is retired now: no group any more, but an unfinished merge to find.
@@ -2142,6 +2150,36 @@ fn a_confirmed_merge_keeps_every_purchase_known_to_the_source() {
     };
     existing.sort();
     assert_eq!(existing, vec!["p1".to_string(), "p2".to_string()]);
+}
+
+#[test]
+fn a_confirmed_merge_unites_the_encoded_from_of_its_members() {
+    let (service, _d, _acid) = make_empty_service();
+    let encoded = |h: &str| src(MusicValue::EncodedFrom(ContentHash::new(h)));
+    // The winner's own EncodedFrom is the newer assertion, so a scalar rule would not
+    // carry the loser's.
+    let l = seed(
+        &service,
+        "l",
+        [base(1, Some("p1"), 1), vec![encoded("sha256:aiffl")]].concat(),
+    );
+    let w = seed(
+        &service,
+        "w",
+        [base(1, Some("p1"), 2), vec![encoded("sha256:aiffw")]].concat(),
+    );
+
+    let resp = service.handle_request(LibraryRequest::DedupMerge {
+        winner: w.clone(),
+        losers: vec![l],
+    });
+
+    assert!(matches!(resp, LibraryResponse::DedupMerged(_)), "{resp:?}");
+    let tracks = service.tracks.lock().unwrap();
+    for source in ["sha256:aiffl", "sha256:aiffw"] {
+        let alias = library_projection::track_encoded_from(&tracks, &ContentHash::new(source));
+        assert_eq!(alias.map(|t| t.content_hash.clone()), Some(w.clone()));
+    }
 }
 
 /// Two purchases of one file, merged by confirmation: the winner (p1) now also holds

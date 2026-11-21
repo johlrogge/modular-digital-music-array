@@ -12,7 +12,7 @@ ContentHash (SHA-256 of the whole file) is the entity key (ADR-003, ADR-004). Re
 
 - New fact `MusicValue::AudioHash(AudioHash)`; ContentHash remains the entity key.
 - Format: `audio-sha256-v1:<64 lowercase hex>`; validated newtype in music_primitives. The version is part of the value; hashes of different versions never compare equal.
-- v1 = SHA-256( "mdma-audiohash\0v1\0" || container_tag[4] || Σ(u64_le(len) || bytes) ) over container-defined ranges, in file order. container_tag ∈ {b"flac", b"mp3\0", b"wav\0", b"mp4\0"}.
+- v1 = SHA-256( "mdma-audiohash\0v1\0" || container_tag[4] || Σ(u64_le(len) || bytes) ) over container-defined ranges, in file order. container_tag ∈ {b"flac", b"mp3\0", b"wav\0", b"mp4\0", b"aif\0"} (AIFF: see the 2026-11-20 amendment).
   - **Trailer stripping** (FLAC and MP3): trailing tags are stripped by repeating the following checks against the current end of the range, in this order, until none matches; the range end never moves below its start. A match on the signature commits to that tag type; any subsequent inconsistency is an error (no fact). Strongest signatures are checked first so that a weak signature (`TAG`) inside another tag cannot misfire.
     1. APEv2/APEv1 footer: `APETAGEX` at end−32 with version (u32 LE at footer offset 8) 1000 or 2000. Size = u32 LE at footer offset 12, must be ≥ 32; total = size, plus 32 if flags (u32 LE at footer offset 20) bit 31 is set, in which case `APETAGEX` must also appear at end−total. Strip total.
     2. Lyrics3v2: `LYRICS200` at end−9 preceded by 6 ASCII decimal digits (size); total = size + 15, and `LYRICSBEGIN` must appear at end−total. Strip total.
@@ -50,6 +50,13 @@ ContentHash (SHA-256 of the whole file) is the entity key (ADR-003, ADR-004). Re
 
 ## Amendments
 
+- 2026-11-20: **AIFF and AIFF-C are v1 containers** (ADR-037), container tag `aif\0`. The v1 algorithm and the existing tags are unchanged: the FLAC/MP3/WAV/MP4 golden hashes still hold, and an AIFF golden hash is added. The ranges, in this order whatever their order in the file (a file with `SSND` before `COMM` hashes the same), are:
+  1. the payload of the *first* `COMM` chunk, whole (it plays the role of WAV's `fmt `; for AIFF-C it carries the compression type and name);
+  2. the SSND *sample bytes*: the payload of the first `SSND` chunk after its 8-byte `offset`/`blockSize` header and the `offset` filler bytes. Those are layout, not audio, so they are not hashed, as WAV's `data` has no header to exclude.
+
+  Every other chunk (`ID3 `, `NAME`, `AUTH`, `ANNO`, `COMT`, `MARK`, `INST`, `APPL`, `FVER`, ...) is ignored, so a retag keeps the hash. An odd-length chunk's pad byte is skipped. Errors, no fact: a missing `COMM` or `SSND`, an `SSND` shorter than its header, an `offset` past the end of the chunk, a chunk reaching past the end of the file (Malformed); empty sample data (NoAudio). A leading ID3v2 chain before `FORM` is not recognised as AIFF (as for WAV).
+
+  The hash covers any AIFF-C compression type, float (`fl32`, `fl64`) and compressed (`ulaw`, `alaw`) included. AudioHash is a hash of the *encoded bytes*, not of decoded PCM (that is PcmHash, ADR-012, which still refuses them), so it needs no decoder and gives every AIFF blob an identity, and with it a waveform (ADR-036). The cost is the usual one of the encoded-bytes tier: the same audio as `sowt` and as `twos`, or in a FLAC, has another AudioHash and is found by PcmHash.
 - 2026-11-19: the explicit blob backfill (`mdma library identity backfill --duration`) also fills `DurationMs`, the exact tag-read duration, for tracks that lack it. It is stamped with the library's `FilesystemScan` source, as ingest stamps it.
 
 ## Related

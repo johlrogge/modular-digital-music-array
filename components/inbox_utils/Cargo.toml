@@ -13,6 +13,9 @@ interface = "inbox-utils"
 
 [dependencies]
 tracing = "0.1"
+# The ingest policy (`AudioFormat`) is the one source of the ingestible extensions,
+# and its sniffer the one that identifies uploads.
+audio-format = { workspace = true }
 zip = "2"
 
 [dev-dependencies]

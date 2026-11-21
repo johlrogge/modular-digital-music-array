@@ -4,6 +4,7 @@ pkgname=mdma-library
 version=0.42.0
 revision=1
 archs="aarch64"
+depends="flac>=1.4"
 short_desc="MDMA music library service"
 # /music/{inbox,blobs} and /metadata are created and chowned by INSTALL.
 maintainer="Joakim Ohlrogge <joakim.ohlrogge@agical.se>"

@@ -7,7 +7,10 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use music_primitives::PcmHash;
 
-use super::{AudioHashError, Channels, PcmHashError, PcmHasher, SampleRate, StoredBits};
+use super::{
+    AudioHashError, Channels, PcmHashError, PcmHasher, PcmInfo, SampleEncoding, SampleRate,
+    StoredBits, Unsupported,
+};
 use crate::tags::be_u32;
 use crate::{flac, Container};
 
@@ -69,7 +72,7 @@ fn map_claxon(e: claxon::Error) -> PcmHashError {
     match e {
         claxon::Error::IoError(e) => PcmHashError::Container(AudioHashError::Io(e)),
         claxon::Error::FormatError(s) => PcmHashError::Decode(s),
-        claxon::Error::Unsupported(s) => PcmHashError::Unsupported(s),
+        claxon::Error::Unsupported(s) => PcmHashError::Unsupported(Unsupported::FlacDecoder(s)),
     }
 }
 
@@ -106,7 +109,11 @@ fn decode<R: Read>(stream: R, si: &StreamInfo, hasher: &mut PcmHasher) -> Result
     Ok(())
 }
 
-pub(crate) fn hash<R: Read + Seek>(r: &mut R, file_len: u64) -> Result<PcmHash, PcmHashError> {
+/// The audio range, the raw STREAMINFO bytes and the parsed STREAMINFO.
+fn load_streaminfo<R: Read + Seek>(
+    r: &mut R,
+    file_len: u64,
+) -> Result<(std::ops::Range<u64>, [u8; STREAMINFO_LEN], StreamInfo), PcmHashError> {
     let l = flac::layout(r, file_len)?;
     let range = l
         .streaminfo
@@ -115,12 +122,30 @@ pub(crate) fn hash<R: Read + Seek>(r: &mut R, file_len: u64) -> Result<PcmHash, 
     r.seek(SeekFrom::Start(range.start))?;
     r.read_exact(&mut si_bytes)?;
     let si = parse_streaminfo(&si_bytes)?;
+    Ok((l.audio, si_bytes, si))
+}
+
+/// The stream properties STREAMINFO declares. No samples are decoded.
+pub(crate) fn info<R: Read + Seek>(r: &mut R, file_len: u64) -> Result<PcmInfo, PcmHashError> {
+    let (_, _, si) = load_streaminfo(r, file_len)?;
+    Ok(PcmInfo {
+        container: C,
+        channels: si.channels.count() as u8,
+        sample_rate: si.rate.get(),
+        frames: si.total_samples,
+        bits_per_sample: si.bits.get(),
+        encoding: SampleEncoding::Other(*b"flac"),
+    })
+}
+
+pub(crate) fn hash<R: Read + Seek>(r: &mut R, file_len: u64) -> Result<PcmHash, PcmHashError> {
+    let (audio, si_bytes, si) = load_streaminfo(r, file_len)?;
 
     let mut head = b"fLaC".to_vec();
     head.extend([0x80, 0, 0, STREAMINFO_LEN as u8]);
     head.extend(si_bytes);
-    r.seek(SeekFrom::Start(l.audio.start))?;
-    let stream = Cursor::new(head).chain(r.by_ref().take(l.audio.end - l.audio.start));
+    r.seek(SeekFrom::Start(audio.start))?;
+    let stream = Cursor::new(head).chain(r.by_ref().take(audio.end - audio.start));
 
     let mut hasher = PcmHasher::new(si.channels, si.rate, si.bits);
     if si.md5 != [0u8; 16] {

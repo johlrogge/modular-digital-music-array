@@ -12,6 +12,7 @@ license = "MIT"
 interface = "audio-decoder"
 
 [dependencies]
+audio-hash = { workspace = true }
 audio-types = { workspace = true }
 thiserror = "1.0"
 tracing = "0.1"
@@ -29,5 +30,7 @@ name = "track_loading"
 harness = false
 
 [dev-dependencies]
+audio-fixtures = { workspace = true }
+tempfile = { workspace = true }
 pretty_assertions = "1"
 criterion = "0.5"
